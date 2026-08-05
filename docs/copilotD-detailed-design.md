@@ -2365,7 +2365,7 @@ claudeD issue 回归门禁：
 | tool/subagent/agent-scoped output 归并为原 thread 的单条 TaskDeck；4 秒 cadence、pending coalescing、terminal flush、select/expand/collapse/prev/next；>=8000 字符 tool result/error 逐字附件化；usage、warning/error、intent、workspace change 与 compaction 状态有非空 lane；raw chain-of-thought 永不展示；零 child-thread 路径 | typed Tasks/Fleet action buttons、完整 reasoning summary/diff artifact lane 尚未实现 |
 | 共享 TaskRegistry、failure consumer、10 分钟 active-execution SUSPECT + non-destructive ping、结构化 heartbeat、protected-work watchdog、macOS bot/watchdog LaunchAgent 与 Windows Scheduled Task definitions | 当前拓扑没有独立 runtime service；真实 service 安装、sleep/wake 和 Windows 实机仍待验证 |
 
-当前 deterministic 验证基线：`ruff check .`、258 个 pytest 全部通过。仓库内 hash-checked
+当前 deterministic 验证基线：`ruff check .`、259 个 pytest 全部通过。仓库内 hash-checked
 fixture 固定 SDK 1.0.8 / runtime 1.0.73 / protocol 3、114-event inventory 与 capability
 evidence；`copilotd sdk-probe --live` 使用当前登录账号创建 disposable session，属于独立的
 release/live acceptance，不由 deterministic fixture 冒充。这个快照用于区分“已验证实现”和后续

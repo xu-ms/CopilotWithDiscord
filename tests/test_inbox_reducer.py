@@ -60,12 +60,14 @@ def _adapted(
     *,
     source: str = "sdk",
     session_id: str = "session-projection",
+    generation: int = 1,
+    fence_token: int = 7,
 ) -> AdaptedEvent:
     event_id = str(uuid4()) if source == "sdk" else None
     return AdaptedEvent(
         sdk_session_id=session_id,
-        generation=1,
-        fence_token=7,
+        generation=generation,
+        fence_token=fence_token,
         inbox_seq=inbox_seq,
         source=source,
         raw_type=raw_type,
@@ -2497,3 +2499,199 @@ async def test_stale_explicit_task_snapshot_cannot_reopen_completed_submission(
     assert link is None
     assert lease["state"] == "released"
     assert incident["kind"] == "stale_task_evidence_ignored_for_completed_submission"
+
+
+@pytest.mark.asyncio
+async def test_repeated_terminal_task_snapshots_are_idempotent_across_resume(
+    tmp_path: Path,
+) -> None:
+    session_id = "session-terminal-repeat"
+    submission_id = "submission-terminal-repeat"
+
+    def requested(seq: int, *, generation: int, fence_token: int) -> AdaptedEvent:
+        return _adapted(
+            "copilotd.snapshot.requested",
+            {"topic": "tasks"},
+            seq,
+            source="internal",
+            session_id=session_id,
+            generation=generation,
+            fence_token=fence_token,
+        )
+
+    def terminal_snapshot(
+        seq: int,
+        epoch: int,
+        observed_at: float,
+        *,
+        generation: int,
+        fence_token: int,
+    ) -> AdaptedEvent:
+        return _adapted(
+            "copilotd.snapshot.observed",
+            {
+                "topic": "tasks",
+                "epoch": epoch,
+                "snapshot_id": f"terminal-repeat-{generation}-{epoch}",
+                "query_start_sdk_receive_seq": 0,
+                "query_end_sdk_receive_seq": 0,
+                "observed_at": observed_at,
+                "payload": {
+                    "tasks": [
+                        {
+                            "id": "task-terminal",
+                            "status": "completed",
+                            "type": "agent",
+                            "submissionId": submission_id,
+                        }
+                    ]
+                },
+            },
+            seq,
+            source="internal",
+            session_id=session_id,
+            generation=generation,
+            fence_token=fence_token,
+        )
+
+    async with Database(tmp_path / "terminal-repeat.sqlite3") as database:
+        await _insert_projection_binding(database, session_id)
+        await database.execute(
+            """
+            INSERT INTO submissions(
+                submission_id, sdk_session_id, origin, requested_mode,
+                state, completion_basis, created_at, observed_at,
+                idle_at, terminal_at
+            ) VALUES (
+                ?, ?, 'runtime_observed', 'interactive',
+                'semantic_complete', 'tasks_terminal_quiet',
+                100, 100, 150, 200
+            )
+            """,
+            (submission_id, session_id),
+        )
+        await database.execute(
+            """
+            INSERT INTO submission_segments(
+                submission_id, segment_index, user_event_id,
+                is_continuation, state, observed_at, idle_at
+            ) VALUES (?, 1, 'terminal-repeat-user', 0,
+                      'semantic_complete', 100, 150)
+            """,
+            (submission_id,),
+        )
+        await database.execute(
+            """
+            INSERT INTO submission_task_links(
+                sdk_session_id, task_id, submission_id, state,
+                terminal_evidence, correlation_basis, linked_at,
+                last_progress_at, terminal_at
+            ) VALUES (
+                ?, 'task-terminal', ?, 'completed', 'task_snapshot',
+                'explicit_submission_id', 120, 180, 180
+            )
+            """,
+            (session_id, submission_id),
+        )
+        await database.execute(
+            """
+            INSERT INTO liveness_leases(
+                sdk_session_id, lease_id, kind, source_id,
+                runtime_generation, owner_fence_token, state,
+                acquired_at, refreshed_at, released_at
+            ) VALUES (?, ?, 'submission', ?, 1, 7, 'released', 100, 200, 200)
+            """,
+            (
+                session_id,
+                f"submission:{submission_id}",
+                submission_id,
+            ),
+        )
+        reducer = JournalReducer(database)
+        first_repeat = [
+            requested(1, generation=1, fence_token=7),
+            terminal_snapshot(
+                2,
+                1,
+                210,
+                generation=1,
+                fence_token=7,
+            ),
+        ]
+        assert await reducer.persist(first_repeat) == len(first_repeat)
+        before_resume = await database.fetchone(
+            "SELECT state, terminal_at FROM submissions WHERE submission_id = ?",
+            (submission_id,),
+        )
+        lease_before = await database.fetchone(
+            """
+            SELECT state, runtime_generation, owner_fence_token
+            FROM liveness_leases WHERE kind = 'submission' AND source_id = ?
+            """,
+            (submission_id,),
+        )
+
+        await database.execute(
+            """
+            UPDATE session_bindings
+            SET runtime_generation = 2, owner_fence_token = 8,
+                last_inbox_seq = 0, last_sdk_receive_seq = NULL
+            WHERE sdk_session_id = ?
+            """,
+            (session_id,),
+        )
+        resumed_repeat = [
+            requested(3, generation=2, fence_token=8),
+            terminal_snapshot(
+                4,
+                2,
+                220,
+                generation=2,
+                fence_token=8,
+            ),
+        ]
+        assert await reducer.persist(resumed_repeat) == len(resumed_repeat)
+        after_resume = await database.fetchone(
+            "SELECT state, completion_basis, terminal_at FROM submissions"
+        )
+        link = await database.fetchone(
+            """
+            SELECT state, terminal_at FROM submission_task_links
+            WHERE task_id = 'task-terminal'
+            """
+        )
+        lease_after = await database.fetchone(
+            """
+            SELECT state, runtime_generation, owner_fence_token
+            FROM liveness_leases WHERE kind = 'submission' AND source_id = ?
+            """,
+            (submission_id,),
+        )
+        reopen_incidents = await database.fetchone(
+            """
+            SELECT COUNT(*) FROM runtime_incidents
+            WHERE kind = 'late_task_reopened_submission'
+            """
+        )
+
+    assert dict(before_resume) == {
+        "state": "semantic_complete",
+        "terminal_at": 200,
+    }
+    assert dict(lease_before) == {
+        "state": "released",
+        "runtime_generation": 1,
+        "owner_fence_token": 7,
+    }
+    assert dict(after_resume) == {
+        "state": "semantic_complete",
+        "completion_basis": "tasks_terminal_quiet",
+        "terminal_at": 200,
+    }
+    assert dict(link) == {"state": "completed", "terminal_at": 180}
+    assert dict(lease_after) == {
+        "state": "released",
+        "runtime_generation": 1,
+        "owner_fence_token": 7,
+    }
+    assert reopen_incidents[0] == 0

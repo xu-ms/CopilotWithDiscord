@@ -3440,7 +3440,8 @@ class JournalReducer:
     ) -> tuple[str | None, str | None, str | None]:
         cursor = await connection.execute(
             """
-            SELECT submission_id, correlation_basis, objective_id
+            SELECT submission_id, correlation_basis, objective_id,
+                   state, terminal_at
             FROM submission_task_links
             WHERE sdk_session_id = ? AND task_id = ?
             """,
@@ -3451,7 +3452,26 @@ class JournalReducer:
         if existing is not None:
             submission_id = str(existing["submission_id"])
             correlation_basis = str(existing["correlation_basis"])
-            if not await self._reopen_submission_for_task(
+            if existing["terminal_at"] is not None:
+                incoming_state = str(task.get("status", "")).lower()
+                if (
+                    incoming_state not in {"completed", "failed", "cancelled"}
+                    and evidence_time > float(existing["terminal_at"])
+                ):
+                    await self._record_runtime_incident_once(
+                        connection,
+                        event,
+                        kind="terminal_task_nonterminal_reappearance_ignored",
+                        detail={
+                            "task_id": task_id,
+                            "submission_id": submission_id,
+                            "terminal_state": str(existing["state"]),
+                            "incoming_state": incoming_state,
+                            "terminal_at": existing["terminal_at"],
+                            "evidence_time": evidence_time,
+                        },
+                    )
+            elif not await self._reopen_submission_for_task(
                 connection,
                 event,
                 submission_id=submission_id,
