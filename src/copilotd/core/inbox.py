@@ -47,6 +47,7 @@ class ReducerInbox:
         self._sdk_closed = False
         self._overflow: OverflowIncident | None = None
         self._producer_observer: Callable[[str], None] | None = None
+        self._loss_observer: Callable[[str], None] | None = None
         self.overflow_event = asyncio.Event()
 
     @property
@@ -203,16 +204,25 @@ class ReducerInbox:
         with self._lock:
             self._producer_observer = observer
 
+    def set_quiesce_observers(
+        self,
+        producer_observer: Callable[[str], None] | None,
+        loss_observer: Callable[[str], None] | None,
+    ) -> None:
+        with self._lock:
+            self._producer_observer = producer_observer
+            self._loss_observer = loss_observer
+
     def _reserve(
         self,
         *,
         source: str,
         record_overflow: bool = True,
     ) -> tuple[int, int | None] | None:
-        observer = self._producer_observer
-        if observer is not None:
-            observer(source)
         with self._lock:
+            observer = self._producer_observer
+            if observer is not None:
+                observer(source)
             if self._closed:
                 return None
             if self._outstanding >= self._capacity:
@@ -290,6 +300,8 @@ class ReducerInbox:
         inbox_seq: int,
         sdk_receive_seq: int | None,
     ) -> None:
+        if self._loss_observer is not None:
+            self._loss_observer("inbox_overflow")
         if self._overflow is None:
             self._overflow = OverflowIncident(
                 sdk_session_id=self.sdk_session_id,

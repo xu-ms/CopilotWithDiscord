@@ -79,7 +79,9 @@ def test_selected_hardware_lanes_require_real_resume_and_recheck_health() -> Non
     assert '"cleanup_verified": True' in macos
     assert "COPILOTD_ACCEPTANCE_ALLOW_SLEEP" in windows
     assert "SetSuspendState" in windows
-    assert "$wakeDeadline = $sleepRequestedAt.AddMinutes(3)" in windows
+    assert "$wakeAt = (Get-Date).AddMinutes(3)" in windows
+    assert "wake trigger does not have sufficient suspend margin" in windows
+    assert "$wakeDeadline = $wakeAt.ToUniversalTime().AddMinutes(2)" in windows
     assert "StartTime=$sleepRequestedAt" in windows
     assert "wake marker is outside the intended wake interval" in windows
     assert "'recent-wake'" in windows

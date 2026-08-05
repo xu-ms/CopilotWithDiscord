@@ -28,7 +28,7 @@ from copilotd.core.sessions import (
 from copilotd.core.task_registry import TaskRegistry
 from copilotd.ops.control import ServiceControlWorker
 from copilotd.ops.heartbeat import HeartbeatWriter
-from copilotd.ops.service import SqliteRestartCoordinator
+from copilotd.ops.service import ServiceManager, SqliteRestartCoordinator
 from copilotd.render.markdown import MarkdownAssembler, TableBlock, TextBlock
 from copilotd.render.outbox import (
     RenderDeliveryError,
@@ -48,6 +48,8 @@ _TABLE_DELIMITER = re.compile(r"^\s*\|?\s*:?-{3,}:?\s*(?:\|\s*:?-{3,}:?\s*)+\|?\
 
 class CopilotDiscordBot(commands.Bot):
     def __init__(self, settings: Settings) -> None:
+        if os.environ.get("COPILOTD_MANAGED_SERVICE") == "1":
+            settings = settings.ensure_service_handoff_token()
         intents = discord.Intents.default()
         intents.message_content = True
         super().__init__(command_prefix=commands.when_mentioned, intents=intents)
@@ -85,17 +87,40 @@ class CopilotDiscordBot(commands.Bot):
 
     async def setup_hook(self) -> None:
         await self.database.open()
-        await asyncio.to_thread(
-            SqliteRestartCoordinator(
-                self.settings.database_path
-            ).recover_for_replacement,
-            replacement_pid=os.getpid(),
-            replacement_generation=self.heartbeat.process_generation,
-            replacement_process_started_at=(
-                self.heartbeat.process_started_at
-            ),
-            now=time.time(),
+        coordinator = SqliteRestartCoordinator(self.settings.database_path)
+        recovery_fence = await asyncio.to_thread(
+            coordinator.recovery_fence
         )
+        if recovery_fence is not None:
+            manager = ServiceManager(self.settings)
+            replacement_is_managed = await asyncio.to_thread(
+                manager.replacement_is_managed,
+                pid=os.getpid(),
+                process_started_at=self.heartbeat.process_started_at,
+            )
+            old_process_alive = await asyncio.to_thread(
+                manager.process_identity_alive,
+                pid=recovery_fence.expected_pid,
+                process_started_at=(
+                    recovery_fence.expected_process_started_at
+                ),
+            )
+            await asyncio.to_thread(
+                coordinator.recover_for_replacement,
+                replacement_pid=os.getpid(),
+                replacement_generation=self.heartbeat.process_generation,
+                replacement_process_started_at=(
+                    self.heartbeat.process_started_at
+                ),
+                manager_handoff_token=(
+                    None
+                    if self.settings.service_handoff_token is None
+                    else self.settings.service_handoff_token.get_secret_value()
+                ),
+                replacement_is_managed=replacement_is_managed,
+                old_process_identity_alive=old_process_alive,
+                now=time.time(),
+            )
         self.projects = ProjectRegistry(
             self.database,
             resolved_home=self.settings.resolved_home,
@@ -151,6 +176,11 @@ class CopilotDiscordBot(commands.Bot):
                 self._require_sessions(),
                 process_generation=self.heartbeat.process_generation,
                 process_started_at=self.heartbeat.process_started_at,
+                handoff_token=(
+                    ""
+                    if self.settings.service_handoff_token is None
+                    else self.settings.service_handoff_token.get_secret_value()
+                ),
             ).run(),
             name="copilotd-service-control",
         )
@@ -322,21 +352,7 @@ class CopilotDiscordBot(commands.Bot):
             if binding is None or (not prompt and not message.attachments):
                 return
             sessions = self._require_sessions()
-            runtime = sessions.for_thread(str(message.channel.id))
-            if runtime is None or runtime.state.value in {
-                "detached",
-                "fenced",
-                "recovery_unknown",
-            }:
-                async with sessions.creation_admission():
-                    runtime = sessions.for_thread(str(message.channel.id))
-                    if runtime is None or runtime.state.value in {
-                        "fenced",
-                        "recovery_unknown",
-                    }:
-                        runtime = await sessions.replace(binding)
-                    if runtime.state.value == "detached":
-                        await runtime.attach_resume()
+            runtime = await sessions.ensure_attached(binding)
             try:
                 prepared = await self.attachment_service.prepare(
                     source_kind="discord-message",
@@ -628,16 +644,10 @@ class CopilotDiscordBot(commands.Bot):
                 if binding is None:
                     raise ValueError("the requested copilotD session is unknown")
             sessions = self._require_sessions()
-            async with sessions.creation_admission():
-                runtime = sessions.for_thread(binding.thread_id)
-                if runtime is None or runtime.state.value in {
-                    "closed",
-                    "fenced",
-                    "recovery_unknown",
-                }:
-                    runtime = await sessions.replace(binding)
-                if runtime.state.value == "detached":
-                    await runtime.attach_resume(reactivate=True)
+            await sessions.ensure_attached(
+                binding,
+                reactivate=True,
+            )
             thread = await self._thread_for_session(binding.sdk_session_id)
             await interaction.followup.send(
                 f"Session resumed: {thread.mention}",
@@ -907,22 +917,7 @@ class CopilotDiscordBot(commands.Bot):
     async def _interaction_runtime(self, interaction: discord.Interaction) -> SessionRuntime:
         binding = await self._interaction_binding(interaction)
         sessions = self._require_sessions()
-        runtime = sessions.for_thread(binding.thread_id)
-        if runtime is None or runtime.state.value in {
-            "detached",
-            "fenced",
-            "recovery_unknown",
-        }:
-            async with sessions.creation_admission():
-                runtime = sessions.for_thread(binding.thread_id)
-                if runtime is None or runtime.state.value in {
-                    "fenced",
-                    "recovery_unknown",
-                }:
-                    runtime = await sessions.replace(binding)
-                if runtime.state.value == "detached":
-                    await runtime.attach_resume()
-        return runtime
+        return await sessions.ensure_attached(binding)
 
     def _clean_prompt(self, message: discord.Message) -> str:
         content = message.content

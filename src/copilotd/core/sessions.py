@@ -213,6 +213,8 @@ class SessionRegistry:
         self._service_violation_callback: Callable[[str], None] | None = None
         self._active_creations = 0
         self._admission_condition = asyncio.Condition()
+        self._transition_lock = asyncio.Lock()
+        self._transitions: dict[str, asyncio.Task[SessionRuntime]] = {}
 
     def for_thread(self, thread_id: str) -> SessionRuntime | None:
         return self._runtimes.get(thread_id)
@@ -253,6 +255,56 @@ class SessionRegistry:
         self.register(runtime)
         return runtime
 
+    async def ensure_attached(
+        self,
+        binding: SessionBinding,
+        *,
+        reactivate: bool = False,
+    ) -> SessionRuntime:
+        runtime = self.for_thread(binding.thread_id)
+        if runtime is not None and runtime.state == RuntimeState.READY:
+            return runtime
+        async with self._transition_lock:
+            transition = self._transitions.get(binding.thread_id)
+            if transition is None:
+                transition = asyncio.create_task(
+                    self._ensure_attached_transition(
+                        binding,
+                        reactivate=reactivate,
+                    ),
+                    name=f"session-attach:{binding.thread_id}",
+                )
+                self._transitions[binding.thread_id] = transition
+        try:
+            return await asyncio.shield(transition)
+        finally:
+            if transition.done():
+                async with self._transition_lock:
+                    if self._transitions.get(binding.thread_id) is transition:
+                        self._transitions.pop(binding.thread_id, None)
+
+    async def _ensure_attached_transition(
+        self,
+        binding: SessionBinding,
+        *,
+        reactivate: bool,
+    ) -> SessionRuntime:
+        async with self.creation_admission():
+            runtime = self.for_thread(binding.thread_id)
+            if runtime is None or runtime.state in {
+                RuntimeState.CLOSED,
+                RuntimeState.FENCED,
+                RuntimeState.RECOVERY_UNKNOWN,
+            }:
+                runtime = await self.replace(binding)
+            if runtime.state == RuntimeState.DETACHED:
+                await runtime.attach_resume(reactivate=reactivate)
+            if runtime.state != RuntimeState.READY:
+                raise RuntimeError(
+                    f"session attach settled in {runtime.state}"
+                )
+            return runtime
+
     async def eager_resume(self) -> dict[str, str]:
         failures: dict[str, str] = {}
         for binding in await self._bindings.eager_bindings():
@@ -267,6 +319,7 @@ class SessionRegistry:
     async def begin_service_quiesce(
         self,
         on_violation: Callable[[str], None],
+        on_loss: Callable[[str], None],
     ) -> None:
         async with self._admission_condition:
             self._service_quiesced = True
@@ -277,7 +330,10 @@ class SessionRegistry:
         begun: list[SessionRuntime] = []
         try:
             for runtime in self._runtimes.values():
-                await runtime.begin_service_quiesce(on_violation)
+                await runtime.begin_service_quiesce(
+                    on_violation,
+                    on_loss,
+                )
                 begun.append(runtime)
         except BaseException:
             for runtime in reversed(begun):

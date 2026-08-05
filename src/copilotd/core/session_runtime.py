@@ -835,6 +835,7 @@ class SessionRuntime:
     async def begin_service_quiesce(
         self,
         on_violation: Callable[[str], None],
+        on_loss: Callable[[str], None],
     ) -> None:
         async with self._admission_lock:
             self._service_quiesced = True
@@ -842,12 +843,13 @@ class SessionRuntime:
             self._service_quiesce_violation_callback = on_violation
             self._accepting_sends = False
             if self._inbox is not None:
-                self._inbox.set_producer_observer(
-                    self._record_service_quiesce_producer
+                self._inbox.set_quiesce_observers(
+                    self._record_service_quiesce_producer,
+                    on_loss,
                 )
                 overflow = self._inbox.overflow
                 if overflow is not None and overflow.lost_count:
-                    self._record_service_quiesce_producer(
+                    on_loss(
                         "pre_quiesce_inbox_overflow"
                     )
         if self._mailbox is not None:
@@ -860,7 +862,7 @@ class SessionRuntime:
 
     async def end_service_quiesce(self) -> None:
         if self._inbox is not None:
-            self._inbox.set_producer_observer(None)
+            self._inbox.set_quiesce_observers(None, None)
         await self._restart_service_quiesce_producers()
         if self._mailbox is not None:
             await self._mailbox.resume_admission()
@@ -1755,7 +1757,15 @@ class SessionRuntime:
             self.state = RuntimeState.ATTACHING
             try:
                 self._lease = await self._acquire_owner_for_attachment()
-            except Exception:
+            except BaseException:
+                cleanup = asyncio.create_task(
+                    self._release_unassigned_owner_lease(),
+                    name=f"owner-acquire-cleanup:{self.binding.sdk_session_id}",
+                )
+                try:
+                    await asyncio.shield(cleanup)
+                except asyncio.CancelledError:
+                    await cleanup
                 self.state = RuntimeState.DETACHED
                 raise
             try:
@@ -1769,15 +1779,8 @@ class SessionRuntime:
                     ),
                 )
                 self._start_components()
-            except Exception:
-                lease = self._lease
-                self._lease = None
-                self.state = RuntimeState.DETACHED
-                if lease is not None:
-                    try:
-                        await self._owner_leases.release(lease)
-                    except FenceLost:
-                        pass
+            except BaseException:
+                await self._shield_attachment_cleanup(mark_unknown=True)
                 raise
 
             try:
@@ -1806,10 +1809,10 @@ class SessionRuntime:
                     )
                 if handle.session_id != self.binding.sdk_session_id:
                     raise RuntimeError("SDK returned a different session ID")
-            except Exception as error:
-                self.binding = await self._bindings.mark_attach_unknown(self.binding)
-                self.state = RuntimeState.RECOVERY_UNKNOWN
-                await self._stop_components(release_owner=True)
+            except BaseException as error:
+                await self._shield_attachment_cleanup(mark_unknown=True)
+                if isinstance(error, asyncio.CancelledError):
+                    raise
                 raise SessionAttachUnknown(
                     f"session {self.binding.sdk_session_id} attachment is unknown"
                 ) from error
@@ -1900,6 +1903,39 @@ class SessionRuntime:
                 self._accepting_sends = True
             self._start_runtime_producers()
 
+    async def _shield_attachment_cleanup(self, *, mark_unknown: bool) -> None:
+        cleanup = asyncio.create_task(
+            self._cleanup_attachment_failure(mark_unknown=mark_unknown),
+            name=f"attach-cleanup:{self.binding.sdk_session_id}",
+        )
+        try:
+            await asyncio.shield(cleanup)
+        except asyncio.CancelledError:
+            await cleanup
+
+    async def _cleanup_attachment_failure(self, *, mark_unknown: bool) -> None:
+        if mark_unknown:
+            current = await self._bindings.by_thread(self.binding.thread_id)
+            if (
+                current is not None
+                and current.runtime_generation == self.binding.runtime_generation
+                and current.owner_fence_token == self.binding.owner_fence_token
+                and current.attachment_state
+                in {AttachmentState.CREATING, AttachmentState.RESUMING}
+            ):
+                self.binding = await self._bindings.mark_attach_unknown(current)
+            self.state = RuntimeState.RECOVERY_UNKNOWN
+        if self._inbox is not None or self._lease is not None:
+            await self._stop_components(release_owner=True)
+            if not mark_unknown:
+                self.state = RuntimeState.DETACHED
+        else:
+            self.state = (
+                RuntimeState.RECOVERY_UNKNOWN
+                if mark_unknown
+                else RuntimeState.DETACHED
+            )
+
     async def _acquire_owner_for_attachment(self) -> OwnerLease:
         error: OwnerConflict | None = None
         for attempt in range(5):
@@ -1915,6 +1951,17 @@ class SessionRuntime:
                 await asyncio.sleep(0.1 * (attempt + 1))
         assert error is not None
         raise error
+
+    async def _release_unassigned_owner_lease(self) -> None:
+        current = await self._owner_leases.current(
+            self.binding.sdk_session_id
+        )
+        if current is None or current.owner_id != self._owner_id:
+            return
+        try:
+            await self._owner_leases.release(current)
+        except FenceLost:
+            return
 
     def _start_components(self) -> None:
         self._loop = asyncio.get_running_loop()

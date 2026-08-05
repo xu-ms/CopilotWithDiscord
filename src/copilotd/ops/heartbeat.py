@@ -17,6 +17,7 @@ from copilotd.ops.contracts import (
     HEARTBEAT_SCHEMA_VERSION,
     HEARTBEAT_WRITE_INTERVAL_SECONDS,
     RESUME_SUPPRESSION_SECONDS,
+    SERVICE_CONTROL_PROTOCOL_VERSION,
 )
 from copilotd.ops.wake import ResumeTimestampProvider, resume_timestamp_provider
 from copilotd.storage.database import Database
@@ -50,6 +51,7 @@ class HeartbeatSnapshot:
     process_started_at: str | None = None
     last_resume_at: str | None = None
     wake_suppression_until: str | None = None
+    service_control_protocol: int = 1
 
     @property
     def protected_work(self) -> bool:
@@ -225,6 +227,7 @@ class HeartbeatWriter:
             process_started_at=_rfc3339(self._process_started_at),
             last_resume_at=_optional_rfc3339(last_resume_at),
             wake_suppression_until=_optional_rfc3339(wake_suppression_until),
+            service_control_protocol=SERVICE_CONTROL_PROTOCOL_VERSION,
         )
 
 

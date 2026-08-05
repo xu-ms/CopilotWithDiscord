@@ -1,5 +1,6 @@
 import asyncio
 import os
+import sqlite3
 import time
 from collections.abc import Callable
 from pathlib import Path
@@ -8,8 +9,12 @@ from types import SimpleNamespace
 import pytest
 
 from copilotd.core.sessions import SessionRegistry
-from copilotd.ops.control import ServiceControlWorker
-from copilotd.ops.service import ServiceError, SqliteRestartCoordinator
+from copilotd.ops.control import ServiceControlWorker, fence_marker_paths
+from copilotd.ops.service import (
+    RestartBlocked,
+    ServiceError,
+    SqliteRestartCoordinator,
+)
 from copilotd.storage.database import Database
 
 
@@ -22,11 +27,16 @@ class FakeSessions:
         self.on_violation: Callable[[str], None] | None = None
         self.produce_during_begin = False
         self.begin_gate: asyncio.Event | None = None
+        self.end_gate: asyncio.Event | None = None
+        self.ignore_end_cancellation = False
+        self.end_error: Exception | None = None
 
     async def begin_service_quiesce(
         self,
         on_violation: Callable[[str], None],
+        on_loss: Callable[[str], None],
     ) -> None:
+        del on_loss
         self.begun += 1
         self.on_violation = on_violation
         if self.produce_during_begin:
@@ -36,6 +46,15 @@ class FakeSessions:
 
     async def end_service_quiesce(self) -> None:
         self.ended += 1
+        if self.end_error is not None:
+            raise self.end_error
+        if self.end_gate is not None:
+            try:
+                await self.end_gate.wait()
+            except asyncio.CancelledError:
+                if not self.ignore_end_cancellation:
+                    raise
+                await self.end_gate.wait()
 
     async def drain_service_quiesce(self) -> None:
         if self.depth:
@@ -54,8 +73,9 @@ class FakeRuntime:
     async def begin_service_quiesce(
         self,
         on_violation: Callable[[str], None],
+        on_loss: Callable[[str], None],
     ) -> None:
-        del on_violation
+        del on_violation, on_loss
         self.begun += 1
 
     async def end_service_quiesce(self) -> None:
@@ -91,6 +111,124 @@ async def test_second_restart_rejects_existing_active_fence_cleanly(
             expected_process_started_at=now - 1,
             now=now + 1,
         )
+
+
+@pytest.mark.asyncio
+async def test_durable_loss_marker_blocks_acknowledged_fence(
+    tmp_path: Path,
+) -> None:
+    database_path = tmp_path / "loss-marker.sqlite3"
+    async with Database(database_path) as database:
+        coordinator = SqliteRestartCoordinator(database_path)
+        now = time.time()
+        fence = coordinator.request_quiesce(
+            expected_pid=os.getpid(),
+            expected_generation="generation-1",
+            expected_process_started_at=now - 1,
+            now=now,
+        )
+        coordinator.acknowledge_quiesce(fence, now=now)
+        worker = ServiceControlWorker(
+            database,
+            FakeSessions(),
+            process_generation="generation-1",
+            process_started_at=now - 1,
+        )
+        worker._active_fence_id = fence.fence_id
+        worker._record_loss_sync("inbox_overflow")
+
+        with pytest.raises(
+            RestartBlocked,
+            match="loss_or_accounting_failure",
+        ):
+            coordinator.assert_quiesced(fence)
+
+        coordinator.release_quiesce(
+            fence,
+            now=now + 1,
+            reason="test_complete",
+        )
+        assert not any(
+            path.exists()
+            for path in fence_marker_paths(database_path, fence.fence_id)
+        )
+
+
+@pytest.mark.asyncio
+async def test_sqlite_accounting_lock_fails_fast_and_persists_marker(
+    tmp_path: Path,
+) -> None:
+    database_path = tmp_path / "accounting-lock.sqlite3"
+    async with Database(database_path) as database:
+        coordinator = SqliteRestartCoordinator(database_path)
+        now = time.time()
+        fence = coordinator.request_quiesce(
+            expected_pid=os.getpid(),
+            expected_generation="generation-1",
+            expected_process_started_at=now - 1,
+            now=now,
+        )
+        worker = ServiceControlWorker(
+            database,
+            FakeSessions(),
+            process_generation="generation-1",
+            process_started_at=now - 1,
+        )
+        worker._active_fence_id = fence.fence_id
+        lock = sqlite3.connect(database_path, timeout=0)
+        lock.execute("BEGIN IMMEDIATE")
+        started = time.monotonic()
+        try:
+            with pytest.raises(RuntimeError, match="durably record"):
+                worker._record_producer_sync("sdk")
+        finally:
+            lock.rollback()
+            lock.close()
+        assert time.monotonic() - started < 0.2
+        _, accounting_marker = fence_marker_paths(
+            database_path,
+            fence.fence_id,
+        )
+        assert accounting_marker.is_file()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("state", ["prepared", "committed"])
+async def test_irreversible_fence_self_terminates_live_worker(
+    tmp_path: Path,
+    state: str,
+) -> None:
+    database_path = tmp_path / f"self-terminate-{state}.sqlite3"
+    terminated: list[int] = []
+    async with Database(database_path) as database:
+        coordinator = SqliteRestartCoordinator(database_path)
+        now = time.time()
+        fence = coordinator.request_quiesce(
+            expected_pid=os.getpid(),
+            expected_generation="generation-1",
+            expected_process_started_at=now - 1,
+            now=now,
+        )
+        coordinator.acknowledge_quiesce(fence, now=now)
+        await database.execute(
+            """
+            UPDATE service_admission_fences SET state = ?
+            WHERE fence_id = ?
+            """,
+            (state, fence.fence_id),
+        )
+        worker = ServiceControlWorker(
+            database,
+            FakeSessions(),
+            process_generation="generation-1",
+            process_started_at=now - 1,
+            terminate_process=terminated.append,
+        )
+        worker._active_fence_id = fence.fence_id
+
+        await worker._poll_once()
+
+    assert terminated == [75]
 
 
 @pytest.mark.asyncio
@@ -408,6 +546,108 @@ async def test_released_fence_cancels_hung_quiesce_and_rolls_back(
 
 
 @pytest.mark.asyncio
+async def test_rollback_timeout_is_persisted_and_retried(
+    tmp_path: Path,
+) -> None:
+    database_path = tmp_path / "rollback-retry.sqlite3"
+    sessions = FakeSessions()
+    sessions.end_gate = asyncio.Event()
+    sessions.ignore_end_cancellation = True
+    generation = "generation-1"
+    started_at = time.time() - 1
+    async with Database(database_path) as database:
+        coordinator = SqliteRestartCoordinator(database_path)
+        fence = coordinator.request_quiesce(
+            expected_pid=os.getpid(),
+            expected_generation=generation,
+            expected_process_started_at=started_at,
+            now=time.time(),
+        )
+        coordinator.acknowledge_quiesce(fence, now=time.time())
+        coordinator.release_quiesce(
+            fence,
+            now=time.time(),
+            reason="test_rollback",
+        )
+        worker = ServiceControlWorker(
+            database,
+            sessions,
+            process_generation=generation,
+            process_started_at=started_at,
+            rollback_timeout_seconds=0.01,
+            terminate_process=lambda _code: None,
+        )
+        worker._active_fence_id = fence.fence_id
+
+        await worker._poll_once()
+        row = await database.fetchone(
+            """
+            SELECT rollback_state, rollback_attempts
+            FROM service_admission_fences WHERE fence_id = ?
+            """,
+            (fence.fence_id,),
+        )
+        assert tuple(row) == ("pending", 1)
+        assert worker._active_fence_id == fence.fence_id
+
+        sessions.end_gate.set()
+        await worker._poll_once()
+        row = await database.fetchone(
+            """
+            SELECT rollback_state, rollback_attempts
+            FROM service_admission_fences WHERE fence_id = ?
+            """,
+            (fence.fence_id,),
+        )
+        assert tuple(row) == ("complete", 2)
+        assert worker._active_fence_id is None
+
+
+@pytest.mark.asyncio
+async def test_rollback_exception_remains_pending_for_retry(
+    tmp_path: Path,
+) -> None:
+    database_path = tmp_path / "rollback-error.sqlite3"
+    sessions = FakeSessions()
+    sessions.end_error = RuntimeError("mailbox resume failed")
+    generation = "generation-1"
+    started_at = time.time() - 1
+    async with Database(database_path) as database:
+        coordinator = SqliteRestartCoordinator(database_path)
+        fence = coordinator.request_quiesce(
+            expected_pid=os.getpid(),
+            expected_generation=generation,
+            expected_process_started_at=started_at,
+            now=time.time(),
+        )
+        coordinator.acknowledge_quiesce(fence, now=time.time())
+        coordinator.release_quiesce(
+            fence,
+            now=time.time(),
+            reason="test_rollback_error",
+        )
+        worker = ServiceControlWorker(
+            database,
+            sessions,
+            process_generation=generation,
+            process_started_at=started_at,
+        )
+        worker._active_fence_id = fence.fence_id
+
+        await worker._poll_once()
+
+        row = await database.fetchone(
+            """
+            SELECT rollback_state, rollback_attempts
+            FROM service_admission_fences WHERE fence_id = ?
+            """,
+            (fence.fence_id,),
+        )
+        assert tuple(row) == ("pending", 1)
+        assert worker._active_fence_id == fence.fence_id
+
+
+@pytest.mark.asyncio
 async def test_registry_quiesce_waits_for_active_create_and_blocks_new_runtime() -> None:
     registry = SessionRegistry(
         SimpleNamespace(),
@@ -423,7 +663,10 @@ async def test_registry_quiesce_waits_for_active_create_and_blocks_new_runtime()
 
     async with registry.creation_admission():
         quiesce = asyncio.create_task(
-            registry.begin_service_quiesce(violated)
+            registry.begin_service_quiesce(
+                violated,
+                lambda _source: None,
+            )
         )
         await asyncio.sleep(0)
         assert not quiesce.done()

@@ -78,6 +78,11 @@ producer and event-journal epochs, marks only true in-flight outcomes unknown, a
 owner-lease handoff before replacing the process. Once force preparation is durable, a
 later failure terminates fail-closed and cannot reopen the old process.
 
+The control protocol is versioned. Upgrades stop and verify a legacy worker before issuing
+a v2 fence; replacement adoption requires the private manager handoff token plus OS
+PID/start identity. Inbox overflow and accounting failures leave durable watermark files
+that block restart, while rollback is bounded and persistently retried.
+
 ## Development
 
 Python 3.11 or newer is required.

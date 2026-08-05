@@ -1,20 +1,37 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import os
 import sqlite3
 import time
 from collections.abc import Callable
+from pathlib import Path
 from typing import Any, Protocol
 
+from copilotd.ops.contracts import SERVICE_CONTROL_PROTOCOL_VERSION
 from copilotd.storage.database import Database
+
+
+def fence_marker_paths(
+    database_path: Path,
+    fence_id: str,
+) -> tuple[Path, Path]:
+    prefix = database_path.with_name(
+        f".{database_path.name}.{fence_id}"
+    )
+    return (
+        prefix.with_name(prefix.name + ".loss"),
+        prefix.with_name(prefix.name + ".accounting-failure"),
+    )
 
 
 class QuiesceSessions(Protocol):
     async def begin_service_quiesce(
         self,
         on_producer: Callable[[str], None],
+        on_loss: Callable[[str], None],
     ) -> None: ...
 
     async def drain_service_quiesce(self) -> None: ...
@@ -34,16 +51,24 @@ class ServiceControlWorker:
         *,
         process_generation: str,
         process_started_at: float,
+        handoff_token: str = "",
         poll_seconds: float = 0.05,
         quiesce_timeout_seconds: float = 15,
+        rollback_timeout_seconds: float = 2,
+        terminate_process: Callable[[int], None] = os._exit,
     ) -> None:
         self._database = database
         self._sessions = sessions
         self._pid = os.getpid()
         self._process_generation = process_generation
         self._process_started_at = process_started_at
+        self._handoff_token_hash = hashlib.sha256(
+            handoff_token.encode()
+        ).hexdigest()
         self._poll_seconds = poll_seconds
         self._quiesce_timeout_seconds = quiesce_timeout_seconds
+        self._rollback_timeout_seconds = rollback_timeout_seconds
+        self._terminate_process = terminate_process
         self._active_fence_id: str | None = None
 
     async def run(self) -> None:
@@ -55,17 +80,20 @@ class ServiceControlWorker:
             if self._active_fence_id is not None:
                 state = await self._fence_state(self._active_fence_id)
                 if state not in {"prepared", "committed"}:
-                    await self._sessions.end_service_quiesce()
+                    await self._rollback_quiesce(
+                        self._active_fence_id
+                    )
 
     async def _poll_once(self) -> None:
         if self._active_fence_id is None:
             row = await self._database.fetchone(
                 """
                 SELECT * FROM service_admission_fences
-                WHERE state = 'requested'
+                WHERE state = 'requested' AND protocol_version = ?
                 ORDER BY requested_at
                 LIMIT 1
-                """
+                """,
+                (SERVICE_CONTROL_PROTOCOL_VERSION,),
             )
             if row is None:
                 return
@@ -77,6 +105,8 @@ class ServiceControlWorker:
                     - self._process_started_at
                 )
                 > 5
+                or str(row["handoff_token_hash"])
+                != self._handoff_token_hash
             ):
                 await self._release_mismatched_fence(row)
                 return
@@ -85,9 +115,11 @@ class ServiceControlWorker:
             return
 
         state = await self._fence_state(self._active_fence_id)
+        if state in {"prepared", "committed"}:
+            self._terminate_process(75)
+            return
         if state is None or state == "released":
-            await self._sessions.end_service_quiesce()
-            self._active_fence_id = None
+            await self._rollback_quiesce(self._active_fence_id)
             return
         if state == "acknowledged":
             depth, _ = self._sessions.service_quiesce_metrics()
@@ -100,6 +132,7 @@ class ServiceControlWorker:
         begin = asyncio.create_task(
             self._sessions.begin_service_quiesce(
                 self._record_producer_sync,
+                self._record_loss_sync,
             ),
             name=f"service-quiesce:{fence_id}",
         )
@@ -116,6 +149,13 @@ class ServiceControlWorker:
             if depth:
                 self._record_producer_sync("drain_depth")
                 continue
+            if self._has_failure_marker(fence_id):
+                await self._mark_quiesce_failed(
+                    fence_id,
+                    "durable_loss_or_accounting_failure",
+                )
+                await self._rollback_quiesce(fence_id)
+                return
             producer_count = await self._producer_count(fence_id)
             journal_id = await self._journal_id()
             async with self._database.transaction() as connection:
@@ -130,6 +170,8 @@ class ServiceControlWorker:
                     WHERE fence_id = ? AND state = 'requested'
                       AND expected_pid = ? AND expected_generation = ?
                       AND ABS(expected_process_started_at - ?) <= 5
+                      AND protocol_version = ?
+                      AND handoff_token_hash = ?
                       AND producer_count = ?
                       AND (SELECT COALESCE(MAX(journal_id), 0)
                            FROM event_journal) = ?
@@ -147,6 +189,8 @@ class ServiceControlWorker:
                         self._pid,
                         self._process_generation,
                         self._process_started_at,
+                        SERVICE_CONTROL_PROTOCOL_VERSION,
+                        self._handoff_token_hash,
                         producer_count,
                         journal_id,
                     ),
@@ -202,15 +246,56 @@ class ServiceControlWorker:
 
     async def _cancel_bounded(self, task: asyncio.Task[None]) -> None:
         task.cancel()
-        try:
-            async with asyncio.timeout(max(1.0, self._poll_seconds * 4)):
-                await asyncio.gather(task, return_exceptions=True)
-        except TimeoutError:
+        done, _ = await asyncio.wait(
+            {task},
+            timeout=max(1.0, self._poll_seconds * 4),
+        )
+        if task not in done:
             task.add_done_callback(_consume_task_result)
 
     async def _rollback_quiesce(self, fence_id: str) -> None:
-        await self._sessions.end_service_quiesce()
-        if self._active_fence_id == fence_id:
+        rollback = asyncio.create_task(
+            self._sessions.end_service_quiesce(),
+            name=f"service-quiesce-rollback:{fence_id}",
+        )
+        done, _ = await asyncio.wait(
+            {rollback},
+            timeout=self._rollback_timeout_seconds,
+        )
+        completed = (
+            rollback in done
+            and not rollback.cancelled()
+            and rollback.exception() is None
+        )
+        if not completed:
+            if rollback in done and not rollback.cancelled():
+                rollback.exception()
+            await self._cancel_bounded(rollback)
+        await self._database.execute(
+            """
+            UPDATE service_admission_fences
+            SET rollback_state = ?,
+                rollback_attempts = rollback_attempts + 1,
+                detail = ?
+            WHERE fence_id = ? AND state = 'released'
+            """,
+            (
+                "complete" if completed else "pending",
+                json.dumps(
+                    {
+                        "reason": (
+                            "rollback_complete"
+                            if completed
+                            else "rollback_timeout_retrying"
+                        )
+                    },
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ),
+                fence_id,
+            ),
+        )
+        if completed and self._active_fence_id == fence_id:
             self._active_fence_id = None
 
     async def _mark_quiesce_failed(self, fence_id: str, reason: str) -> None:
@@ -283,7 +368,7 @@ class ServiceControlWorker:
         if self._active_fence_id is None:
             return
         try:
-            connection = sqlite3.connect(str(self._database.path), timeout=5)
+            connection = sqlite3.connect(str(self._database.path), timeout=0)
             try:
                 connection.row_factory = sqlite3.Row
                 cursor = connection.execute(
@@ -329,9 +414,52 @@ class ServiceControlWorker:
             finally:
                 connection.close()
         except sqlite3.Error as error:
+            self._write_marker(
+                fence_id=self._active_fence_id,
+                kind="accounting-failure",
+                source=source,
+            )
             raise RuntimeError(
                 "could not durably record post-quiesce producer"
             ) from error
+
+    def _record_loss_sync(self, source: str) -> None:
+        if self._active_fence_id is None:
+            return
+        self._write_marker(
+            fence_id=self._active_fence_id,
+            kind="loss",
+            source=source,
+        )
+
+    def _has_failure_marker(self, fence_id: str) -> bool:
+        return any(
+            path.exists() and path.stat().st_size > 0
+            for path in fence_marker_paths(self._database.path, fence_id)
+        )
+
+    def _write_marker(
+        self,
+        *,
+        fence_id: str,
+        kind: str,
+        source: str,
+    ) -> None:
+        loss_path, accounting_path = fence_marker_paths(
+            self._database.path,
+            fence_id,
+        )
+        path = loss_path if kind == "loss" else accounting_path
+        descriptor = os.open(
+            path,
+            os.O_WRONLY | os.O_CREAT | os.O_APPEND,
+            0o600,
+        )
+        try:
+            os.write(descriptor, f"{source}\n".encode())
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
 
 
 def _consume_task_result(task: asyncio.Task[Any]) -> None:

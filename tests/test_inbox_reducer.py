@@ -115,6 +115,63 @@ async def test_quiesce_observer_covers_sdk_and_internal_producers() -> None:
     assert observed == ["sdk", "snapshot"]
 
 
+@pytest.mark.asyncio
+async def test_observer_change_and_reservation_share_one_barrier() -> None:
+    inbox = ReducerInbox(
+        sdk_session_id="session-1",
+        generation=1,
+        fence_token=7,
+        capacity=2,
+    )
+    observer_entered = threading.Event()
+    release_observer = threading.Event()
+    observed: list[str] = []
+
+    def observer(source: str) -> None:
+        observed.append(source)
+        observer_entered.set()
+        release_observer.wait(timeout=1)
+
+    inbox.set_quiesce_observers(observer, None)
+    producer = threading.Thread(target=lambda: _submit(inbox))
+    producer.start()
+    assert observer_entered.wait(timeout=1)
+    setter = threading.Thread(
+        target=lambda: inbox.set_quiesce_observers(None, None)
+    )
+    setter.start()
+    setter.join(timeout=0.02)
+    assert setter.is_alive()
+    release_observer.set()
+    producer.join(timeout=1)
+    setter.join(timeout=1)
+
+    assert observed == ["sdk"]
+    envelope = await inbox.get()
+    inbox.acknowledge(envelope)
+
+
+@pytest.mark.asyncio
+async def test_quiesce_loss_observer_marks_overflow() -> None:
+    inbox = ReducerInbox(
+        sdk_session_id="session-1",
+        generation=1,
+        fence_token=7,
+        capacity=1,
+    )
+    producers: list[str] = []
+    losses: list[str] = []
+    inbox.set_quiesce_observers(producers.append, losses.append)
+
+    assert inbox.submit_sdk(_message_delta())
+    assert not inbox.submit_sdk(_message_delta())
+
+    assert producers == ["sdk", "sdk"]
+    assert losses == ["inbox_overflow"]
+    envelope = await inbox.get()
+    inbox.acknowledge(envelope)
+
+
 def _submit(inbox: ReducerInbox) -> None:
     assert inbox.submit_sdk(_message_delta())
 

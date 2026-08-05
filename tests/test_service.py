@@ -66,6 +66,7 @@ def _heartbeat(now: float, **overrides: Any) -> HeartbeatSnapshot:
         last_callback_at=None,
         last_reducer_progress_at=None,
         durable_replay_capable=False,
+        service_control_protocol=2,
         process_started_at=datetime.fromtimestamp(now - 10, UTC).isoformat().replace("+00:00", "Z"),
     )
     return replace(snapshot, **overrides)
@@ -89,6 +90,7 @@ class FakeRunner:
         self.manager: ServiceManager | None = None
         self.mac_pid = 4321
         self.process_started_at = time.time() - 10
+        self.process_running = True
         self.missing_labels: set[str] = set()
         self.missing_tasks: set[str] = set()
         self.launchctl_overrides: dict[str, str] = {}
@@ -97,6 +99,15 @@ class FakeRunner:
         del check
         call = tuple(str(value) for value in command)
         self.calls.append(call)
+        if call[:2] == ("launchctl", "bootout") and call[-1].endswith(
+            "com.github.copilotd.bot"
+        ):
+            self.process_running = False
+        if (
+            call[:2] == ("launchctl", "bootstrap")
+            and call[-1].endswith("com.github.copilotd.bot.plist")
+        ):
+            self.process_running = True
         if call[0] == "plutil" and "-extract" in call:
             return self._result(call, stdout="300\n")
         if call[:2] == ("launchctl", "print"):
@@ -111,6 +122,23 @@ class FakeRunner:
             action = call[call.index("-Action") + 1]
             if action in {"Install", "Status"}:
                 return self._result(call, stdout=self._windows_status())
+        if (
+            call[0] == "powershell.exe"
+            and "-Command" in call
+            and "ProcessId =" in call[-1]
+        ):
+            return self._result(
+                call,
+                stdout=(
+                    datetime.fromtimestamp(
+                        self.process_started_at,
+                        UTC,
+                    ).isoformat()
+                    + "\n"
+                    if self.process_running
+                    else ""
+                ),
+            )
         return self._result(call)
 
     def _launchctl_output(self, label: str) -> str:
@@ -183,12 +211,14 @@ class AutoAckRestartCoordinator(SqliteRestartCoordinator):
         expected_pid: int,
         expected_generation: str,
         expected_process_started_at: float,
+        handoff_token: str = "",
         now: float,
     ) -> QuiesceFence:
         fence = super().request_quiesce(
             expected_pid=expected_pid,
             expected_generation=expected_generation,
             expected_process_started_at=expected_process_started_at,
+            handoff_token=handoff_token,
             now=now,
         )
         self.acknowledge_quiesce(fence, now=now)
@@ -268,7 +298,9 @@ def _manager(
         uid=501,
         windows_user_id="DOMAIN\\测试用户",
         resume_provider=lambda: None,
-        process_start_provider=lambda _: runner.process_started_at,
+        process_start_provider=lambda _: (
+            runner.process_started_at if runner.process_running else None
+        ),
         sleep=lambda _: None,
     )
     runner.manager = manager
@@ -606,6 +638,30 @@ def test_windows_sidecar_runtime_restart_uses_runtime_task(tmp_path: Path) -> No
         and "-Action" in call
         and call[call.index("-Action") + 1] == "RestartRuntime"
         for call in runner.calls
+    )
+
+
+def test_windows_process_identity_probe_distinguishes_alive_and_dead(
+    tmp_path: Path,
+) -> None:
+    settings = _settings(tmp_path)
+    runner = FakeRunner()
+    manager = ServiceManager(
+        settings,
+        entrypoint=settings.resolved_home / "copilotd.exe",
+        platform="win32",
+        command_runner=runner,
+        windows_user_id="DOMAIN\\test",
+    )
+
+    assert manager.process_identity_alive(
+        pid=runner.mac_pid,
+        process_started_at=runner.process_started_at,
+    )
+    runner.process_running = False
+    assert not manager.process_identity_alive(
+        pid=runner.mac_pid,
+        process_started_at=runner.process_started_at,
     )
 
 
@@ -1281,6 +1337,9 @@ async def test_committed_restart_hands_off_owner_and_recovers_attachment(
         replacement_pid=5000,
         replacement_generation="new-generation",
         replacement_process_started_at=now + 2,
+        manager_handoff_token="",
+        replacement_is_managed=True,
+        old_process_identity_alive=False,
         now=now + 2,
     ) == "committed"
     row = coordinator._fence_row(fence.fence_id)
@@ -1339,6 +1398,9 @@ async def test_replacement_completes_crashed_irreversible_prepare(
         replacement_pid=5000,
         replacement_generation="replacement-generation",
         replacement_process_started_at=now + 1,
+        manager_handoff_token="",
+        replacement_is_managed=True,
+        old_process_identity_alive=False,
         now=now + 1,
     ) == "committed"
 
@@ -1403,6 +1465,9 @@ async def test_replacement_adopts_reversible_crash_owner_without_ttl_wait(
         replacement_pid=5000,
         replacement_generation="replacement-generation",
         replacement_process_started_at=now + 1,
+        manager_handoff_token="",
+        replacement_is_managed=True,
+        old_process_identity_alive=False,
         now=now + 1,
     ) == "requested"
 
@@ -1423,6 +1488,52 @@ async def test_replacement_adopts_reversible_crash_owner_without_ttl_wait(
         "replacement_adopted_reversible_crash",
     )
     assert replacement.fence_token == 5
+
+
+@pytest.mark.asyncio
+async def test_replacement_adoption_requires_manager_token_and_old_process_death(
+    tmp_path: Path,
+) -> None:
+    settings = _settings(tmp_path)
+    async with Database(settings.database_path):
+        pass
+    coordinator = SqliteRestartCoordinator(settings.database_path)
+    now = time.time()
+    coordinator.request_quiesce(
+        expected_pid=4321,
+        expected_generation="old-generation",
+        expected_process_started_at=now - 10,
+        handoff_token="manager-token",
+        now=now,
+    )
+    common = {
+        "replacement_pid": 5000,
+        "replacement_generation": "new-generation",
+        "replacement_process_started_at": now + 1,
+        "now": now + 1,
+    }
+
+    with pytest.raises(ServiceError, match="not the effective"):
+        coordinator.recover_for_replacement(
+            manager_handoff_token="manager-token",
+            replacement_is_managed=False,
+            old_process_identity_alive=False,
+            **common,
+        )
+    with pytest.raises(ServiceError, match="old process is alive"):
+        coordinator.recover_for_replacement(
+            manager_handoff_token="manager-token",
+            replacement_is_managed=True,
+            old_process_identity_alive=True,
+            **common,
+        )
+    with pytest.raises(ServiceError, match="handoff token is invalid"):
+        coordinator.recover_for_replacement(
+            manager_handoff_token="wrong-token",
+            replacement_is_managed=True,
+            old_process_identity_alive=False,
+            **common,
+        )
 
 
 @pytest.mark.asyncio
@@ -1454,6 +1565,9 @@ async def test_replacement_recovers_legacy_committed_fence_with_null_epochs(
         replacement_pid=5000,
         replacement_generation="replacement-generation",
         replacement_process_started_at=now,
+        manager_handoff_token=None,
+        replacement_is_managed=True,
+        old_process_identity_alive=False,
         now=now,
     ) == "committed"
 
@@ -1470,6 +1584,47 @@ async def test_replacement_recovers_legacy_committed_fence_with_null_epochs(
     finally:
         connection.close()
     assert incident["kind"] == "post_commit_producer_violation"
+
+
+@pytest.mark.asyncio
+async def test_replacement_recovers_legacy_prepared_fence_with_null_identity(
+    tmp_path: Path,
+) -> None:
+    settings = _settings(tmp_path)
+    now = time.time()
+    async with Database(settings.database_path) as database:
+        await database.execute(
+            """
+            INSERT INTO service_admission_fences(
+                fence_id, expected_pid, expected_generation,
+                expected_process_started_at, state, requested_at,
+                acknowledged_at, force_prepared_at, ingress_depth,
+                producer_count, acknowledged_producer_count,
+                acknowledged_journal_id, violation_count,
+                protocol_version, handoff_token_hash, detail
+            ) VALUES (
+                'legacy-prepared', 4321, 'legacy-generation', NULL,
+                'prepared', ?, ?, ?, 0, 0, NULL, NULL, 0, 1, NULL, '{}'
+            )
+            """,
+            (now - 10, now - 9, now - 8),
+        )
+    coordinator = SqliteRestartCoordinator(settings.database_path)
+
+    assert coordinator.recover_for_replacement(
+        replacement_pid=5000,
+        replacement_generation="replacement-generation",
+        replacement_process_started_at=now,
+        manager_handoff_token=None,
+        replacement_is_managed=True,
+        old_process_identity_alive=False,
+        now=now,
+    ) == "committed"
+
+    row = coordinator._fence_row("legacy-prepared")
+    assert row is not None
+    assert row["state"] == "released"
+    assert row["owner_handoff_at"] is not None
 
 
 @pytest.mark.asyncio
@@ -1778,6 +1933,142 @@ def test_restart_missing_or_malformed_heartbeat_fails_closed(tmp_path: Path) -> 
 
 
 @pytest.mark.asyncio
+async def test_schema11_manager_replaces_legacy_protocol_worker_before_fence(
+    tmp_path: Path,
+) -> None:
+    settings = _settings(tmp_path)
+    async with Database(settings.database_path):
+        pass
+    runner = FakeRunner()
+    manager = _manager(settings, runner)
+    manager.install()
+    _write_heartbeat(
+        settings,
+        _heartbeat(
+            time.time(),
+            service_control_protocol=1,
+        ),
+    )
+
+    receipt = manager.restart()
+
+    assert receipt.admission_fence_id == "legacy-worker-protocol-upgrade"
+    assert any(
+        call[:2] == ("launchctl", "bootout")
+        and call[-1].endswith("com.github.copilotd.bot")
+        for call in runner.calls
+    )
+    assert any(
+        call[:2] == ("launchctl", "bootstrap")
+        and call[-1].endswith("com.github.copilotd.bot.plist")
+        for call in runner.calls
+    )
+    secrets = json.loads(
+        settings.service_secrets_path.read_text(encoding="utf-8")
+    )
+    assert secrets["service_handoff_token"] == manager._handoff_token
+    connection = sqlite3.connect(settings.database_path)
+    try:
+        count = connection.execute(
+            "SELECT COUNT(*) FROM service_admission_fences"
+        ).fetchone()[0]
+    finally:
+        connection.close()
+    assert count == 0
+
+
+@pytest.mark.asyncio
+async def test_legacy_protocol_replacement_requires_fresh_unprotected_heartbeat(
+    tmp_path: Path,
+) -> None:
+    settings = _settings(tmp_path)
+    async with Database(settings.database_path):
+        pass
+    runner = FakeRunner()
+    manager = _manager(settings, runner)
+    manager.install()
+    now = time.time()
+    _write_heartbeat(
+        settings,
+        _heartbeat(
+            now,
+            service_control_protocol=1,
+            ingress_queue_depth=1,
+        ),
+    )
+
+    with pytest.raises(
+        RestartBlocked,
+        match="legacy_worker_heartbeat_not_detach_safe",
+    ):
+        manager.restart()
+    _write_heartbeat(
+        settings,
+        _heartbeat(
+            now - 180,
+            service_control_protocol=1,
+            process_started_at=(
+                datetime.fromtimestamp(
+                    runner.process_started_at,
+                    UTC,
+                ).isoformat().replace("+00:00", "Z")
+            ),
+        ),
+    )
+    service_state = json.loads(
+        settings.service_state_path.read_text(encoding="utf-8")
+    )
+    service_state["installed_at"] = now - 300
+    settings.service_state_path.write_text(
+        json.dumps(service_state),
+        encoding="utf-8",
+    )
+    assert (
+        manager._watchdog_restart(now)
+        == "legacy-worker-manual-upgrade-required"
+    )
+
+    receipt = manager.restart(force=True)
+    assert receipt.admission_fence_id == "legacy-worker-protocol-upgrade"
+
+
+@pytest.mark.asyncio
+async def test_legacy_sidecar_runtime_loss_restarts_runtime_before_bot(
+    tmp_path: Path,
+) -> None:
+    settings = _settings(tmp_path)
+    async with Database(settings.database_path):
+        pass
+    runner = FakeRunner()
+    manager = _manager(settings, runner, topology="sidecar")
+    _write_heartbeat(
+        settings,
+        _heartbeat(
+            time.time(),
+            service_control_protocol=1,
+            runtime_state="down",
+        ),
+    )
+
+    receipt = manager.restart(force=True, restart_runtime=True)
+
+    assert receipt.admission_fence_id == "legacy-worker-protocol-upgrade"
+    runtime_restart = next(
+        index
+        for index, call in enumerate(runner.calls)
+        if call[:3] == ("launchctl", "kickstart", "-k")
+        and call[-1].endswith("com.github.copilotd.runtime")
+    )
+    bot_start = next(
+        index
+        for index, call in enumerate(runner.calls)
+        if call[:2] == ("launchctl", "bootstrap")
+        and call[-1].endswith("com.github.copilotd.bot.plist")
+    )
+    assert runtime_restart < bot_start
+
+
+@pytest.mark.asyncio
 async def test_restart_aborts_if_ingress_arrives_after_fenced_snapshot(
     tmp_path: Path,
 ) -> None:
@@ -1904,6 +2195,9 @@ async def test_force_prepare_failure_stays_irreversible_and_terminates_bot(
         replacement_pid=5000,
         replacement_generation="replacement-generation",
         replacement_process_started_at=now + 2,
+        manager_handoff_token=manager._handoff_token,
+        replacement_is_managed=True,
+        old_process_identity_alive=False,
         now=now + 2,
     ) == "committed"
     connection = coordinator._connect()

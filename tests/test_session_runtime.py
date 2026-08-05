@@ -1,4 +1,5 @@
 import asyncio
+import time
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -31,6 +32,7 @@ from copilotd.core.session_runtime import (
     SessionNotReady,
     SessionRuntime,
 )
+from copilotd.core.sessions import SessionRegistry
 from copilotd.sdk.bridge import PermissionPostureError
 from copilotd.storage.database import Database
 from copilotd.storage.leases import OwnerConflict, OwnerLeaseStore
@@ -1414,6 +1416,148 @@ async def test_owner_acquisition_retry_can_attach_after_handoff(
 
 
 @pytest.mark.asyncio
+async def test_attach_cancellation_during_owner_acquire_resets_state(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    session_id = str(uuid4())
+    async with Database(tmp_path / "attach-cancel-owner.sqlite3") as database:
+        bindings = SessionBindingRepository(database)
+        binding = await bindings.create(
+            thread_id="thread-attach-cancel-owner",
+            sdk_session_id=session_id,
+            cwd_snapshot=tmp_path,
+            project_source="implicit-home",
+        )
+        store = OwnerLeaseStore(database)
+        started = asyncio.Event()
+        never = asyncio.Event()
+
+        async def blocked_acquire(*_args: Any, **_kwargs: Any):
+            started.set()
+            await never.wait()
+
+        monkeypatch.setattr(store, "acquire", blocked_acquire)
+        runtime = SessionRuntime(
+            database=database,
+            bridge=FakeBridge(session_id),
+            bindings=bindings,
+            owner_leases=store,
+            owner_id="cancelled-owner",
+            binding=binding,
+        )
+        attach = asyncio.create_task(runtime.attach_resume())
+        await started.wait()
+        attach.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await attach
+
+        assert runtime.state == RuntimeState.DETACHED
+        assert await store.current(session_id) is None
+
+
+@pytest.mark.asyncio
+async def test_attach_cancellation_during_resume_releases_owner_and_recovers(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    session_id = str(uuid4())
+    async with Database(tmp_path / "attach-cancel-resume.sqlite3") as database:
+        bindings = SessionBindingRepository(database)
+        binding = await bindings.create(
+            thread_id="thread-attach-cancel-resume",
+            sdk_session_id=session_id,
+            cwd_snapshot=tmp_path,
+            project_source="implicit-home",
+        )
+        bridge = FakeBridge(session_id)
+        started = asyncio.Event()
+        never = asyncio.Event()
+
+        async def blocked_resume(**_kwargs: Any):
+            started.set()
+            await never.wait()
+
+        monkeypatch.setattr(bridge, "resume_session", blocked_resume)
+        store = OwnerLeaseStore(database)
+        runtime = SessionRuntime(
+            database=database,
+            bridge=bridge,
+            bindings=bindings,
+            owner_leases=store,
+            owner_id="cancelled-resume-owner",
+            binding=binding,
+        )
+        attach = asyncio.create_task(runtime.attach_resume())
+        await started.wait()
+        attach.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await attach
+
+        recovered = await bindings.by_thread(binding.thread_id)
+        owner = await store.current(session_id)
+        assert runtime.state == RuntimeState.RECOVERY_UNKNOWN
+        assert recovered is not None
+        assert recovered.attachment_state == AttachmentState.RECOVERY_UNKNOWN
+        assert owner is not None and owner.expires_at <= time.time()
+        assert runtime.inbox is None
+
+
+@pytest.mark.asyncio
+async def test_runtime_reactivation_is_single_flight_for_concurrent_messages(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    session_id = str(uuid4())
+    async with Database(tmp_path / "single-flight-resume.sqlite3") as database:
+        bindings = SessionBindingRepository(database)
+        binding = await bindings.create(
+            thread_id="thread-single-flight",
+            sdk_session_id=session_id,
+            cwd_snapshot=tmp_path,
+            project_source="implicit-home",
+        )
+        bridge = FakeBridge(session_id)
+        entered = asyncio.Event()
+        release = asyncio.Event()
+        resume_calls = 0
+        resume = bridge.resume_session
+
+        async def delayed_resume(**kwargs: Any):
+            nonlocal resume_calls
+            resume_calls += 1
+            entered.set()
+            await release.wait()
+            return await resume(**kwargs)
+
+        monkeypatch.setattr(bridge, "resume_session", delayed_resume)
+
+        def runtime_factory(current_binding):
+            return SessionRuntime(
+                database=database,
+                bridge=bridge,
+                bindings=bindings,
+                owner_leases=OwnerLeaseStore(database),
+                owner_id="single-flight-owner",
+                binding=current_binding,
+            )
+
+        registry = SessionRegistry(bindings, runtime_factory)
+        first = asyncio.create_task(registry.ensure_attached(binding))
+        await entered.wait()
+        second = asyncio.create_task(registry.ensure_attached(binding))
+        await asyncio.sleep(0)
+        assert not second.done()
+        release.set()
+        first_runtime, second_runtime = await asyncio.gather(first, second)
+
+        assert first_runtime is second_runtime
+        assert first_runtime.state == RuntimeState.READY
+        assert resume_calls == 1
+        await first_runtime.close(idempotency_key="close-single-flight")
+
+
+@pytest.mark.asyncio
 async def test_service_quiesce_stops_all_internal_inbox_producers(
     tmp_path: Path,
 ) -> None:
@@ -1437,8 +1581,15 @@ async def test_service_quiesce_stops_all_internal_inbox_producers(
         )
         await runtime.attach_create()
         producers: list[str] = []
+        losses: list[str] = []
+        assert runtime.inbox is not None
+        with runtime.inbox._lock:
+            runtime.inbox._record_overflow_locked(1, 1)
 
-        await runtime.begin_service_quiesce(producers.append)
+        await runtime.begin_service_quiesce(
+            producers.append,
+            losses.append,
+        )
 
         assert runtime._queue_task is None
         assert runtime._task_reconcile_task is None
@@ -1450,6 +1601,7 @@ async def test_service_quiesce_stops_all_internal_inbox_producers(
                 idempotency_key="blocked-during-quiesce",
             )
         assert runtime.service_quiesce_metrics() == (0, 0)
+        assert losses == ["pre_quiesce_inbox_overflow"]
 
         await runtime.end_service_quiesce()
         assert runtime._queue_task is not None
@@ -1484,7 +1636,10 @@ async def test_aborted_quiesce_restores_degraded_owner_renewal(
         await runtime.attach_create()
         runtime.state = RuntimeState.DEGRADED
 
-        await runtime.begin_service_quiesce(lambda _source: None)
+        await runtime.begin_service_quiesce(
+            lambda _source: None,
+            lambda _source: None,
+        )
         assert runtime._renewal_task is None
         await runtime.end_service_quiesce()
 

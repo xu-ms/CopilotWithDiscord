@@ -225,6 +225,13 @@ restart 使用持久事务而不是“读一次 heartbeat 后 kill”：
    terminate，不能 release/reopen。新 PID/generation/process-start 在启动 attach 前完成 committed
    fence adoption，随后 queued claim 以新 generation/fence 重建 submission lease。
 
+schema 11 将 service-control protocol 固定为 v2：旧 v1 worker 在建立 v2 fence 前必须由 OS
+manager 停止并证明原 PID/process-start 已退出；新 worker 通过私有 handoff token、effective
+manager PID/start 和 generation 三重证明后才能 adoption。inbox observer 安装与 reserve 共用
+barrier；overflow 或非阻塞 SQLite accounting 失败写 0600 durable watermark，任何 watermark
+都会阻止 ACK/commit。rollback 有 persisted pending/attempts/complete 状态并有界重试；
+prepared/committed worker 自行退出，避免 fresh heartbeat 掩盖 stranded transaction。
+
 ### Heartbeat 协议
 
 bot 每 30 秒原子写入 heartbeat JSON；不是只 touch mtime：
@@ -2368,7 +2375,7 @@ claudeD issue 回归门禁：
 | 已实现 | 当前边界 |
 |---|---|
 | 官方 `github-copilot-sdk==1.0.8` + bundled runtime 1.0.73，stdio `--yolo`，create/resume 后 full allow-all 对账 | sidecar client transport 断开后 session retention 实测失败，因此不声明 detached continuation；crash window 保守标 outcome unknown |
-| 10 个 SQLite migration、project `$HOME` fallback/cwd snapshot、owner fence、creation saga、bounded ingress、单 reducer、event journal、CommandMailbox、liveness leases、eager resume；共享连接事务隔离；`background_tasks_changed` 后 `tasks.refresh/list`，缺 terminal 消失转 UNKNOWN；force restart intent/outcome durable journal、producer/journal dual epoch admission fence 与 owner handoff | eventLog durable replay reconciler仍未接入 production supervisor；experimental task action RPC 继续 gated |
+| 11 个 SQLite migration、project `$HOME` fallback/cwd snapshot、owner fence、creation saga、bounded ingress、单 reducer、event journal、CommandMailbox、liveness leases、eager resume；共享连接事务隔离；`background_tasks_changed` 后 `tasks.refresh/list`，缺 terminal 消失转 UNKNOWN；force restart intent/outcome durable journal、protocol-v2 producer/journal dual epoch + loss watermark admission fence 与 owner handoff | eventLog durable replay reconciler仍未接入 production supervisor；experimental task action RPC 继续 gated |
 | durable app FIFO；每次用 `metadata.is_processing()`、`metadata.activity()` 与 `queue.pending_items()` readiness snapshot 只派发队首；`/queue add/list/remove/clear` | native queue entry 没有稳定 host ID 时不做虚假一一镜像；transport ambiguity 不自动重放 |
 | Discord core `/session`、`/project`、`/model`、bare `/autopilot`、bare/optional-prompt `/plan`、`/steer`、`/context`、`/usage`；user-input/Plan-exit/auto-mode-switch 使用 durable exactly-once interaction + select/modal 原位结算；Plan 退出 mode 精确关联并消费 | `/session delete`、compact/fork 和 Native-Gated commands 尚未实现，因而不注册；elicitation/MCP OAuth 仍待接入 |
 | durable input attachment manifest、hash/size 复验、图片 blob 压缩；stream/final RenderOutbox；table hold 与 code/PNG/MD/CSV assets；Discord HTTP/rate-limit 错误分类，超上限 artifact 按序无损分片 | Discord archived/locked thread、attachment edit、exact 429 retry-after 仍需真实 gateway fixture |

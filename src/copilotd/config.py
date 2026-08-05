@@ -3,11 +3,13 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import sqlite3
 import stat
+import subprocess
 import sys
 import time
 import uuid
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from pathlib import Path
 
 from platformdirs import user_cache_path, user_data_path, user_log_path
@@ -82,6 +84,7 @@ class Settings(BaseSettings):
     sdk_shutdown_timeout_seconds: float = 10
     runtime_uri: str | None = None
     runtime_connection_token: SecretStr | None = None
+    service_handoff_token: SecretStr | None = None
     owner_lease_ttl_seconds: int = 60
     owner_lease_renew_seconds: int = 20
     ingress_capacity: int = 4096
@@ -162,7 +165,8 @@ class Settings(BaseSettings):
         return self.data_dir / "cache" / "event-fixtures" / "capabilities.json"
 
     def ensure_directories(self) -> None:
-        self.adopt_legacy_windows_layout()
+        if os.environ.get("COPILOTD_MANAGED_SERVICE") != "1":
+            self.adopt_legacy_windows_layout()
         directories = [
             self.data_dir,
             self.cache_dir,
@@ -189,6 +193,7 @@ class Settings(BaseSettings):
         platform_name: str | None = None,
         environ: Mapping[str, str] | None = None,
         home: Path | None = None,
+        service_quiescer: Callable[[tuple[Path, ...]], None] | None = None,
     ) -> bool:
         effective_platform = sys.platform if platform_name is None else platform_name
         if effective_platform != "win32":
@@ -249,6 +254,22 @@ class Settings(BaseSettings):
             else:
                 if expected_data.exists():
                     _assert_merge_compatible(legacy_entries, expected_data)
+            databases = tuple(
+                path
+                for path in {
+                    legacy_source / "copilotd.sqlite3",
+                    expected_data / "copilotd.sqlite3",
+                    staging / "copilotd.sqlite3",
+                }
+                if path.exists()
+            )
+            if service_quiescer is not None:
+                service_quiescer(databases)
+            elif sys.platform == "win32":
+                _quiesce_windows_legacy_services(databases)
+            if databases:
+                _verify_exclusive_sqlite_writers(databases)
+            if not staging.exists():
                 _atomic_private_json(
                     journal,
                     {
@@ -257,6 +278,7 @@ class Settings(BaseSettings):
                         "legacy": str(legacy_source),
                         "target": str(expected_data),
                         "staging": str(staging),
+                        "service_quiesced": True,
                     },
                 )
                 if expected_data.exists():
@@ -271,6 +293,7 @@ class Settings(BaseSettings):
                     "legacy": str(legacy_source),
                     "staging": str(staging),
                     "target": str(expected_data),
+                    "service_quiesced": True,
                 },
             )
             legacy_entries = _legacy_state_entries(
@@ -313,7 +336,11 @@ class Settings(BaseSettings):
                     errors.append(f"{directory}: permissions must be 0700, found {mode:04o}")
         return errors
 
-    def write_service_secrets(self) -> Path:
+    def write_service_secrets(
+        self,
+        *,
+        service_handoff_token: SecretStr | None = None,
+    ) -> Path:
         payload = {
             "schema_version": 1,
             "discord_token": (
@@ -324,9 +351,29 @@ class Settings(BaseSettings):
                 if self.runtime_connection_token is None
                 else self.runtime_connection_token.get_secret_value()
             ),
+            "service_handoff_token": (
+                None
+                if service_handoff_token is None
+                and self.service_handoff_token is None
+                else (
+                    service_handoff_token
+                    or self.service_handoff_token
+                ).get_secret_value()
+            ),
         }
         _atomic_private_json(self.service_secrets_path, payload)
         return self.service_secrets_path
+
+    def ensure_service_handoff_token(self) -> Settings:
+        if self.service_handoff_token is not None:
+            return self
+        updated = self.model_copy(
+            update={"service_handoff_token": SecretStr(uuid.uuid4().hex)}
+        )
+        updated.write_service_secrets(
+            service_handoff_token=updated.service_handoff_token
+        )
+        return updated
 
     @property
     def service_secrets_path(self) -> Path:
@@ -375,7 +422,8 @@ def load_settings() -> Settings:
     """Load environment settings plus the private service-only secret file."""
 
     settings = Settings()
-    settings.adopt_legacy_windows_layout()
+    if os.environ.get("COPILOTD_MANAGED_SERVICE") != "1":
+        settings.adopt_legacy_windows_layout()
     settings = _apply_persisted_service_settings(settings)
     secret_path_text = os.environ.get("COPILOTD_SERVICE_SECRETS")
     if secret_path_text is None and not settings.service_secrets_path.exists():
@@ -399,6 +447,10 @@ def load_settings() -> Settings:
         updates["discord_token"] = SecretStr(str(payload["discord_token"]))
     if settings.runtime_connection_token is None and payload.get("runtime_connection_token"):
         updates["runtime_connection_token"] = SecretStr(str(payload["runtime_connection_token"]))
+    if settings.service_handoff_token is None and payload.get("service_handoff_token"):
+        updates["service_handoff_token"] = SecretStr(
+            str(payload["service_handoff_token"])
+        )
     return settings.model_copy(update=updates)
 
 
@@ -533,6 +585,73 @@ def _read_private_json(path: Path) -> dict[str, object] | None:
     except (OSError, ValueError, json.JSONDecodeError):
         return None
     return payload if isinstance(payload, dict) else None
+
+
+def _quiesce_windows_legacy_services(
+    databases: tuple[Path, ...],
+) -> None:
+    del databases
+    script = r"""
+$ErrorActionPreference = 'Stop'
+$upgraderProcessIds = @($PID, __PARENT_PID__)
+$tasks = @('copilotD Runtime', 'copilotD Bot', 'copilotD Watchdog')
+foreach ($taskName in $tasks) {
+  Stop-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue
+}
+$pattern = '(?i)(copilotd-service\.ps1|(?:^|\s)copilotd(?:\.exe)?\s+run\s+--foreground)'
+$deadline = [DateTime]::UtcNow.AddSeconds(15)
+do {
+  $processes = @(Get-CimInstance Win32_Process | Where-Object {
+    $upgraderProcessIds -notcontains $_.ProcessId -and
+    [regex]::IsMatch([string]$_.CommandLine, $pattern)
+  })
+  foreach ($process in $processes) {
+    & taskkill.exe /PID $process.ProcessId /T /F | Out-Null
+  }
+  if ($processes.Count -eq 0) { break }
+  Start-Sleep -Milliseconds 200
+} while ([DateTime]::UtcNow -lt $deadline)
+$remaining = @(Get-CimInstance Win32_Process | Where-Object {
+  $upgraderProcessIds -notcontains $_.ProcessId -and
+  [regex]::IsMatch([string]$_.CommandLine, $pattern)
+})
+if ($remaining.Count -ne 0) {
+  throw 'legacy copilotD process tree did not stop'
+}
+""".replace("__PARENT_PID__", str(os.getpid()))
+    completed = subprocess.run(
+        [
+            "powershell.exe",
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            script,
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    if completed.returncode != 0:
+        detail = completed.stderr.strip() or completed.stdout.strip()
+        raise RuntimeError(
+            f"could not quiesce legacy Windows service: {detail}"
+        )
+
+
+def _verify_exclusive_sqlite_writers(
+    databases: tuple[Path, ...],
+) -> None:
+    for database in databases:
+        connection = sqlite3.connect(str(database), timeout=0)
+        try:
+            connection.execute("BEGIN EXCLUSIVE")
+            connection.rollback()
+        except sqlite3.Error as error:
+            raise RuntimeError(
+                f"legacy SQLite database still has an active writer: {database}"
+            ) from error
+        finally:
+            connection.close()
 
 
 def _acquire_private_lock(path: Path) -> int:

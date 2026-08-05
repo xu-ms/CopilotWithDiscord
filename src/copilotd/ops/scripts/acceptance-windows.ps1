@@ -58,14 +58,13 @@ foreach ($TaskName in $expected) {
 
 $wakeTask = "copilotD Acceptance Wake $([Guid]::NewGuid())"
 $wakeMarker = Join-Path $env:TEMP "$wakeTask.txt"
-$sleepRequestedAt = [DateTime]::UtcNow
-$wakeDeadline = $sleepRequestedAt.AddMinutes(3)
+$wakeAt = (Get-Date).AddMinutes(3)
 $wakeAction = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument (
   "-NoProfile -NonInteractive -Command " +
   "`"Set-Content -LiteralPath '$($wakeMarker.Replace("'", "''"))' " +
   "-Value ([DateTime]::UtcNow.ToString('o')) -Encoding UTF8`""
 )
-$wakeTrigger = New-ScheduledTaskTrigger -Once -At (Get-Date).AddMinutes(1)
+$wakeTrigger = New-ScheduledTaskTrigger -Once -At $wakeAt
 $wakeSettings = New-ScheduledTaskSettingsSet -WakeToRun -StartWhenAvailable
 $wakePrincipal = New-ScheduledTaskPrincipal -UserId (
   [Security.Principal.WindowsIdentity]::GetCurrent().Name
@@ -74,6 +73,12 @@ try {
   Register-ScheduledTask -TaskName $wakeTask -Action $wakeAction `
     -Trigger $wakeTrigger -Settings $wakeSettings -Principal $wakePrincipal `
     -Force | Out-Null
+  $wakeInfo = Get-ScheduledTaskInfo -TaskName $wakeTask -ErrorAction Stop
+  if ($wakeInfo.NextRunTime -lt (Get-Date).AddMinutes(2)) {
+    throw 'wake trigger does not have sufficient suspend margin'
+  }
+  $sleepRequestedAt = [DateTime]::UtcNow
+  $wakeDeadline = $wakeAt.ToUniversalTime().AddMinutes(2)
   Add-Type -AssemblyName System.Windows.Forms
   $suspended = [Windows.Forms.Application]::SetSuspendState(
     [Windows.Forms.PowerState]::Suspend,
