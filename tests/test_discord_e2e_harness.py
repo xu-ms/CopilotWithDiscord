@@ -4,6 +4,7 @@ import pytest
 
 from copilotd.e2e.discord_harness import (
     DiscordE2EConfigurationError,
+    DiscordRealHarness,
     FeatureEvidence,
     RunEvidence,
     load_required_token,
@@ -56,3 +57,43 @@ def test_evidence_is_sanitized_and_atomic(tmp_path: Path) -> None:
     write_evidence(output, evidence)
     assert output.is_file()
     assert not list(tmp_path.glob("*.tmp"))
+
+
+def test_human_driver_plan_has_actions_assertions_and_stable_ids(
+    tmp_path: Path,
+) -> None:
+    harness = DiscordRealHarness(
+        token="not-used",
+        evidence_path=tmp_path / "evidence.json",
+    )
+    harness.evidence.guild_id = "guild"
+    harness.evidence.channel_id = "channel"
+    harness.evidence.thread_id = "thread"
+    harness._command_paths = [
+        "session list",
+        "project mcp add",
+        "Ask Copilot",
+        "Pin message",
+    ]
+    harness._stable_ids = {
+        "thread_name": "e2e-thread",
+        "seed_message_id": "seed",
+        "taskdeck_message_id": "taskdeck",
+    }
+
+    harness._record_interaction_coverage()
+
+    pending = [
+        feature for feature in harness.evidence.features if feature.status == "pending_human_driver"
+    ]
+    assert pending
+    assert all(feature.ui_actions for feature in pending)
+    assert all(feature.assertions for feature in pending)
+    assert all(feature.stable_identifiers["thread_id"] == "thread" for feature in pending)
+    slash_paths = {
+        feature.stable_identifiers["command_path"]
+        for feature in pending
+        if "command_path" in feature.stable_identifiers
+    }
+    assert slash_paths == {"/session list", "/project mcp add"}
+    assert all("blocked" not in feature.status for feature in pending)
