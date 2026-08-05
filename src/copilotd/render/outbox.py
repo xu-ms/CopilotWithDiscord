@@ -77,32 +77,65 @@ class RenderOutboxDispatcher:
         self._max_transient_attempts = max_transient_attempts
         self._last_delivery: dict[tuple[str, str], float] = {}
         self._dispatch_lock = asyncio.Lock()
+        self._restore_tasks: set[asyncio.Task[None]] = set()
 
     async def dispatch_once(
         self,
         *,
         limit: int = 20,
         now: float | None = None,
+        _deadline: float | None = None,
     ) -> int:
         async with self._dispatch_lock:
             live_clock = now is None
             timestamp = time.time() if live_clock else now
-            items = await self._claim(limit=limit, now=timestamp)
+            claimed_ids: list[str] = []
+            try:
+                items = await self._claim(
+                    limit=limit,
+                    now=timestamp,
+                    claimed_ids=claimed_ids,
+                )
+            except asyncio.CancelledError:
+                await self._restore_claim_ids(
+                    claimed_ids,
+                    deadline=_deadline,
+                )
+                raise
+            except Exception:
+                await self._restore_claim_ids(
+                    claimed_ids,
+                    deadline=_deadline,
+                )
+                raise
             delivered = 0
             for index, item in enumerate(items):
                 delivery_now = time.time() if live_clock else timestamp
                 try:
-                    if await self._deliver(
+                    was_delivered, stop_for_retry = await self._deliver(
                         item,
                         now=delivery_now,
                         live_clock=live_clock,
-                    ):
+                    )
+                    if was_delivered:
                         delivered += 1
+                    if stop_for_retry:
+                        await self._restore_claims(
+                            items[index + 1 :],
+                            deadline=_deadline,
+                        )
+                        break
                 except asyncio.CancelledError:
-                    await self._restore_claims(items[index:])
+                    await self._restore_claims(
+                        items[index:],
+                        deadline=_deadline,
+                    )
                     raise
                 except Exception:
-                    await self._restore_claims(items[index:])
+                    await self._restore_claims(
+                        items[index:],
+                        deadline=_deadline,
+                    )
                     raise
             return delivered
 
@@ -115,24 +148,32 @@ class RenderOutboxDispatcher:
         if deadline_seconds <= 0:
             raise ValueError("drain deadline must be positive")
         deadline = time.monotonic() + deadline_seconds
+        restore_reserve = min(0.05, deadline_seconds * 0.2)
         delivered = 0
         while True:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 return delivered
+            dispatch_budget = remaining - min(restore_reserve, remaining / 2)
+            if dispatch_budget <= 0:
+                return delivered
             try:
-                async with asyncio.timeout(remaining):
-                    count = await self.dispatch_once(limit=limit)
+                async with asyncio.timeout(dispatch_budget):
+                    count = await self.dispatch_once(
+                        limit=limit,
+                        _deadline=deadline,
+                    )
+                    pending = await self._database.fetchone(
+                        """
+                        SELECT COUNT(*) AS count,
+                               MIN(next_attempt_at) AS next_attempt_at
+                        FROM render_outbox
+                        WHERE state IN ('pending', 'sending')
+                        """
+                    )
             except TimeoutError:
                 return delivered
             delivered += count
-            pending = await self._database.fetchone(
-                """
-                SELECT COUNT(*) AS count, MIN(next_attempt_at) AS next_attempt_at
-                FROM render_outbox
-                WHERE state IN ('pending', 'sending')
-                """
-            )
             if pending is None or int(pending["count"]) == 0:
                 return delivered
             remaining = deadline - time.monotonic()
@@ -144,10 +185,25 @@ class RenderOutboxDispatcher:
             )
             await asyncio.sleep(min(eligibility_wait, 0.25, remaining))
 
-    async def _restore_claims(self, items: list[OutboxItem]) -> None:
-        if not items:
+    async def _restore_claims(
+        self,
+        items: list[OutboxItem],
+        *,
+        deadline: float | None = None,
+    ) -> None:
+        await self._restore_claim_ids(
+            [item.id for item in items],
+            deadline=deadline,
+        )
+
+    async def _restore_claim_ids(
+        self,
+        identifiers: list[str],
+        *,
+        deadline: float | None = None,
+    ) -> None:
+        if not identifiers:
             return
-        identifiers = [item.id for item in items]
         placeholders = ", ".join("?" for _ in identifiers)
         timestamp = time.time()
 
@@ -163,12 +219,35 @@ class RenderOutboxDispatcher:
             )
 
         task = asyncio.create_task(restore())
+        self._restore_tasks.add(task)
+        task.add_done_callback(self._restore_task_done)
+        remaining = None if deadline is None else max(0.0, deadline - time.monotonic())
+        if remaining == 0:
+            return
         try:
-            await asyncio.shield(task)
+            if remaining is None:
+                await asyncio.shield(task)
+            else:
+                async with asyncio.timeout(remaining):
+                    await asyncio.shield(task)
+        except TimeoutError:
+            return
         except asyncio.CancelledError:
-            await task
+            if deadline is None:
+                await task
 
-    async def _claim(self, *, limit: int, now: float) -> list[OutboxItem]:
+    def _restore_task_done(self, task: asyncio.Task[None]) -> None:
+        self._restore_tasks.discard(task)
+        if not task.cancelled():
+            task.exception()
+
+    async def _claim(
+        self,
+        *,
+        limit: int,
+        now: float,
+        claimed_ids: list[str],
+    ) -> list[OutboxItem]:
         async with self._database.transaction() as connection:
             await connection.execute(
                 """
@@ -196,9 +275,24 @@ class RenderOutboxDispatcher:
             )
             cursor = await connection.execute(
                 """
-                SELECT * FROM render_outbox
-                WHERE state = 'pending' AND next_attempt_at <= ?
-                ORDER BY session_id, logical_seq, created_at
+                SELECT candidate.* FROM render_outbox AS candidate
+                WHERE candidate.state = 'pending'
+                  AND candidate.next_attempt_at <= ?
+                  AND NOT EXISTS (
+                    SELECT 1 FROM render_outbox AS earlier
+                    WHERE earlier.session_id = candidate.session_id
+                      AND earlier.state IN ('pending', 'sending')
+                      AND (
+                        earlier.logical_seq < candidate.logical_seq
+                        OR (
+                            earlier.logical_seq = candidate.logical_seq
+                            AND earlier.created_at < candidate.created_at
+                        )
+                      )
+                  )
+                ORDER BY candidate.session_id,
+                         candidate.logical_seq,
+                         candidate.created_at
                 LIMIT ?
                 """,
                 (now, limit),
@@ -218,6 +312,7 @@ class RenderOutboxDispatcher:
                 claimed = update.rowcount == 1
                 await update.close()
                 if claimed:
+                    claimed_ids.append(str(row["id"]))
                     items.append(
                         OutboxItem(
                             id=row["id"],
@@ -238,7 +333,7 @@ class RenderOutboxDispatcher:
         *,
         now: float,
         live_clock: bool,
-    ) -> bool:
+    ) -> tuple[bool, bool]:
         logical_key = item.coalesce_key or item.id
         payload_hash = _payload_hash(item.payload)
         mapping = await self._database.fetchone(
@@ -259,7 +354,7 @@ class RenderOutboxDispatcher:
                 next_attempt_at=time.time() + cadence - elapsed,
                 now=now,
             )
-            return False
+            return False, True
         try:
             if mapping is not None and mapping["content_hash"] == payload_hash:
                 message_id = mapping["discord_message_id"]
@@ -294,7 +389,7 @@ class RenderOutboxDispatcher:
                 next_attempt_at=retry_now + error.retry_after,
                 now=retry_now,
             )
-            return False
+            return False, True
         except RenderTransientError:
             retry_now = time.time() if live_clock else now
             if item.attempts >= self._max_transient_attempts:
@@ -305,10 +400,10 @@ class RenderOutboxDispatcher:
                     next_attempt_at=retry_now + min(2 ** (item.attempts - 1), 30),
                     now=retry_now,
                 )
-            return False
+            return False, item.attempts < self._max_transient_attempts
         except RenderPermanentError:
             await self._block(item, now=time.time() if live_clock else now)
-            return False
+            return False, False
 
         self._last_delivery[delivery_key] = time.monotonic()
         async with self._database.transaction() as connection:
@@ -330,19 +425,40 @@ class RenderOutboxDispatcher:
                     int(finalized),
                 ),
             )
+            payload_cursor = await connection.execute(
+                "SELECT payload FROM render_outbox WHERE id = ?",
+                (item.id,),
+            )
+            current_row = await payload_cursor.fetchone()
+            await payload_cursor.close()
+            payload_changed = (
+                current_row is not None
+                and _payload_hash(json.loads(current_row["payload"])) != payload_hash
+            )
             cursor = await connection.execute(
                 """
                 UPDATE render_outbox
-                SET state = 'sent', updated_at = ?
+                SET state = ?,
+                    next_attempt_at = CASE
+                        WHEN ? = 'pending' THEN ?
+                        ELSE next_attempt_at
+                    END,
+                    updated_at = ?
                 WHERE id = ? AND state = 'sending'
                 """,
-                (now, item.id),
+                (
+                    "pending" if payload_changed else "sent",
+                    "pending" if payload_changed else "sent",
+                    time.time(),
+                    now,
+                    item.id,
+                ),
             )
             if cursor.rowcount != 1:
                 await cursor.close()
                 raise RuntimeError(f"render outbox claim was lost: {item.id}")
             await cursor.close()
-        return True
+        return True, False
 
     async def _retry(
         self,

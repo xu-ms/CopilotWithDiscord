@@ -140,3 +140,34 @@ async def test_local_markdown_image_extraction_ignores_code_containers_and_batch
     assert "![one]" not in plan.content
     assert "![outside]" in plan.content
     assert {warning.kind for warning in plan.warnings} == {"invalid-root"}
+
+
+@pytest.mark.asyncio
+async def test_local_markdown_image_extraction_handles_multiline_code_spans_and_blockquote_fences(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "allowed"
+    root.mkdir()
+    visible = root / "visible.png"
+    hidden_single = root / "hidden-single.png"
+    hidden_double = root / "hidden-double.png"
+    hidden_quote = root / "hidden-quote.png"
+    for path_item in (visible, hidden_single, hidden_double, hidden_quote):
+        _write_png(path_item)
+
+    source = (
+        f"`single start\n![hidden-single]({hidden_single.name})\nsingle end`\n"
+        f"``double start\n![hidden-double]({hidden_double.name})\ndouble end``\n"
+        f"> ```\n> ![hidden-quote]({hidden_quote.name})\n> ```\n"
+        f"![visible]({visible.name})\n"
+    )
+
+    plan = extract_local_markdown_images(source, allowed_roots=[root])
+
+    assert len(plan.attachments) == 1
+    assert plan.attachments[0].resolved_path == str(visible.resolve())
+    assert "![hidden-single]" in plan.content
+    assert "![hidden-double]" in plan.content
+    assert "![hidden-quote]" in plan.content
+    assert "![visible]" not in plan.content
+    assert plan.warnings == ()

@@ -11,7 +11,7 @@ from typing import Any
 
 import aiosqlite
 
-_CORE_MIGRATION_VERSION = 11
+_CORE_MIGRATION_VERSION = 13
 
 
 class Database:

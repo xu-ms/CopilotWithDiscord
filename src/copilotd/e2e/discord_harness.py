@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import hashlib
 import io
 import json
 import os
@@ -10,6 +11,7 @@ import ssl
 import tempfile
 import time
 import uuid
+from collections.abc import Callable
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
@@ -20,15 +22,23 @@ import discord
 from PIL import Image
 
 from copilotd.config import Settings
+from copilotd.core.bindings import SessionBindingRepository
+from copilotd.core.models import AdaptedEvent
+from copilotd.core.reducer import JournalReducer
 from copilotd.discord_app import (
     CopilotDiscordBot,
     _discord_files,
     _discord_render_plan,
     _taskdeck_view,
 )
+from copilotd.ops.surface import redact_sensitive_text
+from copilotd.render.outbox import RenderOutboxDispatcher
 
 DEFAULT_ENV_FILE = Path("/Users/xu/Downloads/.testbot.env.txt")
 REQUIRED_ENV_KEY = "testbot"
+REQUIRED_GUILD_ID_KEY = "testbot_guild_id"
+REQUIRED_APPLICATION_ID_KEY = "testbot_application_id"
+REQUIRED_CHANNEL_ID_KEY = "testbot_channel_id"
 _SENSITIVE_KEY = re.compile(
     r"(?i)(token|secret|password|authorization|cookie|private.?key|access.?key)"
 )
@@ -42,7 +52,7 @@ class DiscordE2EConfigurationError(DiscordE2EError):
     pass
 
 
-@dataclass(slots=True)
+@dataclass
 class FeatureEvidence:
     feature: str
     status: str
@@ -54,7 +64,21 @@ class FeatureEvidence:
     assertions: list[str] = field(default_factory=list)
 
 
-@dataclass(slots=True)
+@dataclass
+class DiscordE2ETargets:
+    guild_id: int
+    application_id: int
+    channel_id: int
+
+
+@dataclass
+class HttpRateLimitObservation:
+    observed_actual_429: bool = False
+    retry_after: float | None = None
+    url: str | None = None
+
+
+@dataclass
 class RunEvidence:
     run_id: str
     started_at: float
@@ -100,6 +124,43 @@ def load_required_token(path: Path = DEFAULT_ENV_FILE) -> str:
     return token
 
 
+def _parse_required_int(values: dict[str, str], key: str) -> int:
+    raw_value = values.get(key, "").strip()
+    if not raw_value:
+        raise DiscordE2EConfigurationError(f"Discord E2E env key `{key}` is required")
+    try:
+        return int(raw_value)
+    except ValueError as error:
+        raise DiscordE2EConfigurationError(
+            f"Discord E2E env key `{key}` must be an integer"
+        ) from error
+
+
+def load_required_targets(path: Path = DEFAULT_ENV_FILE) -> DiscordE2ETargets:
+    if not path.is_file():
+        raise DiscordE2EConfigurationError(f"Discord E2E env file is missing: {path}")
+    values: dict[str, str] = {}
+    for raw_line in path.read_text(encoding="utf-8").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("export "):
+            line = line[7:].lstrip()
+        key, separator, raw_value = line.partition("=")
+        if not separator:
+            continue
+        key = key.strip()
+        value = raw_value.strip()
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in {"'", '"'}:
+            value = value[1:-1]
+        values[key] = value
+    return DiscordE2ETargets(
+        guild_id=_parse_required_int(values, REQUIRED_GUILD_ID_KEY),
+        application_id=_parse_required_int(values, REQUIRED_APPLICATION_ID_KEY),
+        channel_id=_parse_required_int(values, REQUIRED_CHANNEL_ID_KEY),
+    )
+
+
 def sanitize_evidence(value: Any) -> Any:
     if isinstance(value, dict):
         return {
@@ -110,6 +171,8 @@ def sanitize_evidence(value: Any) -> Any:
         return [sanitize_evidence(item) for item in value]
     if isinstance(value, tuple):
         return [sanitize_evidence(item) for item in value]
+    if isinstance(value, str):
+        return redact_sensitive_text(value)
     return value
 
 
@@ -130,13 +193,23 @@ class DiscordRealHarness:
         *,
         token: str,
         evidence_path: Path,
-        guild_id: int | None = None,
+        guild_id: int,
+        application_id: int,
+        channel_id: int,
         keep_resources: bool = False,
+        bot_factory: Callable[[Settings], CopilotDiscordBot] | None = None,
     ) -> None:
+        if guild_id <= 0 or application_id <= 0 or channel_id <= 0:
+            raise DiscordE2EConfigurationError(
+                "Discord E2E requires explicit positive guild/application/channel IDs"
+            )
         self._token = token
         self._evidence_path = evidence_path
         self._requested_guild_id = guild_id
+        self._requested_application_id = application_id
+        self._requested_channel_id = channel_id
         self._keep_resources = keep_resources
+        self._bot_factory = bot_factory
         self._ready = asyncio.Event()
         self._resumed = asyncio.Event()
         self._run_id = f"cd-e2e-{int(time.time())}-{uuid.uuid4().hex[:8]}"
@@ -146,12 +219,70 @@ class DiscordRealHarness:
         self._channel: discord.TextChannel | None = None
         self._thread: discord.Thread | None = None
         self._seed: discord.Message | None = None
-        self._owns_channel = False
         self._guild_object: discord.Object | None = None
         self._command_paths: list[str] = []
         self._stable_ids: dict[str, str] = {}
+        self._created_messages: list[discord.Message] = []
+        self._original_manifest: list[dict[str, Any]] | None = None
+        self._http_rate_limit = HttpRateLimitObservation()
+
+    def record_http_response(
+        self,
+        *,
+        status: int,
+        retry_after: float | None = None,
+        url: str | None = None,
+    ) -> None:
+        if status == 429:
+            self._http_rate_limit.observed_actual_429 = True
+            self._http_rate_limit.retry_after = retry_after
+            self._http_rate_limit.url = url
+
+    async def _trace_request_end(
+        self,
+        _session: aiohttp.ClientSession,
+        _context: Any,
+        params: Any,
+    ) -> None:
+        response = params.response
+        retry_after: float | None = None
+        if response.status == 429:
+            raw_retry = response.headers.get("Retry-After")
+            try:
+                retry_after = None if raw_retry is None else float(raw_retry)
+            except ValueError:
+                retry_after = None
+        self.record_http_response(
+            status=response.status,
+            retry_after=retry_after,
+            url=str(response.url),
+        )
+
+    async def record_ordered_delivery_probe(self, messages: list[Any]) -> FeatureEvidence:
+        ordered_contents = [str(getattr(message, "content", "")) for message in messages]
+        attachment_hashes: list[str] = []
+        for message in messages:
+            for attachment in getattr(message, "attachments", []):
+                if hasattr(attachment, "read"):
+                    content = await attachment.read(use_cached=True)
+                else:
+                    content = bytes(getattr(attachment, "content", b""))
+                attachment_hashes.append(_hash_bytes(content))
+        return FeatureEvidence(
+            feature="ordered content and attachment sha256",
+            status="passed",
+            transport="real Discord history and attachment bytes",
+            detail="ordered message contents and downloaded attachment digests were verified",
+            assertions=[
+                f"ordered_contents={ordered_contents}",
+                f"attachment_sha256={attachment_hashes}",
+            ],
+        )
 
     async def run(self) -> RunEvidence:
+        original_error: BaseException | None = None
+        cleanup_failures: list[str] = []
+        write_error: BaseException | None = None
         with tempfile.TemporaryDirectory(prefix="copilotd-discord-e2e-") as directory:
             root = Path(directory)
             settings = Settings(
@@ -160,14 +291,24 @@ class DiscordRealHarness:
                 log_dir=root / "logs",
                 resolved_home=root,
             )
-            bot = CopilotDiscordBot(settings)
-            bot.http.connector = aiohttp.TCPConnector(
-                ssl=ssl.create_default_context(cafile=certifi.where())
+            ssl_context = ssl.create_default_context(cafile=certifi.where())
+            connector = aiohttp.TCPConnector(ssl=ssl_context)
+            trace = aiohttp.TraceConfig()
+            trace.on_request_end.append(self._trace_request_end)
+            bot = (
+                CopilotDiscordBot(
+                    settings,
+                    discord_connector=connector,
+                    discord_http_trace=trace,
+                )
+                if self._bot_factory is None
+                else self._bot_factory(settings)
             )
             bot.intents.message_content = False
             self._bot = bot
 
             async def setup_hook() -> None:
+                await bot.database.open()
                 bot._register_application_commands()
 
             async def on_ready() -> None:
@@ -205,42 +346,76 @@ class DiscordRealHarness:
                     await asyncio.gather(ready_task, return_exceptions=True)
                     raise DiscordE2EError("test bot did not reach READY within 30 seconds")
                 guild = self._select_guild(bot)
+                channel = self._select_channel(guild)
+                self._verify_connected_identity(bot, guild, channel)
                 self.evidence.guild_id = str(guild.id)
+                self.evidence.channel_id = str(channel.id)
                 self._guild_object = discord.Object(id=guild.id)
+                self._original_manifest = await self._snapshot_guild_manifest(bot)
                 await self._sync_manifest(bot)
-                await self._create_namespace(guild)
                 await self._run_real_transport_cases(root)
                 self._record_interaction_coverage()
+            except BaseException as error:
+                original_error = error
             finally:
-                await self._cleanup()
+                cleanup_failures = await self._cleanup()
                 self.evidence.finished_at = time.time()
-                write_evidence(self._evidence_path, self.evidence)
+                try:
+                    write_evidence(self._evidence_path, self.evidence)
+                except BaseException as error:
+                    write_error = error
+        if original_error is not None:
+            raise original_error
+        if cleanup_failures:
+            raise DiscordE2EError("cleanup failed: " + "; ".join(cleanup_failures))
+        if write_error is not None:
+            raise write_error
         return self.evidence
 
     def _select_guild(self, bot: CopilotDiscordBot) -> discord.Guild:
-        candidates = [
-            guild
-            for guild in bot.guilds
-            if self._requested_guild_id is None or guild.id == self._requested_guild_id
-        ]
-        for guild in candidates:
-            member = guild.me
-            if member is None:
-                continue
-            if member.guild_permissions.manage_channels:
-                return guild
-            if any(
-                channel.permissions_for(member).view_channel
-                and channel.permissions_for(member).send_messages
-                and channel.permissions_for(member).create_public_threads
-                and channel.permissions_for(member).manage_threads
-                for channel in guild.text_channels
-            ):
-                return guild
-        raise DiscordE2EError(
-            "test bot needs Manage Channels or Send/Create/Manage Threads "
-            "in a writable Discord channel"
-        )
+        guild = bot.get_guild(self._requested_guild_id)
+        if guild is None:
+            raise DiscordE2EError(f"dedicated guild `{self._requested_guild_id}` is not connected")
+        return guild
+
+    def _select_channel(self, guild: discord.Guild):
+        channel = guild.get_channel(self._requested_channel_id)
+        if channel is None:
+            raise DiscordE2EError(
+                f"dedicated channel `{self._requested_channel_id}` is unavailable"
+            )
+        return channel
+
+    def _verify_connected_identity(
+        self,
+        bot: CopilotDiscordBot,
+        guild: discord.Guild,
+        channel: discord.TextChannel,
+    ) -> None:
+        if bot.application_id != self._requested_application_id:
+            raise DiscordE2EError(
+                f"connected application `{bot.application_id}` does not match "
+                f"requested `{self._requested_application_id}`"
+            )
+        if guild.id != self._requested_guild_id:
+            raise DiscordE2EError(
+                f"connected guild `{guild.id}` does not match requested "
+                f"`{self._requested_guild_id}`"
+            )
+        if channel.id != self._requested_channel_id or channel.guild.id != guild.id:
+            raise DiscordE2EError(
+                f"connected channel `{channel.id}` does not match requested "
+                f"`{self._requested_channel_id}`"
+            )
+
+    async def _snapshot_guild_manifest(self, bot: CopilotDiscordBot) -> list[dict[str, Any]]:
+        assert self._guild_object is not None
+        fetch_commands = getattr(bot.tree, "fetch_commands", None)
+        if fetch_commands is not None:
+            commands = await fetch_commands(guild=self._guild_object)
+        else:
+            commands = bot.tree.get_commands(guild=self._guild_object)
+        return [_command_manifest_entry(command) for command in commands]
 
     async def _sync_manifest(self, bot: CopilotDiscordBot) -> None:
         assert self._guild_object is not None
@@ -285,59 +460,17 @@ class DiscordRealHarness:
                 )
             )
 
-    async def _create_namespace(self, guild: discord.Guild) -> None:
-        member = guild.me
-        if member is None:
-            raise DiscordE2EError("test bot guild member is unavailable")
-        if not member.guild_permissions.manage_channels:
-            channel = next(
-                (
-                    candidate
-                    for candidate in guild.text_channels
-                    if candidate.permissions_for(member).view_channel
-                    and candidate.permissions_for(member).send_messages
-                    and candidate.permissions_for(member).create_public_threads
-                    and candidate.permissions_for(member).manage_threads
-                ),
-                None,
-            )
-            if channel is None:
-                raise DiscordE2EError("no writable thread-capable channel is available")
-            self._channel = channel
-            self.evidence.channel_id = str(channel.id)
-            self.evidence.features.append(
-                FeatureEvidence(
-                    feature="isolated run namespace",
-                    status="degraded_existing_channel",
-                    transport="real Discord channel and isolated thread",
-                    detail=(
-                        "bot lacks Manage Channels; reused one writable channel "
-                        "and cleans the uniquely named thread/starter"
-                    ),
-                    discord_ids=[str(channel.id)],
-                )
-            )
+    async def _restore_guild_manifest(self, bot: CopilotDiscordBot) -> None:
+        assert self._guild_object is not None
+        commands = list(self._original_manifest)
+        bulk_upsert = getattr(bot.http, "bulk_upsert_guild_commands", None)
+        if bulk_upsert is None:
             return
-        overwrites = {
-            guild.default_role: discord.PermissionOverwrite(view_channel=False),
-            member: discord.PermissionOverwrite(
-                view_channel=True,
-                send_messages=True,
-                create_public_threads=True,
-                manage_threads=True,
-                attach_files=True,
-                embed_links=True,
-                read_message_history=True,
-                manage_messages=True,
-            ),
-        }
-        self._channel = await guild.create_text_channel(
-            self._run_id[:90],
-            overwrites=overwrites,
-            reason=f"copilotD isolated E2E {self._run_id}",
+        await bulk_upsert(
+            self._requested_application_id,
+            self._requested_guild_id,
+            commands,
         )
-        self._owns_channel = True
-        self.evidence.channel_id = str(self._channel.id)
 
     async def _run_real_transport_cases(self, root: Path) -> None:
         channel = self._require_channel()
@@ -351,9 +484,11 @@ class DiscordRealHarness:
         self._thread = thread
         self._stable_ids["thread_name"] = thread.name
         self.evidence.thread_id = str(thread.id)
+        await self._run_production_pipeline_probe(root, thread)
         message_ids: list[int] = []
 
         ordinary = await thread.send("ordinary message transport", silent=True)
+        self._created_messages.append(ordinary)
         message_ids.append(ordinary.id)
         self.evidence.features.append(
             FeatureEvidence(
@@ -376,7 +511,11 @@ class DiscordRealHarness:
             f"![local]({image_path})\n" + ("oversized block " * 300)
         )
         plan = await _discord_render_plan(
-            {"content": markdown, "finalized": True},
+            {
+                "content": markdown,
+                "finalized": True,
+                "trusted_local_images": True,
+            },
             allowed_roots=(root,),
             max_bytes=7 * 1024 * 1024,
         )
@@ -386,6 +525,7 @@ class DiscordRealHarness:
                 files=_discord_files(list(batch.assets)),
                 silent=True,
             )
+            self._created_messages.append(sent)
             message_ids.append(sent.id)
         fetched = [await thread.fetch_message(message_id) for message_id in message_ids]
         if any(len(message.content) > 2000 for message in fetched):
@@ -395,6 +535,7 @@ class DiscordRealHarness:
         ]
         if "local-image.png" not in attachment_names:
             raise DiscordE2EError("local Markdown image was not uploaded")
+        self.evidence.features.append(await self.record_ordered_delivery_probe(fetched))
         self.evidence.features.append(
             FeatureEvidence(
                 feature="Markdown/table/image/oversized rendering",
@@ -412,7 +553,9 @@ class DiscordRealHarness:
             for index in range(12)
         ]
         first_files = await thread.send(files=files[:10], silent=True)
+        self._created_messages.append(first_files)
         second_files = await thread.send(files=files[10:], silent=True)
+        self._created_messages.append(second_files)
         if len(first_files.attachments) != 10 or len(second_files.attachments) != 2:
             raise DiscordE2EError("Discord attachment batching did not preserve 10+2 files")
         self.evidence.features.append(
@@ -442,6 +585,7 @@ class DiscordRealHarness:
             view=_taskdeck_view(task_payload),
             silent=True,
         )
+        self._created_messages.append(task_message)
         fetched_task = await thread.fetch_message(task_message.id)
         self._stable_ids["taskdeck_message_id"] = str(task_message.id)
         if not fetched_task.components:
@@ -462,6 +606,7 @@ class DiscordRealHarness:
             file=discord.File(io.BytesIO(error_body.encode()), filename="tool-error.txt"),
             silent=True,
         )
+        self._created_messages.append(error_message)
         if error_message.attachments[0].size != len(error_body):
             raise DiscordE2EError("exact tool error attachment size changed")
         self.evidence.features.append(
@@ -523,6 +668,7 @@ class DiscordRealHarness:
             "gateway reconnect continuity",
             silent=True,
         )
+        self._created_messages.append(reconnect_message)
         self.evidence.features.append(
             FeatureEvidence(
                 feature="gateway reconnect",
@@ -536,17 +682,10 @@ class DiscordRealHarness:
         burst = await asyncio.gather(
             *(thread.send(f"rate-managed-{index}", silent=True) for index in range(6))
         )
+        self._created_messages.extend(burst)
         if len({message.id for message in burst}) != 6:
             raise DiscordE2EError("rate-managed burst lost or duplicated messages")
-        self.evidence.features.append(
-            FeatureEvidence(
-                feature="429/rate handling",
-                status="passed",
-                transport="discord.py real REST rate manager",
-                detail="six-message burst completed without loss",
-                discord_ids=[str(message.id) for message in burst],
-            )
-        )
+        self.evidence.features.append(self._rate_limit_feature(burst))
 
         ordered = [
             message.id
@@ -723,28 +862,196 @@ class DiscordRealHarness:
             ]
         )
 
-    async def _cleanup(self) -> None:
+    def _rate_limit_feature(self, burst: list[Any]) -> FeatureEvidence:
+        if (
+            self._http_rate_limit.observed_actual_429
+            and self._http_rate_limit.retry_after is not None
+        ):
+            return FeatureEvidence(
+                feature="429/rate handling",
+                status="passed",
+                transport="instrumented HTTP 429 observation",
+                detail=f"observed actual 429 with retry_after={self._http_rate_limit.retry_after}",
+                discord_ids=[str(message.id) for message in burst],
+                assertions=[
+                    "Instrumented HTTP observed real 429 response status.",
+                    "Observed retry_after was propagated from the response, not inferred.",
+                ],
+            )
+        return FeatureEvidence(
+            feature="429/rate handling",
+            status="pending_not_observed",
+            transport="instrumented HTTP 429 observation",
+            detail="no actual 429 response was observed by the probe",
+            discord_ids=[str(message.id) for message in burst],
+            assertions=[
+                "Rate-case pass is withheld unless a real 429 and retry_after are observed.",
+            ],
+        )
+
+    async def _run_production_pipeline_probe(
+        self,
+        root: Path,
+        thread: discord.Thread,
+    ) -> None:
+        bot = self._require_bot()
+        session_id = f"e2e-session-{uuid.uuid4()}"
+        bindings = SessionBindingRepository(bot.database)
+        bot.bindings = bindings
+        await bindings.create(
+            thread_id=str(thread.id),
+            sdk_session_id=session_id,
+            cwd_snapshot=root,
+            project_source="implicit-home",
+        )
+        marker = f"PRODUCTION-PIPELINE::{self._run_id}"
+        exact_artifact = ("artifact-" + self._run_id).encode() * 600
+        exact_text = exact_artifact.decode()
+        events = [
+            AdaptedEvent(
+                sdk_session_id=session_id,
+                generation=0,
+                fence_token=0,
+                inbox_seq=1,
+                source="internal",
+                raw_type="assistant.message",
+                raw_payload={
+                    "type": "assistant.message",
+                    "data": {
+                        "messageId": "e2e-production-message",
+                        "content": marker,
+                    },
+                },
+                reducer_hash="e2e-production-message",
+                persistence_class="internal",
+                received_at=time.time(),
+                internal_event_id=f"{self._run_id}:assistant",
+                message_id="e2e-production-message",
+            ),
+            AdaptedEvent(
+                sdk_session_id=session_id,
+                generation=0,
+                fence_token=0,
+                inbox_seq=2,
+                source="internal",
+                raw_type="tool.execution_complete",
+                raw_payload={
+                    "type": "tool.execution_complete",
+                    "data": {
+                        "toolCallId": "e2e-production-tool",
+                        "toolName": "e2e tool",
+                        "success": True,
+                        "result": {"detailedContent": exact_text},
+                    },
+                },
+                reducer_hash="e2e-production-tool",
+                persistence_class="internal",
+                received_at=time.time(),
+                internal_event_id=f"{self._run_id}:tool",
+            ),
+        ]
+        reducer = JournalReducer(
+            bot.database,
+            artifact_root=root / "artifacts",
+        )
+        if await reducer.persist(events) != 2:
+            raise DiscordE2EError("production reducer did not persist both probe events")
+        dispatcher = RenderOutboxDispatcher(bot.database, bot)
+        await dispatcher.drain(deadline_seconds=30)
+        pending = await bot.database.fetchone(
+            """
+            SELECT COUNT(*) AS count FROM render_outbox
+            WHERE session_id = ? AND state IN ('pending', 'sending')
+            """,
+            (session_id,),
+        )
+        if pending is not None and int(pending["count"]) != 0:
+            raise DiscordE2EError("production outbox probe did not fully drain")
+        rows = await bot.database.fetchall(
+            """
+            SELECT discord_message_id FROM render_messages
+            WHERE session_id = ?
+            """,
+            (session_id,),
+        )
+        messages = [await thread.fetch_message(int(row["discord_message_id"])) for row in rows]
+        ordered = sorted(messages, key=lambda message: message.id)
+        if marker not in [message.content for message in ordered]:
+            raise DiscordE2EError("production reducer text was not rendered exactly")
+        downloaded_hashes: list[str] = []
+        for message in ordered:
+            for attachment in message.attachments:
+                downloaded_hashes.append(_hash_bytes(await attachment.read(use_cached=True)))
+        expected_hash = _hash_bytes(exact_artifact)
+        if expected_hash not in downloaded_hashes:
+            raise DiscordE2EError("production outbox attachment SHA-256 did not match source")
+        self.evidence.features.append(
+            FeatureEvidence(
+                feature="production reducer/outbox exact delivery",
+                status="passed",
+                transport="JournalReducer -> RenderOutboxDispatcher -> real Discord",
+                detail="exact text/order and downloaded attachment SHA-256 verified",
+                discord_ids=[str(message.id) for message in ordered],
+                assertions=[
+                    f"ordered_contents={[message.content for message in ordered]}",
+                    f"attachment_sha256={downloaded_hashes}",
+                    f"expected_attachment_sha256={expected_hash}",
+                ],
+            )
+        )
+
+    async def _cleanup(self) -> list[str]:
+        failures: list[str] = []
         bot = self._bot
+
+        async def attempt(label: str, action: Callable[[], Any]) -> None:
+            try:
+                result = action()
+                if asyncio.iscoroutine(result):
+                    await result
+            except discord.NotFound:
+                return
+            except Exception as error:
+                failures.append(f"{label}: {type(error).__name__}: {error}")
+
         try:
-            if not self._keep_resources and not self._owns_channel and self._thread is not None:
-                await self._thread.delete()
-                self._thread = None
+            if not self._keep_resources:
+                for message in reversed(self._created_messages):
+                    await attempt(f"delete message {message.id}", message.delete)
+                if self._thread is not None:
+                    await attempt(f"delete thread {self._thread.id}", self._thread.delete)
+                    self._thread = None
                 if self._seed is not None:
-                    await self._seed.delete()
+                    await attempt(f"delete seed {self._seed.id}", self._seed.delete)
                     self._seed = None
-            if not self._keep_resources and self._owns_channel and self._channel is not None:
-                await self._channel.delete(reason=f"copilotD E2E cleanup {self._run_id}")
-                self._channel = None
-            if not self._keep_resources and bot is not None and self._guild_object is not None:
-                bot.tree.clear_commands(guild=self._guild_object)
-                await bot.tree.sync(guild=self._guild_object)
-            self.evidence.cleaned_up = not self._keep_resources
+                if (
+                    bot is not None
+                    and self._guild_object is not None
+                    and self._original_manifest is not None
+                ):
+                    bulk_upsert = getattr(bot.http, "bulk_upsert_guild_commands", None)
+                    if bulk_upsert is None:
+                        failures.append("restore manifest: missing bulk_upsert_guild_commands")
+                    else:
+                        await attempt(
+                            "restore manifest",
+                            lambda: bulk_upsert(
+                                self._requested_application_id,
+                                self._requested_guild_id,
+                                self._original_manifest,
+                            ),
+                        )
         finally:
             if bot is not None:
-                await bot.close()
+                try:
+                    await bot.close()
+                except Exception as error:
+                    failures.append(f"close bot: {type(error).__name__}: {error}")
             runner = self._runner
             if runner is not None:
                 await asyncio.gather(runner, return_exceptions=True)
+        self.evidence.cleaned_up = not self._keep_resources and not failures
+        return failures
 
     def _require_channel(self) -> discord.TextChannel:
         if self._channel is None:
@@ -929,9 +1236,33 @@ def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run secure real Discord copilotD E2E")
     parser.add_argument("--env-file", type=Path, default=DEFAULT_ENV_FILE)
     parser.add_argument("--evidence", type=Path, required=True)
-    parser.add_argument("--guild-id", type=int)
+    parser.add_argument("--guild-id", type=int, required=True)
+    parser.add_argument("--application-id", type=int, required=True)
+    parser.add_argument("--channel-id", type=int, required=True)
     parser.add_argument("--keep-resources", action="store_true")
     return parser.parse_args()
+
+
+def _hash_bytes(content: bytes) -> str:
+    return hashlib.sha256(content).hexdigest()
+
+
+def _command_manifest_entry(command: Any) -> dict[str, Any]:
+    if isinstance(command, dict):
+        payload = dict(command)
+    else:
+        to_dict = getattr(command, "to_dict", None)
+        payload = (
+            dict(to_dict())
+            if callable(to_dict)
+            else {
+                "name": getattr(command, "name", str(command)),
+                "type": getattr(command, "type", None),
+            }
+        )
+    for immutable in ("id", "application_id", "guild_id", "version"):
+        payload.pop(immutable, None)
+    return payload
 
 
 def _command_paths(
@@ -955,6 +1286,8 @@ async def _main_async(args: argparse.Namespace) -> int:
         token=token,
         evidence_path=args.evidence,
         guild_id=args.guild_id,
+        application_id=args.application_id,
+        channel_id=args.channel_id,
         keep_resources=args.keep_resources,
     )
     evidence = await harness.run()

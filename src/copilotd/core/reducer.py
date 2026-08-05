@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import inspect
 import json
+import os
 import time
 import uuid
 from collections.abc import Awaitable, Callable
+from pathlib import Path
 from typing import Any, ClassVar
 
 from copilotd.core.event_adapter import EventAdapter
@@ -160,13 +163,25 @@ class RenderPlanner:
                 finalized=finalized,
             )
         ]
+        diff = _diff_render_payload(event)
         artifact = (
             artifact_override
             if artifact_override is not None or suppress_default_artifact
             else _tool_output_artifact(event)
         )
+        if (
+            diff is not None
+            and event.raw_type == "tool.execution_complete"
+            and artifact_override is None
+        ):
+            artifact = None
         if artifact is not None:
-            artifact_key = f"{idempotency_key}:artifact"
+            stable_outbox_key = artifact.get("stable_outbox_key")
+            artifact_key = (
+                f"artifact:{event.sdk_session_id}:{stable_outbox_key}"
+                if stable_outbox_key is not None
+                else f"{idempotency_key}:artifact"
+            )
             artifact_finalized = bool(artifact.get("finalized", True))
             intents.append(
                 RenderIntent(
@@ -184,7 +199,6 @@ class RenderPlanner:
                     finalized=artifact_finalized,
                 )
             )
-        diff = _diff_render_payload(event)
         if diff is not None:
             diff_key = f"{idempotency_key}:diff"
             intents.append(
@@ -205,9 +219,18 @@ class RenderPlanner:
 class JournalReducer:
     """Atomically persists event journal rows and their render intents."""
 
-    def __init__(self, database: Database, planner: RenderPlanner | None = None) -> None:
+    def __init__(
+        self,
+        database: Database,
+        planner: RenderPlanner | None = None,
+        *,
+        artifact_root: Path | None = None,
+    ) -> None:
         self._database = database
         self._planner = planner or RenderPlanner()
+        self._artifact_root = (
+            database.path.parent / "sessions" if artifact_root is None else artifact_root
+        )
 
     async def persist(self, events: list[AdaptedEvent]) -> int:
         inserted = 0
@@ -299,6 +322,52 @@ class JournalReducer:
                         suppress_default_artifact=suppress_default_artifact,
                     )
                 for intent in self._planner.plan(event, **planner_kwargs):
+                    serialized_payload = json.dumps(
+                        intent.payload,
+                        ensure_ascii=False,
+                        sort_keys=True,
+                    )
+                    if intent.payload.get("stable_outbox_key") is not None:
+                        await connection.execute(
+                            """
+                            INSERT INTO render_outbox(
+                                id, session_id, logical_seq, lane, coalesce_key,
+                                idempotency_key, payload, state, attempts,
+                                next_attempt_at, created_at, updated_at
+                            ) VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', 0, ?, ?, ?)
+                            ON CONFLICT(idempotency_key) DO UPDATE SET
+                                logical_seq = excluded.logical_seq,
+                                coalesce_key = excluded.coalesce_key,
+                                payload = excluded.payload,
+                                state = CASE
+                                    WHEN render_outbox.state = 'sending'
+                                    THEN 'sending'
+                                    ELSE 'pending'
+                                END,
+                                next_attempt_at = CASE
+                                    WHEN render_outbox.state IN ('pending', 'sending')
+                                    THEN MAX(
+                                        render_outbox.next_attempt_at,
+                                        excluded.next_attempt_at
+                                    )
+                                    ELSE excluded.next_attempt_at
+                                END,
+                                updated_at = excluded.updated_at
+                            """,
+                            (
+                                intent.id,
+                                intent.session_id,
+                                intent.logical_seq,
+                                intent.lane,
+                                intent.coalesce_key,
+                                intent.idempotency_key,
+                                serialized_payload,
+                                now,
+                                now,
+                                now,
+                            ),
+                        )
+                        continue
                     await connection.execute(
                         """
                         INSERT INTO render_outbox(
@@ -315,7 +384,7 @@ class JournalReducer:
                             intent.lane,
                             intent.coalesce_key,
                             intent.idempotency_key,
-                            json.dumps(intent.payload, ensure_ascii=False, sort_keys=True),
+                            serialized_payload,
                             now,
                             now,
                             now,
@@ -716,6 +785,122 @@ class JournalReducer:
         await cursor.close()
         return "" if row is None else str(row["content"])
 
+    async def _append_tool_output(
+        self,
+        connection: Any,
+        event: AdaptedEvent,
+        *,
+        data: dict[str, Any],
+        now: float,
+    ) -> None:
+        tool_call_id = _value(data, "toolCallId")
+        partial = _tool_partial_text(data)
+        if tool_call_id is None or partial is None:
+            return
+        cursor = await connection.execute(
+            """
+            SELECT content, finalized FROM tool_output_streams
+            WHERE session_id = ? AND tool_call_id = ?
+            """,
+            (event.sdk_session_id, tool_call_id),
+        )
+        stream = await cursor.fetchone()
+        await cursor.close()
+        if stream is not None and bool(stream["finalized"]):
+            return
+        cursor = await connection.execute(
+            """
+            SELECT local_path, byte_size FROM tool_spill_artifacts
+            WHERE session_id = ? AND tool_call_id = ?
+            """,
+            (event.sdk_session_id, tool_call_id),
+        )
+        artifact = await cursor.fetchone()
+        await cursor.close()
+        encoded = partial.encode("utf-8")
+        if artifact is not None:
+            path = Path(str(artifact["local_path"]))
+            byte_size = await asyncio.to_thread(
+                _append_spill_bytes,
+                path,
+                int(artifact["byte_size"]),
+                encoded,
+            )
+            await connection.execute(
+                """
+                UPDATE tool_spill_artifacts
+                SET byte_size = ?, sha256 = NULL, updated_at = ?
+                WHERE session_id = ? AND tool_call_id = ? AND finalized = 0
+                """,
+                (byte_size, now, event.sdk_session_id, tool_call_id),
+            )
+            await connection.execute(
+                """
+                UPDATE tool_output_streams
+                SET content = '', spilled = 1, updated_at = ?
+                WHERE session_id = ? AND tool_call_id = ? AND finalized = 0
+                """,
+                (now, event.sdk_session_id, tool_call_id),
+            )
+            return
+        existing = "" if stream is None else str(stream["content"])
+        combined = existing.encode("utf-8") + encoded
+        if len(combined) < 64 * 1024:
+            await connection.execute(
+                """
+                INSERT INTO tool_output_streams(
+                    session_id, tool_call_id, content, spilled, updated_at
+                ) VALUES (?, ?, ?, 0, ?)
+                ON CONFLICT(session_id, tool_call_id) DO UPDATE SET
+                    content = excluded.content,
+                    updated_at = excluded.updated_at
+                WHERE tool_output_streams.finalized = 0
+                """,
+                (event.sdk_session_id, tool_call_id, combined.decode(), now),
+            )
+            return
+        path = _tool_spill_path(
+            self._artifact_root,
+            event.sdk_session_id,
+            tool_call_id,
+        )
+        await asyncio.to_thread(_write_spill_bytes, path, combined)
+        await connection.execute(
+            """
+            INSERT INTO tool_spill_artifacts(
+                session_id, tool_call_id, local_path, byte_size,
+                sha256, finalized, updated_at
+            ) VALUES (?, ?, ?, ?, NULL, 0, ?)
+            ON CONFLICT(session_id, tool_call_id) DO UPDATE SET
+                local_path = excluded.local_path,
+                byte_size = excluded.byte_size,
+                sha256 = NULL,
+                finalized = 0,
+                updated_at = excluded.updated_at
+            """,
+            (
+                event.sdk_session_id,
+                tool_call_id,
+                str(path),
+                len(combined),
+                now,
+            ),
+        )
+        await connection.execute(
+            """
+            INSERT INTO tool_output_streams(
+                session_id, tool_call_id, content, spilled,
+                artifact_emitted, finalized, updated_at
+            ) VALUES (?, ?, '', 1, 0, 0, ?)
+            ON CONFLICT(session_id, tool_call_id) DO UPDATE SET
+                content = '',
+                spilled = 1,
+                updated_at = excluded.updated_at
+            WHERE tool_output_streams.finalized = 0
+            """,
+            (event.sdk_session_id, tool_call_id, now),
+        )
+
     async def _cumulative_tool_artifact(
         self,
         connection: Any,
@@ -736,7 +921,7 @@ class JournalReducer:
             return False, None
         cursor = await connection.execute(
             """
-            SELECT content, spilled, artifact_emitted
+            SELECT content, spilled, artifact_emitted, finalized
             FROM tool_output_streams
             WHERE session_id = ? AND tool_call_id = ?
             """,
@@ -746,37 +931,116 @@ class JournalReducer:
         await cursor.close()
         if row is None:
             return False, None
+        if event.raw_type == "tool.execution_progress" and bool(row["finalized"]):
+            return True, None
+        if event.raw_type == "tool.execution_complete" and bool(row["finalized"]):
+            return True, None
         if event.raw_type == "tool.execution_progress" and _tool_partial_text(data) is None:
             return bool(row["spilled"]), None
-        content = str(row["content"])
+        cursor = await connection.execute(
+            """
+            SELECT local_path, byte_size, sha256, finalized
+            FROM tool_spill_artifacts
+            WHERE session_id = ? AND tool_call_id = ?
+            """,
+            (event.sdk_session_id, tool_call_id),
+        )
+        artifact = await cursor.fetchone()
+        await cursor.close()
         source = "durable-stream"
         verbatim = True
+        completion_bytes = b""
+        completion_already_written = False
         if event.raw_type == "tool.execution_complete":
             completion, completion_source, completion_verbatim = _tool_display_text(
                 data,
                 success=bool(data.get("success")),
             )
             if completion:
-                if completion.startswith(content):
-                    content = completion
-                elif not content.startswith(completion):
-                    content = (
-                        f"{content}\n\n--- completion payload "
-                        f"({completion_source}) ---\n{completion}"
-                    )
+                completion_bytes = (
+                    f"\n\n--- completion payload ({completion_source}) ---\n{completion}"
+                ).encode()
                 source = f"durable-stream+{completion_source}"
                 verbatim = completion_verbatim
+        if artifact is None and event.raw_type == "tool.execution_complete":
+            combined = str(row["content"]).encode() + completion_bytes
+            if len(combined) >= 64 * 1024:
+                path = _tool_spill_path(
+                    self._artifact_root,
+                    event.sdk_session_id,
+                    tool_call_id,
+                )
+                await asyncio.to_thread(_write_spill_bytes, path, combined)
+                digest = await asyncio.to_thread(_spill_sha256, path)
+                await connection.execute(
+                    """
+                    INSERT INTO tool_spill_artifacts(
+                        session_id, tool_call_id, local_path, byte_size,
+                        sha256, finalized, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, 1, ?)
+                    """,
+                    (
+                        event.sdk_session_id,
+                        tool_call_id,
+                        str(path),
+                        len(combined),
+                        digest,
+                        now,
+                    ),
+                )
+                artifact = {
+                    "local_path": str(path),
+                    "byte_size": len(combined),
+                    "sha256": digest,
+                    "finalized": 1,
+                }
+                completion_already_written = True
+            else:
+                await connection.execute(
+                    """
+                    UPDATE tool_output_streams
+                    SET finalized = 1, updated_at = ?
+                    WHERE session_id = ? AND tool_call_id = ?
+                    """,
+                    (now, event.sdk_session_id, tool_call_id),
+                )
+                return False, None
+        if artifact is None:
+            return False, None
+        path = Path(str(artifact["local_path"]))
+        byte_size = int(artifact["byte_size"])
+        digest = None if artifact["sha256"] is None else str(artifact["sha256"])
+        if event.raw_type == "tool.execution_complete":
+            if completion_bytes and not completion_already_written:
+                byte_size = await asyncio.to_thread(
+                    _append_spill_bytes,
+                    path,
+                    byte_size,
+                    completion_bytes,
+                )
+            digest = await asyncio.to_thread(_spill_sha256, path)
             await connection.execute(
                 """
                 UPDATE tool_output_streams
-                SET content = ?, finalized = 1, updated_at = ?
+                SET content = '', spilled = 1, finalized = 1, updated_at = ?
                 WHERE session_id = ? AND tool_call_id = ?
                 """,
-                (content, now, event.sdk_session_id, tool_call_id),
+                (now, event.sdk_session_id, tool_call_id),
             )
-        spilled = bool(row["spilled"]) or len(content.encode("utf-8")) >= 64 * 1024
-        if not spilled:
-            return False, None
+            await connection.execute(
+                """
+                UPDATE tool_spill_artifacts
+                SET byte_size = ?, sha256 = ?, finalized = 1, updated_at = ?
+                WHERE session_id = ? AND tool_call_id = ?
+                """,
+                (
+                    byte_size,
+                    digest,
+                    now,
+                    event.sdk_session_id,
+                    tool_call_id,
+                ),
+            )
         if not bool(row["artifact_emitted"]):
             await connection.execute(
                 """
@@ -788,24 +1052,25 @@ class JournalReducer:
                 (now, event.sdk_session_id, tool_call_id),
             )
         filename = f"tool-partial-{tool_call_id[:12]}.txt"
-        line_count = content.count("\n") + 1
         finalized = event.raw_type == "tool.execution_complete"
         return True, {
             "type": "tool_output_artifact",
             "content": (
-                f"**Tool partial spill** — `{len(content):,}` characters / "
-                f"`{line_count:,}` lines; verbatim durable stream attached as "
-                f"`{filename}`."
+                f"**Tool partial spill** — `{byte_size:,}` bytes; "
+                f"verbatim durable stream attached as `{filename}`."
             ),
             "finalized": finalized,
             "coalesce_key": f"tool-spill:{tool_call_id}",
+            "stable_outbox_key": f"tool-spill:{tool_call_id}",
             "tool_source": source,
             "verbatim": verbatim,
             "attachments": [
                 {
                     "filename": filename,
                     "media_type": "text/plain",
-                    "content": content,
+                    "path": str(path),
+                    "byte_size": byte_size,
+                    "sha256": digest,
                 }
             ],
         }
@@ -875,35 +1140,12 @@ class JournalReducer:
                 ),
             )
         if event.raw_type.startswith("tool.execution_"):
-            tool_call_id = _value(data, "toolCallId")
-            partial = _tool_partial_text(data)
-            if tool_call_id is not None and partial:
-                await connection.execute(
-                    """
-                    INSERT INTO tool_output_streams(
-                        session_id, tool_call_id, content, spilled, updated_at
-                    ) VALUES (?, ?, ?, ?, ?)
-                    ON CONFLICT(session_id, tool_call_id) DO UPDATE SET
-                        content = tool_output_streams.content || excluded.content,
-                        spilled = MAX(
-                            tool_output_streams.spilled,
-                            LENGTH(
-                                CAST(
-                                    tool_output_streams.content || excluded.content
-                                    AS BLOB
-                                )
-                            ) >= 65536
-                        ),
-                        updated_at = excluded.updated_at
-                    """,
-                    (
-                        event.sdk_session_id,
-                        tool_call_id,
-                        partial,
-                        int(len(partial) >= 65536),
-                        now,
-                    ),
-                )
+            await self._append_tool_output(
+                connection,
+                event,
+                data=data,
+                now=now,
+            )
         request_id = data.get("requestId")
         if request_id is not None and event.event_id is not None:
             if event.raw_type.endswith(".requested"):
@@ -2617,22 +2859,7 @@ def _diff_render_payload(event: AdaptedEvent) -> dict[str, Any] | None:
             if isinstance(value, str) and value:
                 patch = value
                 break
-    tool_name = str(data.get("toolName", "")).lower()
-    if patch is None and "diff" in tool_name:
-        content = result.get("detailedContent") or result.get("content")
-        if isinstance(content, str) and content:
-            patch = content
-            source = "tool-content"
     if patch is None:
-        if "diff" in tool_name:
-            return {
-                "type": "diff",
-                "content": "",
-                "source": "local-git",
-                "local_git": True,
-                "finalized": True,
-                "attachments": [],
-            }
         return None
     encoded_patch = patch.encode("utf-8", errors="replace")
     if len(encoded_patch) > _DIFF_OUTPUT_LIMIT:
@@ -2765,3 +2992,49 @@ def _model_config_matches(
     observed: dict[str, Any],
 ) -> bool:
     return all(value is None or observed.get(key) == value for key, value in requested.items())
+
+
+def _tool_spill_path(root: Path, session_id: str, tool_call_id: str) -> Path:
+    session_token = uuid.uuid5(uuid.NAMESPACE_URL, f"session:{session_id}").hex[:16]
+    tool_token = uuid.uuid5(uuid.NAMESPACE_URL, f"tool:{tool_call_id}").hex[:16]
+    return root / session_token / "artifacts" / f"tool-{tool_token}.txt"
+
+
+def _write_spill_bytes(path: Path, content: bytes) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+    try:
+        with temporary.open("wb") as file:
+            file.write(content)
+            file.flush()
+            os.fsync(file.fileno())
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def _append_spill_bytes(path: Path, expected_size: int, content: bytes) -> int:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    mode = "r+b" if path.exists() else "w+b"
+    with path.open(mode) as file:
+        file.seek(0, os.SEEK_END)
+        current_size = file.tell()
+        if current_size < expected_size:
+            raise RuntimeError(
+                f"tool spill artifact is truncated: {current_size} < {expected_size}"
+            )
+        if current_size > expected_size:
+            file.truncate(expected_size)
+        file.seek(expected_size)
+        file.write(content)
+        file.flush()
+        os.fsync(file.fileno())
+    return expected_size + len(content)
+
+
+def _spill_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as file:
+        for chunk in iter(lambda: file.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()

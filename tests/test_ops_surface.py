@@ -28,7 +28,7 @@ def _aws_secret() -> str:
     return "".join(["AWS_", "SECRET_", "ACCESS_", "KEY"])
 
 
-def test_redact_text_consumes_auth_cookie_and_composite_formats() -> None:
+def test_redact_text_consumes_sensitive_header_keyvalue_and_ignores_benign_names() -> None:
     text = (
         "safe keep "
         '{"token":"json-secret-123","aws_secret_access_key":"aws-secret-1"} '
@@ -46,8 +46,16 @@ def test_redact_text_consumes_auth_cookie_and_composite_formats() -> None:
         + "client_secret='client-secret' "
         + "private_key=private-secret "
         + 'client_access_token = "client-access-secret" '
-        + 'client_private_token = "client-private-secret" '
-        + "nonsecret=keep-me"
+        + 'client_private_token = "client-private-token" '
+        + 'webhook_secret = "webhook-secret" '
+        + 'credentials = "cred-secret" '
+        + "passphrase=pass-secret "
+        + "secret=direct-secret "
+        + "secret_count=7 "
+        + "credential_type=basic "
+        + "has_secret=true "
+        + "nonsecret=keep-me "
+        + 'public_metadata="visible"'
     )
     redacted = _redact_text(text)
 
@@ -64,7 +72,11 @@ def test_redact_text_consumes_auth_cookie_and_composite_formats() -> None:
         "client-secret",
         "private-secret",
         "client-access-secret",
-        "client-private-secret",
+        "client-private-token",
+        "webhook-secret",
+        "cred-secret",
+        "pass-secret",
+        "direct-secret",
     ):
         assert secret not in redacted
 
@@ -81,18 +93,34 @@ def test_redact_text_consumes_auth_cookie_and_composite_formats() -> None:
     assert "private_key=[redacted]" in redacted
     assert 'client_access_token = "[redacted]"' in redacted
     assert 'client_private_token = "[redacted]"' in redacted
+    assert 'webhook_secret = "[redacted]"' in redacted
+    assert 'credentials = "[redacted]"' in redacted
+    assert "passphrase=[redacted]" in redacted
+    assert "secret=[redacted]" in redacted
+    assert "secret_count=7" in redacted
+    assert "credential_type=basic" in redacted
+    assert "has_secret=true" in redacted
     assert "nonsecret=keep-me" in redacted
+    assert 'public_metadata="visible"' in redacted
 
 
-def test_redact_structure_recurses_nested_sensitive_keys() -> None:
+def test_redact_structure_recurses_nested_sensitive_keys_and_preserves_benign_keys() -> None:
     payload = {
         "authorization": {
             "token": "abc",
             "aws_secret_access_key": "aws-secret-2",
+            "webhook_secret": "webhook-2",
+            "credentials": "cred-2",
+            "passphrase": "phrase-2",
             "nested": [
                 {"cookie": "crumb"},
                 {"client_access_token": "client-access"},
                 {"note": "visible"},
+                {"secret_count": 4},
+                {"credential_type": "basic"},
+                {"has_secret": True},
+                {"nonsecret": "keep"},
+                {"public_metadata": "show"},
             ],
             "plain": "keep me",
         },
@@ -107,16 +135,29 @@ def test_redact_structure_recurses_nested_sensitive_keys() -> None:
         "aws_secret_access_key": "top-secret",
         "client_key": "client-key-secret",
         "client_id": "id-1",
+        "secret_count": 9,
+        "credential_type": "oauth",
+        "has_secret": False,
+        "nonsecret": "keep",
+        "public_metadata": "visible",
     }
 
     redacted = _redact_structure(payload)
 
     assert redacted["authorization"]["token"] == "[redacted]"
     assert redacted["authorization"]["aws_secret_access_key"] == "[redacted]"
+    assert redacted["authorization"]["webhook_secret"] == "[redacted]"
+    assert redacted["authorization"]["credentials"] == "[redacted]"
+    assert redacted["authorization"]["passphrase"] == "[redacted]"
     assert redacted["authorization"]["nested"][0]["cookie"] == "[redacted]"
     assert redacted["authorization"]["nested"][1]["client_access_token"] == "[redacted]"
-    assert redacted["authorization"]["nested"][2]["note"] == "[redacted]"
-    assert redacted["authorization"]["plain"] == "[redacted]"
+    assert redacted["authorization"]["nested"][2]["note"] == "visible"
+    assert redacted["authorization"]["nested"][3]["secret_count"] == 4
+    assert redacted["authorization"]["nested"][4]["credential_type"] == "basic"
+    assert redacted["authorization"]["nested"][5]["has_secret"] is True
+    assert redacted["authorization"]["nested"][6]["nonsecret"] == "keep"
+    assert redacted["authorization"]["nested"][7]["public_metadata"] == "show"
+    assert redacted["authorization"]["plain"] == "keep me"
     assert redacted["meta"]["note"] == "Authorization: [redacted]"
     assert redacted["meta"]["list"][0]["password"] == "[redacted]"
     assert redacted["meta"]["list"][1]["private_key"] == "[redacted]"
@@ -124,6 +165,11 @@ def test_redact_structure_recurses_nested_sensitive_keys() -> None:
     assert redacted["aws_secret_access_key"] == "[redacted]"
     assert redacted["client_key"] == "[redacted]"
     assert redacted["client_id"] == "id-1"
+    assert redacted["secret_count"] == 9
+    assert redacted["credential_type"] == "oauth"
+    assert redacted["has_secret"] is False
+    assert redacted["nonsecret"] == "keep"
+    assert redacted["public_metadata"] == "visible"
 
 
 @pytest.mark.asyncio
@@ -147,6 +193,13 @@ async def test_ops_surface_redacts_diagnostics_log_tail_and_event_dump(
         + 'corr-1 client_access_token = "client-access-secret"'
         + NL
         + 'corr-1 private_key = "private-secret"'
+        + NL
+        + 'corr-1 webhook_secret = "webhook-secret"'
+        + NL
+        + 'corr-1 credentials = "cred-secret"'
+        + NL
+        + "corr-1 secret_count=7 credential_type=basic has_secret=true "
+        + 'nonsecret=keep-me public_metadata="visible"'
         + NL
         + "corr-1 keep this text"
         + NL
@@ -179,7 +232,7 @@ async def test_ops_surface_redacts_diagnostics_log_tail_and_event_dump(
                 "1.0",
                 "demo",
                 1,
-                '{"aws_secret_access_key":"cap-secret","client_private_token":"cap-private"}',
+                '{"aws_secret_access_key":"cap-secret","client_private_token":"cap-private","secret_count":3,"credential_type":"basic","has_secret":false,"nonsecret":"ok","public_metadata":"yes"}',
                 now,
             ),
         )
@@ -221,7 +274,7 @@ async def test_ops_surface_redacts_diagnostics_log_tail_and_event_dump(
                 f"{_cookie()} = message-secret",
                 f"{_aws_secret()} = turn-secret",
                 "hash",
-                '{"client_access_token":"payload-secret"}',
+                '{"client_access_token":"payload-secret","secret_count":1,"credential_type":"kind","has_secret":false,"nonsecret":"meta","public_metadata":"pub"}',
                 now,
             ),
         )
@@ -236,7 +289,7 @@ async def test_ops_surface_redacts_diagnostics_log_tail_and_event_dump(
     assert health["pending_outbox"] == 0
     assert diagnostics["bindings"][0]["owner_fence_token"] == "[redacted]"
     assert diagnostics["capabilities"][0]["probe_detail"] == (
-        '{"aws_secret_access_key":"[redacted]","client_private_token":"[redacted]"}'
+        '{"aws_secret_access_key":"[redacted]","client_private_token":"[redacted]","secret_count":3,"credential_type":"basic","has_secret":false,"nonsecret":"ok","public_metadata":"yes"}'
     )
     assert diagnostics["incidents"][0]["stderr_tail"] == "Authorization = [redacted]"
     assert "incident-secret" not in diagnostics["incidents"][0]["stderr_tail"]
@@ -249,6 +302,8 @@ async def test_ops_surface_redacts_diagnostics_log_tail_and_event_dump(
     assert "very-secret" not in logs["files"]["copilotd.log"]
     assert "client-access-secret" not in logs["files"]["copilotd.log"]
     assert "private-secret" not in logs["files"]["copilotd.log"]
+    assert "webhook-secret" not in logs["files"]["copilotd.log"]
+    assert "cred-secret" not in logs["files"]["copilotd.log"]
     assert '"token":"[redacted]"' in logs["files"]["copilotd.log"]
     assert '"aws_secret_access_key":"[redacted]"' in logs["files"]["copilotd.log"]
     assert "Authorization    :   [redacted]" in logs["files"]["copilotd.log"]
@@ -257,6 +312,13 @@ async def test_ops_surface_redacts_diagnostics_log_tail_and_event_dump(
     assert f"corr-1 {_aws_secret()} = [redacted]" in logs["files"]["copilotd.log"]
     assert 'client_access_token = "[redacted]"' in logs["files"]["copilotd.log"]
     assert 'private_key = "[redacted]"' in logs["files"]["copilotd.log"]
+    assert 'webhook_secret = "[redacted]"' in logs["files"]["copilotd.log"]
+    assert 'credentials = "[redacted]"' in logs["files"]["copilotd.log"]
+    assert "secret_count=7" in logs["files"]["copilotd.log"]
+    assert "credential_type=basic" in logs["files"]["copilotd.log"]
+    assert "has_secret=true" in logs["files"]["copilotd.log"]
+    assert "nonsecret=keep-me" in logs["files"]["copilotd.log"]
+    assert 'public_metadata="visible"' in logs["files"]["copilotd.log"]
     assert "safe text" in logs["files"]["boot.log"]
     assert events["events"][0]["parent_id"] == "Authorization    : [redacted]"
     assert events["events"][0]["agent_id"] == 'client_secret="[redacted]"'

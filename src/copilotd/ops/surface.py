@@ -208,15 +208,13 @@ def _redact_structure(value: Any, *, sensitive: bool = False) -> Any:
     if isinstance(value, Mapping):
         redacted: dict[Any, Any] = {}
         for key, item in value.items():
-            redacted[key] = _redact_structure(
-                item,
-                sensitive=sensitive or _is_sensitive_key(key),
-            )
+            child_sensitive = _is_sensitive_key(key)
+            redacted[key] = _redact_structure(item, sensitive=child_sensitive)
         return redacted
     if isinstance(value, list):
-        return [_redact_structure(item, sensitive=sensitive) for item in value]
+        return [_redact_structure(item, sensitive=False) for item in value]
     if isinstance(value, tuple):
-        return tuple(_redact_structure(item, sensitive=sensitive) for item in value)
+        return tuple(_redact_structure(item, sensitive=False) for item in value)
     if sensitive:
         return "[redacted]"
     if isinstance(value, str):
@@ -226,9 +224,27 @@ def _redact_structure(value: Any, *, sensitive: bool = False) -> Any:
     return value
 
 
+def redact_sensitive_text(value: str) -> str:
+    return _redact_text(value)
+
+
+def redact_sensitive_value(value: Any) -> Any:
+    return _redact_structure(value)
+
+
 def _is_sensitive_key(key: Any) -> bool:
     normalized = re.sub(r"[^a-z0-9]+", "", str(key).lower())
     if not normalized:
+        return False
+    benign = {
+        "secretcount",
+        "credentialtype",
+        "hassecret",
+        "nonsecret",
+        "publicmetadata",
+        "metadata",
+    }
+    if normalized in benign:
         return False
     direct_tokens = (
         "authorization",
@@ -237,6 +253,12 @@ def _is_sensitive_key(key: Any) -> bool:
         "token",
         "password",
         "apikey",
+        "secret",
+        "secrets",
+        "credential",
+        "credentials",
+        "passphrase",
+        "webhooksecret",
         "awssecretaccesskey",
         "accesstoken",
         "accesssecret",
@@ -261,7 +283,7 @@ def _is_sensitive_key(key: Any) -> bool:
         return True
     if any(
         prefix in normalized for prefix in ("access", "client", "private", "session", "refresh")
-    ) and any(suffix in normalized for suffix in ("key", "token", "secret")):
+    ) and any(suffix in normalized for suffix in ("key", "token", "secret", "credential")):
         return True
     return False
 

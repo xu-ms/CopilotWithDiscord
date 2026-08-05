@@ -64,6 +64,49 @@ class HungTransport(FakeTransport):
         return "unexpected"
 
 
+class BlockingSuccessTransport(FakeTransport):
+    def __init__(self) -> None:
+        super().__init__()
+        self.started = asyncio.Event()
+        self.release = asyncio.Event()
+
+    async def send(
+        self,
+        *,
+        session_id: str,
+        lane: str,
+        payload: dict[str, Any],
+        idempotency_key: str,
+    ) -> str:
+        self.sent.append((session_id, lane, payload, idempotency_key))
+        self.started.set()
+        await self.release.wait()
+        return "discord-stable"
+
+
+class PausingClaimDispatcher(RenderOutboxDispatcher):
+    def __init__(self, database: Database, transport: FakeTransport) -> None:
+        super().__init__(database, transport)
+        self.claim_committed = asyncio.Event()
+        self.release_claim = asyncio.Event()
+
+    async def _claim(
+        self,
+        *,
+        limit: int,
+        now: float,
+        claimed_ids: list[str],
+    ) -> list[Any]:
+        items = await super()._claim(
+            limit=limit,
+            now=now,
+            claimed_ids=claimed_ids,
+        )
+        self.claim_committed.set()
+        await self.release_claim.wait()
+        return items
+
+
 async def _insert_outbox(
     database: Database,
     *,
@@ -168,6 +211,49 @@ async def test_rate_limit_uses_exact_retry_after_and_does_not_lose_item(
 
 
 @pytest.mark.asyncio
+async def test_retryable_head_prevents_later_claimed_message_overtake(
+    tmp_path: Path,
+) -> None:
+    async with Database(tmp_path / "ordered-retry.sqlite3") as database:
+        await _insert_outbox(
+            database,
+            item_id="first",
+            sequence=1,
+            payload={"content": "first", "finalized": True},
+            coalesce_key="first",
+            lane="status",
+        )
+        await _insert_outbox(
+            database,
+            item_id="second",
+            sequence=2,
+            payload={"content": "second", "finalized": True},
+            coalesce_key="second",
+            lane="status",
+        )
+        transport = FakeTransport()
+        transport.failures.append(RenderRateLimited(1))
+        dispatcher = RenderOutboxDispatcher(database, transport)
+
+        assert await dispatcher.dispatch_once(limit=2, now=100) == 0
+        states = await database.fetchall("SELECT id, state FROM render_outbox ORDER BY logical_seq")
+        assert [dict(row) for row in states] == [
+            {"id": "first", "state": "pending"},
+            {"id": "second", "state": "pending"},
+        ]
+        assert transport.sent == []
+
+        assert await dispatcher.dispatch_once(limit=2, now=100.5) == 0
+        assert await dispatcher.dispatch_once(limit=2, now=101) == 1
+        assert await dispatcher.dispatch_once(limit=2, now=101) == 1
+
+    assert [entry[2]["content"] for entry in transport.sent] == [
+        "first",
+        "second",
+    ]
+
+
+@pytest.mark.asyncio
 async def test_drain_waits_for_final_rate_limit_retry(tmp_path: Path) -> None:
     async with Database(tmp_path / "drain-rate-limit.sqlite3") as database:
         await _insert_outbox(
@@ -224,6 +310,69 @@ async def test_cancelled_dispatch_restores_all_claims_to_pending(
 
 
 @pytest.mark.asyncio
+async def test_cancellation_after_claim_commit_restores_known_ids(
+    tmp_path: Path,
+) -> None:
+    async with Database(tmp_path / "claim-gap.sqlite3") as database:
+        await _insert_outbox(
+            database,
+            item_id="claim-gap",
+            sequence=1,
+            payload={"content": "claim gap", "finalized": True},
+        )
+        dispatcher = PausingClaimDispatcher(database, FakeTransport())
+        task = asyncio.create_task(dispatcher.dispatch_once())
+        await dispatcher.claim_committed.wait()
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        row = await database.fetchone("SELECT state FROM render_outbox WHERE id = 'claim-gap'")
+
+    assert row["state"] == "pending"
+
+
+@pytest.mark.asyncio
+async def test_stable_outbox_update_during_send_requeues_same_row(
+    tmp_path: Path,
+) -> None:
+    async with Database(tmp_path / "stable-update.sqlite3") as database:
+        await _insert_outbox(
+            database,
+            item_id="stable",
+            sequence=1,
+            payload={"content": "old", "finalized": False},
+            coalesce_key="tool-spill:one",
+            lane="artifact",
+        )
+        transport = BlockingSuccessTransport()
+        dispatcher = RenderOutboxDispatcher(database, transport)
+        first = asyncio.create_task(dispatcher.dispatch_once())
+        await transport.started.wait()
+        await database.execute(
+            """
+            UPDATE render_outbox
+            SET logical_seq = 2,
+                payload = ?,
+                updated_at = 2
+            WHERE id = 'stable' AND state = 'sending'
+            """,
+            (json.dumps({"content": "new", "finalized": True}),),
+        )
+        transport.release.set()
+        assert await first == 1
+        pending = await database.fetchone("SELECT state FROM render_outbox WHERE id = 'stable'")
+        assert pending["state"] == "pending"
+
+        assert await dispatcher.dispatch_once() == 1
+        final = await database.fetchone(
+            "SELECT state, COUNT(*) OVER () AS row_count FROM render_outbox"
+        )
+
+    assert transport.edited[-1][2] == {"content": "new", "finalized": True}
+    assert dict(final) == {"state": "sent", "row_count": 1}
+
+
+@pytest.mark.asyncio
 async def test_drain_deadline_bounds_hung_delivery_and_restores_claim(
     tmp_path: Path,
 ) -> None:
@@ -241,6 +390,39 @@ async def test_drain_deadline_bounds_hung_delivery_and_restores_claim(
         row = await database.fetchone("SELECT state FROM render_outbox WHERE id = 'hung'")
 
     assert delivered == 0
+    assert row["state"] == "pending"
+
+
+@pytest.mark.asyncio
+async def test_drain_deadline_bounds_pending_fetch(
+    tmp_path: Path,
+) -> None:
+    async with Database(tmp_path / "hung-pending-fetch.sqlite3") as database:
+        await _insert_outbox(
+            database,
+            item_id="rate-limited",
+            sequence=1,
+            payload={"content": "retry", "finalized": True},
+        )
+        transport = FakeTransport()
+        transport.failures.append(RenderRateLimited(10))
+        dispatcher = RenderOutboxDispatcher(database, transport)
+        original_fetchone = database.fetchone
+
+        async def blocked_fetchone(sql: str, parameters: Any = ()) -> Any:
+            if "MIN(next_attempt_at)" in sql:
+                await asyncio.Event().wait()
+            return await original_fetchone(sql, parameters)
+
+        database.fetchone = blocked_fetchone
+        started = asyncio.get_running_loop().time()
+        delivered = await dispatcher.drain(deadline_seconds=0.05)
+        elapsed = asyncio.get_running_loop().time() - started
+        database.fetchone = original_fetchone
+        row = await database.fetchone("SELECT state FROM render_outbox WHERE id = 'rate-limited'")
+
+    assert delivered == 0
+    assert elapsed < 0.2
     assert row["state"] == "pending"
 
 

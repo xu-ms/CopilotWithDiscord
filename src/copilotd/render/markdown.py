@@ -298,6 +298,7 @@ def extract_local_markdown_images(
     fence_char = ""
     fence_len = 0
     in_indented_code = False
+    inline_code_delim: int | None = None
     for line in source.splitlines(keepends=True):
         text = _strip_newline(line)
         stripped = _strip_blockquote_prefix(text)
@@ -321,7 +322,14 @@ def extract_local_markdown_images(
             pieces.append(line)
             in_indented_code = True
             continue
-        pieces.append(_extract_images_from_line(text, roots, warnings, attachments))
+        rendered, inline_code_delim = _extract_images_from_line(
+            text,
+            roots,
+            warnings,
+            attachments,
+            inline_code_delim,
+        )
+        pieces.append(rendered)
         if line.endswith("\n"):
             pieces.append("\n")
     content = "".join(pieces)
@@ -358,10 +366,10 @@ def _extract_images_from_line(
     roots: tuple[Path, ...],
     warnings: list[MarkdownImageWarning],
     attachments: list[MarkdownImageAttachmentPlan],
-) -> str:
+    inline_code_delim: int | None,
+) -> tuple[str, int | None]:
     pieces: list[str] = []
     index = 0
-    inline_code_delim: int | None = None
     while index < len(text):
         character = text[index]
         if character == "\\":
@@ -456,7 +464,7 @@ def _extract_images_from_line(
             continue
         pieces.append(character)
         index += 1
-    return "".join(pieces)
+    return "".join(pieces), inline_code_delim
 
 
 def _backtick_run_length(text: str, index: int) -> int:

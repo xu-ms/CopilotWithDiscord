@@ -368,6 +368,116 @@ async def test_runtime_preregisters_ingress_stays_alive_after_idle_and_closes_cl
 
 
 @pytest.mark.asyncio
+async def test_attachment_frame_resolver_runs_immediately_before_send(
+    tmp_path: Path,
+) -> None:
+    session_id = str(uuid4())
+    calls: list[dict[str, Any]] = []
+
+    async def resolver(manifest_id: str, **kwargs: Any) -> list[dict[str, Any]]:
+        calls.append({"manifest_id": manifest_id, **kwargs})
+        return [
+            {
+                "type": "file",
+                "path": "/tmp/fallback.bin",
+                "displayName": "fallback.bin",
+            }
+        ]
+
+    async with Database(tmp_path / "frame-resolver.sqlite3") as database:
+        bindings = SessionBindingRepository(database)
+        binding = await bindings.create(
+            thread_id="thread-frame",
+            sdk_session_id=session_id,
+            cwd_snapshot=tmp_path,
+            project_source="implicit-home",
+        )
+        bridge = FakeBridge(session_id)
+        runtime = SessionRuntime(
+            database=database,
+            bridge=bridge,
+            bindings=bindings,
+            owner_leases=OwnerLeaseStore(database),
+            owner_id="process-frame",
+            binding=binding,
+            attachment_resolver=resolver,
+        )
+        await runtime.attach_create()
+        await database.execute(
+            """
+            INSERT INTO attachment_manifests(
+                id, source_kind, source_id, session_id,
+                state, total_bytes, created_at
+            ) VALUES ('manifest-frame', 'test', 'frame', ?, 'ready', 0, 0)
+            """,
+            (session_id,),
+        )
+
+        await runtime.send(
+            "长提示" * 100,
+            idempotency_key="frame-send",
+            attachments=[{"type": "blob", "data": "old"}],
+            attachment_manifest_id="manifest-frame",
+            mode="immediate",
+            agent_mode="plan",
+        )
+
+        assert calls == [
+            {
+                "manifest_id": "manifest-frame",
+                "session_id": session_id,
+                "prompt": "长提示" * 100,
+                "mode": "immediate",
+                "agent_mode": "plan",
+            }
+        ]
+        assert bridge.handle.sent[-1][1]["attachments"][0]["type"] == "file"
+        await runtime.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_direct_attachments_cannot_bypass_complete_frame_limit(
+    tmp_path: Path,
+) -> None:
+    session_id = str(uuid4())
+    async with Database(tmp_path / "direct-frame-limit.sqlite3") as database:
+        bindings = SessionBindingRepository(database)
+        binding = await bindings.create(
+            thread_id="thread-direct-frame",
+            sdk_session_id=session_id,
+            cwd_snapshot=tmp_path,
+            project_source="implicit-home",
+        )
+        bridge = FakeBridge(session_id)
+        runtime = SessionRuntime(
+            database=database,
+            bridge=bridge,
+            bindings=bindings,
+            owner_leases=OwnerLeaseStore(database),
+            owner_id="process-direct-frame",
+            binding=binding,
+            send_frame_max_bytes=256,
+        )
+        await runtime.attach_create()
+
+        with pytest.raises(OperationRejected, match=r"serialized session\.send"):
+            await runtime.send(
+                "x" * 1000,
+                idempotency_key="oversized-direct-frame",
+                attachments=[{"type": "blob", "data": "x" * 1000}],
+                mode="immediate",
+            )
+
+        assert bridge.handle.sent == []
+        submission = await database.fetchone(
+            "SELECT state FROM submissions WHERE sdk_session_id = ?",
+            (session_id,),
+        )
+        assert submission["state"] == "rejected"
+        await runtime.shutdown()
+
+
+@pytest.mark.asyncio
 async def test_runtime_routes_user_input_through_durable_interaction(
     tmp_path: Path,
 ) -> None:

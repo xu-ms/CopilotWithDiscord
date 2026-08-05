@@ -17,6 +17,7 @@ from copilotd.core.attachments import (
     AttachmentCapabilities,
     AttachmentError,
     AttachmentService,
+    sdk_send_frame_size,
 )
 from copilotd.storage.database import Database
 
@@ -94,6 +95,42 @@ def _make_noisy_jpeg_bytes(size: int = 2048) -> bytes:
     buffer = io.BytesIO()
     image.save(buffer, format="JPEG", quality=95, optimize=True)
     return buffer.getvalue()
+
+
+def test_sdk_send_frame_matches_pinned_jsonrpc_serialization() -> None:
+    attachments = [
+        {
+            "type": "file",
+            "path": "/tmp/文件.txt",
+            "displayName": "文件.txt",
+        }
+    ]
+    message = {
+        "jsonrpc": "2.0",
+        "id": "00000000-0000-0000-0000-000000000000",
+        "method": "session.send",
+        "params": {
+            "sessionId": "session-1",
+            "prompt": "你好",
+            "attachments": attachments,
+            "mode": "enqueue",
+            "agentMode": "interactive",
+        },
+    }
+    content = json.dumps(message, separators=(",", ":")).encode("utf-8")
+    expected = len(f"Content-Length: {len(content)}\r\n\r\n".encode()) + len(content)
+
+    assert (
+        sdk_send_frame_size(
+            session_id="session-1",
+            prompt="你好",
+            attachments=attachments,
+            mode="enqueue",
+            agent_mode="interactive",
+            trace_context={},
+        )
+        == expected
+    )
 
 
 @pytest.mark.asyncio
@@ -408,6 +445,163 @@ async def test_later_file_can_downgrade_an_earlier_blob_to_fit_frame(
         sdk_attachments = await service.sdk_attachments(prepared.manifest_id)
 
     assert sdk_attachments == all_files
+
+
+@pytest.mark.asyncio
+async def test_complete_send_frame_downgrades_blob_for_long_prompt(
+    tmp_path: Path,
+) -> None:
+    content = _make_noisy_jpeg_bytes(256)
+    attachment = FakeAttachment(1, "长文件名.jpg", content, "image/jpeg")
+    prompt = "很长的提示" * 10_000
+    manifest_id = str(
+        uuid.uuid5(
+            uuid.NAMESPACE_URL,
+            "copilotd:attachment:discord-message:full-send-frame",
+        )
+    )
+    path = (
+        tmp_path / "sessions" / "session-full-frame" / "attachments" / manifest_id / "000-jpg"
+    ).resolve()
+    file_payload = _file_payload(str(path), attachment.filename)
+    blob_payload = _blob_payload(content, attachment.filename, "image/jpeg")
+    file_frame_size = sdk_send_frame_size(
+        session_id="session-full-frame",
+        prompt=prompt,
+        attachments=[file_payload],
+        mode="enqueue",
+        agent_mode="interactive",
+        trace_context={},
+    )
+    attachment_only_size = _serialized_request_size([blob_payload])
+    frame_budget = max(file_frame_size, attachment_only_size) + 1024
+    assert (
+        sdk_send_frame_size(
+            session_id="session-full-frame",
+            prompt=prompt,
+            attachments=[blob_payload],
+            mode="enqueue",
+            agent_mode="interactive",
+            trace_context={},
+        )
+        > frame_budget
+    )
+
+    async with Database(tmp_path / "full-send-frame.sqlite3") as database:
+        service = AttachmentService(
+            database,
+            tmp_path,
+            capabilities=AttachmentCapabilities(
+                runtime_inline_blob_max_bytes=8 * 1024 * 1024,
+                runtime_serialized_frame_max_bytes=frame_budget,
+            ),
+        )
+        prepared = await service.prepare(
+            source_kind="discord-message",
+            source_id="full-send-frame",
+            session_id="session-full-frame",
+            attachments=[attachment],
+        )
+        assert prepared is not None
+        attachment_only = await service.sdk_attachments(prepared.manifest_id)
+        send_attachments = await service.sdk_attachments_for_send(
+            prepared.manifest_id,
+            session_id="session-full-frame",
+            prompt=prompt,
+            mode="enqueue",
+            agent_mode="interactive",
+        )
+
+    assert attachment_only[0]["type"] == "blob"
+    assert send_attachments[0]["type"] == "file"
+    assert (
+        sdk_send_frame_size(
+            session_id="session-full-frame",
+            prompt=prompt,
+            attachments=send_attachments,
+            mode="enqueue",
+            agent_mode="interactive",
+            trace_context={},
+        )
+        <= frame_budget
+    )
+
+
+@pytest.mark.asyncio
+async def test_transcoded_inline_variant_keeps_original_file_fallback(
+    tmp_path: Path,
+) -> None:
+    original_buffer = io.BytesIO()
+    Image.new("RGB", (256, 256), "orange").save(original_buffer, format="BMP")
+    original = original_buffer.getvalue()
+    attachment = FakeAttachment(1, "screenshot.png", original, "image/bmp")
+    prompt = "inspect"
+    manifest_id = str(
+        uuid.uuid5(
+            uuid.NAMESPACE_URL,
+            "copilotd:attachment:discord-message:transcode-original",
+        )
+    )
+    original_path = (
+        tmp_path
+        / "sessions"
+        / "session-transcode"
+        / "attachments"
+        / manifest_id
+        / "000-screenshot.png"
+    ).resolve()
+    file_payload = _file_payload(str(original_path), "screenshot.png")
+    frame_budget = (
+        sdk_send_frame_size(
+            session_id="session-transcode",
+            prompt=prompt,
+            attachments=[file_payload],
+            mode="enqueue",
+            agent_mode="interactive",
+            trace_context={},
+        )
+        + 128
+    )
+    async with Database(tmp_path / "transcode.sqlite3") as database:
+        service = AttachmentService(
+            database,
+            tmp_path,
+            blob_max_bytes=50 * 1024,
+            capabilities=AttachmentCapabilities(
+                runtime_inline_blob_max_bytes=50 * 1024,
+                runtime_serialized_frame_max_bytes=1024 * 1024,
+            ),
+        )
+        prepared = await service.prepare(
+            source_kind="discord-message",
+            source_id="transcode-original",
+            session_id="session-transcode",
+            attachments=[attachment],
+        )
+        assert prepared is not None
+        inline = await service.sdk_attachments(prepared.manifest_id)
+        send_service = AttachmentService(
+            database,
+            tmp_path,
+            blob_max_bytes=50 * 1024,
+            capabilities=AttachmentCapabilities(
+                runtime_inline_blob_max_bytes=50 * 1024,
+                runtime_serialized_frame_max_bytes=frame_budget,
+            ),
+        )
+        send_attachments = await send_service.sdk_attachments_for_send(
+            prepared.manifest_id,
+            session_id="session-transcode",
+            prompt=prompt,
+            mode="enqueue",
+            agent_mode="interactive",
+        )
+
+    assert inline[0]["type"] == "blob"
+    assert inline[0]["mimeType"] == "image/jpeg"
+    assert base64.b64decode(inline[0]["data"]).startswith(b"\xff\xd8")
+    assert send_attachments == [file_payload]
+    assert await asyncio.to_thread(_read_bytes, original_path) == original
 
 
 @pytest.mark.asyncio

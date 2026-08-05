@@ -9,6 +9,11 @@ from collections.abc import Awaitable, Callable, Mapping
 from enum import StrEnum
 from typing import Any, Literal, Protocol, TypeVar, cast
 
+from copilotd.core.attachments import (
+    AttachmentError,
+    sdk_send_frame_size,
+    sdk_trace_context,
+)
 from copilotd.core.bindings import (
     AttachmentState,
     BindingConflict,
@@ -40,7 +45,7 @@ from copilotd.storage.leases import FenceLost, OwnerLease, OwnerLeaseStore
 
 AgentMode = Literal["interactive", "plan", "autopilot", "shell"]
 DeliveryMode = Literal["enqueue", "immediate"]
-AttachmentResolver = Callable[[str], Awaitable[list[Any]]]
+AttachmentResolver = Callable[..., Awaitable[list[Any]]]
 T = TypeVar("T")
 
 
@@ -161,6 +166,7 @@ class SessionRuntime:
         interaction_timeout_seconds: float = 24 * 60 * 60,
         sdk_operation_timeout_seconds: float = 30,
         shutdown_timeout_seconds: float = 5,
+        send_frame_max_bytes: int = 7 * 1024 * 1024,
         model_summary_adapter: ModelReasoningSummaryAdapter | None = None,
         task_action_adapter: TaskActionAdapter | None = None,
     ) -> None:
@@ -178,6 +184,7 @@ class SessionRuntime:
         self._interaction_timeout_seconds = interaction_timeout_seconds
         self._sdk_operation_timeout_seconds = sdk_operation_timeout_seconds
         self._shutdown_timeout_seconds = shutdown_timeout_seconds
+        self._send_frame_max_bytes = send_frame_max_bytes
         self._model_summary_adapter = model_summary_adapter
         self._task_action_adapter = task_action_adapter
 
@@ -402,12 +409,6 @@ class SessionRuntime:
                 return None
             attachments = self._volatile_attachments.get(row["id"])
             manifest_id = row["attachment_manifest_id"]
-            if (
-                attachments is None
-                and manifest_id is not None
-                and self._attachment_resolver is not None
-            ):
-                attachments = await self._attachment_resolver(str(manifest_id))
             message_id = await self._dispatch_submission(
                 submission_id=str(row["id"]),
                 idempotency_key=f"queue:{row['id']}",
@@ -452,10 +453,35 @@ class SessionRuntime:
                 internal_event_id=f"submission:{submission_id}:submitting",
             )
             await self._assert_dispatchable()
+            resolved_attachments = attachments
+            try:
+                if attachment_manifest_id is not None and self._attachment_resolver is not None:
+                    resolved_attachments = await self._attachment_resolver(
+                        attachment_manifest_id,
+                        session_id=self.binding.sdk_session_id,
+                        prompt=prompt,
+                        mode=mode,
+                        agent_mode=agent_mode,
+                    )
+            except AttachmentError as error:
+                raise OperationRejected(str(error)) from error
+            frame_size = await asyncio.to_thread(
+                sdk_send_frame_size,
+                session_id=self.binding.sdk_session_id,
+                prompt=prompt,
+                attachments=resolved_attachments,
+                mode=mode,
+                agent_mode=agent_mode,
+                trace_context=sdk_trace_context(),
+            )
+            if frame_size > self._send_frame_max_bytes:
+                raise OperationRejected(
+                    "complete serialized session.send frame exceeds runtime limit"
+                )
             return await self._sdk_call(
                 self._require_handle().send(
                     prompt,
-                    attachments=attachments,
+                    attachments=resolved_attachments,
                     mode=mode,
                     agent_mode=agent_mode,
                 )

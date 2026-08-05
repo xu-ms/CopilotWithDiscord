@@ -101,4 +101,4 @@ async def test_render_stream_compatibility_patch_preserves_existing_rows(
         "finalized": 1,
         "updated_at": 123.0,
     }
-    assert [item["version"] for item in schema_rows] == list(range(1, 12))
+    assert [item["version"] for item in schema_rows] == list(range(1, 14))

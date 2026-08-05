@@ -1,3 +1,5 @@
+import asyncio
+import hashlib
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -164,19 +166,68 @@ async def test_discord_render_preserves_explicit_text_artifact() -> None:
 
 
 @pytest.mark.asyncio
+async def test_discord_render_materializes_verified_artifact_reference(
+    tmp_path: Path,
+) -> None:
+    artifact = tmp_path / "spill.txt"
+    content = b"append-only spill"
+    artifact.write_bytes(content)
+
+    rendered, assets = await _discord_render(
+        {
+            "content": "Tool spill attached.",
+            "finalized": True,
+            "attachments": [
+                {
+                    "filename": "spill.txt",
+                    "media_type": "text/plain",
+                    "path": str(artifact),
+                    "byte_size": len(content),
+                    "sha256": hashlib.sha256(content).hexdigest(),
+                }
+            ],
+        }
+    )
+
+    assert rendered == "Tool spill attached."
+    assert assets[0].content == content
+
+
+@pytest.mark.asyncio
 async def test_local_image_warning_flood_stays_within_discord_limit(
     tmp_path: Path,
 ) -> None:
     content = "\n".join(f"![missing-{index}](missing-{index}.png)" for index in range(80))
 
     plan = await _discord_render_plan(
-        {"content": content, "finalized": True},
+        {
+            "content": content,
+            "finalized": True,
+            "trusted_local_images": True,
+        },
         allowed_roots=(tmp_path,),
     )
 
     assert len(plan.batches) > 1
     assert all(len(batch.content) <= 1850 for batch in plan.batches)
     assert any("image path" in batch.content for batch in plan.batches)
+
+
+@pytest.mark.asyncio
+async def test_assistant_markdown_cannot_dereference_local_image_without_trust(
+    tmp_path: Path,
+) -> None:
+    local = tmp_path / "private.png"
+    await asyncio.to_thread(local.write_bytes, b"local private bytes")
+    source = f"Do not upload ![private]({local.name})"
+
+    plan = await _discord_render_plan(
+        {"content": source, "finalized": True},
+        allowed_roots=(tmp_path,),
+    )
+
+    assert all(not batch.assets for batch in plan.batches)
+    assert "![private]" in plan.batches[0].content
 
 
 def test_large_discord_assets_are_split_losslessly_below_upload_limit() -> None:

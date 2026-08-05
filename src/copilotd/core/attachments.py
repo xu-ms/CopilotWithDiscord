@@ -56,6 +56,10 @@ class _StoredItem:
     sha256: str
     local_path: Path
     sdk_attachment_kind: str
+    inline_path: Path | None
+    inline_mime_type: str | None
+    inline_byte_size: int | None
+    inline_sha256: str | None
 
 
 @dataclass(frozen=True)
@@ -180,6 +184,57 @@ class AttachmentService:
             result = proposed
         return result
 
+    async def sdk_attachments_for_send(
+        self,
+        manifest_id: str,
+        *,
+        session_id: str,
+        prompt: str,
+        mode: str,
+        agent_mode: str,
+    ) -> list[dict[str, Any]]:
+        items = await self._verified_items(manifest_id)
+        limits = self._resolved_limits()
+        attachments = [
+            (
+                await asyncio.to_thread(_load_inline_blob, item)
+                if item.sdk_attachment_kind == "blob"
+                else _load_file_attachment(item)
+            )
+            for item in items
+        ]
+        trace_context = await asyncio.to_thread(sdk_trace_context)
+        frame_size = await asyncio.to_thread(
+            sdk_send_frame_size,
+            session_id=session_id,
+            prompt=prompt,
+            attachments=attachments,
+            mode=mode,
+            agent_mode=agent_mode,
+            trace_context=trace_context,
+        )
+        if frame_size > limits.serialized_frame_max_bytes:
+            for index in range(len(attachments) - 1, -1, -1):
+                if attachments[index]["type"] != "blob":
+                    continue
+                attachments[index] = _load_file_attachment(items[index])
+                frame_size = await asyncio.to_thread(
+                    sdk_send_frame_size,
+                    session_id=session_id,
+                    prompt=prompt,
+                    attachments=attachments,
+                    mode=mode,
+                    agent_mode=agent_mode,
+                    trace_context=trace_context,
+                )
+                if frame_size <= limits.serialized_frame_max_bytes:
+                    break
+        if frame_size > limits.serialized_frame_max_bytes:
+            raise AttachmentError(
+                "complete serialized session.send frame exceeds the runtime limit"
+            )
+        return attachments
+
     async def _begin_manifest(
         self,
         *,
@@ -246,13 +301,15 @@ class AttachmentService:
             if actual_total > limits.message_max_bytes:
                 raise AttachmentError("actual attachments exceed the message limit")
             mime_type = attachment.content_type or "application/octet-stream"
-            stored_bytes = content
-            stored_mime = mime_type
             kind = "file"
+            inline_bytes: bytes | None = None
+            inline_mime: str | None = None
 
             if mime_type.startswith("image/"):
                 if len(content) <= limits.inline_blob_max_bytes:
                     kind = "blob"
+                    inline_bytes = content
+                    inline_mime = mime_type
                 else:
                     try:
                         compressed, compressed_mime = await asyncio.to_thread(
@@ -266,25 +323,41 @@ class AttachmentService:
                             raise
                     else:
                         if len(compressed) <= limits.inline_blob_max_bytes:
-                            stored_bytes = compressed
-                            stored_mime = compressed_mime
                             kind = "blob"
+                            inline_bytes = compressed
+                            inline_mime = compressed_mime
                         elif strict_legacy:
                             raise AttachmentError(
                                 "image cannot be reduced below the SDK inline attachment limit"
                             )
             filename = f"{index:03d}-{_safe_filename(attachment.filename)}"
             target = directory / filename
-            await asyncio.to_thread(_atomic_write, target, stored_bytes)
+            await asyncio.to_thread(_atomic_write, target, content)
+            inline_path: Path | None = None
+            inline_size: int | None = None
+            inline_sha: str | None = None
+            if kind == "blob":
+                if inline_bytes is None:
+                    raise AttachmentError("inline image bytes are unavailable")
+                inline_path = target
+                if inline_bytes != content:
+                    inline_path = target.with_name(f"{target.name}.inline.jpg")
+                    await asyncio.to_thread(_atomic_write, inline_path, inline_bytes)
+                inline_size = len(inline_bytes)
+                inline_sha = await asyncio.to_thread(_sha256_hex, inline_bytes)
             stored.append(
                 _StoredItem(
                     item_index=index,
                     original_name=attachment.filename,
-                    mime_type=stored_mime,
-                    byte_size=len(stored_bytes),
-                    sha256=await asyncio.to_thread(_sha256_hex, stored_bytes),
+                    mime_type=mime_type,
+                    byte_size=len(content),
+                    sha256=await asyncio.to_thread(_sha256_hex, content),
                     local_path=target.resolve(),
                     sdk_attachment_kind=kind,
+                    inline_path=None if inline_path is None else inline_path.resolve(),
+                    inline_mime_type=inline_mime,
+                    inline_byte_size=inline_size,
+                    inline_sha256=inline_sha,
                 )
             )
         return stored
@@ -315,6 +388,23 @@ class AttachmentService:
                         item.sdk_attachment_kind,
                     ),
                 )
+                if item.inline_path is not None:
+                    await connection.execute(
+                        """
+                        INSERT INTO attachment_inline_variants(
+                            manifest_id, item_index, mime_type,
+                            byte_size, sha256, local_path
+                        ) VALUES (?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            manifest_id,
+                            item.item_index,
+                            item.inline_mime_type or item.mime_type,
+                            item.inline_byte_size or item.byte_size,
+                            item.inline_sha256 or item.sha256,
+                            str(item.inline_path),
+                        ),
+                    )
             await connection.execute(
                 """
                 UPDATE attachment_manifests
@@ -333,11 +423,19 @@ class AttachmentService:
             raise AttachmentError(f"attachment manifest is not ready: {manifest_id}")
         rows = await self._database.fetchall(
             """
-            SELECT item_index, original_name, mime_type, byte_size, sha256,
-                   local_path, sdk_attachment_kind
-            FROM attachment_items
-            WHERE manifest_id = ? AND state = 'ready'
-            ORDER BY item_index
+            SELECT i.item_index, i.original_name, i.mime_type,
+                   i.byte_size, i.sha256, i.local_path,
+                   i.sdk_attachment_kind,
+                   v.mime_type AS inline_mime_type,
+                   v.byte_size AS inline_byte_size,
+                   v.sha256 AS inline_sha256,
+                   v.local_path AS inline_path
+            FROM attachment_items AS i
+            LEFT JOIN attachment_inline_variants AS v
+              ON v.manifest_id = i.manifest_id
+             AND v.item_index = i.item_index
+            WHERE i.manifest_id = ? AND i.state = 'ready'
+            ORDER BY i.item_index
             """,
             (manifest_id,),
         )
@@ -350,6 +448,34 @@ class AttachmentService:
                 sha256=str(row["sha256"]),
                 local_path=Path(str(row["local_path"])),
                 sdk_attachment_kind=str(row["sdk_attachment_kind"]),
+                inline_path=(
+                    Path(str(row["inline_path"]))
+                    if row["inline_path"] is not None
+                    else Path(str(row["local_path"]))
+                    if str(row["sdk_attachment_kind"]) == "blob"
+                    else None
+                ),
+                inline_mime_type=(
+                    str(row["inline_mime_type"])
+                    if row["inline_mime_type"] is not None
+                    else str(row["mime_type"])
+                    if str(row["sdk_attachment_kind"]) == "blob"
+                    else None
+                ),
+                inline_byte_size=(
+                    int(row["inline_byte_size"])
+                    if row["inline_byte_size"] is not None
+                    else int(row["byte_size"])
+                    if str(row["sdk_attachment_kind"]) == "blob"
+                    else None
+                ),
+                inline_sha256=(
+                    str(row["inline_sha256"])
+                    if row["inline_sha256"] is not None
+                    else str(row["sha256"])
+                    if str(row["sdk_attachment_kind"]) == "blob"
+                    else None
+                ),
             )
             for row in rows
         ]
@@ -419,12 +545,14 @@ def _sha256_hex(content: bytes) -> str:
 
 
 def _load_inline_blob(item: _StoredItem) -> dict[str, Any]:
-    content = item.local_path.read_bytes()
+    if item.inline_path is None:
+        raise AttachmentError(f"inline variant is missing: {item.original_name}")
+    content = item.inline_path.read_bytes()
     data = base64.b64encode(content).decode("ascii")
     return {
         "type": "blob",
         "data": data,
-        "mimeType": item.mime_type,
+        "mimeType": item.inline_mime_type or item.mime_type,
         "displayName": item.original_name,
     }
 
@@ -447,12 +575,62 @@ def _serialized_request_size(items: list[dict[str, Any]]) -> int:
     return len(payload.encode("utf-8"))
 
 
+def sdk_send_frame_size(
+    *,
+    session_id: str,
+    prompt: str,
+    attachments: list[dict[str, Any]] | None,
+    mode: str | None,
+    agent_mode: str | None,
+    trace_context: dict[str, str] | None = None,
+) -> int:
+    params: dict[str, Any] = {
+        "sessionId": session_id,
+        "prompt": prompt,
+    }
+    if attachments is not None:
+        params["attachments"] = attachments
+    if mode is not None:
+        params["mode"] = mode
+    if agent_mode is not None:
+        params["agentMode"] = agent_mode
+    params.update(trace_context or {})
+    message = {
+        "jsonrpc": "2.0",
+        "id": "00000000-0000-0000-0000-000000000000",
+        "method": "session.send",
+        "params": params,
+    }
+    content_bytes = json.dumps(message, separators=(",", ":")).encode("utf-8")
+    header = f"Content-Length: {len(content_bytes)}\r\n\r\n".encode()
+    return len(header) + len(content_bytes)
+
+
+def sdk_trace_context() -> dict[str, str]:
+    try:
+        from copilot._telemetry import get_trace_context
+    except ImportError:
+        return {}
+    return get_trace_context()
+
+
 def _matches_integrity(item: _StoredItem) -> bool:
     try:
         content = item.local_path.read_bytes()
     except OSError:
         return False
-    return len(content) == item.byte_size and _sha256_hex(content) == item.sha256
+    if len(content) != item.byte_size or _sha256_hex(content) != item.sha256:
+        return False
+    if item.inline_path is None:
+        return True
+    try:
+        inline_content = item.inline_path.read_bytes()
+    except OSError:
+        return False
+    return (
+        len(inline_content) == item.inline_byte_size
+        and _sha256_hex(inline_content) == item.inline_sha256
+    )
 
 
 def _compress_image(content: bytes, mime_type: str, limit: int) -> tuple[bytes, str]:

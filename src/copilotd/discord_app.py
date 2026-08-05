@@ -13,6 +13,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+import aiohttp
 import discord
 import structlog
 from discord import app_commands
@@ -101,10 +102,17 @@ class CopilotDiscordBot(commands.Bot):
         model_summary_adapter: ModelReasoningSummaryAdapter | None = None,
         schedule_origin_adapter: ScheduleOriginAdapter | None = None,
         task_action_adapter: TaskActionAdapter | None = None,
+        discord_connector: aiohttp.BaseConnector | None = None,
+        discord_http_trace: aiohttp.TraceConfig | None = None,
     ) -> None:
         intents = discord.Intents.default()
         intents.message_content = True
-        super().__init__(command_prefix=commands.when_mentioned, intents=intents)
+        super().__init__(
+            command_prefix=commands.when_mentioned,
+            intents=intents,
+            connector=discord_connector,
+            http_trace=discord_http_trace,
+        )
         self.settings = settings
         self.database = Database(settings.database_path)
         self.bridge = CopilotBridge(settings)
@@ -166,7 +174,8 @@ class CopilotDiscordBot(commands.Bot):
                 ingress_capacity=self.settings.ingress_capacity,
                 reducer_batch_size=self.settings.reducer_batch_size,
                 owner_renew_seconds=self.settings.owner_lease_renew_seconds,
-                attachment_resolver=self.attachment_service.sdk_attachments,
+                attachment_resolver=self.attachment_service.sdk_attachments_for_send,
+                send_frame_max_bytes=(self.settings.attachment_runtime_frame_max_bytes),
                 model_summary_adapter=self.model_summary_adapter,
                 task_action_adapter=self.task_action_adapter,
             )
@@ -2836,6 +2845,17 @@ async def _discord_render_plan(
                 encoded = body.encode("utf-8")
             elif isinstance(body, bytes):
                 encoded = body
+            elif isinstance(attachment.get("path"), str):
+                artifact_path = Path(str(attachment["path"]))
+                encoded = await asyncio.to_thread(artifact_path.read_bytes)
+                expected_size = attachment.get("byte_size")
+                if expected_size is not None and len(encoded) != int(expected_size):
+                    raise RenderPermanentError(f"render artifact size changed: {artifact_path}")
+                expected_sha = attachment.get("sha256")
+                if expected_sha is not None and hashlib.sha256(encoded).hexdigest() != str(
+                    expected_sha
+                ):
+                    raise RenderPermanentError(f"render artifact digest changed: {artifact_path}")
             else:
                 continue
             explicit_assets.append(
@@ -2862,7 +2882,7 @@ async def _discord_render_plan(
 
     local_image_assets: list[TableAsset] = []
     image_warnings: list[str] = []
-    if allowed_roots:
+    if allowed_roots and payload.get("trusted_local_images") is True:
         extraction = await asyncio.to_thread(
             lambda: extract_local_markdown_images(
                 content,
