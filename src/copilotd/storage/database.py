@@ -111,6 +111,13 @@ class Database:
         async with self._serialized_connection():
             await self.connection.execute(sql, tuple(parameters))
 
+    async def execute_count(self, sql: str, parameters: Iterable[Any] = ()) -> int:
+        async with self._serialized_connection():
+            cursor = await self.connection.execute(sql, tuple(parameters))
+            count = cursor.rowcount
+            await cursor.close()
+            return count
+
     async def fetchone(self, sql: str, parameters: Iterable[Any] = ()) -> aiosqlite.Row | None:
         async with self._serialized_connection():
             async with self.connection.execute(sql, tuple(parameters)) as cursor:

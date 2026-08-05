@@ -34,6 +34,10 @@ The implementation follows [`docs/copilotD-detailed-design.md`](docs/copilotD-de
   8000 characters; oversized Discord uploads are split into ordered lossless parts.
 - Capability-backed registration for core `/session`, `/project`, `/model`,
   `/autopilot`, `/plan`, `/steer`, `/context`, `/usage`, and `/queue` commands.
+- Application-owned `/schedule` message/new-session jobs with durable leases, DST-safe
+  IANA time handling, FIFO coupling, crash recovery, and semantic completion evidence.
+- Intent-first `/project worktree` lifecycle with exact Git ownership checks, durable
+  compensation/recovery, reference blockers, and capability-gated history forks.
 - Default always-on definitions for macOS LaunchAgents and Windows Scheduled Tasks,
   plus a protected-work-aware watchdog, shared task-failure supervision, and a
   non-destructive active-execution SUSPECT monitor.
@@ -51,11 +55,17 @@ Python 3.11 or newer and an authenticated GitHub Copilot CLI identity are requir
 python3.11 -m venv .venv
 .venv/bin/pip install -e '.[dev]'
 export COPILOTD_DISCORD_TOKEN='...'
+export COPILOTD_DISCORD_OPERATOR_IDS='123456789012345678'
 .venv/bin/copilotd setup
 ```
 
 `setup` installs and starts the current platform's service definitions. For local
 development, use the explicit foreground entrypoint:
+
+`COPILOTD_DISCORD_OPERATOR_IDS` is a comma-separated allowlist. Administrative
+`/project` (including MCP, variables, agents, and worktrees) and runtime restart
+commands fail closed when the caller is not listed. Discord never reveals stored
+project variable values.
 
 ```bash
 .venv/bin/copilotd run --foreground
@@ -88,6 +98,20 @@ disposable persistent session:
 ```bash
 .venv/bin/copilotd sdk-probe --live
 ```
+
+Scheduler/worktree integration has a stricter opt-in runner. It uses real Copilot
+sessions and real temporary Git worktrees, fails when authentication is unavailable,
+cleans disposable resources, and writes sanitized per-feature JSON plus `summary.json`:
+
+```bash
+.venv/bin/copilotd-live-acceptance \
+  --live \
+  --output "$HOME/copilotd-live-results"
+```
+
+The runner accepts injected `ThreadGateway` and `HistoryForkAdapter` implementations,
+so a combined Discord branch can drive real threads without coupling scheduler state to
+Discord rendering internals. History fork is fail-closed when no verified adapter exists.
 
 Runtime data, cache, and logs use platform-specific user directories. Override them
 with `COPILOTD_DATA_DIR`, `COPILOTD_CACHE_DIR`, and `COPILOTD_LOG_DIR`. A guild-scoped

@@ -105,8 +105,8 @@ async def run_command(args: argparse.Namespace) -> int:
     if args.command == "run":
         if not args.foreground:
             raise ValueError("use `copilotd run --foreground`; service mode is installed by setup")
-        await run_discord_bot(settings)
-        return 0
+        restart_requested = await run_discord_bot(settings)
+        return 75 if restart_requested else 0
 
     if args.command == "setup":
         if settings.discord_token is None:

@@ -29,6 +29,7 @@ dev = [
 
 [project.scripts]
 copilotd = "copilotd.cli:main"
+copilotd-live-acceptance = "copilotd.acceptance.live_scheduler_worktree:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/copilotd"]

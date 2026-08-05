@@ -27,6 +27,7 @@ from copilotd.core.mailbox import (
     OperationStore,
 )
 from copilotd.core.reducer import EventReducerWorker, JournalReducer
+from copilotd.core.session_config import SessionLaunchOptions
 from copilotd.core.task_registry import TaskRegistry
 from copilotd.sdk.bridge import EventLogBatch, PermissionPostureError
 from copilotd.sdk.capabilities import CapabilityManifest
@@ -72,6 +73,7 @@ class RuntimeBridge(Protocol):
         on_user_input_request: Any,
         on_exit_plan_mode_request: Any,
         on_auto_mode_switch_request: Any,
+        launch_options: SessionLaunchOptions | None,
     ) -> SessionHandle: ...
 
     async def resume_session(
@@ -84,6 +86,7 @@ class RuntimeBridge(Protocol):
         on_user_input_request: Any,
         on_exit_plan_mode_request: Any,
         on_auto_mode_switch_request: Any,
+        launch_options: SessionLaunchOptions | None,
     ) -> SessionHandle: ...
 
     async def ensure_allow_all(self, session: SessionHandle) -> Any: ...
@@ -411,6 +414,64 @@ class SessionRuntime:
                 observed_model,
             ):
                 await self._block_queue_item(row["id"], "blocked_model_drift")
+                return None
+            config_row = await self._database.fetchone(
+                """
+                SELECT permission_posture, pending_mode, pending_model_config,
+                       desired_agent, pending_agent, runtime_agent,
+                       desired_session_config_version, pending_session_config_version,
+                       runtime_session_config_version, pending_remote_transition_id,
+                       runtime_remote_mode
+                FROM session_bindings WHERE thread_id = ?
+                """,
+                (self.binding.thread_id,),
+            )
+            if config_row is None:
+                await self._block_queue_item(row["id"], "blocked_config_unknown")
+                return None
+            if (
+                config_row["permission_posture"] != "verified_allow_all"
+                or config_row["pending_mode"] is not None
+                or config_row["pending_model_config"] is not None
+                or config_row["pending_agent"] is not None
+                or config_row["pending_session_config_version"] is not None
+            ):
+                await self._block_queue_item(row["id"], "blocked_config_unknown")
+                return None
+            if config_row["pending_remote_transition_id"] is not None:
+                await self._block_queue_item(row["id"], "blocked_remote_transition")
+                return None
+            remote_evidenced = (
+                self._capabilities is not None
+                and self._capabilities.supports("remote")
+            )
+            if remote_evidenced and config_row["runtime_remote_mode"] == "unknown":
+                await self._block_queue_item(row["id"], "blocked_remote_transition")
+                return None
+            agent_evidenced = (
+                self._capabilities is not None
+                and self._capabilities.supports("selected_agent")
+            )
+            runtime_agent = str(config_row["runtime_agent"])
+            if (
+                row["requested_agent_snapshot"] != runtime_agent
+                and (
+                    agent_evidenced
+                    or runtime_agent != "unknown"
+                    or row["requested_agent_snapshot"] != "default"
+                )
+            ):
+                await self._block_queue_item(row["id"], "blocked_agent_drift")
+                return None
+            if (
+                config_row["runtime_session_config_version"] is not None
+                and int(row["requested_session_config_version"])
+                != int(config_row["runtime_session_config_version"])
+            ):
+                await self._block_queue_item(
+                    row["id"],
+                    "blocked_session_config_drift",
+                )
                 return None
             attachments = self._volatile_attachments.get(row["id"])
             manifest_id = row["attachment_manifest_id"]
@@ -1596,7 +1657,7 @@ class SessionRuntime:
     async def queue_items(self) -> list[dict[str, Any]]:
         rows = await self._database.fetchall(
             """
-            SELECT id, prompt, position, state, created_at
+            SELECT id, prompt, position, state, schedule_run_id, replaces_id, created_at
             FROM message_queue
             WHERE thread_id = ?
               AND state NOT IN ('cancelled', 'submitted', 'failed')
@@ -1605,6 +1666,9 @@ class SessionRuntime:
             (self.binding.thread_id,),
         )
         return [dict(row) for row in rows]
+
+    async def dispatch_queued_once(self) -> tuple[str, str] | None:
+        return await self._dispatch_next_queued()
 
     async def cancel_queue_item(self, submission_id: str) -> bool:
         async with self._queue_dispatch_lock:
@@ -1618,6 +1682,121 @@ class SessionRuntime:
     async def clear_queue(self) -> int:
         async with self._queue_dispatch_lock:
             return await self._cancel_queued("1 = 1", ())
+
+    async def resubmit_queue_item(
+        self,
+        submission_id: str,
+        *,
+        idempotency_key: str,
+    ) -> str:
+        allowed = {
+            "blocked_mode_drift",
+            "blocked_model_drift",
+            "blocked_agent_drift",
+            "blocked_session_config_drift",
+        }
+        return await self._replace_queue_item(
+            submission_id,
+            prompt=None,
+            idempotency_key=idempotency_key,
+            allowed_states=allowed,
+        )
+
+    async def update_queue_item(
+        self,
+        submission_id: str,
+        *,
+        prompt: str,
+        idempotency_key: str,
+    ) -> str:
+        if not prompt.strip():
+            raise ValueError("queue prompt cannot be empty")
+        allowed = {
+            "local_queued",
+            "blocked_config_unknown",
+            "blocked_remote_transition",
+            "blocked_mode_drift",
+            "blocked_model_drift",
+            "blocked_agent_drift",
+            "blocked_session_config_drift",
+        }
+        return await self._replace_queue_item(
+            submission_id,
+            prompt=prompt,
+            idempotency_key=idempotency_key,
+            allowed_states=allowed,
+        )
+
+    async def _replace_queue_item(
+        self,
+        submission_id: str,
+        *,
+        prompt: str | None,
+        idempotency_key: str,
+        allowed_states: set[str],
+    ) -> str:
+        async with self._queue_dispatch_lock:
+            await self._assert_dispatchable()
+            row = await self._database.fetchone(
+                """
+                SELECT q.*, s.prompt_hash, s.origin
+                FROM message_queue q
+                JOIN submissions s ON s.submission_id = q.id
+                WHERE q.id = ? AND q.thread_id = ?
+                """,
+                (submission_id, self.binding.thread_id),
+            )
+            if row is None or str(row["state"]) not in allowed_states:
+                raise ValueError("queue item is not replaceable in its current state")
+            binding = await self._database.fetchone(
+                """
+                SELECT desired_mode, desired_model_config, desired_agent,
+                       desired_session_config_version
+                FROM session_bindings WHERE thread_id = ?
+                """,
+                (self.binding.thread_id,),
+            )
+            if binding is None:
+                raise SessionNotReady("session execution configuration is unavailable")
+            replacement_id = str(
+                uuid.uuid5(
+                    uuid.NAMESPACE_URL,
+                    f"copilotd:{self.binding.sdk_session_id}:queue-replace:"
+                    f"{submission_id}:{idempotency_key}",
+                )
+            )
+            replacement_prompt = str(row["prompt"]) if prompt is None else prompt
+            await self._require_inbox().commit_internal(
+                {
+                    "type": "copilotd.queue.replaced",
+                    "data": {
+                        "old_submission_id": submission_id,
+                        "new_submission_id": replacement_id,
+                        "prompt": replacement_prompt,
+                        "prompt_hash": hashlib.sha256(
+                            replacement_prompt.encode()
+                        ).hexdigest(),
+                        "allowed_states": sorted(allowed_states),
+                        "requested_mode": str(binding["desired_mode"]),
+                        "requested_model_config": json.loads(
+                            str(binding["desired_model_config"])
+                        ),
+                        "requested_agent": str(binding["desired_agent"]),
+                        "requested_session_config_version": int(
+                            binding["desired_session_config_version"]
+                        ),
+                        "created_at": time.time(),
+                    },
+                },
+                internal_event_id=f"queue:{replacement_id}:replaced",
+            )
+            replacement = await self._database.fetchone(
+                "SELECT id FROM message_queue WHERE id = ?",
+                (replacement_id,),
+            )
+            if replacement is None:
+                raise RuntimeError("queue replacement was not persisted")
+            return replacement_id
 
     async def update_taskdeck_view(
         self,
@@ -1714,6 +1893,8 @@ class SessionRuntime:
             "blocked_model_drift",
             "blocked_agent_drift",
             "blocked_session_config_drift",
+            "blocked_attachment_unavailable",
+            "blocked_attachment_manifest_missing",
         )
         placeholders = ", ".join("?" for _ in cancellable)
         rows = await self._database.fetchall(
@@ -1939,6 +2120,9 @@ class SessionRuntime:
         async with self._lifecycle_lock:
             if self.state != RuntimeState.DETACHED:
                 raise SessionNotReady(f"runtime cannot attach from state {self.state}")
+            launch_options = SessionLaunchOptions.from_json(
+                self.binding.session_config_snapshot_json
+            )
             self.state = RuntimeState.ATTACHING
             self._lease = await self._owner_leases.acquire(
                 self.binding.sdk_session_id,
@@ -1979,7 +2163,6 @@ class SessionRuntime:
                         f"session {self.binding.sdk_session_id} is held by another process"
                     )
             self._start_components()
-
             try:
                 if create:
                     handle = await self._sdk_call(
@@ -1990,6 +2173,7 @@ class SessionRuntime:
                             on_user_input_request=self._handle_user_input_request,
                             on_exit_plan_mode_request=self._handle_exit_plan_mode_request,
                             on_auto_mode_switch_request=self._handle_auto_mode_switch_request,
+                            launch_options=launch_options,
                         )
                     )
                 else:
@@ -2002,6 +2186,7 @@ class SessionRuntime:
                             on_user_input_request=self._handle_user_input_request,
                             on_exit_plan_mode_request=self._handle_exit_plan_mode_request,
                             on_auto_mode_switch_request=self._handle_auto_mode_switch_request,
+                            launch_options=launch_options,
                         )
                     )
                 if handle.session_id != self.binding.sdk_session_id:
@@ -2563,10 +2748,22 @@ class SessionRuntime:
     async def _assert_dispatchable(self) -> None:
         if self.state != RuntimeState.READY:
             raise SessionNotReady(f"session runtime is {self.state}")
+        draining = await self._database.fetchone(
+            "SELECT value FROM global_config WHERE key = 'restart_draining'"
+        )
+        if draining is not None and draining["value"] == "1":
+            raise SessionNotReady("copilotD is draining for restart")
         await self._assert_owned_handle()
         binding = await self._bindings.by_thread(self.binding.thread_id)
         if binding is None:
             raise SessionNotReady("session binding no longer exists")
+        if binding.project_id is not None:
+            project = await self._database.fetchone(
+                "SELECT state FROM projects WHERE id = ?",
+                (binding.project_id,),
+            )
+            if project is None or project["state"] == "closing":
+                raise SessionNotReady("session project is closing")
         self.binding = binding
         if binding.attachment_state != AttachmentState.ATTACHED:
             raise SessionNotReady(f"session attachment is {binding.attachment_state}")

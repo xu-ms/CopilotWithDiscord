@@ -1,6 +1,7 @@
 import asyncio
 from dataclasses import replace
 from pathlib import Path
+from types import SimpleNamespace
 
 import discord
 import pytest
@@ -73,7 +74,21 @@ def test_discord_registration_omits_commands_without_capability_evidence(
     bot._register_application_commands()
     roots = {command.name for command in bot.tree.get_commands()}
 
-    assert roots == {"project", "queue", "session", "steer"}
+    assert roots == {"ops", "project", "queue", "schedule", "session", "steer"}
+
+
+def test_administrative_commands_require_explicit_operator_allowlist(
+    tmp_path: Path,
+) -> None:
+    denied = CopilotDiscordBot(Settings(data_dir=tmp_path))
+    interaction = SimpleNamespace(user=SimpleNamespace(id=42))
+    with pytest.raises(discord.app_commands.CheckFailure):
+        denied._require_operator(interaction)
+
+    allowed = CopilotDiscordBot(
+        Settings(data_dir=tmp_path, discord_operator_ids="41,42")
+    )
+    allowed._require_operator(interaction)
 
 
 def test_streaming_table_is_held_before_discord_edit() -> None:

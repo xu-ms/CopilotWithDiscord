@@ -47,11 +47,19 @@ class SessionBinding:
     sdk_session_id: str
     binding_intent: BindingIntent
     attachment_state: AttachmentState
+    attachment_reason: str | None
     permission_posture: PermissionPosture
     desired_mode: str
     pending_mode: str | None
     pending_mode_transition_id: str | None
     runtime_mode: str
+    desired_agent: str
+    runtime_agent: str
+    desired_session_config_version: int
+    runtime_session_config_version: int | None
+    runtime_remote_mode: str
+    project_snapshot_json: str | None
+    session_config_snapshot_json: str | None
     runtime_generation: int
     owner_fence_token: int | None
     last_inbox_seq: int
@@ -75,27 +83,49 @@ class SessionBindingRepository:
         cwd_snapshot: Path,
         project_source: str,
         project_id: str | None = None,
+        project_snapshot_json: str | None = None,
+        session_config_snapshot_json: str | None = None,
+        session_config_version: int = 1,
         now: float | None = None,
     ) -> SessionBinding:
         timestamp = time.time() if now is None else now
         resolved_cwd = await asyncio.to_thread(_resolve_path, cwd_snapshot)
-        await self._database.execute(
-            """
-            INSERT INTO session_bindings(
-                thread_id, project_id, project_source, cwd_snapshot, sdk_session_id,
-                created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                thread_id,
-                project_id,
-                project_source,
-                str(resolved_cwd),
-                sdk_session_id,
-                timestamp,
-                timestamp,
-            ),
-        )
+        async with self._database.transaction() as connection:
+            if project_id is not None:
+                cursor = await connection.execute(
+                    "SELECT state, project_kind FROM projects WHERE id = ?",
+                    (project_id,),
+                )
+                project = await cursor.fetchone()
+                await cursor.close()
+                if project is None:
+                    raise BindingConflict("session project does not exist")
+                if project["state"] == "closing" or (
+                    project["project_kind"] == "worktree"
+                    and project["state"] == "retired"
+                ):
+                    raise BindingConflict("session project is closing or closed")
+            await connection.execute(
+                """
+                INSERT INTO session_bindings(
+                    thread_id, project_id, project_source, cwd_snapshot, sdk_session_id,
+                    project_snapshot_json, session_config_snapshot_json,
+                    desired_session_config_version, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    thread_id,
+                    project_id,
+                    project_source,
+                    str(resolved_cwd),
+                    sdk_session_id,
+                    project_snapshot_json,
+                    session_config_snapshot_json,
+                    session_config_version,
+                    timestamp,
+                    timestamp,
+                ),
+            )
         binding = await self.by_thread(thread_id)
         if binding is None:
             raise RuntimeError("created session binding could not be read back")
@@ -125,6 +155,31 @@ class SessionBindingRepository:
             """
         )
         return [_row_to_binding(row) for row in rows]
+
+    async def set_attachment_reason(
+        self,
+        binding: SessionBinding,
+        reason: str | None,
+        *,
+        now: float | None = None,
+    ) -> SessionBinding:
+        if reason not in {None, "user_active", "scheduler_run", "recovery_cleanup"}:
+            raise ValueError(f"invalid attachment reason: {reason}")
+        timestamp = time.time() if now is None else now
+        changed = await self._database.execute_count(
+            """
+            UPDATE session_bindings
+            SET attachment_reason = ?, updated_at = ?, row_version = row_version + 1
+            WHERE thread_id = ? AND row_version = ?
+            """,
+            (reason, timestamp, binding.thread_id, binding.row_version),
+        )
+        if changed != 1:
+            raise BindingConflict("session binding changed while setting attachment reason")
+        result = await self.by_thread(binding.thread_id)
+        if result is None:
+            raise RuntimeError("session binding disappeared")
+        return result
 
     async def begin_attachment(
         self,
@@ -498,11 +553,19 @@ def _row_to_binding(row: Row) -> SessionBinding:
         sdk_session_id=row["sdk_session_id"],
         binding_intent=BindingIntent(row["binding_intent"]),
         attachment_state=AttachmentState(row["attachment_state"]),
+        attachment_reason=row["attachment_reason"],
         permission_posture=PermissionPosture(row["permission_posture"]),
         desired_mode=row["desired_mode"],
         pending_mode=row["pending_mode"],
         pending_mode_transition_id=row["pending_mode_transition_id"],
         runtime_mode=row["runtime_mode"],
+        desired_agent=row["desired_agent"],
+        runtime_agent=row["runtime_agent"],
+        desired_session_config_version=row["desired_session_config_version"],
+        runtime_session_config_version=row["runtime_session_config_version"],
+        runtime_remote_mode=row["runtime_remote_mode"],
+        project_snapshot_json=row["project_snapshot_json"],
+        session_config_snapshot_json=row["session_config_snapshot_json"],
         runtime_generation=row["runtime_generation"],
         owner_fence_token=row["owner_fence_token"],
         last_inbox_seq=row["last_inbox_seq"],

@@ -21,6 +21,7 @@ from copilot.session import CopilotSession, PermissionHandler
 from copilot.session_events import SessionEvent
 
 from copilotd.config import Settings
+from copilotd.core.session_config import SessionLaunchOptions
 
 
 class PermissionPostureError(RuntimeError):
@@ -131,7 +132,9 @@ class CopilotBridge:
         on_user_input_request: Callable[..., Any] | None = None,
         on_exit_plan_mode_request: Callable[..., Any] | None = None,
         on_auto_mode_switch_request: Callable[..., Any] | None = None,
+        launch_options: SessionLaunchOptions | None = None,
     ) -> CopilotSession:
+        launch_kwargs = {} if launch_options is None else launch_options.sdk_kwargs()
         return await self.client.create_session(
             session_id=session_id,
             working_directory=working_directory,
@@ -143,6 +146,7 @@ class CopilotBridge:
             on_user_input_request=on_user_input_request,
             on_exit_plan_mode_request=on_exit_plan_mode_request,
             on_auto_mode_switch_request=on_auto_mode_switch_request,
+            **launch_kwargs,
         )
 
     async def resume_session(
@@ -155,7 +159,9 @@ class CopilotBridge:
         on_user_input_request: Callable[..., Any] | None = None,
         on_exit_plan_mode_request: Callable[..., Any] | None = None,
         on_auto_mode_switch_request: Callable[..., Any] | None = None,
+        launch_options: SessionLaunchOptions | None = None,
     ) -> CopilotSession:
+        launch_kwargs = {} if launch_options is None else launch_options.sdk_kwargs()
         return await self.client.resume_session(
             session_id,
             working_directory=working_directory,
@@ -168,6 +174,7 @@ class CopilotBridge:
             on_user_input_request=on_user_input_request,
             on_exit_plan_mode_request=on_exit_plan_mode_request,
             on_auto_mode_switch_request=on_auto_mode_switch_request,
+            **launch_kwargs,
         )
 
     async def ensure_allow_all(self, session: CopilotSession) -> PermissionPosture:

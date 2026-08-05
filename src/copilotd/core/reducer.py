@@ -8,6 +8,8 @@ import uuid
 from collections.abc import Awaitable, Callable
 from typing import Any, ClassVar
 
+from aiosqlite import Connection, Row
+
 from copilotd.core.event_adapter import EventAdapter, InvalidSdkEvent
 from copilotd.core.inbox import ReducerInbox
 from copilotd.core.interactions import interaction_target_mode
@@ -1025,6 +1027,21 @@ class JournalReducer:
                 raise RuntimeError(
                     f"submission queue state diverged while claiming {data['submission_id']}"
                 )
+            await connection.execute(
+                """
+                UPDATE schedule_runs
+                SET status = 'submitting', send_started_at = COALESCE(send_started_at, ?),
+                    last_progress_at = ?, updated_at = ?
+                WHERE result_submission_id = ?
+                  AND status IN ('claimed', 'submitting')
+                """,
+                (
+                    event.received_at,
+                    now,
+                    now,
+                    str(data["submission_id"]),
+                ),
+            )
         elif event.raw_type == "copilotd.submission.cancel_queued":
             submission_ids = [str(item) for item in data.get("submission_ids", [])]
             cancellable = [str(item) for item in data.get("cancellable_states", [])]
@@ -1032,6 +1049,15 @@ class JournalReducer:
                 return
             ids = ", ".join("?" for _ in submission_ids)
             states = ", ".join("?" for _ in cancellable)
+            schedule_rows = await _fetchall_rows(
+                connection,
+                f"""
+                SELECT DISTINCT schedule_run_id FROM message_queue
+                WHERE id IN ({ids}) AND schedule_run_id IS NOT NULL
+                  AND state IN ({states})
+                """,
+                (*submission_ids, *cancellable),
+            )
             await connection.execute(
                 f"""
                 UPDATE message_queue SET state = 'cancelled', updated_at = ?
@@ -1059,6 +1085,158 @@ class JournalReducer:
                 """,
                 (now, now, event.sdk_session_id, *submission_ids),
             )
+            for schedule_row in schedule_rows:
+                await _finalize_schedule_run_from_reducer(
+                    connection,
+                    run_id=str(schedule_row["schedule_run_id"]),
+                    status="cancelled",
+                    completion_basis="queue_cancelled",
+                    error_code=None,
+                    now=now,
+                )
+        elif event.raw_type == "copilotd.queue.replaced":
+            old_id = str(data["old_submission_id"])
+            new_id = str(data["new_submission_id"])
+            allowed = [str(state) for state in data.get("allowed_states", [])]
+            if not allowed:
+                return
+            placeholders = ", ".join("?" for _ in allowed)
+            old = await _fetchone_row(
+                connection,
+                f"""
+                SELECT q.*, s.sdk_session_id, s.origin, s.attachment_count,
+                       s.requested_delivery
+                FROM message_queue q
+                JOIN submissions s ON s.submission_id = q.id
+                WHERE q.id = ? AND q.state IN ({placeholders})
+                """,
+                (old_id, *allowed),
+            )
+            if old is None:
+                existing = await _fetchone_row(
+                    connection,
+                    "SELECT id FROM message_queue WHERE id = ?",
+                    (new_id,),
+                )
+                if existing is not None:
+                    return
+                raise RuntimeError(f"queue item cannot be replaced: {old_id}")
+            await connection.execute(
+                "UPDATE message_queue SET state = 'cancelled', updated_at = ? WHERE id = ?",
+                (now, old_id),
+            )
+            await connection.execute(
+                "UPDATE submissions SET state = 'cancelled' WHERE submission_id = ?",
+                (old_id,),
+            )
+            await connection.execute(
+                """
+                UPDATE liveness_leases
+                SET state = 'released', refreshed_at = ?, released_at = ?
+                WHERE sdk_session_id = ? AND kind = 'submission'
+                  AND source_id = ? AND state = 'active'
+                """,
+                (now, now, event.sdk_session_id, old_id),
+            )
+            position = await _fetchone_row(
+                connection,
+                """
+                SELECT COALESCE(MAX(position), 0) + 1 AS next_position
+                FROM message_queue WHERE thread_id = ?
+                """,
+                (str(old["thread_id"]),),
+            )
+            assert position is not None
+            schedule_run_id = old["schedule_run_id"]
+            await connection.execute(
+                """
+                INSERT INTO submissions(
+                    submission_id, sdk_session_id, origin, parent_submission_id,
+                    attachment_manifest_id, prompt_hash, requested_mode,
+                    requested_model_config, requested_agent,
+                    requested_session_config_version, requested_delivery,
+                    correlation_id, attachment_count, state, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                          'local_queued', ?)
+                ON CONFLICT(submission_id) DO NOTHING
+                """,
+                (
+                    new_id,
+                    old["sdk_session_id"],
+                    old["origin"],
+                    old_id,
+                    old["attachment_manifest_id"],
+                    str(data["prompt_hash"]),
+                    str(data["requested_mode"]),
+                    json.dumps(data.get("requested_model_config", {}), sort_keys=True),
+                    str(data["requested_agent"]),
+                    int(data["requested_session_config_version"]),
+                    old["requested_delivery"],
+                    f"queue-replacement:{old_id}",
+                    int(old["attachment_count"]),
+                    float(data.get("created_at", now)),
+                ),
+            )
+            await connection.execute(
+                """
+                INSERT INTO message_queue(
+                    id, thread_id, discord_message_id, schedule_run_id, prompt,
+                    attachment_manifest_id, requested_mode_snapshot,
+                    requested_model_config_snapshot, requested_agent_snapshot,
+                    requested_session_config_version, position, state, replaces_id,
+                    created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'local_queued', ?, ?, ?)
+                ON CONFLICT(id) DO NOTHING
+                """,
+                (
+                    new_id,
+                    old["thread_id"],
+                    old["discord_message_id"],
+                    schedule_run_id,
+                    str(data["prompt"]),
+                    old["attachment_manifest_id"],
+                    str(data["requested_mode"]),
+                    json.dumps(data.get("requested_model_config", {}), sort_keys=True),
+                    str(data["requested_agent"]),
+                    int(data["requested_session_config_version"]),
+                    int(position["next_position"]),
+                    old_id,
+                    float(data.get("created_at", now)),
+                    float(data.get("created_at", now)),
+                ),
+            )
+            await connection.execute(
+                """
+                INSERT INTO liveness_leases(
+                    sdk_session_id, lease_id, kind, source_id,
+                    runtime_generation, owner_fence_token, state,
+                    acquired_at, refreshed_at
+                ) VALUES (?, ?, 'submission', ?, ?, ?, 'active', ?, ?)
+                ON CONFLICT DO NOTHING
+                """,
+                (
+                    event.sdk_session_id,
+                    f"submission:{new_id}",
+                    new_id,
+                    event.generation,
+                    event.fence_token,
+                    now,
+                    now,
+                ),
+            )
+            if schedule_run_id is not None:
+                await connection.execute(
+                    """
+                    UPDATE schedule_runs
+                    SET status = 'submitting', result_submission_id = ?,
+                        last_progress_at = ?, updated_at = ?
+                    WHERE run_id = ? AND status NOT IN (
+                        'semantic_complete', 'failed', 'outcome_unknown',
+                        'cancelled', 'target_unknown', 'dispatch_unknown'
+                    )
+                    """,
+                    (new_id, now, now, schedule_run_id),
+                )
         elif event.raw_type == "copilotd.submission.active_unknown":
             observed_at = float(data.get("observed_at", now))
             await connection.execute(
@@ -1088,6 +1266,25 @@ class JournalReducer:
                     event.fence_token,
                 ),
             )
+            run_rows = await _fetchall_rows(
+                connection,
+                """
+                SELECT r.run_id FROM schedule_runs r
+                JOIN submissions s ON s.submission_id = r.result_submission_id
+                WHERE s.sdk_session_id = ?
+                  AND r.status IN ('submitting', 'accepted', 'waiting')
+                """,
+                (event.sdk_session_id,),
+            )
+            for run_row in run_rows:
+                await _finalize_schedule_run_from_reducer(
+                    connection,
+                    run_id=str(run_row["run_id"]),
+                    status="outcome_unknown",
+                    completion_basis=None,
+                    error_code="runtime_active_unknown",
+                    now=now,
+                )
         elif event.raw_type == "copilotd.submission.accepted":
             submission_id = str(data["submission_id"])
             message_id = str(data["message_id"])
@@ -1177,6 +1374,18 @@ class JournalReducer:
                     event.received_at,
                     submission_id,
                 ),
+            )
+            await connection.execute(
+                """
+                UPDATE schedule_runs
+                SET status = 'accepted',
+                    accepted_message_id = COALESCE(accepted_message_id, ?),
+                    accepted_at = COALESCE(accepted_at, ?),
+                    last_progress_at = ?, updated_at = ?
+                WHERE result_submission_id = ?
+                  AND status IN ('claimed', 'submitting', 'accepted')
+                """,
+                (message_id, event.received_at, now, now, submission_id),
             )
             await connection.execute(
                 """
@@ -1289,6 +1498,24 @@ class JournalReducer:
                         submission_id,
                     ),
                 )
+                run_row = await _fetchone_row(
+                    connection,
+                    """
+                    SELECT run_id FROM schedule_runs
+                    WHERE result_submission_id = ?
+                      AND accepted_message_id IS NULL
+                    """,
+                    (submission_id,),
+                )
+                if run_row is not None:
+                    await _finalize_schedule_run_from_reducer(
+                        connection,
+                        run_id=str(run_row["run_id"]),
+                        status="dispatch_unknown",
+                        completion_basis=None,
+                        error_code="send_acceptance_unknown",
+                        now=now,
+                    )
             else:
                 cursor = await connection.execute(
                     """
@@ -1362,6 +1589,20 @@ class JournalReducer:
                     """,
                     (now, now, event.sdk_session_id, submission_id),
                 )
+                run_row = await _fetchone_row(
+                    connection,
+                    "SELECT run_id FROM schedule_runs WHERE result_submission_id = ?",
+                    (submission_id,),
+                )
+                if run_row is not None:
+                    await _finalize_schedule_run_from_reducer(
+                        connection,
+                        run_id=str(run_row["run_id"]),
+                        status="failed",
+                        completion_basis=None,
+                        error_code="submission_rejected",
+                        now=now,
+                    )
         elif event.raw_type == "copilotd.queue.blocked":
             await connection.execute(
                 """
@@ -1889,6 +2130,7 @@ class JournalReducer:
                     updated_at = ?, row_version = row_version + 1
                 WHERE sdk_session_id = ? AND runtime_generation = ?
                   AND owner_fence_token = ?
+                  AND binding_intent != 'closed'
                 """,
                 (
                     now,
@@ -4539,6 +4781,151 @@ def _task_state_icon(state: str) -> str:
 def _bounded_text(value: str, limit: int) -> str:
     normalized = " ".join(value.split())
     return normalized if len(normalized) <= limit else normalized[: limit - 1] + "…"
+
+
+async def _finalize_schedule_run_from_reducer(
+    connection: Connection,
+    *,
+    run_id: str,
+    status: str,
+    completion_basis: str | None,
+    error_code: str | None,
+    now: float,
+) -> None:
+    row = await _fetchone_row(
+        connection,
+        """
+        SELECT r.*, s.thread_id AS schedule_thread_id,
+               s.channel_id AS schedule_channel_id,
+               EXISTS (
+                   SELECT 1 FROM session_bindings b
+                   WHERE b.sdk_session_id = r.result_session_id
+               ) AS result_session_bound
+        FROM schedule_runs r
+        JOIN schedules s ON s.id = r.schedule_id
+        WHERE r.run_id = ?
+        """,
+        (run_id,),
+    )
+    if row is None or row["render_intent_id"] is not None:
+        return
+    render_id = str(
+        uuid.uuid5(uuid.NAMESPACE_URL, f"copilotd:schedule-run:{run_id}:final-render")
+    )
+    if row["result_session_id"] is not None and bool(row["result_session_bound"]):
+        session_id = str(row["result_session_id"])
+    elif row["result_thread_id"] is not None or row["schedule_thread_id"] is not None:
+        session_id = f"thread:{row['result_thread_id'] or row['schedule_thread_id']}"
+    elif row["schedule_channel_id"] is not None:
+        session_id = f"channel:{row['schedule_channel_id']}"
+    else:
+        session_id = "ops:scheduler"
+    logical = await _fetchone_row(
+        connection,
+        """
+        SELECT COALESCE(MAX(logical_seq), 0) + 1 AS logical_seq
+        FROM render_outbox WHERE session_id = ?
+        """,
+        (session_id,),
+    )
+    assert logical is not None
+    content = f"Scheduled run `{run_id}` is `{status}`."
+    if completion_basis:
+        content += f" Completion basis: `{completion_basis}`."
+    if error_code:
+        content += f" Error: `{error_code}`."
+    payload = json.dumps(
+        {
+            "content": content,
+            "finalized": True,
+            "schedule_run": {
+                "run_id": run_id,
+                "schedule_id": str(row["schedule_id"]),
+                "status": status,
+                "completion_basis": completion_basis,
+                "error_code": error_code,
+            },
+            "render_destination": session_id,
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    await connection.execute(
+        """
+        INSERT INTO render_outbox(
+            id, session_id, logical_seq, lane, coalesce_key,
+            idempotency_key, payload, state, attempts,
+            next_attempt_at, created_at, updated_at
+        ) VALUES (?, ?, ?, 'schedule', ?, ?, ?, 'pending', 0, ?, ?, ?)
+        ON CONFLICT(idempotency_key) DO NOTHING
+        """,
+        (
+            render_id,
+            session_id,
+            int(logical["logical_seq"]),
+            f"schedule-run:{run_id}",
+            f"schedule-run:{run_id}:final",
+            payload,
+            now,
+            now,
+            now,
+        ),
+    )
+    await connection.execute(
+        """
+        INSERT INTO scheduler_render_intents(
+            run_id, render_outbox_id, terminal_status, completion_basis, created_at
+        ) VALUES (?, ?, ?, ?, ?)
+        ON CONFLICT(run_id) DO NOTHING
+        """,
+        (run_id, render_id, status, completion_basis, now),
+    )
+    await connection.execute(
+        """
+        UPDATE schedule_runs
+        SET status = ?, completion_basis = ?, error_code = ?,
+            render_intent_id = ?, lease_owner = NULL, lease_expires_at = NULL,
+            terminal_at = COALESCE(terminal_at, ?),
+            cancelled_at = CASE WHEN ? = 'cancelled' THEN ? ELSE cancelled_at END,
+            last_progress_at = ?, updated_at = ?
+        WHERE run_id = ?
+        """,
+        (
+            status,
+            completion_basis,
+            error_code,
+            render_id,
+            now,
+            status,
+            now,
+            now,
+            now,
+            run_id,
+        ),
+    )
+
+
+async def _fetchone_row(
+    connection: Connection,
+    statement: str,
+    parameters: tuple[object, ...],
+) -> Row | None:
+    cursor = await connection.execute(statement, parameters)
+    row = await cursor.fetchone()
+    await cursor.close()
+    return row
+
+
+async def _fetchall_rows(
+    connection: Connection,
+    statement: str,
+    parameters: tuple[object, ...],
+) -> list[Row]:
+    cursor = await connection.execute(statement, parameters)
+    rows = list(await cursor.fetchall())
+    await cursor.close()
+    return rows
 
 
 def _model_config_matches(

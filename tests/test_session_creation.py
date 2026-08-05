@@ -6,7 +6,13 @@ from uuid import uuid4
 import pytest
 
 from copilotd.core.bindings import SessionBindingRepository
-from copilotd.core.projects import ProjectRegistry
+from copilotd.core.projects import (
+    McpServerSnapshot,
+    ProjectConfigSnapshot,
+    ProjectRegistry,
+    ProjectSource,
+)
+from copilotd.core.session_config import SessionConfigSnapshotError
 from copilotd.core.session_runtime import SessionRuntime
 from copilotd.core.sessions import (
     CreationIntentRepository,
@@ -267,3 +273,127 @@ async def test_ambiguous_sdk_create_is_reconciled_by_resume_without_second_creat
         assert bridge.create_calls == 1
         assert bridge.resume_calls == 1
         await sessions.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_schedule_creation_reuses_preallocated_session_and_thread_after_retry(
+    tmp_path: Path,
+) -> None:
+    home = tmp_path / "home"
+    await asyncio.to_thread(home.mkdir)
+    async with Database(tmp_path / "schedule-creation.sqlite3") as database:
+        bridge = FakeBridge()
+        threads = FakeThreads(ambiguous_first_create=True)
+        service, sessions = await _build_service(database, home, bridge, threads)
+        project = await service._projects.resolve("channel-1")
+        config = await service._projects.config_snapshot(project)
+        preallocated = str(uuid4())
+
+        with pytest.raises(SessionCreationUnknown, match="Discord"):
+            await service.create_from_source(
+                channel_id="channel-1",
+                source_kind="schedule",
+                source_id="run-1",
+                prompt="",
+                thread_name="scheduled",
+                send_initial_prompt=False,
+                project_snapshot=project,
+                config_snapshot=config,
+                preallocated_session_id=preallocated,
+            )
+        runtime = await service.create_from_source(
+            channel_id="channel-1",
+            source_kind="schedule",
+            source_id="run-1",
+            prompt="",
+            thread_name="scheduled",
+            send_initial_prompt=False,
+            project_snapshot=project,
+            config_snapshot=config,
+            preallocated_session_id=preallocated,
+        )
+
+        assert threads.create_calls == 1
+        assert bridge.create_calls == 1
+        assert runtime.binding.sdk_session_id == preallocated
+        assert runtime.binding.thread_id == "thread-1"
+        await sessions.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_invalid_snapshot_fails_before_discord_or_sdk_creation(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    await asyncio.to_thread(home.mkdir)
+    async with Database(tmp_path / "invalid-snapshot.sqlite3") as database:
+        bridge = FakeBridge()
+        threads = FakeThreads()
+        service, sessions = await _build_service(database, home, bridge, threads)
+        project = await service._projects.resolve("channel-1")
+        invalid = ProjectConfigSnapshot(
+            project_id=None,
+            source=ProjectSource.IMPLICIT_HOME,
+            cwd=home,
+            timezone="UTC",
+            config_version=1,
+            mcp_servers=(
+                McpServerSnapshot(
+                    name="broken",
+                    transport="stdio",
+                    command="server",
+                    url=None,
+                    args=(),
+                    headers=(),
+                    env_refs=("MISSING",),
+                    enabled=True,
+                    version=1,
+                ),
+            ),
+        )
+
+        with pytest.raises(SessionConfigSnapshotError):
+            await service.create_from_source(
+                channel_id="channel-1",
+                source_kind="message",
+                source_id="invalid",
+                prompt="hello",
+                thread_name="invalid",
+                project_snapshot=project,
+                config_snapshot=invalid,
+            )
+        intent = await database.fetchone(
+            "SELECT state FROM session_creation_intents WHERE source_id = 'invalid'"
+        )
+
+        assert intent["state"] == "failed"
+        assert threads.create_calls == 0
+        assert bridge.create_calls == 0
+        await sessions.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_existing_creation_intent_cannot_bypass_restart_drain(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    await asyncio.to_thread(home.mkdir)
+    async with Database(tmp_path / "intent-drain.sqlite3") as database:
+        projects = ProjectRegistry(database, resolved_home=home)
+        await projects.initialize()
+        project = await projects.resolve("channel-1")
+        intents = CreationIntentRepository(database)
+        await intents.reserve(
+            source_kind="message",
+            source_id="message-1",
+            project=project,
+        )
+        await database.execute(
+            """
+            INSERT INTO global_config(key, value, updated_at)
+            VALUES ('restart_draining', '1', 1)
+            """
+        )
+
+        with pytest.raises(RuntimeError, match="draining"):
+            await intents.reserve(
+                source_kind="message",
+                source_id="message-1",
+                project=project,
+            )

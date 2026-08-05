@@ -37,6 +37,11 @@ class HeartbeatSnapshot:
     last_reducer_progress_at: str | None
     durable_replay_capable: bool
     suspect_executions: int = 0
+    app_scheduler_state: str = "stopped"
+    enabled_app_schedules: int = 0
+    active_app_schedule_runs: int = 0
+    unknown_app_schedule_runs: int = 0
+    scheduler_last_tick_at: str | None = None
 
     @property
     def protected_work(self) -> bool:
@@ -47,6 +52,8 @@ class HeartbeatSnapshot:
                 self.active_or_unknown_native_schedules,
                 self.remote_steerable_or_unknown_sessions,
                 self.pending_interactions,
+                self.active_app_schedule_runs,
+                self.unknown_app_schedule_runs,
             )
         )
 
@@ -117,7 +124,17 @@ class HeartbeatWriter:
               (SELECT COUNT(*) FROM pending_interactions
                WHERE state = 'pending') AS pending_interactions,
               (SELECT COUNT(*) FROM execution_health
-               WHERE state = 'suspect') AS suspect_executions
+               WHERE state = 'suspect') AS suspect_executions,
+              (SELECT COUNT(*) FROM schedules
+               WHERE state = 'enabled') AS enabled_app_schedules,
+              (SELECT COUNT(*) FROM schedule_runs
+               WHERE status IN (
+                   'claimed', 'submitting', 'accepted', 'waiting'
+               )) AS active_app_schedule_runs,
+              (SELECT COUNT(*) FROM schedule_runs
+               WHERE status IN (
+                   'target_unknown', 'dispatch_unknown', 'outcome_unknown'
+               )) AS unknown_app_schedule_runs
             """
         )
         latest = await self._database.fetchone(
@@ -125,6 +142,12 @@ class HeartbeatWriter:
             SELECT MAX(last_event_at) AS last_callback_at,
                    MAX(updated_at) AS last_reducer_progress_at
             FROM session_bindings
+            """
+        )
+        scheduler = await self._database.fetchone(
+            """
+            SELECT worker_state, last_tick_at
+            FROM scheduler_state WHERE singleton = 1
             """
         )
         return HeartbeatSnapshot(
@@ -153,6 +176,17 @@ class HeartbeatWriter:
             ),
             durable_replay_capable=self._durable_replay_capable,
             suspect_executions=int(counts["suspect_executions"]),
+            app_scheduler_state=(
+                "stopped" if scheduler is None else str(scheduler["worker_state"])
+            ),
+            enabled_app_schedules=int(counts["enabled_app_schedules"]),
+            active_app_schedule_runs=int(counts["active_app_schedule_runs"]),
+            unknown_app_schedule_runs=int(counts["unknown_app_schedule_runs"]),
+            scheduler_last_tick_at=(
+                None
+                if scheduler is None
+                else _optional_rfc3339(scheduler["last_tick_at"])
+            ),
         )
 
 

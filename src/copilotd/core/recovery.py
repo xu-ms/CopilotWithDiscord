@@ -24,6 +24,7 @@ class RecoveryInventoryReport:
     dispatch_unknown_runs: int
     target_unknown_runs: int
     retry_wait_runs: int
+    outcome_unknown_runs: int
 
 
 class StartupRecoveryInventory:
@@ -165,9 +166,13 @@ class StartupRecoveryInventory:
                 """
                 UPDATE schedule_runs
                 SET status = 'target_unknown', updated_at = ?
-                WHERE status IN ('claimed', 'dispatching')
+                WHERE status IN ('claimed', 'dispatching', 'submitting')
                   AND session_create_started_at IS NOT NULL
-                  AND result_session_id IS NOT NULL
+                  AND result_thread_id IS NULL
+                  AND NOT EXISTS (
+                      SELECT 1 FROM message_queue
+                      WHERE schedule_run_id = schedule_runs.run_id
+                  )
                 """,
                 (timestamp,),
             )
@@ -176,8 +181,9 @@ class StartupRecoveryInventory:
                 """
                 UPDATE schedule_runs
                 SET status = 'dispatch_unknown', updated_at = ?
-                WHERE status = 'dispatching' AND send_started_at IS NOT NULL
-                  AND session_create_started_at IS NULL
+                WHERE status IN ('dispatching', 'submitting')
+                  AND send_started_at IS NOT NULL
+                  AND accepted_message_id IS NULL
                 """,
                 (timestamp,),
             )
@@ -187,12 +193,26 @@ class StartupRecoveryInventory:
                 UPDATE schedule_runs
                 SET status = 'retry_wait', lease_owner = NULL,
                     lease_expires_at = NULL, updated_at = ?
-                WHERE status IN ('claimed', 'dispatching')
+                WHERE status IN ('claimed', 'dispatching', 'submitting')
                   AND send_started_at IS NULL
                   AND session_create_started_at IS NULL
                   AND COALESCE(lease_expires_at, 0) <= ?
                 """,
                 (timestamp, timestamp),
+            )
+            counts["outcome_unknown_runs"] = await _update_count(
+                connection,
+                """
+                UPDATE schedule_runs
+                SET status = 'outcome_unknown', updated_at = ?
+                WHERE status IN ('accepted', 'waiting')
+                  AND EXISTS (
+                      SELECT 1 FROM submissions
+                      WHERE submission_id = schedule_runs.result_submission_id
+                        AND state IN ('submitted_unknown', 'outcome_unknown')
+                  )
+                """,
+                (timestamp,),
             )
             report = RecoveryInventoryReport(run_id=run_id, **counts)
             await connection.execute(
