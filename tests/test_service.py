@@ -172,3 +172,48 @@ def test_watchdog_refuses_protected_restart_and_suppresses_restart_storm(
     ]
     assert manager.watchdog(now=now + 3) == "restart-storm"
     assert manager.restarts == 3
+
+
+def test_watchdog_treats_fresh_runtime_down_as_unhealthy(tmp_path: Path) -> None:
+    settings = _settings(tmp_path)
+    settings.ensure_directories()
+    manager = RecordingServiceManager(settings)
+    now = time.time()
+    protected = HeartbeatSnapshot(
+        schema_version=1,
+        pid=1,
+        process_generation="generation",
+        written_at=datetime.fromtimestamp(now, UTC).isoformat().replace("+00:00", "Z"),
+        gateway_state="down",
+        gateway_down_since=None,
+        runtime_state="down",
+        attached_sessions=1,
+        active_submissions=1,
+        observed_background_tasks=0,
+        active_or_unknown_native_schedules=0,
+        remote_steerable_or_unknown_sessions=0,
+        pending_interactions=0,
+        ingress_queue_depth=0,
+        max_reducer_lag_ms=0,
+        last_callback_at=None,
+        last_reducer_progress_at=None,
+        durable_replay_capable=True,
+    )
+    settings.heartbeat_path.write_text(json.dumps(asdict(protected)), encoding="utf-8")
+
+    assert manager.watchdog(now=now) == "runtime-down-protected"
+    assert manager.restarts == 0
+
+    unprotected = HeartbeatSnapshot(
+        **{
+            **asdict(protected),
+            "active_submissions": 0,
+            "attached_sessions": 0,
+        }
+    )
+    settings.heartbeat_path.write_text(
+        json.dumps(asdict(unprotected)),
+        encoding="utf-8",
+    )
+    assert manager.watchdog(now=now + 1) == "restarted-runtime-down"
+    assert manager.restarts == 1

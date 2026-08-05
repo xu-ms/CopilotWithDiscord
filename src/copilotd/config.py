@@ -3,8 +3,15 @@ from __future__ import annotations
 from pathlib import Path
 
 from platformdirs import user_cache_path, user_data_path, user_log_path
-from pydantic import Field, SecretStr, field_validator
+from pydantic import Field, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+from copilotd.storage.leases import (
+    MUTATION_HEADROOM_SECONDS,
+    OWNER_LEASE_RENEW_SECONDS,
+    OWNER_LEASE_TTL_SECONDS,
+    RENEWAL_JITTER_MARGIN_SECONDS,
+)
 
 
 class Settings(BaseSettings):
@@ -33,8 +40,8 @@ class Settings(BaseSettings):
     sdk_shutdown_timeout_seconds: float = 10
     runtime_uri: str | None = None
     runtime_connection_token: SecretStr | None = None
-    owner_lease_ttl_seconds: int = 60
-    owner_lease_renew_seconds: int = 20
+    owner_lease_ttl_seconds: int = int(OWNER_LEASE_TTL_SECONDS)
+    owner_lease_renew_seconds: int = int(OWNER_LEASE_RENEW_SECONDS)
     ingress_capacity: int = 4096
     reducer_batch_size: int = 64
     attachment_file_max_bytes: int = 25 * 1024 * 1024
@@ -50,8 +57,10 @@ class Settings(BaseSettings):
     @field_validator("owner_lease_ttl_seconds")
     @classmethod
     def validate_lease_ttl(cls, value: int) -> int:
-        if value < 40:
-            raise ValueError("owner lease TTL must be at least 40 seconds")
+        if value < MUTATION_HEADROOM_SECONDS + RENEWAL_JITTER_MARGIN_SECONDS:
+            raise ValueError(
+                "owner lease TTL must exceed mutation headroom by the jitter margin"
+            )
         return value
 
     @field_validator("owner_lease_renew_seconds")
@@ -60,6 +69,17 @@ class Settings(BaseSettings):
         if value < 1:
             raise ValueError("owner lease renew interval must be positive")
         return value
+
+    @model_validator(mode="after")
+    def validate_lease_timing_policy(self) -> Settings:
+        required = MUTATION_HEADROOM_SECONDS + RENEWAL_JITTER_MARGIN_SECONDS
+        available = self.owner_lease_ttl_seconds - self.owner_lease_renew_seconds
+        if available < required:
+            raise ValueError(
+                "owner lease TTL minus renewal interval must preserve "
+                f"at least {required:g} seconds of mutation headroom and jitter margin"
+            )
+        return self
 
     @field_validator("sdk_shutdown_timeout_seconds")
     @classmethod

@@ -51,6 +51,7 @@ async def test_initial_migration_creates_full_schema(tmp_path: Path) -> None:
         "snapshot_observations",
         "submissions",
         "submission_segments",
+        "submission_task_links",
         "task_card_projections",
         "taskdeck_panel_state",
         "usage_samples",
@@ -81,7 +82,7 @@ async def test_migrations_are_idempotent(tmp_path: Path) -> None:
     async with Database(database_path) as database:
         rows = await database.fetchall("SELECT version FROM schema_migrations")
 
-    assert [row["version"] for row in rows] == [1, 2, 3, 4, 5, 6, 7, 8]
+    assert [row["version"] for row in rows] == list(range(1, 10))
 
 
 @pytest.mark.asyncio
@@ -122,7 +123,7 @@ async def test_foundation_migration_upgrades_existing_v7_database(tmp_path: Path
             "SELECT name FROM sqlite_master WHERE type = 'table'"
         )
 
-    assert [row["version"] for row in versions] == list(range(1, 9))
+    assert [row["version"] for row in versions] == list(range(1, 10))
     assert "protocol_version" in {row["name"] for row in capability_columns}
     assert {
         "schema_version",
@@ -136,6 +137,7 @@ async def test_foundation_migration_upgrades_existing_v7_database(tmp_path: Path
         "snapshot_observations",
         "startup_recovery_runs",
         "submission_segments",
+        "submission_task_links",
     } <= {row["name"] for row in tables}
 
 

@@ -31,7 +31,13 @@ from copilotd.core.task_registry import TaskRegistry
 from copilotd.sdk.bridge import EventLogBatch, PermissionPostureError
 from copilotd.sdk.capabilities import CapabilityManifest
 from copilotd.storage.database import Database
-from copilotd.storage.leases import FenceLost, OwnerLease, OwnerLeaseStore
+from copilotd.storage.leases import (
+    MUTATION_HEADROOM_SECONDS,
+    OWNER_LEASE_RENEW_SECONDS,
+    FenceLost,
+    OwnerLease,
+    OwnerLeaseStore,
+)
 
 AgentMode = Literal["interactive", "plan", "autopilot", "shell"]
 DeliveryMode = Literal["enqueue", "immediate"]
@@ -174,7 +180,7 @@ class SessionRuntime:
         binding: SessionBinding,
         ingress_capacity: int = 4096,
         reducer_batch_size: int = 64,
-        owner_renew_seconds: float = 20,
+        owner_renew_seconds: float = OWNER_LEASE_RENEW_SECONDS,
         queue_poll_seconds: float = 1,
         attachment_resolver: AttachmentResolver | None = None,
         interaction_timeout_seconds: float = 24 * 60 * 60,
@@ -760,6 +766,9 @@ class SessionRuntime:
             await self._require_inbox().join()
             topics = set(self._snapshot_topics)
             self._snapshot_topics.clear()
+            if "tasks" in topics:
+                await self._query_snapshot_topic("tasks")
+                topics.remove("tasks")
             if {"activity", "queue"}.intersection(topics):
                 try:
                     await self._refresh_readiness()
@@ -1065,7 +1074,7 @@ class SessionRuntime:
         )
         topics: set[str] = set()
         if raw_type == "session.background_tasks_changed":
-            topics.add("tasks")
+            topics.update({"activity", "queue", "tasks"})
         if raw_type == "pending_messages.modified":
             topics.update({"activity", "queue"})
         if raw_type == "session.remote_steerable_changed":
@@ -1885,8 +1894,14 @@ class SessionRuntime:
         return blockers
 
     async def _refresh_all_snapshots(self) -> None:
+        # Flush callback-scheduled snapshot requests before selecting the latest epochs.
+        await asyncio.sleep(0)
+        await self._require_inbox().join()
+        topics = self._supported_snapshot_topics()
+        if "tasks" in topics:
+            await self._query_snapshot_topic("tasks")
         await self._refresh_readiness()
-        for topic in sorted(self._supported_snapshot_topics() - {"activity", "queue"}):
+        for topic in sorted(topics - {"activity", "queue", "tasks"}):
             await self._query_snapshot_topic(topic)
         await self._require_inbox().join()
 
@@ -2616,7 +2631,7 @@ class SessionRuntime:
         lease = self._lease
         return lease is not None and await self._owner_leases.has_mutation_headroom(
             lease,
-            minimum_seconds=40,
+            minimum_seconds=MUTATION_HEADROOM_SECONDS,
         )
 
     async def _force_active_unknown(self) -> None:

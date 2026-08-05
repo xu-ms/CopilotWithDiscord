@@ -574,7 +574,8 @@ intent 误杀工作。
 `binding_intent=CLOSED`，其他 routine/error shutdown 均先进入 recovery/diagnostics，不能从
 `shutdownType` 猜用户意图。
 
-owner lease TTL 固定 60 秒、每 20 秒续租；每次 takeover 在 SQLite transaction 内分配严格
+owner lease TTL 固定 60 秒、每 15 秒续租，保留 40 秒 mutation headroom 与至少 5 秒调度抖动
+余量；每次 takeover 在 SQLite transaction 内分配严格
 递增的 `fence_token`。所有 mutating RPC dispatch、snapshot commit 和 callback reduction 都
 必须携带并重新校验当前 token，不能只在 attach 时检查一次。续租失败后立即暂停新 mutating
 RPC；一旦发现 token 已被替换，旧 runtime 进入 fenced/quarantined，旧 callback 只计 incident，
@@ -829,7 +830,7 @@ thread/session。`session_create_started_at` 已写但无法确认 create
 5. 没有 idle reaper。`liveness_leases` 只用于状态、graceful shutdown 与 watchdog；
    跨进程写权限只由独立 `session_owner_leases` fence 决定，两者不能混用。
 6. raw event、task snapshot 变化、callback enqueue 和 reducer progress 刷新 heartbeat。
-7. owner lease 每 20 秒续租且 fence token 单调递增；任一 RPC/commit 前失配即冻结旧 owner，
+7. owner lease 每 15 秒续租且 fence token 单调递增；任一 RPC/commit 前失配即冻结旧 owner，
    旧 owner 不通过 disconnect 破坏新 owner。
 
 CommandMailbox 同时最多向 runtime dispatch 一个 app submission。SDK 的默认 delivery 就是
@@ -2356,7 +2357,7 @@ claudeD issue 回归门禁：
 | 已实现 | 当前边界 |
 |---|---|
 | 官方 `github-copilot-sdk==1.0.8` + bundled runtime 1.0.73，stdio `--yolo`，create/resume 后 full allow-all 对账 | sidecar client transport 断开后 session retention 实测失败，因此不声明 detached continuation；crash window 保守标 outcome unknown |
-| 8 个 SQLite migration、project `$HOME` fallback/cwd snapshot、owner fence、creation saga、strict-UUID event journal、reducer-owned operation/submission receipts、liveness leases、startup recovery inventory 与 eager resume | bundled runtime 进程死亡后的 in-flight execution 仍只能标 outcome unknown；experimental task action RPC 继续 gated |
+| 9 个 SQLite migration、project `$HOME` fallback/cwd snapshot、owner fence、creation saga、strict-UUID event journal、reducer-owned operation/submission receipts、submission-task links、liveness leases、startup recovery inventory 与 eager resume | bundled runtime 进程死亡后的 in-flight execution 仍只能标 outcome unknown；experimental task action RPC 继续 gated |
 | eventLog `read/tail` durable backfill（固定过滤 ephemeral）、cursor epoch/rebase/predecessor-gap diagnostics、overflow freeze/backfill/generation replacement；activity/queue/task/remote/schedule snapshot requested/applied epoch 与 query watermark | ephemeral idle/delta 离开 live window 后不可恢复，不从 transcript 猜 terminal |
 | durable app FIFO；fresh readiness snapshot、reducer caught-up、config/agent/remote/schedule/task known gate 后只派发队首；attachment manifest READY + hash/size 复验，无 attachment-free fallback；`/queue add/list/remove/clear` | native queue entry 没有 stable opaque ID 时只以 snapshot-local opaque key 诊断；transport ambiguity 不自动重放 |
 | Discord core `/session`、`/project`、`/model`、bare `/autopilot`、bare/optional-prompt `/plan`、`/steer`、`/context`、`/usage`；user-input/Plan-exit/auto-mode-switch 使用 durable exactly-once interaction + select/modal 原位结算；Plan 退出 mode 精确关联并消费 | `/session delete`、compact/fork 和 Native-Gated commands 尚未实现，因而不注册；elicitation/MCP OAuth 仍待接入 |
@@ -2364,7 +2365,7 @@ claudeD issue 回归门禁：
 | tool/subagent/agent-scoped output 归并为原 thread 的单条 TaskDeck；4 秒 cadence、pending coalescing、terminal flush、select/expand/collapse/prev/next；>=8000 字符 tool result/error 逐字附件化；usage、warning/error、intent、workspace change 与 compaction 状态有非空 lane；raw chain-of-thought 永不展示；零 child-thread 路径 | typed Tasks/Fleet action buttons、完整 reasoning summary/diff artifact lane 尚未实现 |
 | 共享 TaskRegistry、failure consumer、10 分钟 active-execution SUSPECT + non-destructive ping、结构化 heartbeat、protected-work watchdog、macOS bot/watchdog LaunchAgent 与 Windows Scheduled Task definitions | 当前拓扑没有独立 runtime service；真实 service 安装、sleep/wake 和 Windows 实机仍待验证 |
 
-当前 deterministic 验证基线：`ruff check .`、237 个 pytest 全部通过。仓库内 hash-checked
+当前 deterministic 验证基线：`ruff check .`、252 个 pytest 全部通过。仓库内 hash-checked
 fixture 固定 SDK 1.0.8 / runtime 1.0.73 / protocol 3、114-event inventory 与 capability
 evidence；`copilotd sdk-probe --live` 使用当前登录账号创建 disposable session，属于独立的
 release/live acceptance，不由 deterministic fixture 冒充。这个快照用于区分“已验证实现”和后续

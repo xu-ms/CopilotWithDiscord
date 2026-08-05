@@ -219,6 +219,21 @@ class ServiceManager:
             snapshot = None
             age = float("inf")
 
+        if snapshot is not None and snapshot.runtime_state == "down":
+            if snapshot.protected_work:
+                self._write_alert(
+                    "runtime reported down with protected work; waiting for process exit "
+                    "instead of guessing recovery"
+                )
+                return "runtime-down-protected"
+            if self._restart_storm(current):
+                self._write_alert(
+                    "runtime-down restart suppressed after 3 attempts in 5 minutes"
+                )
+                return "restart-storm"
+            self._record_restart(current)
+            self._restart_bot()
+            return "restarted-runtime-down"
         if age <= 120:
             return "healthy"
         if snapshot is not None and snapshot.protected_work:

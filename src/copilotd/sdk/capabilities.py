@@ -115,7 +115,7 @@ class RuntimeIdentity:
 @dataclass(frozen=True, slots=True)
 class CapabilityEvidence:
     name: str
-    supported: bool
+    supported: bool | None
     evidence_kind: str
     detail: Any
 
@@ -168,7 +168,11 @@ class CapabilityManifest:
                 capabilities={
                     str(name): CapabilityEvidence(
                         name=str(name),
-                        supported=bool(evidence["supported"]),
+                        supported=(
+                            None
+                            if evidence["supported"] is None
+                            else bool(evidence["supported"])
+                        ),
                         evidence_kind=str(evidence["evidence_kind"]),
                         detail=evidence["detail"],
                     )
@@ -228,7 +232,52 @@ class CapabilityManifest:
 
     def supports(self, capability: str) -> bool:
         evidence = self.capabilities.get(capability)
-        return evidence is not None and evidence.supported
+        return evidence is not None and evidence.supported is True
+
+    def with_checked_fallback(
+        self,
+        checked: CapabilityManifest,
+    ) -> CapabilityManifest:
+        if self.identity != checked.identity:
+            raise RuntimeIdentityMismatch(
+                "live and checked capability evidence identities do not match"
+            )
+        merged: dict[str, CapabilityEvidence] = {}
+        for name in sorted(set(self.capabilities) | set(checked.capabilities)):
+            live = self.capabilities.get(name)
+            fallback = checked.capabilities.get(name)
+            if live is not None and (
+                live.supported is not None or live.evidence_kind != "unprobed"
+            ):
+                merged[name] = live
+                continue
+            if fallback is None:
+                if live is not None:
+                    merged[name] = live
+                continue
+            merged[name] = CapabilityEvidence(
+                name=name,
+                supported=fallback.supported,
+                evidence_kind=f"checked-fallback:{fallback.evidence_kind}",
+                detail={
+                    "live": None if live is None else live.detail,
+                    "checked": fallback.detail,
+                },
+            )
+        manifest = CapabilityManifest(
+            schema_version=self.schema_version,
+            source=f"{self.source}+checked-fallback",
+            generated_at=self.generated_at,
+            identity=self.identity,
+            generated_event_count=self.generated_event_count,
+            generated_event_sha256=self.generated_event_sha256,
+            main_branch_only_events=self.main_branch_only_events,
+            capabilities=merged,
+            fixture_path=self.fixture_path,
+            fixture_sha256=self.fixture_sha256,
+        )
+        manifest.validate()
+        return manifest
 
     def require_startup_capabilities(self) -> None:
         missing = sorted(
@@ -318,11 +367,19 @@ class CapabilityRegistry:
     def resolve(self, runtime_payload: dict[str, Any]) -> CapabilityManifest:
         identity = RuntimeIdentity.from_runtime_payload(runtime_payload)
         local = self.load_local()
-        candidates = [manifest for manifest in (local, self.load_checked()) if manifest is not None]
-        for manifest in candidates:
-            if manifest.matches(identity):
-                manifest.require_startup_capabilities()
-                return manifest
+        checked = self.load_checked()
+        candidates = [manifest for manifest in (local, checked) if manifest is not None]
+        if local is not None and local.matches(identity):
+            manifest = (
+                local.with_checked_fallback(checked)
+                if checked.matches(identity)
+                else local
+            )
+            manifest.require_startup_capabilities()
+            return manifest
+        if checked.matches(identity):
+            checked.require_startup_capabilities()
+            return checked
         expected = ", ".join(
             (
                 f"{item.identity.sdk_version}/"
@@ -352,13 +409,15 @@ class CapabilityRegistry:
                     INSERT INTO capabilities(
                         runtime_version, sdk_version, protocol_version,
                         ping_protocol_version, capability, supported,
-                        evidence_kind, probe_detail, fixture_path, fixture_sha256,
+                        evidence_status, evidence_kind, probe_detail,
+                        fixture_path, fixture_sha256,
                         generated_event_count, event_types_sha256, source, probed_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     ON CONFLICT(runtime_version, sdk_version, protocol_version, capability)
                     DO UPDATE SET
                         ping_protocol_version = excluded.ping_protocol_version,
                         supported = excluded.supported,
+                        evidence_status = excluded.evidence_status,
                         evidence_kind = excluded.evidence_kind,
                         probe_detail = excluded.probe_detail,
                         fixture_path = excluded.fixture_path,
@@ -374,7 +433,14 @@ class CapabilityRegistry:
                         manifest.identity.protocol_version,
                         manifest.identity.ping_protocol_version,
                         evidence.name,
-                        int(evidence.supported),
+                        -1 if evidence.supported is None else int(evidence.supported),
+                        (
+                            "unknown"
+                            if evidence.supported is None
+                            else "supported"
+                            if evidence.supported
+                            else "unsupported"
+                        ),
                         evidence.evidence_kind,
                         json.dumps(evidence.detail, ensure_ascii=False, sort_keys=True),
                         str(manifest.fixture_path),

@@ -1,8 +1,10 @@
+import asyncio
 from dataclasses import replace
 from pathlib import Path
 
 import discord
 import pytest
+from discord.ext import commands
 
 from copilotd.config import Settings
 from copilotd.discord_app import (
@@ -249,3 +251,47 @@ def test_resolved_interaction_removes_controls() -> None:
         )
         is None
     )
+
+
+@pytest.mark.asyncio
+async def test_critical_task_failure_closes_gateway_and_persists_incident(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    bot = CopilotDiscordBot(Settings(data_dir=tmp_path))
+    await bot.database.open()
+    gateway_closed = asyncio.Event()
+
+    async def fake_base_close(_bot: commands.Bot) -> None:
+        gateway_closed.set()
+
+    monkeypatch.setattr(commands.Bot, "close", fake_base_close)
+    supervisor = asyncio.create_task(bot._task_failure_loop())
+
+    async def fail() -> None:
+        raise RuntimeError("reducer stopped")
+
+    bot._tasks.create(
+        fail(),
+        name="reducer:session-1",
+        source="event-reducer",
+        session_id="session-1",
+        runtime_generation=4,
+    )
+    await asyncio.wait_for(gateway_closed.wait(), timeout=1)
+    await supervisor
+    incident = await bot.database.fetchone(
+        """
+        SELECT runtime_generation, kind, detail
+        FROM runtime_incidents WHERE session_id = 'session-1'
+        """
+    )
+    await bot._tasks.cancel_all()
+    await bot.database.close()
+
+    assert isinstance(bot._fatal_worker_error, RuntimeError)
+    assert bot.heartbeat.runtime_state == "down"
+    assert bot.heartbeat.gateway_state == "down"
+    assert incident["runtime_generation"] == 4
+    assert incident["kind"] == "background_task_failed"
+    assert "event-reducer" in incident["detail"]

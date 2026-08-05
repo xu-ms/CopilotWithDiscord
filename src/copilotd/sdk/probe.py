@@ -365,8 +365,12 @@ class SdkProbe:
                 {"activity": live.get("activity"), "processing": live.get("processing")},
             ),
             "builtin_commands": _evidence(
-                _supported(commands) and _supported(native_schedule),
-                "live-command-probe",
+                (
+                    None
+                    if native_schedule is None
+                    else _supported(commands) and _supported(native_schedule)
+                ),
+                "unprobed" if native_schedule is None else "live-command-probe",
                 {"list": commands, "disposable_invoke": native_schedule},
             ),
             "context_info": _evidence(
@@ -375,8 +379,8 @@ class SdkProbe:
                 live.get("context_info"),
             ),
             "detached_continuation": _evidence(
-                _supported(sidecar),
-                "live-sidecar-probe",
+                None if sidecar is None else _supported(sidecar),
+                "unprobed" if sidecar is None else "live-sidecar-probe",
                 sidecar or {"reason": "sidecar probe not requested"},
             ),
             "event_log": _evidence(
@@ -385,7 +389,7 @@ class SdkProbe:
                 {"read": event_log_read, "tail": event_log_tail},
             ),
             "model_config": _evidence(
-                False,
+                None,
                 "unprobed",
                 "live probe did not mutate model configuration",
             ),
@@ -400,8 +404,8 @@ class SdkProbe:
                 live.get("queue"),
             ),
             "native_schedule": _evidence(
-                _supported(native_schedule),
-                "live-command-probe",
+                None if native_schedule is None else _supported(native_schedule),
+                "unprobed" if native_schedule is None else "live-command-probe",
                 native_schedule or {"reason": "native schedule probe not requested"},
             ),
             "permission_allow_all": _evidence(
@@ -430,12 +434,12 @@ class SdkProbe:
                 },
             ),
             "reasoning_summary_readback": _evidence(
-                False,
+                None,
                 "unprobed",
                 "no durable reasoning-summary readback was exercised",
             ),
             "remote": _evidence(
-                False,
+                None,
                 "unprobed",
                 "remote enable/disable was not exercised",
             ),
@@ -876,7 +880,11 @@ def _supported(value: Any) -> bool:
     return False
 
 
-def _evidence(supported: bool, evidence_kind: str, detail: Any) -> dict[str, Any]:
+def _evidence(
+    supported: bool | None,
+    evidence_kind: str,
+    detail: Any,
+) -> dict[str, Any]:
     return {
         "supported": supported,
         "evidence_kind": evidence_kind,

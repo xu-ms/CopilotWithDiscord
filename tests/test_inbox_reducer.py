@@ -18,6 +18,7 @@ from copilot.session_events import (
     SubagentStartedData,
 )
 
+from copilotd.config import Settings
 from copilotd.core.event_adapter import EventAdapter
 from copilotd.core.event_inventory import (
     EVENT_DISPOSITIONS,
@@ -27,6 +28,7 @@ from copilotd.core.event_inventory import (
 from copilotd.core.inbox import ReducerInbox
 from copilotd.core.models import AdaptedEvent, InboxEnvelope
 from copilotd.core.reducer import EventReducerWorker, JournalReducer
+from copilotd.sdk.capabilities import CapabilityRegistry
 from copilotd.storage.database import Database
 
 
@@ -926,6 +928,392 @@ async def test_ambiguous_duplicate_prompt_does_not_pollute_app_submissions(
 
 
 @pytest.mark.asyncio
+async def test_overflow_unknown_replay_reuses_retained_acceptance_facts(
+    tmp_path: Path,
+) -> None:
+    session_id = "session-overflow-replay"
+    prompt = "accepted before overflow"
+    accepted_id = str(uuid4())
+    async with Database(tmp_path / "overflow-replay.sqlite3") as database:
+        await _insert_projection_binding(database, session_id)
+        events = [
+            _adapted(
+                "copilotd.submission.queued",
+                {
+                    "submission_id": "submission-overflow",
+                    "thread_id": "thread-projection",
+                    "origin": "app_message",
+                    "prompt": prompt,
+                    "prompt_hash": hashlib.sha256(prompt.encode()).hexdigest(),
+                    "requested_mode": "interactive",
+                    "requested_delivery": "enqueue",
+                },
+                1,
+                source="internal",
+                session_id=session_id,
+            ),
+            _adapted(
+                "copilotd.submission.accepted",
+                {
+                    "submission_id": "submission-overflow",
+                    "message_id": accepted_id,
+                },
+                2,
+                source="internal",
+                session_id=session_id,
+            ),
+            _adapted(
+                "copilotd.submission.active_unknown",
+                {"observed_at": 103},
+                3,
+                source="internal",
+                session_id=session_id,
+            ),
+            AdaptedEvent(
+                sdk_session_id=session_id,
+                generation=1,
+                fence_token=7,
+                inbox_seq=4,
+                source="sdk",
+                raw_type="user.message",
+                raw_payload={
+                    "type": "user.message",
+                    "data": {"content": prompt, "agentMode": "interactive"},
+                },
+                reducer_hash="overflow-replayed-user",
+                persistence_class="durable",
+                received_at=104,
+                event_id=accepted_id,
+            ),
+        ]
+        assert await JournalReducer(database).persist(events) == len(events)
+        submissions = await database.fetchall(
+            """
+            SELECT origin, state, accepted_message_id, observed_user_event_id,
+                   correlation_basis
+            FROM submissions WHERE sdk_session_id = ?
+            """,
+            (session_id,),
+        )
+
+    assert [dict(row) for row in submissions] == [
+        {
+            "origin": "app_message",
+            "state": "observed_active",
+            "accepted_message_id": accepted_id,
+            "observed_user_event_id": accepted_id,
+            "correlation_basis": "single_candidate_facts",
+        }
+    ]
+
+
+@pytest.mark.asyncio
+async def test_acceptance_receipts_are_monotonic_across_unknown_and_duplicates(
+    tmp_path: Path,
+) -> None:
+    session_id = "session-acceptance-monotonic"
+    message_id = str(uuid4())
+    conflicting_id = str(uuid4())
+    async with Database(tmp_path / "acceptance-monotonic.sqlite3") as database:
+        await _insert_projection_binding(database, session_id)
+        events = [
+            _adapted(
+                "copilotd.submission.queued",
+                {
+                    "submission_id": "submission-1",
+                    "thread_id": "thread-projection",
+                    "prompt": "hello",
+                    "prompt_hash": hashlib.sha256(b"hello").hexdigest(),
+                    "requested_mode": "interactive",
+                },
+                1,
+                source="internal",
+                session_id=session_id,
+            ),
+            _adapted(
+                "copilotd.submission.acceptance_unknown",
+                {"submission_id": "submission-1"},
+                2,
+                source="internal",
+                session_id=session_id,
+            ),
+            _adapted(
+                "copilotd.submission.accepted",
+                {"submission_id": "submission-1", "message_id": message_id},
+                3,
+                source="internal",
+                session_id=session_id,
+            ),
+            _adapted(
+                "copilotd.submission.acceptance_unknown",
+                {"submission_id": "submission-1"},
+                4,
+                source="internal",
+                session_id=session_id,
+            ),
+            _adapted(
+                "copilotd.submission.accepted",
+                {"submission_id": "submission-1", "message_id": message_id},
+                5,
+                source="internal",
+                session_id=session_id,
+            ),
+            _adapted(
+                "copilotd.submission.accepted",
+                {"submission_id": "submission-1", "message_id": conflicting_id},
+                6,
+                source="internal",
+                session_id=session_id,
+            ),
+        ]
+        assert await JournalReducer(database).persist(events) == len(events)
+        submission = await database.fetchone(
+            """
+            SELECT state, accepted_message_id, accepted_at, terminal_at
+            FROM submissions WHERE submission_id = 'submission-1'
+            """
+        )
+        queue = await database.fetchone(
+            "SELECT state FROM message_queue WHERE id = 'submission-1'"
+        )
+        lease = await database.fetchone(
+            """
+            SELECT state FROM liveness_leases
+            WHERE sdk_session_id = ? AND source_id = 'submission-1'
+            """,
+            (session_id,),
+        )
+        incident = await database.fetchone(
+            """
+            SELECT kind, detail FROM runtime_incidents
+            WHERE session_id = ? AND kind = 'submission_acceptance_conflict'
+            """,
+            (session_id,),
+        )
+
+    assert dict(submission) == {
+        "state": "submitted",
+        "accepted_message_id": message_id,
+        "accepted_at": 103,
+        "terminal_at": None,
+    }
+    assert queue["state"] == "submitted"
+    assert lease["state"] == "active"
+    assert incident["kind"] == "submission_acceptance_conflict"
+    assert conflicting_id in incident["detail"]
+
+
+@pytest.mark.asyncio
+async def test_explicit_rejection_moves_early_callback_to_runtime_observed_submission(
+    tmp_path: Path,
+) -> None:
+    session_id = "session-rejected-early-callback"
+    prompt = "callback before rejection"
+    user_event_id = str(uuid4())
+    async with Database(tmp_path / "rejected-early-callback.sqlite3") as database:
+        await _insert_projection_binding(database, session_id)
+        events = [
+            _adapted(
+                "copilotd.submission.queued",
+                {
+                    "submission_id": "submission-app",
+                    "thread_id": "thread-projection",
+                    "origin": "app_message",
+                    "prompt": prompt,
+                    "prompt_hash": hashlib.sha256(prompt.encode()).hexdigest(),
+                    "requested_mode": "interactive",
+                },
+                1,
+                source="internal",
+                session_id=session_id,
+            ),
+            _adapted(
+                "copilotd.operation.pending",
+                {
+                    "operation_id": "operation-send",
+                    "runtime_generation": 1,
+                    "owner_fence_token": 7,
+                    "kind": "send",
+                    "idempotency_key": "send:test",
+                    "input_hash": "hash",
+                    "created_at": 102,
+                },
+                2,
+                source="internal",
+                session_id=session_id,
+            ),
+            _adapted(
+                "copilotd.submission.submitting",
+                {
+                    "submission_id": "submission-app",
+                    "operation_id": "operation-send",
+                },
+                3,
+                source="internal",
+                session_id=session_id,
+            ),
+            _adapted(
+                "copilotd.submission.accepted",
+                {
+                    "submission_id": "submission-app",
+                    "message_id": user_event_id,
+                },
+                4,
+                source="internal",
+                session_id=session_id,
+            ),
+            AdaptedEvent(
+                sdk_session_id=session_id,
+                generation=1,
+                fence_token=7,
+                inbox_seq=5,
+                source="sdk",
+                raw_type="user.message",
+                raw_payload={
+                    "type": "user.message",
+                    "data": {"content": prompt, "agentMode": "interactive"},
+                },
+                reducer_hash="early-user-message",
+                persistence_class="durable",
+                received_at=105,
+                event_id=user_event_id,
+            ),
+            _adapted(
+                "copilotd.submission.rejected",
+                {"submission_id": "submission-app"},
+                6,
+                source="internal",
+                session_id=session_id,
+            ),
+        ]
+        assert await JournalReducer(database).persist(events) == len(events)
+        submissions = await database.fetchall(
+            """
+            SELECT submission_id, origin, state, accepted_message_id,
+                   accepted_at, observed_user_event_id, correlation_basis
+            FROM submissions WHERE sdk_session_id = ? ORDER BY origin
+            """,
+            (session_id,),
+        )
+        segment = await database.fetchone(
+            "SELECT submission_id FROM submission_segments WHERE user_event_id = ?",
+            (user_event_id,),
+        )
+        lease = await database.fetchone(
+            """
+            SELECT source_id, state FROM liveness_leases
+            WHERE sdk_session_id = ? AND kind = 'submission'
+            """,
+            (session_id,),
+        )
+        queue = await database.fetchone(
+            "SELECT state FROM message_queue WHERE id = 'submission-app'"
+        )
+
+    assert [dict(row) for row in submissions] == [
+        {
+            "submission_id": "submission-app",
+            "origin": "app_message",
+            "state": "rejected",
+            "accepted_message_id": None,
+            "accepted_at": None,
+            "observed_user_event_id": None,
+            "correlation_basis": None,
+        },
+        {
+            "submission_id": segment["submission_id"],
+            "origin": "runtime_observed",
+            "state": "observed_active",
+            "accepted_message_id": user_event_id,
+            "accepted_at": 104,
+            "observed_user_event_id": user_event_id,
+            "correlation_basis": "rejected_send_runtime_observed",
+        },
+    ]
+    assert lease["source_id"] == segment["submission_id"]
+    assert lease["state"] == "active"
+    assert queue["state"] == "rejected"
+
+
+@pytest.mark.asyncio
+async def test_unknown_acceptance_mapping_capability_is_not_treated_as_supported(
+    tmp_path: Path,
+) -> None:
+    session_id = "session-unknown-mapping"
+    accepted_id = str(uuid4())
+    async with Database(tmp_path / "unknown-mapping.sqlite3") as database:
+        await CapabilityRegistry(
+            Settings(_env_file=None, data_dir=tmp_path)
+        ).activate(
+            database,
+            {
+                "runtime_version": "1.0.73",
+                "protocol_version": 3,
+                "ping_protocol_version": 3,
+            },
+        )
+        await database.execute(
+            """
+            UPDATE capabilities
+            SET supported = -1, evidence_status = 'unknown'
+            WHERE capability = 'accepted_user_event_id_mapping'
+            """
+        )
+        await _insert_projection_binding(database, session_id)
+        events = [
+            _adapted(
+                "copilotd.submission.queued",
+                {
+                    "submission_id": "submission-app",
+                    "thread_id": "thread-projection",
+                    "prompt": "different prompt",
+                    "prompt_hash": hashlib.sha256(b"different prompt").hexdigest(),
+                    "requested_mode": "interactive",
+                },
+                1,
+                source="internal",
+                session_id=session_id,
+            ),
+            _adapted(
+                "copilotd.submission.accepted",
+                {"submission_id": "submission-app", "message_id": accepted_id},
+                2,
+                source="internal",
+                session_id=session_id,
+            ),
+            AdaptedEvent(
+                sdk_session_id=session_id,
+                generation=1,
+                fence_token=7,
+                inbox_seq=3,
+                source="sdk",
+                raw_type="user.message",
+                raw_payload={
+                    "type": "user.message",
+                    "data": {"content": "actual runtime message"},
+                },
+                reducer_hash="unknown-mapping-user",
+                persistence_class="durable",
+                received_at=103,
+                event_id=accepted_id,
+            ),
+        ]
+        assert await JournalReducer(database).persist(events) == len(events)
+        submissions = await database.fetchall(
+            """
+            SELECT origin, state FROM submissions
+            WHERE sdk_session_id = ? ORDER BY origin
+            """,
+            (session_id,),
+        )
+
+    assert [dict(row) for row in submissions] == [
+        {"origin": "app_message", "state": "submitted"},
+        {"origin": "runtime_observed", "state": "observed_active"},
+    ]
+
+
+@pytest.mark.asyncio
 async def test_model_turn_projection_and_interactive_idle_are_semantically_terminal(
     tmp_path: Path,
 ) -> None:
@@ -962,7 +1350,82 @@ async def test_model_turn_projection_and_interactive_idle_are_semantically_termi
         _adapted("session.idle", {"aborted": False}, 5, session_id=session_id),
     ]
     async with Database(tmp_path / "turns.sqlite3") as database:
-        assert await JournalReducer(database).persist(events) == len(events)
+        await _insert_projection_binding(database, session_id)
+        reducer = JournalReducer(database)
+        assert await reducer.persist(events) == len(events)
+        snapshots = [
+            _adapted(
+                "copilotd.snapshot.requested",
+                {"topic": "tasks"},
+                6,
+                source="internal",
+                session_id=session_id,
+            ),
+            _adapted(
+                "copilotd.snapshot.observed",
+                {
+                    "topic": "tasks",
+                    "epoch": 1,
+                    "snapshot_id": "turns-tasks",
+                    "query_start_sdk_receive_seq": 0,
+                    "query_end_sdk_receive_seq": 0,
+                    "observed_at": 107,
+                    "payload": {"tasks": []},
+                },
+                7,
+                source="internal",
+                session_id=session_id,
+            ),
+            _adapted(
+                "copilotd.snapshot.requested",
+                {"topic": "activity"},
+                8,
+                source="internal",
+                session_id=session_id,
+            ),
+            _adapted(
+                "copilotd.snapshot.observed",
+                {
+                    "topic": "activity",
+                    "epoch": 1,
+                    "snapshot_id": "turns-activity",
+                    "query_start_sdk_receive_seq": 0,
+                    "query_end_sdk_receive_seq": 0,
+                    "observed_at": 109,
+                    "payload": {
+                        "processing": False,
+                        "has_active_work": False,
+                        "abortable": False,
+                    },
+                },
+                9,
+                source="internal",
+                session_id=session_id,
+            ),
+            _adapted(
+                "copilotd.snapshot.requested",
+                {"topic": "queue"},
+                10,
+                source="internal",
+                session_id=session_id,
+            ),
+            _adapted(
+                "copilotd.snapshot.observed",
+                {
+                    "topic": "queue",
+                    "epoch": 1,
+                    "snapshot_id": "turns-queue",
+                    "query_start_sdk_receive_seq": 0,
+                    "query_end_sdk_receive_seq": 0,
+                    "observed_at": 111,
+                    "payload": {"items": [], "steering_messages": []},
+                },
+                11,
+                source="internal",
+                session_id=session_id,
+            ),
+        ]
+        assert await reducer.persist(snapshots) == len(snapshots)
         turn = await database.fetchone(
             """
             SELECT submission_id, state, retry_count, started_at, ended_at
@@ -991,7 +1454,7 @@ async def test_model_turn_projection_and_interactive_idle_are_semantically_termi
     assert dict(submission) == {
         "state": "semantic_complete",
         "completion_basis": "loop_idle",
-        "terminal_at": 105,
+        "terminal_at": 111,
     }
     assert dict(segment) == {"state": "semantic_complete", "idle_at": 105}
     assert lease["state"] == "released"
@@ -1279,3 +1742,346 @@ async def test_snapshot_epochs_suppress_stale_negative_and_keep_terminal_monoton
         "status": "idle",
     }
     assert stale["negative_applied"] == 0
+
+
+@pytest.mark.asyncio
+async def test_linked_task_terminal_waits_for_late_activity_and_queue_quiet_snapshots(
+    tmp_path: Path,
+) -> None:
+    session_id = "session-linked-task"
+
+    def requested(topic: str, seq: int) -> AdaptedEvent:
+        return _adapted(
+            "copilotd.snapshot.requested",
+            {"topic": topic},
+            seq,
+            source="internal",
+            session_id=session_id,
+        )
+
+    def observed(
+        topic: str,
+        seq: int,
+        epoch: int,
+        payload: dict[str, Any],
+    ) -> AdaptedEvent:
+        return _adapted(
+            "copilotd.snapshot.observed",
+            {
+                "topic": topic,
+                "epoch": epoch,
+                "snapshot_id": f"{topic}-{epoch}-{seq}",
+                "query_start_sdk_receive_seq": 0,
+                "query_end_sdk_receive_seq": 0,
+                "observed_at": 100 + seq,
+                "payload": payload,
+            },
+            seq,
+            source="internal",
+            session_id=session_id,
+        )
+
+    async with Database(tmp_path / "linked-task-quiet.sqlite3") as database:
+        await _insert_projection_binding(database, session_id)
+        reducer = JournalReducer(database)
+        assert await reducer.persist(
+            [
+                _adapted(
+                    "user.message",
+                    {"content": "start worker", "agentMode": "interactive"},
+                    1,
+                    session_id=session_id,
+                ),
+                requested("tasks", 2),
+                observed(
+                    "tasks",
+                    3,
+                    1,
+                    {
+                        "tasks": [
+                            {
+                                "id": "task-1",
+                                "status": "running",
+                                "type": "agent",
+                                "description": "Worker",
+                            }
+                        ]
+                    },
+                ),
+                _adapted(
+                    "session.idle",
+                    {"aborted": False},
+                    4,
+                    session_id=session_id,
+                ),
+            ]
+        ) == 4
+        initial = await database.fetchone(
+            """
+            SELECT state FROM submissions WHERE sdk_session_id = ?
+            """,
+            (session_id,),
+        )
+        link = await database.fetchone(
+            """
+            SELECT submission_id, state, correlation_basis
+            FROM submission_task_links WHERE task_id = 'task-1'
+            """
+        )
+        assert initial["state"] == "loop_idle"
+        assert link["state"] == "running"
+        assert link["correlation_basis"] == "single_active_submission"
+
+        assert await reducer.persist(
+            [
+                requested("tasks", 5),
+                observed(
+                    "tasks",
+                    6,
+                    2,
+                    {
+                        "tasks": [
+                            {
+                                "id": "task-1",
+                                "status": "completed",
+                                "type": "agent",
+                                "description": "Worker",
+                            }
+                        ]
+                    },
+                ),
+            ]
+        ) == 2
+        after_task = await database.fetchone(
+            "SELECT state FROM submissions WHERE sdk_session_id = ?",
+            (session_id,),
+        )
+        assert after_task["state"] == "loop_idle"
+
+        assert await reducer.persist(
+            [
+                requested("activity", 7),
+                observed(
+                    "activity",
+                    8,
+                    1,
+                    {
+                        "processing": False,
+                        "has_active_work": False,
+                        "abortable": False,
+                    },
+                ),
+            ]
+        ) == 2
+        after_activity = await database.fetchone(
+            "SELECT state FROM submissions WHERE sdk_session_id = ?",
+            (session_id,),
+        )
+        assert after_activity["state"] == "loop_idle"
+
+        assert await reducer.persist(
+            [
+                requested("queue", 9),
+                observed(
+                    "queue",
+                    10,
+                    1,
+                    {"items": [], "steering_messages": []},
+                ),
+            ]
+        ) == 2
+        terminal = await database.fetchone(
+            """
+            SELECT state, completion_basis FROM submissions
+            WHERE sdk_session_id = ?
+            """,
+            (session_id,),
+        )
+        segment = await database.fetchone(
+            "SELECT state FROM submission_segments WHERE submission_id = ?",
+            (link["submission_id"],),
+        )
+        leases = await database.fetchall(
+            """
+            SELECT kind, state FROM liveness_leases
+            WHERE sdk_session_id = ? ORDER BY kind
+            """,
+            (session_id,),
+        )
+
+    assert dict(terminal) == {
+        "state": "semantic_complete",
+        "completion_basis": "tasks_terminal_quiet",
+    }
+    assert segment["state"] == "semantic_complete"
+    assert [dict(row) for row in leases] == [
+        {"kind": "background", "state": "released"},
+        {"kind": "submission", "state": "released"},
+    ]
+
+
+@pytest.mark.asyncio
+async def test_task_discovered_after_quiet_completion_reopens_latest_submission(
+    tmp_path: Path,
+) -> None:
+    session_id = "session-truly-late-task"
+
+    def requested(topic: str, seq: int) -> AdaptedEvent:
+        return _adapted(
+            "copilotd.snapshot.requested",
+            {"topic": topic},
+            seq,
+            source="internal",
+            session_id=session_id,
+        )
+
+    def observed(
+        topic: str,
+        seq: int,
+        epoch: int,
+        payload: dict[str, Any],
+    ) -> AdaptedEvent:
+        return _adapted(
+            "copilotd.snapshot.observed",
+            {
+                "topic": topic,
+                "epoch": epoch,
+                "snapshot_id": f"late-{topic}-{epoch}-{seq}",
+                "query_start_sdk_receive_seq": 0,
+                "query_end_sdk_receive_seq": 0,
+                "observed_at": 100 + seq,
+                "payload": payload,
+            },
+            seq,
+            source="internal",
+            session_id=session_id,
+        )
+
+    async with Database(tmp_path / "truly-late-task.sqlite3") as database:
+        await _insert_projection_binding(database, session_id)
+        reducer = JournalReducer(database)
+        initial = [
+            _adapted(
+                "user.message",
+                {"content": "maybe background", "agentMode": "interactive"},
+                1,
+                session_id=session_id,
+            ),
+            _adapted(
+                "session.idle",
+                {"aborted": False},
+                2,
+                session_id=session_id,
+            ),
+            requested("tasks", 3),
+            observed("tasks", 4, 1, {"tasks": []}),
+            requested("activity", 5),
+            observed(
+                "activity",
+                6,
+                1,
+                {
+                    "processing": False,
+                    "has_active_work": False,
+                    "abortable": False,
+                },
+            ),
+            requested("queue", 7),
+            observed("queue", 8, 1, {"items": [], "steering_messages": []}),
+        ]
+        assert await reducer.persist(initial) == len(initial)
+        completed = await database.fetchone(
+            "SELECT state, completion_basis FROM submissions WHERE sdk_session_id = ?",
+            (session_id,),
+        )
+        assert dict(completed) == {
+            "state": "semantic_complete",
+            "completion_basis": "loop_idle",
+        }
+
+        late_running = [
+            requested("tasks", 9),
+            observed(
+                "tasks",
+                10,
+                2,
+                {
+                    "tasks": [
+                        {
+                            "id": "late-task",
+                            "status": "running",
+                            "type": "agent",
+                            "description": "Late worker",
+                        }
+                    ]
+                },
+            ),
+        ]
+        assert await reducer.persist(late_running) == len(late_running)
+        reopened = await database.fetchone(
+            "SELECT state, completion_basis, terminal_at FROM submissions"
+        )
+        link = await database.fetchone(
+            """
+            SELECT state, correlation_basis FROM submission_task_links
+            WHERE task_id = 'late-task'
+            """
+        )
+        incident = await database.fetchone(
+            """
+            SELECT kind FROM runtime_incidents
+            WHERE kind = 'late_task_reopened_submission'
+            """
+        )
+
+        assert dict(reopened) == {
+            "state": "loop_idle",
+            "completion_basis": None,
+            "terminal_at": None,
+        }
+        assert dict(link) == {
+            "state": "running",
+            "correlation_basis": "late_task_after_idle",
+        }
+        assert incident["kind"] == "late_task_reopened_submission"
+
+        terminal = [
+            requested("tasks", 11),
+            observed(
+                "tasks",
+                12,
+                3,
+                {
+                    "tasks": [
+                        {
+                            "id": "late-task",
+                            "status": "completed",
+                            "type": "agent",
+                            "description": "Late worker",
+                        }
+                    ]
+                },
+            ),
+            requested("activity", 13),
+            observed(
+                "activity",
+                14,
+                2,
+                {
+                    "processing": False,
+                    "has_active_work": False,
+                    "abortable": False,
+                },
+            ),
+            requested("queue", 15),
+            observed("queue", 16, 2, {"items": [], "steering_messages": []}),
+        ]
+        assert await reducer.persist(terminal) == len(terminal)
+        settled = await database.fetchone(
+            "SELECT state, completion_basis FROM submissions"
+        )
+
+    assert dict(settled) == {
+        "state": "semantic_complete",
+        "completion_basis": "tasks_terminal_quiet",
+    }

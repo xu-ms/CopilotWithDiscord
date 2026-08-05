@@ -1,3 +1,4 @@
+import hashlib
 import json
 from dataclasses import replace
 from pathlib import Path
@@ -11,7 +12,7 @@ from copilotd.sdk.capabilities import (
     CapabilityRegistry,
     RuntimeIdentityMismatch,
 )
-from copilotd.sdk.probe import SdkProbe
+from copilotd.sdk.probe import CapabilityResult, SdkProbe
 from copilotd.storage.database import Database
 
 
@@ -128,3 +129,86 @@ async def test_activation_persists_exact_capability_evidence(tmp_path: Path) -> 
         "fixture_sha256": CHECKED_CAPABILITY_FIXTURE_SHA256,
         "generated_event_count": 114,
     }
+
+
+def test_unprobed_live_capabilities_merge_checked_facts_without_erasing_support(
+    tmp_path: Path,
+) -> None:
+    settings = Settings(_env_file=None, data_dir=tmp_path)
+    probe = SdkProbe(settings)
+    fixture = tmp_path / "normal-live.events.jsonl"
+    fixture.write_text("{}\n", encoding="utf-8")
+    fixture_hash = hashlib.sha256(fixture.read_bytes()).hexdigest()
+    supported = CapabilityResult(True, {"observed": True})
+    live = {
+        "runtime": {
+            "runtime_version": "1.0.73",
+            "protocol_version": 3,
+            "ping_protocol_version": 3,
+        },
+        "accepted_user_event_id_mapping": True,
+        "activity": supported,
+        "processing": supported,
+        "commands": supported,
+        "context_info": supported,
+        "event_log_read": supported,
+        "event_log_tail": supported,
+        "models": supported,
+        "queue": supported,
+        "permission_posture": {"enabled": True, "mode": "on"},
+        "durable_history_recovered": True,
+        "session_id_matches": True,
+        "resume_session_id_matches": True,
+        "callback_survived_idle": True,
+        "agents": supported,
+        "agent_current": supported,
+        "mode_initial": supported,
+        "mode_autopilot": supported,
+        "sessions_check_in_use": supported,
+        "tasks": supported,
+        "task_list": supported,
+        "usage_metrics": supported,
+    }
+    matrix = probe._live_matrix(live, fixture, fixture_hash)
+    probe._write_matrix(matrix)
+
+    local = CapabilityRegistry(settings).load_local()
+    assert local is not None
+    assert local.capabilities["native_schedule"].supported is None
+    assert local.capabilities["model_config"].supported is None
+    assert local.capabilities["remote"].supported is None
+
+    merged = CapabilityRegistry(settings).resolve(live["runtime"])
+    assert merged.supports("native_schedule")
+    assert merged.supports("model_config")
+    assert merged.supports("remote")
+    assert merged.capabilities["native_schedule"].evidence_kind.startswith(
+        "checked-fallback:"
+    )
+
+    live["native_schedule_direct"] = CapabilityResult(
+        False,
+        {"reason": "explicit disposable invocation failure"},
+    )
+    probe._write_matrix(probe._live_matrix(live, fixture, fixture_hash))
+    explicit_negative = CapabilityRegistry(settings).resolve(live["runtime"])
+    assert not explicit_negative.supports("native_schedule")
+    assert (
+        explicit_negative.capabilities["native_schedule"].evidence_kind
+        == "live-command-probe"
+    )
+
+    live.pop("native_schedule_direct")
+    unknown_error = probe._live_matrix(live, fixture, fixture_hash)
+    unknown_error["capabilities"]["remote"] = {
+        "supported": None,
+        "evidence_kind": "live-rpc-error",
+        "detail": {"error_type": "ConnectionError"},
+    }
+    probe._write_matrix(unknown_error)
+    preserved_unknown = CapabilityRegistry(settings).resolve(live["runtime"])
+    assert not preserved_unknown.supports("remote")
+    assert (
+        preserved_unknown.capabilities["remote"].evidence_kind
+        == "live-rpc-error"
+    )

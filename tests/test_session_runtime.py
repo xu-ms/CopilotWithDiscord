@@ -294,6 +294,7 @@ async def test_runtime_preregisters_ingress_stays_alive_after_idle_and_closes_cl
         bridge.ingress(_event(SessionIdleData(), SessionEventType.SESSION_IDLE))
         assert runtime.inbox is not None
         await runtime.inbox.join()
+        await runtime._refresh_all_snapshots()
 
         submission = await database.fetchone(
             """
@@ -330,6 +331,99 @@ async def test_runtime_preregisters_ingress_stays_alive_after_idle_and_closes_cl
     assert closed.attachment_state == AttachmentState.ABSENT
     assert owner is not None
     assert owner.expires_at <= datetime.now(UTC).timestamp()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("callback_before_response", [True, False])
+async def test_user_message_and_send_response_orderings_keep_one_submission(
+    tmp_path: Path,
+    callback_before_response: bool,
+) -> None:
+    session_id = str(uuid4())
+    async with Database(
+        tmp_path / f"send-order-{callback_before_response}.sqlite3"
+    ) as database:
+        bindings = SessionBindingRepository(database)
+        binding = await bindings.create(
+            thread_id="thread-send-order",
+            sdk_session_id=session_id,
+            cwd_snapshot=tmp_path,
+            project_source="implicit-home",
+        )
+        bridge = FakeBridge(session_id)
+        runtime = SessionRuntime(
+            database=database,
+            bridge=bridge,
+            bindings=bindings,
+            owner_leases=OwnerLeaseStore(database),
+            owner_id="process-send-order",
+            binding=binding,
+        )
+        await runtime.attach_create()
+        accepted_id: str
+        if callback_before_response:
+            accepted_id = str(uuid4())
+            original_send = bridge.handle.send
+
+            async def callback_first_send(prompt: str, **kwargs: Any) -> str:
+                if prompt != "first prompt":
+                    return await original_send(prompt, **kwargs)
+                bridge.handle.sent.append((prompt, kwargs))
+                bridge.ingress(
+                    _event(
+                        UserMessageData(content=prompt),
+                        SessionEventType.USER_MESSAGE,
+                        event_id=UUID(accepted_id),
+                    )
+                )
+                assert runtime.inbox is not None
+                await runtime.inbox.join()
+                return accepted_id
+
+            bridge.handle.send = callback_first_send  # type: ignore[method-assign]
+
+        returned_id = await runtime.send(
+            "first prompt",
+            idempotency_key="first-prompt",
+        )
+        if not callback_before_response:
+            accepted_id = returned_id
+            bridge.ingress(
+                _event(
+                    UserMessageData(content="first prompt"),
+                    SessionEventType.USER_MESSAGE,
+                    event_id=UUID(accepted_id),
+                )
+            )
+        assert runtime.inbox is not None
+        await runtime.inbox.join()
+        rows = await database.fetchall(
+            """
+            SELECT origin, state, accepted_message_id, observed_user_event_id
+            FROM submissions WHERE sdk_session_id = ?
+            """,
+            (session_id,),
+        )
+
+        assert returned_id == accepted_id
+        assert [dict(row) for row in rows] == [
+            {
+                "origin": "app_message",
+                "state": "observed_active",
+                "accepted_message_id": accepted_id,
+                "observed_user_event_id": accepted_id,
+            }
+        ]
+
+        bridge.ingress(_event(SessionIdleData(), SessionEventType.SESSION_IDLE))
+        await runtime.inbox.join()
+        await runtime._refresh_all_snapshots()
+        await runtime.send("second prompt", idempotency_key="second-prompt")
+        assert [prompt for prompt, _ in bridge.handle.sent] == [
+            "first prompt",
+            "second prompt",
+        ]
+        await runtime.shutdown()
 
 
 @pytest.mark.asyncio

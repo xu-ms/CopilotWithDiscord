@@ -101,3 +101,52 @@ async def test_startup_inventory_settles_only_expired_owner_work_before_ready(
     assert creation["state"] == "unknown"
     assert run["status"] == "completed"
     assert json.loads(run["detail"])["run_id"] == report.run_id
+
+
+@pytest.mark.asyncio
+async def test_startup_recovery_preserves_acceptance_evidence_for_backfill(
+    tmp_path: Path,
+) -> None:
+    async with Database(tmp_path / "startup-acceptance.sqlite3") as database:
+        await database.execute(
+            """
+            INSERT INTO session_bindings(
+                thread_id, project_source, cwd_snapshot, sdk_session_id,
+                attachment_state, runtime_generation, owner_fence_token,
+                created_at, updated_at
+            ) VALUES ('thread-1', 'home', '/tmp', 'session-1',
+                      'attached', 1, 1, 1, 1)
+            """
+        )
+        await OwnerLeaseStore(database, ttl_seconds=60).acquire(
+            "session-1",
+            "dead-owner",
+            now=100,
+        )
+        await database.execute(
+            """
+            INSERT INTO submissions(
+                submission_id, sdk_session_id, origin, state,
+                accepted_message_id, accepted_at, created_at
+            ) VALUES (
+                'submission-accepted', 'session-1', 'app_message',
+                'submitted', '7e543dd8-4483-4c1a-ab7f-bf99dbad6d4c',
+                105, 101
+            )
+            """
+        )
+
+        report = await StartupRecoveryInventory(database).run(now=200)
+        submission = await database.fetchone(
+            """
+            SELECT state, accepted_message_id, accepted_at
+            FROM submissions WHERE submission_id = 'submission-accepted'
+            """
+        )
+
+    assert report.unknown_submissions == 1
+    assert dict(submission) == {
+        "state": "submitted_unknown",
+        "accepted_message_id": "7e543dd8-4483-4c1a-ab7f-bf99dbad6d4c",
+        "accepted_at": 105,
+    }

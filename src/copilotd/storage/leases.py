@@ -7,6 +7,11 @@ from aiosqlite import Connection, Row
 
 from copilotd.storage.database import Database
 
+OWNER_LEASE_TTL_SECONDS = 60.0
+OWNER_LEASE_RENEW_SECONDS = 15.0
+MUTATION_HEADROOM_SECONDS = 40.0
+RENEWAL_JITTER_MARGIN_SECONDS = 5.0
+
 
 class OwnerConflict(RuntimeError):
     pass
@@ -29,7 +34,15 @@ class OwnerLease:
 class OwnerLeaseStore:
     """Cross-process lease with a monotonically increasing fencing token."""
 
-    def __init__(self, database: Database, ttl_seconds: float = 60) -> None:
+    def __init__(
+        self,
+        database: Database,
+        ttl_seconds: float = OWNER_LEASE_TTL_SECONDS,
+    ) -> None:
+        if ttl_seconds < MUTATION_HEADROOM_SECONDS + RENEWAL_JITTER_MARGIN_SECONDS:
+            raise ValueError(
+                "owner lease TTL must exceed mutation headroom by the jitter margin"
+            )
         self._database = database
         self._ttl_seconds = ttl_seconds
 
@@ -203,7 +216,7 @@ class OwnerLeaseStore:
         self,
         lease: OwnerLease,
         *,
-        minimum_seconds: float = 40,
+        minimum_seconds: float = MUTATION_HEADROOM_SECONDS,
         now: float | None = None,
     ) -> bool:
         timestamp = time.time() if now is None else now

@@ -1981,8 +1981,9 @@ session（官方对 concurrent access 不提供定义）。
 close 已在进行时才提交 <code>binding_intent=CLOSED</code>，其他
 routine/error shutdown 均先进入 recovery/diagnostics，不能从
 <code>shutdownType</code> 猜用户意图。</p>
-<p>owner lease TTL 固定 60 秒、每 20 秒续租；每次 takeover 在 SQLite
-transaction 内分配严格 递增的 <code>fence_token</code>。所有 mutating
+<p>owner lease TTL 固定 60 秒、每 15 秒续租，保留 40 秒 mutation headroom
+与至少 5 秒调度抖动余量；每次 takeover 在 SQLite transaction 内分配严格
+递增的 <code>fence_token</code>。所有 mutating
 RPC dispatch、snapshot commit 和 callback reduction 都
 必须携带并重新校验当前 token，不能只在 attach
 时检查一次。续租失败后立即暂停新 mutating RPC；一旦发现 token
@@ -2271,7 +2272,7 @@ shutdown 与 watchdog； 跨进程写权限只由独立
 <code>session_owner_leases</code> fence 决定，两者不能混用。</li>
 <li>raw event、task snapshot 变化、callback enqueue 和 reducer progress
 刷新 heartbeat。</li>
-<li>owner lease 每 20 秒续租且 fence token 单调递增；任一 RPC/commit
+<li>owner lease 每 15 秒续租且 fence token 单调递增；任一 RPC/commit
 前失配即冻结旧 owner， 旧 owner 不通过 disconnect 破坏新 owner。</li>
 </ol>
 <p>CommandMailbox 同时最多向 runtime dispatch 一个 app submission。SDK
@@ -5287,9 +5288,10 @@ model、<code>/mode</code>、<code>/goal</code>、<code>/bare</code>、<code>/to
 unknown</td>
 </tr>
 <tr>
-<td>8 个 SQLite migration、project <code>$HOME</code> fallback/cwd
+<td>9 个 SQLite migration、project <code>$HOME</code> fallback/cwd
 snapshot、owner fence、creation saga、strict-UUID event
-journal、reducer-owned operation/submission receipts、liveness leases、startup
+journal、reducer-owned operation/submission receipts、submission-task
+links、liveness leases、startup
 recovery inventory 与 eager resume</td>
 <td>bundled runtime 进程死亡后的 in-flight execution 仍只能标 outcome
 unknown；experimental task action RPC 继续 gated</td>
@@ -5348,7 +5350,7 @@ Windows 实机仍待验证</td>
 </tr>
 </tbody>
 </table>
-<p>当前 deterministic 验证基线：<code>ruff check .</code>、237 个 pytest
+<p>当前 deterministic 验证基线：<code>ruff check .</code>、252 个 pytest
 全部通过。仓库内 hash-checked fixture 固定 SDK 1.0.8 / runtime 1.0.73 /
 protocol 3、114-event inventory 与 capability evidence；<code>copilotd
 sdk-probe --live</code> 使用当前登录账号创建 disposable session，属于独立的

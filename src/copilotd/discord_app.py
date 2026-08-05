@@ -75,6 +75,7 @@ class CopilotDiscordBot(commands.Bot):
         self._tasks = TaskRegistry()
         self._owner_id = f"discord:{uuid.uuid4()}"
         self._commands_registered = False
+        self._fatal_worker_error: BaseException | None = None
 
     async def setup_hook(self) -> None:
         await self.database.open()
@@ -227,6 +228,10 @@ class CopilotDiscordBot(commands.Bot):
                             ),
                         ),
                     )
+                self._fatal_worker_error = failure.error
+                self.heartbeat.set_gateway("down")
+                await super().close()
+                return
             finally:
                 self._tasks.errors.task_done()
 
@@ -1343,6 +1348,7 @@ async def run_discord_bot(settings: Settings) -> None:
     bot = CopilotDiscordBot(settings)
     try:
         await bot.start(settings.discord_token.get_secret_value(), reconnect=True)
+        if bot._fatal_worker_error is not None:
+            raise RuntimeError("critical copilotD worker failed") from bot._fatal_worker_error
     finally:
-        if not bot.is_closed():
-            await bot.close()
+        await bot.close()

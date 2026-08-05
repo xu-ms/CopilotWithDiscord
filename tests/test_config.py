@@ -39,3 +39,16 @@ def test_settings_resolve_paths_and_create_layout(tmp_path: Path) -> None:
 def test_settings_reject_invalid_runtime_limits(field: str, value: int) -> None:
     with pytest.raises(ValidationError):
         Settings(_env_file=None, **{field: value})
+
+
+def test_owner_lease_timing_preserves_headroom_under_renewal_jitter() -> None:
+    settings = Settings(_env_file=None)
+    assert settings.owner_lease_ttl_seconds == 60
+    assert settings.owner_lease_renew_seconds == 15
+
+    with pytest.raises(ValidationError, match="jitter margin"):
+        Settings(
+            _env_file=None,
+            owner_lease_ttl_seconds=60,
+            owner_lease_renew_seconds=16,
+        )

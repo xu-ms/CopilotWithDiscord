@@ -1,8 +1,14 @@
+import hashlib
 from pathlib import Path
+from uuid import uuid4
 
 import pytest
 
+from copilotd.config import Settings
 from copilotd.core.bindings import AttachmentState, SessionBindingRepository
+from copilotd.core.models import AdaptedEvent
+from copilotd.core.reducer import JournalReducer
+from copilotd.sdk.capabilities import CapabilityRegistry
 from copilotd.storage.database import Database
 from copilotd.storage.leases import FenceLost, OwnerConflict, OwnerLeaseStore
 
@@ -171,6 +177,13 @@ async def test_mutation_headroom_requires_at_least_forty_seconds(tmp_path: Path)
 
         assert await store.has_mutation_headroom(lease, now=120)
         assert not await store.has_mutation_headroom(lease, now=121)
+        renewed = await store.renew(lease, now=120)
+        assert await store.has_mutation_headroom(renewed, now=140)
+
+
+def test_owner_lease_store_rejects_ttl_without_jitter_margin(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="jitter margin"):
+        OwnerLeaseStore(Database(tmp_path / "unsafe.sqlite3"), ttl_seconds=44)
 
 
 @pytest.mark.asyncio
@@ -206,3 +219,158 @@ async def test_new_attachment_generation_resets_reducer_watermarks(tmp_path: Pat
     assert attached.runtime_generation == 1
     assert attached.last_inbox_seq == 0
     assert attached.last_sdk_receive_seq is None
+
+
+@pytest.mark.asyncio
+async def test_takeover_replay_reconciles_persisted_acceptance_without_duplicate(
+    tmp_path: Path,
+) -> None:
+    session_id = "session-replay"
+    prompt = "accepted before crash"
+    accepted_id = str(uuid4())
+    async with Database(tmp_path / "takeover-replay.sqlite3") as database:
+        await CapabilityRegistry(
+            Settings(_env_file=None, data_dir=tmp_path)
+        ).activate(
+            database,
+            {
+                "runtime_version": "1.0.73",
+                "protocol_version": 3,
+                "ping_protocol_version": 3,
+            },
+        )
+        bindings = SessionBindingRepository(database)
+        binding = await bindings.create(
+            thread_id="thread-replay",
+            sdk_session_id=session_id,
+            cwd_snapshot=tmp_path,
+            project_source="implicit-home",
+            now=100,
+        )
+        store = OwnerLeaseStore(database, ttl_seconds=60)
+        first_lease = await store.acquire(session_id, "owner-a", now=100)
+        binding = await bindings.begin_attachment(
+            thread_id=binding.thread_id,
+            lease=first_lease,
+            state=AttachmentState.RESUMING,
+            now=100,
+        )
+        binding = await bindings.mark_attached(
+            binding,
+            permission_verified_at=100,
+        )
+        await database.execute(
+            """
+            INSERT INTO submissions(
+                submission_id, sdk_session_id, origin, prompt_hash,
+                requested_mode, state, accepted_message_id,
+                send_started_at, accepted_at, created_at
+            ) VALUES (
+                'submission-replay', ?, 'app_message', ?, 'interactive',
+                'submitted', ?, 104, 105, 101
+            )
+            """,
+            (
+                session_id,
+                hashlib.sha256(prompt.encode()).hexdigest(),
+                accepted_id,
+            ),
+        )
+        await database.execute(
+            """
+            INSERT INTO message_queue(
+                id, thread_id, prompt, requested_mode_snapshot,
+                requested_model_config_snapshot, requested_session_config_version,
+                position, state, created_at, updated_at
+            ) VALUES (
+                'submission-replay', 'thread-replay', ?, 'interactive',
+                '{}', 1, 1, 'submitted', 101, 105
+            )
+            """,
+            (prompt,),
+        )
+        await database.execute(
+            """
+            INSERT INTO liveness_leases(
+                sdk_session_id, lease_id, kind, source_id,
+                runtime_generation, owner_fence_token, state,
+                acquired_at, refreshed_at
+            ) VALUES (
+                ?, 'submission:submission-replay', 'submission',
+                'submission-replay', ?, ?, 'active', 101, 105
+            )
+            """,
+            (
+                session_id,
+                binding.runtime_generation,
+                binding.owner_fence_token,
+            ),
+        )
+
+        takeover = await store.acquire(session_id, "owner-b", now=161)
+        unknown = await database.fetchone(
+            """
+            SELECT state, accepted_message_id, accepted_at
+            FROM submissions WHERE submission_id = 'submission-replay'
+            """
+        )
+        replacement = await bindings.begin_attachment(
+            thread_id=binding.thread_id,
+            lease=takeover,
+            state=AttachmentState.RESUMING,
+            now=161,
+        )
+        event = AdaptedEvent(
+            sdk_session_id=session_id,
+            generation=replacement.runtime_generation,
+            fence_token=takeover.fence_token,
+            inbox_seq=1,
+            source="sdk",
+            raw_type="user.message",
+            raw_payload={
+                "type": "user.message",
+                "data": {"content": prompt, "agentMode": "interactive"},
+            },
+            reducer_hash="replayed-user-message",
+            persistence_class="durable",
+            received_at=162,
+            event_id=accepted_id,
+        )
+        assert await JournalReducer(database).persist([event]) == 1
+        submissions = await database.fetchall(
+            """
+            SELECT origin, state, accepted_message_id, observed_user_event_id,
+                   correlation_basis, terminal_at
+            FROM submissions WHERE sdk_session_id = ?
+            """,
+            (session_id,),
+        )
+        lease = await database.fetchone(
+            """
+            SELECT state, runtime_generation, owner_fence_token
+            FROM liveness_leases
+            WHERE sdk_session_id = ? AND source_id = 'submission-replay'
+            """,
+            (session_id,),
+        )
+
+    assert dict(unknown) == {
+        "state": "submitted_unknown",
+        "accepted_message_id": accepted_id,
+        "accepted_at": 105,
+    }
+    assert [dict(row) for row in submissions] == [
+        {
+            "origin": "app_message",
+            "state": "observed_active",
+            "accepted_message_id": accepted_id,
+            "observed_user_event_id": accepted_id,
+            "correlation_basis": "accepted_event_id_fixture",
+            "terminal_at": None,
+        }
+    ]
+    assert dict(lease) == {
+        "state": "active",
+        "runtime_generation": replacement.runtime_generation,
+        "owner_fence_token": takeover.fence_token,
+    }

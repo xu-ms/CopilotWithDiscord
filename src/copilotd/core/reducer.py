@@ -1089,25 +1089,96 @@ class JournalReducer:
                 ),
             )
         elif event.raw_type == "copilotd.submission.accepted":
+            submission_id = str(data["submission_id"])
+            message_id = str(data["message_id"])
+            cursor = await connection.execute(
+                """
+                SELECT accepted_message_id FROM submissions
+                WHERE submission_id = ? AND sdk_session_id = ?
+                """,
+                (submission_id, event.sdk_session_id),
+            )
+            accepted = await cursor.fetchone()
+            await cursor.close()
+            if (
+                accepted is not None
+                and accepted["accepted_message_id"] is not None
+                and str(accepted["accepted_message_id"]) != message_id
+            ):
+                await self._record_runtime_incident(
+                    connection,
+                    event,
+                    kind="submission_acceptance_conflict",
+                    detail={
+                        "submission_id": submission_id,
+                        "retained_message_id": str(accepted["accepted_message_id"]),
+                        "conflicting_message_id": message_id,
+                    },
+                )
+                return
             await connection.execute(
                 """
                 UPDATE submissions
-                SET state = 'submitted', accepted_message_id = ?,
-                    accepted_at = ?
-                WHERE submission_id = ? AND state IN ('local_queued', 'submitting')
+                SET state = CASE
+                        WHEN state IN (
+                            'local_queued', 'submitting', 'submitted_unknown'
+                        )
+                        THEN 'submitted'
+                        ELSE state
+                    END,
+                    accepted_message_id = COALESCE(accepted_message_id, ?),
+                    accepted_at = COALESCE(accepted_at, ?),
+                    terminal_at = CASE
+                        WHEN state = 'submitted_unknown' THEN NULL
+                        ELSE terminal_at
+                    END
+                WHERE submission_id = ? AND state IN (
+                    'local_queued', 'submitting', 'submitted',
+                    'submitted_unknown', 'observed_active', 'loop_idle',
+                    'continuation_expected', 'semantic_complete',
+                    'semantic_blocked', 'observed_aborted'
+                )
                 """,
                 (
-                    str(data["message_id"]),
+                    message_id,
                     event.received_at,
-                    str(data["submission_id"]),
+                    submission_id,
                 ),
             )
             await connection.execute(
                 """
                 UPDATE message_queue SET state = 'submitted', updated_at = ?
-                WHERE id = ? AND state IN ('local_queued', 'submitting')
+                WHERE id = ? AND state IN (
+                    'local_queued', 'submitting', 'submitted_unknown'
+                )
                 """,
-                (now, str(data["submission_id"])),
+                (now, submission_id),
+            )
+            await connection.execute(
+                """
+                INSERT INTO liveness_leases(
+                    sdk_session_id, lease_id, kind, source_id,
+                    runtime_generation, owner_fence_token, state,
+                    acquired_at, refreshed_at
+                )
+                SELECT sdk_session_id, 'submission:' || submission_id,
+                       'submission', submission_id, ?, ?, 'active', ?, ?
+                FROM submissions
+                WHERE submission_id = ? AND state = 'submitted'
+                ON CONFLICT(sdk_session_id, lease_id) DO UPDATE SET
+                    state = 'active',
+                    runtime_generation = excluded.runtime_generation,
+                    owner_fence_token = excluded.owner_fence_token,
+                    refreshed_at = excluded.refreshed_at,
+                    released_at = NULL
+                """,
+                (
+                    event.generation,
+                    event.fence_token,
+                    now,
+                    now,
+                    submission_id,
+                ),
             )
         elif event.raw_type in {
             "copilotd.submission.rejected",
@@ -1119,29 +1190,112 @@ class JournalReducer:
                 else "submitted_unknown"
             )
             submission_id = str(data["submission_id"])
-            await connection.execute(
-                """
-                UPDATE submissions SET state = ?, terminal_at = ?
-                WHERE submission_id = ?
-                """,
-                (state, event.received_at, submission_id),
-            )
-            await connection.execute(
-                """
-                UPDATE message_queue SET state = ?, updated_at = ?
-                WHERE id = ? AND state IN ('local_queued', 'submitting')
-                """,
-                (state, now, submission_id),
-            )
-            await connection.execute(
-                """
-                UPDATE liveness_leases
-                SET state = 'released', refreshed_at = ?, released_at = ?
-                WHERE sdk_session_id = ? AND kind = 'submission'
-                  AND source_id = ? AND state = 'active'
-                """,
-                (now, now, event.sdk_session_id, submission_id),
-            )
+            if event.raw_type == "copilotd.submission.acceptance_unknown":
+                await connection.execute(
+                    """
+                    UPDATE submissions
+                    SET state = CASE
+                            WHEN observed_user_event_id IS NOT NULL
+                              OR accepted_message_id IS NOT NULL
+                            THEN state
+                            ELSE 'submitted_unknown'
+                        END,
+                        terminal_at = CASE
+                            WHEN observed_user_event_id IS NOT NULL
+                              OR accepted_message_id IS NOT NULL
+                            THEN terminal_at
+                            ELSE ?
+                        END
+                    WHERE submission_id = ?
+                    """,
+                    (event.received_at, submission_id),
+                )
+                await connection.execute(
+                    """
+                    UPDATE message_queue
+                    SET state = CASE
+                            WHEN EXISTS (
+                                SELECT 1 FROM submissions
+                                WHERE submission_id = ?
+                                  AND (
+                                      observed_user_event_id IS NOT NULL
+                                      OR accepted_message_id IS NOT NULL
+                                  )
+                            ) THEN 'submitted'
+                            ELSE 'submitted_unknown'
+                        END,
+                        updated_at = ?
+                    WHERE id = ? AND state IN ('local_queued', 'submitting')
+                    """,
+                    (submission_id, now, submission_id),
+                )
+                await connection.execute(
+                    """
+                    UPDATE liveness_leases
+                    SET state = 'released', refreshed_at = ?, released_at = ?
+                    WHERE sdk_session_id = ? AND kind = 'submission'
+                      AND source_id = ? AND state = 'active'
+                      AND NOT EXISTS (
+                          SELECT 1 FROM submissions
+                          WHERE submission_id = ?
+                            AND (
+                                observed_user_event_id IS NOT NULL
+                                OR accepted_message_id IS NOT NULL
+                            )
+                      )
+                    """,
+                    (
+                        now,
+                        now,
+                        event.sdk_session_id,
+                        submission_id,
+                        submission_id,
+                    ),
+                )
+            else:
+                cursor = await connection.execute(
+                    """
+                    SELECT observed_user_event_id FROM submissions
+                    WHERE submission_id = ? AND sdk_session_id = ?
+                    """,
+                    (submission_id, event.sdk_session_id),
+                )
+                rejected = await cursor.fetchone()
+                await cursor.close()
+                if rejected is not None and rejected["observed_user_event_id"] is not None:
+                    await self._split_observed_rejected_submission(
+                        connection,
+                        event,
+                        submission_id=submission_id,
+                        now=now,
+                    )
+                else:
+                    await connection.execute(
+                        """
+                        UPDATE submissions SET state = ?, terminal_at = ?
+                        WHERE submission_id = ?
+                        """,
+                        (state, event.received_at, submission_id),
+                    )
+                await connection.execute(
+                    """
+                    UPDATE message_queue SET state = ?, updated_at = ?
+                    WHERE id = ? AND state IN (
+                        'local_queued', 'submitting', 'submitted',
+                        'submitted_unknown'
+                    )
+                    """,
+                    (state, now, submission_id),
+                )
+                await connection.execute(
+                    """
+                    UPDATE liveness_leases
+                    SET state = 'released', refreshed_at = ?, released_at = ?
+                    WHERE sdk_session_id = ? AND kind = 'submission'
+                      AND source_id = ? AND state = 'active'
+                    """,
+                    (now, now, event.sdk_session_id, submission_id),
+                )
         elif event.raw_type == "copilotd.queue.blocked":
             await connection.execute(
                 """
@@ -1829,7 +1983,10 @@ class JournalReducer:
             await self._apply_task_snapshot(
                 connection,
                 event,
-                data={"tasks": values.get("tasks", [])},
+                data={
+                    "tasks": values.get("tasks", []),
+                    "observed_at": observed_at,
+                },
                 now=now,
                 allow_negative=fresh and caught_up,
             )
@@ -1978,6 +2135,118 @@ class JournalReducer:
                 topic,
             ),
         )
+        if applied and topic in {"activity", "queue", "tasks"}:
+            await self._settle_linked_loop_idle_submissions(
+                connection,
+                event,
+                now=now,
+            )
+
+    async def _split_observed_rejected_submission(
+        self,
+        connection: Any,
+        event: AdaptedEvent,
+        *,
+        submission_id: str,
+        now: float,
+    ) -> None:
+        cursor = await connection.execute(
+            """
+            SELECT observed_user_event_id FROM submissions
+            WHERE submission_id = ? AND sdk_session_id = ?
+            """,
+            (submission_id, event.sdk_session_id),
+        )
+        observed = await cursor.fetchone()
+        await cursor.close()
+        if observed is None or observed["observed_user_event_id"] is None:
+            return
+        user_event_id = str(observed["observed_user_event_id"])
+        runtime_submission_id = str(
+            uuid.uuid5(
+                uuid.NAMESPACE_URL,
+                f"copilotd:{event.sdk_session_id}:runtime-observed:{user_event_id}",
+            )
+        )
+        await connection.execute(
+            """
+            INSERT INTO submissions(
+                submission_id, sdk_session_id, origin, runtime_schedule_id,
+                prompt_hash, requested_mode, requested_delivery, observed_delivery,
+                state, accepted_message_id, accepted_at,
+                observed_user_event_id, observed_origin_hint,
+                correlation_basis, autopilot_objective_id,
+                task_completion_outcome, completion_basis, created_at, idle_at,
+                observed_at, observed_interaction_id, objective_status,
+                task_complete_event_id, abort_event_id, terminal_at,
+                continuation_count
+            )
+            SELECT ?, sdk_session_id, 'runtime_observed', runtime_schedule_id,
+                   prompt_hash, requested_mode, requested_delivery, observed_delivery,
+                   state, accepted_message_id, accepted_at,
+                   observed_user_event_id, observed_origin_hint,
+                   'rejected_send_runtime_observed', autopilot_objective_id,
+                   task_completion_outcome, completion_basis,
+                   COALESCE(observed_at, created_at), idle_at,
+                   observed_at, observed_interaction_id, objective_status,
+                   task_complete_event_id, abort_event_id, terminal_at,
+                   continuation_count
+            FROM submissions WHERE submission_id = ?
+            ON CONFLICT(submission_id) DO NOTHING
+            """,
+            (runtime_submission_id, submission_id),
+        )
+        for table in (
+            "submission_segments",
+            "model_turns",
+            "submission_task_links",
+            "background_observations",
+            "task_card_projections",
+            "autopilot_objectives",
+        ):
+            await connection.execute(
+                f"UPDATE {table} SET submission_id = ? WHERE submission_id = ?",
+                (runtime_submission_id, submission_id),
+            )
+        await connection.execute(
+            """
+            UPDATE liveness_leases
+            SET lease_id = ?, source_id = ?
+            WHERE sdk_session_id = ? AND kind = 'submission' AND source_id = ?
+            """,
+            (
+                f"submission:{runtime_submission_id}",
+                runtime_submission_id,
+                event.sdk_session_id,
+                submission_id,
+            ),
+        )
+        await connection.execute(
+            """
+            UPDATE submissions
+            SET state = 'rejected', accepted_message_id = NULL,
+                accepted_at = NULL, observed_user_event_id = NULL,
+                observed_origin_hint = NULL, observed_delivery = NULL,
+                observed_at = NULL, observed_interaction_id = NULL,
+                correlation_basis = NULL, autopilot_objective_id = NULL,
+                task_completion_outcome = NULL, completion_basis = NULL,
+                objective_status = NULL, task_complete_event_id = NULL,
+                abort_event_id = NULL, idle_at = NULL, terminal_at = ?,
+                continuation_count = 0
+            WHERE submission_id = ?
+            """,
+            (event.received_at, submission_id),
+        )
+        await self._record_runtime_incident(
+            connection,
+            event,
+            kind="rejected_send_observed_as_runtime_message",
+            detail={
+                "rejected_submission_id": submission_id,
+                "runtime_submission_id": runtime_submission_id,
+                "user_event_id": user_event_id,
+            },
+        )
 
     async def _apply_user_message(
         self,
@@ -2031,7 +2300,8 @@ class JournalReducer:
                 """
                 SELECT * FROM submissions
                 WHERE sdk_session_id = ? AND accepted_message_id = ?
-                  AND observed_user_event_id IS NULL AND state = 'submitted'
+                  AND observed_user_event_id IS NULL
+                  AND state IN ('submitted', 'submitted_unknown', 'outcome_unknown')
                 """,
                 (event.sdk_session_id, event.event_id),
             )
@@ -2044,7 +2314,10 @@ class JournalReducer:
                 """
                 SELECT * FROM submissions
                 WHERE sdk_session_id = ? AND correlation_id = ?
-                  AND observed_user_event_id IS NULL AND state = 'submitted'
+                  AND observed_user_event_id IS NULL
+                  AND state IN (
+                      'submitting', 'submitted', 'submitted_unknown', 'outcome_unknown'
+                  )
                 """,
                 (event.sdk_session_id, interaction_id),
             )
@@ -2056,12 +2329,27 @@ class JournalReducer:
             cursor = await connection.execute(
                 """
                 SELECT * FROM submissions
-                WHERE sdk_session_id = ? AND state = 'submitted'
+                WHERE sdk_session_id = ?
+                  AND state IN (
+                      'submitting', 'submitted', 'submitted_unknown', 'outcome_unknown'
+                  )
                   AND observed_user_event_id IS NULL
-                  AND accepted_at IS NOT NULL AND accepted_at <= ?
-                ORDER BY accepted_at, created_at
+                  AND (
+                      (state = 'submitting'
+                       AND send_started_at IS NOT NULL
+                       AND send_started_at <= ?)
+                      OR
+                      (state IN ('submitted', 'submitted_unknown', 'outcome_unknown')
+                       AND accepted_at IS NOT NULL
+                       AND accepted_at <= ?)
+                  )
+                ORDER BY COALESCE(accepted_at, send_started_at), created_at
                 """,
-                (event.sdk_session_id, event.received_at),
+                (
+                    event.sdk_session_id,
+                    event.received_at,
+                    event.received_at,
+                ),
             )
             raw_candidates = list(await cursor.fetchall())
             await cursor.close()
@@ -2152,7 +2440,8 @@ class JournalReducer:
                 observed_delivery = COALESCE(?, observed_delivery),
                 observed_origin_hint = COALESCE(?, observed_origin_hint),
                 correlation_basis = ?,
-                continuation_count = continuation_count + ?
+                continuation_count = continuation_count + ?,
+                terminal_at = NULL
             WHERE submission_id = ? AND sdk_session_id = ?
             """,
             (
@@ -2648,17 +2937,6 @@ class JournalReducer:
         await cursor.close()
         if not candidates:
             return
-        cursor = await connection.execute(
-            """
-            SELECT COUNT(*) FROM liveness_leases
-            WHERE sdk_session_id = ? AND kind = 'background' AND state = 'active'
-              AND runtime_generation = ? AND owner_fence_token = ?
-            """,
-            (event.sdk_session_id, event.generation, event.fence_token),
-        )
-        background = await cursor.fetchone()
-        await cursor.close()
-        has_background = background is not None and int(background[0]) > 0
         aborted = bool(data.get("aborted"))
         for candidate in candidates:
             submission_id = str(candidate["submission_id"])
@@ -2684,14 +2962,11 @@ class JournalReducer:
                 )
                 terminal = True
             elif mode == "autopilot":
-                if outcome == "completed" and not has_background:
-                    state = "semantic_complete"
-                    completion_basis = "task_complete_final_idle"
-                    terminal = True
-            elif mode in {None, "interactive", "plan", "shell"} and not has_background:
-                state = "semantic_complete"
-                completion_basis = "loop_idle"
-                terminal = True
+                # Completion waits for post-idle task/activity/queue snapshots.
+                pass
+            elif mode in {None, "interactive", "plan", "shell"}:
+                # A late task can appear after idle; snapshots own terminalization.
+                pass
 
             await connection.execute(
                 """
@@ -2789,7 +3064,7 @@ class JournalReducer:
     ) -> bool:
         cursor = await connection.execute(
             """
-            SELECT supported FROM capabilities
+            SELECT supported, evidence_status FROM capabilities
             WHERE capability = ? AND protocol_version > 0
             ORDER BY probed_at DESC LIMIT 1
             """,
@@ -2797,7 +3072,11 @@ class JournalReducer:
         )
         row = await cursor.fetchone()
         await cursor.close()
-        return row is not None and bool(row["supported"])
+        return (
+            row is not None
+            and int(row["supported"]) == 1
+            and row["evidence_status"] != "unknown"
+        )
 
 
     async def _update_task_projection(
@@ -2925,6 +3204,331 @@ class JournalReducer:
                 ),
             )
 
+    async def _resolve_task_submission(
+        self,
+        connection: Any,
+        event: AdaptedEvent,
+        *,
+        task: dict[str, Any],
+        task_id: str,
+        evidence_time: float,
+    ) -> tuple[str | None, str | None, str | None]:
+        cursor = await connection.execute(
+            """
+            SELECT submission_id, correlation_basis, objective_id
+            FROM submission_task_links
+            WHERE sdk_session_id = ? AND task_id = ?
+            """,
+            (event.sdk_session_id, task_id),
+        )
+        existing = await cursor.fetchone()
+        await cursor.close()
+        if existing is not None:
+            return (
+                str(existing["submission_id"]),
+                str(existing["correlation_basis"]),
+                (
+                    None
+                    if existing["objective_id"] is None
+                    else str(existing["objective_id"])
+                ),
+            )
+
+        explicit_submission_id = _value(task, "submissionId") or _value(
+            task,
+            "submission_id",
+        )
+        objective_id = _value(task, "objectiveId") or _value(task, "objective_id")
+        if explicit_submission_id is not None:
+            cursor = await connection.execute(
+                """
+                SELECT submission_id FROM submissions
+                WHERE sdk_session_id = ? AND submission_id = ?
+                """,
+                (event.sdk_session_id, explicit_submission_id),
+            )
+            explicit = await cursor.fetchone()
+            await cursor.close()
+            if explicit is None:
+                await self._record_runtime_incident(
+                    connection,
+                    event,
+                    kind="task_submission_reference_missing",
+                    detail={
+                        "task_id": task_id,
+                        "submission_id": explicit_submission_id,
+                    },
+                )
+                return None, None, objective_id
+            return explicit_submission_id, "explicit_submission_id", objective_id
+
+        if objective_id is not None:
+            cursor = await connection.execute(
+                """
+                SELECT submission_id FROM submissions
+                WHERE sdk_session_id = ? AND autopilot_objective_id = ?
+                """,
+                (event.sdk_session_id, objective_id),
+            )
+            objective_candidates = await cursor.fetchall()
+            await cursor.close()
+            if len(objective_candidates) == 1:
+                return (
+                    str(objective_candidates[0]["submission_id"]),
+                    "objective_id",
+                    objective_id,
+                )
+            if objective_candidates:
+                await self._record_runtime_incident(
+                    connection,
+                    event,
+                    kind="task_objective_correlation_ambiguous",
+                    detail={
+                        "task_id": task_id,
+                        "objective_id": objective_id,
+                        "candidate_count": len(objective_candidates),
+                    },
+                )
+                return None, None, objective_id
+
+        cursor = await connection.execute(
+            """
+            SELECT submission_id FROM submissions
+            WHERE sdk_session_id = ?
+              AND state IN ('observed_active', 'loop_idle', 'continuation_expected')
+              AND observed_at IS NOT NULL AND observed_at <= ?
+            ORDER BY observed_at DESC, created_at DESC
+            """,
+            (event.sdk_session_id, evidence_time),
+        )
+        candidates = await cursor.fetchall()
+        await cursor.close()
+        if len(candidates) == 1:
+            return str(candidates[0]["submission_id"]), "single_active_submission", None
+        if not candidates:
+            cursor = await connection.execute(
+                """
+                SELECT submission_id, state, completion_basis, terminal_at
+                FROM submissions
+                WHERE sdk_session_id = ?
+                ORDER BY created_at DESC, submission_id DESC
+                LIMIT 1
+                """,
+                (event.sdk_session_id,),
+            )
+            latest = await cursor.fetchone()
+            await cursor.close()
+            if (
+                latest is not None
+                and latest["state"] == "semantic_complete"
+                and latest["completion_basis"]
+                in {"loop_idle", "task_complete_final_idle", "tasks_terminal_quiet"}
+                and latest["terminal_at"] is not None
+                and float(latest["terminal_at"]) <= evidence_time
+            ):
+                submission_id = str(latest["submission_id"])
+                await connection.execute(
+                    """
+                    UPDATE submissions
+                    SET state = 'loop_idle', completion_basis = NULL,
+                        terminal_at = NULL
+                    WHERE submission_id = ? AND state = 'semantic_complete'
+                    """,
+                    (submission_id,),
+                )
+                await connection.execute(
+                    """
+                    UPDATE submission_segments
+                    SET state = 'loop_idle'
+                    WHERE submission_id = ?
+                      AND segment_index = (
+                          SELECT MAX(segment_index) FROM submission_segments
+                          WHERE submission_id = ?
+                      )
+                      AND state = 'semantic_complete'
+                    """,
+                    (submission_id, submission_id),
+                )
+                await connection.execute(
+                    """
+                    INSERT INTO liveness_leases(
+                        sdk_session_id, lease_id, kind, source_id,
+                        runtime_generation, owner_fence_token, state,
+                        acquired_at, refreshed_at
+                    ) VALUES (?, ?, 'submission', ?, ?, ?, 'active', ?, ?)
+                    ON CONFLICT(sdk_session_id, lease_id) DO UPDATE SET
+                        state = 'active',
+                        runtime_generation = excluded.runtime_generation,
+                        owner_fence_token = excluded.owner_fence_token,
+                        refreshed_at = excluded.refreshed_at,
+                        released_at = NULL
+                    """,
+                    (
+                        event.sdk_session_id,
+                        f"submission:{submission_id}",
+                        submission_id,
+                        event.generation,
+                        event.fence_token,
+                        evidence_time,
+                        evidence_time,
+                    ),
+                )
+                await self._record_runtime_incident(
+                    connection,
+                    event,
+                    kind="late_task_reopened_submission",
+                    detail={"task_id": task_id, "submission_id": submission_id},
+                )
+                return submission_id, "late_task_after_idle", None
+        if candidates:
+            await self._record_runtime_incident(
+                connection,
+                event,
+                kind="task_submission_correlation_ambiguous",
+                detail={
+                    "task_id": task_id,
+                    "candidate_count": len(candidates),
+                },
+            )
+        return None, None, objective_id
+
+    async def _settle_linked_loop_idle_submissions(
+        self,
+        connection: Any,
+        event: AdaptedEvent,
+        *,
+        now: float,
+    ) -> None:
+        cursor = await connection.execute(
+            """
+            SELECT submission_id, idle_at, requested_mode,
+                   task_completion_outcome, objective_status
+            FROM submissions
+            WHERE sdk_session_id = ? AND state = 'loop_idle'
+            """,
+            (event.sdk_session_id,),
+        )
+        candidates = await cursor.fetchall()
+        await cursor.close()
+        for candidate in candidates:
+            submission_id = str(candidate["submission_id"])
+            cursor = await connection.execute(
+                """
+                SELECT state, terminal_at FROM submission_task_links
+                WHERE sdk_session_id = ? AND submission_id = ?
+                """,
+                (event.sdk_session_id, submission_id),
+            )
+            links = await cursor.fetchall()
+            await cursor.close()
+            if links and any(
+                link["state"] not in {"completed", "failed", "cancelled"}
+                or link["terminal_at"] is None
+                for link in links
+            ):
+                continue
+            cutoff = float(candidate["idle_at"] or 0)
+            if links:
+                cutoff = max(
+                    cutoff,
+                    max(float(link["terminal_at"]) for link in links),
+                )
+            cursor = await connection.execute(
+                """
+                SELECT topic, requested_epoch, applied_epoch, status, observed_at
+                FROM reconciliation_state
+                WHERE sdk_session_id = ?
+                  AND topic IN ('activity', 'queue', 'tasks')
+                """,
+                (event.sdk_session_id,),
+            )
+            snapshots = {str(row["topic"]): row for row in await cursor.fetchall()}
+            await cursor.close()
+            if any(
+                topic not in snapshots
+                or snapshots[topic]["status"] != "idle"
+                or int(snapshots[topic]["requested_epoch"])
+                != int(snapshots[topic]["applied_epoch"])
+                or snapshots[topic]["observed_at"] is None
+                or float(snapshots[topic]["observed_at"]) < cutoff
+                for topic in ("activity", "queue", "tasks")
+            ):
+                continue
+            settled_at = max(
+                float(snapshots[topic]["observed_at"])
+                for topic in ("activity", "queue", "tasks")
+            )
+            cursor = await connection.execute(
+                """
+                SELECT runtime_processing, runtime_has_active_work,
+                       native_queue_count, native_steering_count
+                FROM session_bindings
+                WHERE sdk_session_id = ? AND runtime_generation = ?
+                  AND owner_fence_token = ?
+                """,
+                (
+                    event.sdk_session_id,
+                    event.generation,
+                    event.fence_token,
+                ),
+            )
+            binding = await cursor.fetchone()
+            await cursor.close()
+            if binding is None or any(
+                (
+                    bool(binding["runtime_processing"]),
+                    bool(binding["runtime_has_active_work"]),
+                    int(binding["native_queue_count"] or 0) > 0,
+                    int(binding["native_steering_count"] or 0) > 0,
+                )
+            ):
+                continue
+            failed = any(link["state"] in {"failed", "cancelled"} for link in links)
+            if failed:
+                state = "semantic_blocked"
+                basis = "tasks_terminal_failure_quiet"
+            elif links:
+                state = "semantic_complete"
+                basis = "tasks_terminal_quiet"
+            elif candidate["requested_mode"] == "autopilot":
+                if candidate["task_completion_outcome"] != "completed":
+                    continue
+                state = "semantic_complete"
+                basis = "task_complete_final_idle"
+            else:
+                state = "semantic_complete"
+                basis = "loop_idle"
+            cursor = await connection.execute(
+                """
+                UPDATE submissions
+                SET state = ?, completion_basis = ?, terminal_at = ?
+                WHERE submission_id = ? AND state = 'loop_idle'
+                """,
+                (state, basis, settled_at, submission_id),
+            )
+            changed = cursor.rowcount
+            await cursor.close()
+            if changed == 1:
+                await connection.execute(
+                    """
+                    UPDATE submission_segments
+                    SET state = ?
+                    WHERE submission_id = ?
+                      AND segment_index = (
+                          SELECT MAX(segment_index) FROM submission_segments
+                          WHERE submission_id = ?
+                      )
+                      AND state = 'loop_idle'
+                    """,
+                    (state, submission_id, submission_id),
+                )
+                await self._release_submission_liveness(
+                    connection,
+                    event,
+                    submission_id=submission_id,
+                    now=settled_at,
+                )
+
     async def _apply_task_snapshot(
         self,
         connection: Any,
@@ -2936,6 +3540,7 @@ class JournalReducer:
     ) -> None:
         raw_tasks = data.get("tasks", [])
         tasks = [task for task in raw_tasks if isinstance(task, dict)]
+        evidence_time = float(data.get("observed_at", now))
         seen: set[str] = set()
         terminal_states = {"completed", "failed", "cancelled"}
         panel_id = str(
@@ -2972,20 +3577,34 @@ class JournalReducer:
                 None,
             )
             card_key = f"task:{task_id}"
+            submission_id, correlation_basis, objective_id = (
+                await self._resolve_task_submission(
+                    connection,
+                    event,
+                    task=task,
+                    task_id=task_id,
+                    evidence_time=evidence_time,
+                )
+            )
             card_token = str(
                 uuid.uuid5(
                     uuid.NAMESPACE_URL,
                     f"copilotd:{event.sdk_session_id}:taskdeck:{card_key}",
                 )
             )[:16]
-            terminal_at = now if state in terminal_states else None
+            terminal_at = evidence_time if state in terminal_states else None
             await connection.execute(
                 """
                 INSERT INTO task_card_projections(
                     sdk_session_id, panel_id, card_token, card_key, task_id,
-                    kind, title, state, progress_summary, first_seen_at, terminal_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    submission_id, kind, title, state, progress_summary,
+                    first_seen_at, terminal_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(sdk_session_id, panel_id, card_key) DO UPDATE SET
+                    submission_id = COALESCE(
+                        task_card_projections.submission_id,
+                        excluded.submission_id
+                    ),
                     kind = excluded.kind,
                     title = excluded.title,
                     state = CASE
@@ -3013,11 +3632,12 @@ class JournalReducer:
                     card_token,
                     card_key,
                     task_id,
+                    submission_id,
                     kind,
                     title,
                     state,
                     progress,
-                    now,
+                    evidence_time,
                     terminal_at,
                 ),
             )
@@ -3025,9 +3645,9 @@ class JournalReducer:
                 """
                 INSERT INTO background_observations(
                     sdk_session_id, runtime_generation, source_event_id,
-                    task_id, task_type, observed_state, terminal_evidence,
-                    last_progress_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    task_id, task_type, submission_id, observed_state,
+                    terminal_evidence, last_progress_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(
                     sdk_session_id, runtime_generation, source_event_id
                 ) DO UPDATE SET
@@ -3040,6 +3660,10 @@ class JournalReducer:
                         background_observations.terminal_evidence,
                         excluded.terminal_evidence
                     ),
+                    submission_id = COALESCE(
+                        background_observations.submission_id,
+                        excluded.submission_id
+                    ),
                     last_progress_at = excluded.last_progress_at
                 """,
                 (
@@ -3048,11 +3672,54 @@ class JournalReducer:
                     card_key,
                     task_id,
                     kind,
+                    submission_id,
                     state,
                     "task_snapshot" if state in terminal_states else None,
-                    now,
+                    evidence_time,
                 ),
             )
+            if submission_id is not None and correlation_basis is not None:
+                await connection.execute(
+                    """
+                    INSERT INTO submission_task_links(
+                        sdk_session_id, task_id, submission_id, objective_id,
+                        state, terminal_evidence, correlation_basis,
+                        linked_at, last_progress_at, terminal_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(sdk_session_id, task_id) DO UPDATE SET
+                        submission_id = submission_task_links.submission_id,
+                        objective_id = COALESCE(
+                            submission_task_links.objective_id,
+                            excluded.objective_id
+                        ),
+                        state = CASE
+                            WHEN submission_task_links.terminal_at IS NOT NULL
+                            THEN submission_task_links.state
+                            ELSE excluded.state
+                        END,
+                        terminal_evidence = COALESCE(
+                            submission_task_links.terminal_evidence,
+                            excluded.terminal_evidence
+                        ),
+                        last_progress_at = excluded.last_progress_at,
+                        terminal_at = COALESCE(
+                            submission_task_links.terminal_at,
+                            excluded.terminal_at
+                        )
+                    """,
+                    (
+                        event.sdk_session_id,
+                        task_id,
+                        submission_id,
+                        objective_id,
+                        state,
+                        "task_snapshot" if state in terminal_states else None,
+                        correlation_basis,
+                        evidence_time,
+                        evidence_time,
+                        terminal_at,
+                    ),
+                )
             lease_id = f"background:{card_key}"
             if state in terminal_states:
                 await connection.execute(
@@ -3146,6 +3813,18 @@ class JournalReducer:
                   AND terminal_at IS NULL
                 """,
                 (event.sdk_session_id, panel_id, card_key),
+            )
+            await connection.execute(
+                """
+                UPDATE submission_task_links
+                SET state = 'unknown', last_progress_at = ?
+                WHERE sdk_session_id = ? AND task_id = ? AND terminal_at IS NULL
+                """,
+                (
+                    evidence_time,
+                    event.sdk_session_id,
+                    task_id,
+                ),
             )
 
 
