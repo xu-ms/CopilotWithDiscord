@@ -5281,11 +5281,12 @@ model、<code>/mode</code>、<code>/goal</code>、<code>/bare</code>、<code>/to
 unknown</td>
 </tr>
 <tr>
-<td>7 个 SQLite migration、project <code>$HOME</code> fallback/cwd
+<td>8 个 SQLite migration、project <code>$HOME</code> fallback/cwd
 snapshot、owner fence、creation saga、bounded ingress、单 reducer、event
 journal、CommandMailbox、liveness leases、eager
 resume；共享连接事务隔离；<code>background_tasks_changed</code> 后
-<code>tasks.refresh/list</code>，缺 terminal 消失转 UNKNOWN</td>
+<code>tasks.refresh/list</code>，缺 terminal 消失转 UNKNOWN；force restart
+intent/outcome durable journal</td>
 <td>eventLog durable replay reconciler 仍未接入 production
 supervisor；experimental task action RPC 继续 gated</td>
 </tr>
@@ -5326,16 +5327,20 @@ child-thread 路径</td>
 artifact lane 尚未实现</td>
 </tr>
 <tr>
-<td>结构化 heartbeat、protected-work watchdog、macOS bot/watchdog
-LaunchAgent 与 Windows bot/watchdog Scheduled Task definitions</td>
-<td>当前拓扑没有独立 runtime service；macOS definition/CLI smoke
-已验证，真实安装、sleep/wake 和 Windows 实机仍待验证</td>
+<td>完整 setup preflight、fresh PID/generation heartbeat、current-fence
+status、bounded restart saga、restart-storm alert、10 MiB × 7 JSON
+log、macOS 2/3 LaunchAgent 与 Windows 2/3 Scheduled Task
+install/status/uninstall/effective-definition contract</td>
+<td>当前验证 topology 为 bundled-runtime；macOS/Windows
+definitions、wake/restart/storm simulations 与 wheel/sdist isolated install
+已验证，真实 credentialed install、sleep/wake、60-minute macOS soak 和 Windows
+实机仍由显式 acceptance lane 验证</td>
 </tr>
 </tbody>
 </table>
-<p>当前验证基线：<code>ruff check src tests</code>、83 个 pytest、CLI
-<code>db-init</code>/<code>doctor</code> smoke、service definition parse
-与 wheel build
+<p>当前验证基线：<code>ruff check src tests scripts</code>、full pytest、CLI
+JSON/error contract、service definition/effective-state simulations 与 wheel/sdist
+isolated install
 均通过。这个快照用于区分“已验证实现”和后续设计，不降低以下
 章节对最终产品的契约要求。</p>
 <h3 id="html-交付要求">HTML 交付要求</h3>

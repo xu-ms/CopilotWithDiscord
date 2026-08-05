@@ -29,7 +29,8 @@ The implementation follows [`docs/copilotD-detailed-design.md`](docs/copilotD-de
 - Core `/session`, `/project`, `/model`, `/autopilot`, `/plan`, `/steer`, `/context`,
   `/usage`, and `/queue` commands.
 - Default always-on definitions for macOS LaunchAgents and Windows Scheduled Tasks,
-  plus a protected-work-aware watchdog.
+  effective-definition/PID verification, protected-work-aware restart coordination,
+  sleep/resume suppression, and durable restart-storm alerts.
 
 Native-gated commands such as Fleet, Tasks, quick ask, runtime schedules, and remote
 sessions are intentionally not registered until their pinned-runtime fixtures are
@@ -47,8 +48,13 @@ export COPILOTD_DISCORD_TOKEN='...'
 .venv/bin/copilotd setup
 ```
 
-`setup` installs and starts the current platform's service definitions. For local
-development, use the explicit foreground entrypoint:
+`setup` first verifies the Discord token with Discord, starts the pinned Copilot runtime
+to validate authentication/version/model access, checks timezone data and private
+directories, then installs and starts the current platform definitions. It succeeds only
+after a new heartbeat reports `gateway_state=ready`, `runtime_state=ready`, and a PID that
+matches the effective OS-managed process. The token is stored in a private per-user
+service secret file and is never embedded in a plist, Task XML, or PowerShell script.
+For local development, use the explicit foreground entrypoint:
 
 ```bash
 .venv/bin/copilotd run --foreground
@@ -61,7 +67,13 @@ Useful operations:
 .venv/bin/copilotd service logs
 .venv/bin/copilotd service restart
 .venv/bin/copilotd doctor
+.venv/bin/copilotd-ops-audit --repository .
 ```
+
+`service restart` fails closed when the heartbeat is missing, malformed, stale, or does
+not match the OS PID. A normal restart also refuses active current-generation leases,
+queued work, remote exposure, native schedules, and trigger windows. `--force` first
+durably marks ambiguous outcomes unknown and records remote/schedule stop intents.
 
 ## Development
 
@@ -81,6 +93,20 @@ disposable persistent session:
 .venv/bin/copilotd sdk-probe --live
 ```
 
-Runtime data, cache, and logs use platform-specific user directories. Override them
-with `COPILOTD_DATA_DIR`, `COPILOTD_CACHE_DIR`, and `COPILOTD_LOG_DIR`. A guild-scoped
+Runtime paths are fixed by platform:
+
+| Platform | State | Heartbeat | Logs |
+|---|---|---|---|
+| macOS | `~/Library/Application Support/copilotd/` | `~/Library/Caches/copilotd/heartbeat.json` | `~/Library/Logs/copilotd/` |
+| Windows | `%LOCALAPPDATA%\copilotd\state\` | `%LOCALAPPDATA%\copilotd\cache\heartbeat.json` | `%LOCALAPPDATA%\copilotd\logs\` |
+
+`copilotd.log` is rotating JSON (10 MiB with seven backups); `boot.log`,
+`watchdog.log`, and `alerts.log` have distinct destinations. Override paths with
+`COPILOTD_DATA_DIR`, `COPILOTD_CACHE_DIR`, and `COPILOTD_LOG_DIR`. A guild-scoped
 development command sync can be selected with `COPILOTD_DISCORD_GUILD_ID`.
+
+The opt-in hardware/credential lanes are `scripts/acceptance-macos.sh` and
+`scripts/acceptance-windows.ps1`. They intentionally exit with failure when selected on
+the wrong OS or without required credentials/system facilities; they never silently
+skip. `scripts/package-smoke.sh` builds and installs both the wheel and sdist in isolated
+environments.

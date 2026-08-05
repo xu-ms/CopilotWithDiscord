@@ -213,6 +213,25 @@ class SessionRegistry:
             raise RuntimeError(f"thread already has a SessionRuntime: {thread_id}")
         self._runtimes[thread_id] = runtime
 
+    def heartbeat_metrics(self) -> tuple[int, int, float | None]:
+        depth = 0
+        max_lag_ms = 0
+        last_callback_at: float | None = None
+        for runtime in self._runtimes.values():
+            inbox = runtime.inbox
+            if inbox is None:
+                continue
+            depth += inbox.size
+            max_lag_ms = max(max_lag_ms, inbox.lag_ms)
+            received_at = inbox.last_received_at
+            if received_at is not None:
+                last_callback_at = (
+                    received_at
+                    if last_callback_at is None
+                    else max(last_callback_at, received_at)
+                )
+        return depth, max_lag_ms, last_callback_at
+
     async def replace(self, binding: SessionBinding) -> SessionRuntime:
         existing = self._runtimes.pop(binding.thread_id, None)
         if existing is not None:

@@ -1,0 +1,46 @@
+name: Operations acceptance
+
+on:
+  workflow_dispatch:
+    inputs:
+      macos:
+        description: Run the credentialed real-macOS service and soak lane
+        required: true
+        default: false
+        type: boolean
+      windows:
+        description: Run the credentialed real-Windows Task Scheduler lane
+        required: true
+        default: false
+        type: boolean
+
+jobs:
+  macos:
+    if: inputs.macos
+    runs-on: macos-15
+    timeout-minutes: 90
+    env:
+      COPILOTD_DISCORD_TOKEN: ${{ secrets.COPILOTD_DISCORD_TOKEN }}
+      COPILOTD_ACCEPTANCE_SOAK_SECONDS: "3600"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: python -m pip install .
+      - run: scripts/acceptance-macos.sh
+
+  windows:
+    if: inputs.windows
+    runs-on: windows-2025
+    timeout-minutes: 30
+    env:
+      COPILOTD_DISCORD_TOKEN: ${{ secrets.COPILOTD_DISCORD_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: python -m pip install .
+      - shell: pwsh
+        run: scripts/acceptance-windows.ps1

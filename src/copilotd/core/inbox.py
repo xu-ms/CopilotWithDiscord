@@ -4,6 +4,7 @@ import asyncio
 import threading
 import time
 import uuid
+from collections import deque
 from collections.abc import Callable
 from typing import Any
 
@@ -40,6 +41,8 @@ class ReducerInbox:
         self._outstanding = 0
         self._next_inbox_seq = 0
         self._next_sdk_receive_seq = 0
+        self._outstanding_received_at: deque[float] = deque()
+        self._last_received_at: float | None = None
         self._closed = False
         self._sdk_closed = False
         self._overflow: OverflowIncident | None = None
@@ -54,6 +57,21 @@ class ReducerInbox:
     def overflow(self) -> OverflowIncident | None:
         with self._lock:
             return self._overflow
+
+    @property
+    def lag_ms(self) -> int:
+        with self._lock:
+            if not self._outstanding_received_at:
+                return 0
+            return max(
+                0,
+                round((time.time() - self._outstanding_received_at[0]) * 1000),
+            )
+
+    @property
+    def last_received_at(self) -> float | None:
+        with self._lock:
+            return self._last_received_at
 
     def submit_sdk(self, event: SessionEvent) -> bool:
         with self._lock:
@@ -150,6 +168,7 @@ class ReducerInbox:
             if self._outstanding < 1:
                 raise RuntimeError("inbox acknowledgement underflow")
             self._outstanding -= 1
+            self._outstanding_received_at.popleft()
             self._set_space_available()
             self._signal_progress()
         if envelope.commit_ack is not None and not envelope.commit_ack.done():
@@ -205,6 +224,9 @@ class ReducerInbox:
                 sdk_receive_seq = self._next_sdk_receive_seq
 
             self._outstanding += 1
+            received_at = time.time()
+            self._last_received_at = received_at
+            self._outstanding_received_at.append(received_at)
             if self._outstanding >= self._capacity:
                 self._clear_space_available()
             return inbox_seq, sdk_receive_seq
@@ -215,6 +237,7 @@ class ReducerInbox:
         except RuntimeError:
             with self._lock:
                 self._outstanding -= 1
+                self._outstanding_received_at.pop()
                 self._set_space_available()
                 self._signal_progress()
                 self._record_overflow_locked(envelope.inbox_seq, envelope.sdk_receive_seq)
@@ -227,6 +250,7 @@ class ReducerInbox:
         except asyncio.QueueFull:
             with self._lock:
                 self._outstanding -= 1
+                self._outstanding_received_at.pop()
                 self._set_space_available()
                 self._signal_progress()
                 self._record_overflow_locked(envelope.inbox_seq, envelope.sdk_receive_seq)

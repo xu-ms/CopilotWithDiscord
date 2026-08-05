@@ -70,6 +70,25 @@ async def test_inbox_reserves_capacity_before_cross_thread_scheduling() -> None:
     assert inbox.overflow is None
 
 
+@pytest.mark.asyncio
+async def test_inbox_reports_real_oldest_outstanding_lag() -> None:
+    inbox = ReducerInbox(
+        sdk_session_id="session-1",
+        generation=1,
+        fence_token=7,
+        capacity=2,
+    )
+    assert inbox.submit_sdk(_message_delta())
+    await asyncio.sleep(0.01)
+
+    assert inbox.size == 1
+    assert inbox.lag_ms >= 5
+    assert inbox.last_received_at is not None
+    envelope = await inbox.get()
+    inbox.acknowledge(envelope)
+    assert inbox.lag_ms == 0
+
+
 def _submit(inbox: ReducerInbox) -> None:
     assert inbox.submit_sdk(_message_delta())
 
@@ -235,9 +254,7 @@ async def test_reducer_materializes_full_stream_content_for_each_outbox_edit(
         ]
 
         assert await JournalReducer(database).persist(adapted) == 3
-        rows = await database.fetchall(
-            "SELECT payload FROM render_outbox ORDER BY logical_seq"
-        )
+        rows = await database.fetchall("SELECT payload FROM render_outbox ORDER BY logical_seq")
         stream = await database.fetchone(
             "SELECT content, finalized FROM render_streams WHERE message_id = 'message-1'"
         )

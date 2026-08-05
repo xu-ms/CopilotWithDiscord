@@ -57,7 +57,14 @@ class CopilotDiscordBot(commands.Bot):
             message_max_bytes=settings.attachment_message_max_bytes,
             blob_max_bytes=settings.attachment_blob_max_bytes,
         )
-        self.heartbeat = HeartbeatWriter(self.database, settings.heartbeat_path)
+        self.heartbeat = HeartbeatWriter(
+            self.database,
+            settings.heartbeat_path,
+            interval_seconds=settings.heartbeat_interval_seconds,
+            gateway_down_seconds=settings.gateway_down_restart_seconds,
+            resume_suppression_seconds=settings.resume_suppression_seconds,
+            metrics_provider=self._heartbeat_metrics,
+        )
         self.projects: ProjectRegistry | None = None
         self.bindings: SessionBindingRepository | None = None
         self.sessions: SessionRegistry | None = None
@@ -66,6 +73,11 @@ class CopilotDiscordBot(commands.Bot):
         self._tasks = TaskRegistry()
         self._owner_id = f"discord:{uuid.uuid4()}"
         self._commands_registered = False
+
+    def _heartbeat_metrics(self) -> tuple[int, int, float | None]:
+        if self.sessions is None:
+            return 0, 0, None
+        return self.sessions.heartbeat_metrics()
 
     async def setup_hook(self) -> None:
         await self.database.open()

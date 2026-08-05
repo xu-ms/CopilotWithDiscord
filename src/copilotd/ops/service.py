@@ -1,358 +1,2119 @@
 from __future__ import annotations
 
+import getpass
+import hashlib
 import json
 import os
 import plistlib
+import queue
+import re
+import sqlite3
 import subprocess
 import sys
+import threading
 import time
+import uuid
 import xml.etree.ElementTree as ET
-from dataclasses import asdict, dataclass
+from collections.abc import Callable, Sequence
+from dataclasses import asdict, dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Literal, Protocol
 
 from copilotd.config import Settings
-from copilotd.ops.heartbeat import heartbeat_age_seconds, read_heartbeat
+from copilotd.ops.contracts import (
+    FORCE_RESTART_DRAIN_SECONDS,
+    RESTART_STORM_LIMIT,
+    RESTART_STORM_WINDOW_SECONDS,
+    SERVICE_STATE_SCHEMA_VERSION,
+    SERVICE_STATUS_SCHEMA_VERSION,
+    WATCHDOG_INTERVAL_SECONDS,
+)
+from copilotd.ops.heartbeat import HeartbeatSnapshot, heartbeat_age_seconds, read_heartbeat
+from copilotd.ops.wake import ResumeTimestampProvider, resume_timestamp_provider
 
-Topology = Literal["bundled-runtime"]
+Topology = Literal["bundled-runtime", "sidecar"]
+EffectiveState = Literal["running", "loaded", "stopped", "missing", "unknown"]
 
+_MAC_RUNTIME_LABEL = "com.github.copilotd.runtime"
 _MAC_BOT_LABEL = "com.github.copilotd.bot"
 _MAC_WATCHDOG_LABEL = "com.github.copilotd.watchdog"
+_WINDOWS_RUNTIME_TASK = "copilotD Runtime"
 _WINDOWS_BOT_TASK = "copilotD Bot"
 _WINDOWS_WATCHDOG_TASK = "copilotD Watchdog"
 _TASK_NAMESPACE = "http://schemas.microsoft.com/windows/2004/02/mit/task"
 
+_TERMINAL_SUBMISSION_STATES = {
+    "rejected",
+    "semantic_complete",
+    "semantic_blocked",
+    "observed_aborted",
+    "outcome_unknown",
+}
+_TERMINAL_SCHEDULE_RUN_STATES = {
+    "cancelled",
+    "completed",
+    "failed",
+    "outcome_unknown",
+    "target_unknown",
+    "dispatch_unknown",
+}
+
+
+class ServiceError(RuntimeError):
+    pass
+
+
+class ServiceVerificationError(ServiceError):
+    pass
+
+
+class RestartBlocked(ServiceError):
+    def __init__(self, blockers: Sequence[str]) -> None:
+        self.blockers = tuple(blockers)
+        super().__init__("restart is not detach-safe: " + ", ".join(self.blockers))
+
+
+@dataclass(frozen=True, slots=True)
+class CommandResult:
+    command: tuple[str, ...]
+    returncode: int
+    stdout: str
+    stderr: str
+
+
+class CommandRunner(Protocol):
+    def run(self, command: Sequence[str], *, check: bool = False) -> CommandResult: ...
+
+
+class SubprocessCommandRunner:
+    def run(self, command: Sequence[str], *, check: bool = False) -> CommandResult:
+        try:
+            completed = subprocess.run(
+                list(command),
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+        except OSError as error:
+            result = CommandResult(
+                command=tuple(command),
+                returncode=127,
+                stdout="",
+                stderr=str(error),
+            )
+        else:
+            result = CommandResult(
+                command=tuple(command),
+                returncode=completed.returncode,
+                stdout=completed.stdout,
+                stderr=completed.stderr,
+            )
+        if check and result.returncode != 0:
+            detail = result.stderr.strip() or result.stdout.strip() or "no output"
+            raise ServiceError(
+                f"command failed ({result.returncode}): {' '.join(result.command)}: {detail}"
+            )
+        return result
+
+
+@dataclass(frozen=True, slots=True)
+class ServiceUnitStatus:
+    name: str
+    manager_id: str
+    definition_path: str
+    installed_definition: bool
+    effective_state: EffectiveState
+    pid: int | None
+    definition_matches: bool
+    expected_definition_hash: str
+    effective_definition_hash: str | None
+    detail: str | None = None
+
+    @property
+    def loaded(self) -> bool:
+        return self.effective_state not in {"missing", "unknown"}
+
+
+@dataclass(frozen=True, slots=True)
+class LeaseMetrics:
+    active_submissions: int = 0
+    observed_background_tasks: int = 0
+    pending_interactions: int = 0
+    total: int = 0
+
+
+@dataclass(frozen=True, slots=True)
+class QueueMetrics:
+    ingress_queue_depth: int = 0
+    max_reducer_lag_ms: int = 0
+    local_pending: int = 0
+    render_pending: int = 0
+    last_callback_at: str | None = None
+    last_reducer_progress_at: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class ExposureMetrics:
+    remote_steerable_or_unknown_sessions: int = 0
+    active_or_unknown_native_schedules: int = 0
+
 
 @dataclass(frozen=True, slots=True)
 class ServiceStatus:
+    schema_version: int
     platform: str
     topology: Topology
     installed: bool
+    effective_state: str
+    ready: bool
     bot_loaded: bool
     watchdog_loaded: bool
+    runtime_loaded: bool
+    pid: int | None
+    process_generation: str | None
+    process_identity_matches: bool | None
     heartbeat_age_seconds: float | None
+    heartbeat_written_at: str | None
+    heartbeat_fresh: bool
+    heartbeat_frozen: bool
+    heartbeat_error: str | None
     gateway_state: str | None
     runtime_state: str | None
     protected_work: bool | None
+    active_leases: LeaseMetrics
+    queue: QueueMetrics
+    exposure: ExposureMetrics
+    units: tuple[ServiceUnitStatus, ...]
+    definition_drift: tuple[str, ...]
+    last_resume_at: str | None
+    wake_suppression_until: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class InstallReceipt:
+    installed_at: float
+    topology: Topology
+    previous_pid: int | None
+    previous_generation: str | None
+    expected_units: tuple[str, ...]
+    definition_hashes: dict[str, str]
+
+
+@dataclass(frozen=True, slots=True)
+class RestartSafetySnapshot:
+    captured_at: float
+    active_leases: LeaseMetrics
+    local_pending: int
+    pending_operations: int
+    remote_sessions: int
+    native_schedules: int
+    native_trigger_windows: int
+    blockers: tuple[str, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class ForceRestartOutcome:
+    submissions_unknown: int
+    operations_unknown: int
+    interactions_cancelled: int
+    remote_unknown: int
+    native_schedules_unknown: int
+    native_triggers_unknown: int
+    leases_orphaned: int
+    bounded: bool
+    detail: str
+    intents_recorded: int = 0
+
+
+@dataclass(frozen=True, slots=True)
+class RestartReceipt:
+    requested_at: float
+    force: bool
+    previous_pid: int
+    previous_generation: str
+    safety_snapshot: RestartSafetySnapshot
+    force_outcome: ForceRestartOutcome | None
+
+
+class RestartCoordinator(Protocol):
+    def snapshot(self, *, now: float) -> RestartSafetySnapshot: ...
+
+    def prepare_force(
+        self,
+        snapshot: RestartSafetySnapshot,
+        *,
+        deadline: float,
+    ) -> ForceRestartOutcome: ...
+
+    def prepare_replay_restart(
+        self,
+        snapshot: RestartSafetySnapshot,
+        *,
+        deadline: float,
+    ) -> bool: ...
+
+
+class SqliteRestartCoordinator:
+    """Durably fences ambiguous work before the OS process is replaced."""
+
+    def __init__(self, database_path: Path) -> None:
+        self._database_path = database_path
+
+    def snapshot(self, *, now: float) -> RestartSafetySnapshot:
+        connection = self._connect()
+        try:
+            connection.execute("BEGIN")
+            lease_rows = connection.execute(
+                """
+                SELECT l.kind, COUNT(*) AS count
+                FROM liveness_leases AS l
+                JOIN session_bindings AS b USING (sdk_session_id)
+                WHERE l.state = 'active'
+                  AND l.runtime_generation = b.runtime_generation
+                  AND l.owner_fence_token = b.owner_fence_token
+                GROUP BY l.kind
+                """
+            ).fetchall()
+            lease_counts = {str(row["kind"]): int(row["count"]) for row in lease_rows}
+            submissions = lease_counts.get("submission", 0)
+            background = lease_counts.get("observed_background", 0)
+            interactions = lease_counts.get("interaction", 0)
+            leases = LeaseMetrics(
+                active_submissions=submissions,
+                observed_background_tasks=background,
+                pending_interactions=interactions,
+                total=sum(lease_counts.values()),
+            )
+            local_pending = self._count(
+                connection,
+                """
+                SELECT COUNT(*) FROM message_queue
+                WHERE state NOT IN ('cancelled', 'submitted', 'failed')
+                """,
+            )
+            pending_operations = self._count(
+                connection,
+                """
+                SELECT COUNT(*)
+                FROM session_operations AS o
+                JOIN session_bindings AS b USING (sdk_session_id)
+                WHERE o.state IN ('pending', 'started')
+                  AND o.runtime_generation = b.runtime_generation
+                  AND o.owner_fence_token = b.owner_fence_token
+                """,
+            )
+            remote_sessions = self._count(
+                connection,
+                """
+                SELECT COUNT(*) FROM session_bindings
+                WHERE attachment_state = 'attached'
+                  AND (
+                    runtime_remote_mode IN ('on', 'unknown')
+                    OR pending_remote_transition_id IS NOT NULL
+                  )
+                """,
+            )
+            native_schedules = self._count(
+                connection,
+                """
+                SELECT COUNT(*) FROM runtime_schedules
+                WHERE state IN ('active', 'unknown')
+                """,
+            )
+            terminal_placeholders = ",".join("?" for _ in _TERMINAL_SCHEDULE_RUN_STATES)
+            native_trigger_windows = self._count(
+                connection,
+                f"""
+                SELECT COUNT(*) FROM schedule_runs
+                WHERE status NOT IN ({terminal_placeholders})
+                  AND (
+                    claimed_at IS NOT NULL
+                    OR session_create_started_at IS NOT NULL
+                    OR send_started_at IS NOT NULL
+                  )
+                """,
+                tuple(sorted(_TERMINAL_SCHEDULE_RUN_STATES)),
+            )
+            connection.commit()
+        except sqlite3.Error as error:
+            connection.rollback()
+            raise ServiceError(f"could not capture durable restart snapshot: {error}") from error
+        finally:
+            connection.close()
+        blockers = _restart_blockers(
+            leases=leases,
+            local_pending=local_pending,
+            pending_operations=pending_operations,
+            remote_sessions=remote_sessions,
+            native_schedules=native_schedules,
+            native_trigger_windows=native_trigger_windows,
+        )
+        return RestartSafetySnapshot(
+            captured_at=now,
+            active_leases=leases,
+            local_pending=local_pending,
+            pending_operations=pending_operations,
+            remote_sessions=remote_sessions,
+            native_schedules=native_schedules,
+            native_trigger_windows=native_trigger_windows,
+            blockers=tuple(blockers),
+        )
+
+    def prepare_force(
+        self,
+        snapshot: RestartSafetySnapshot,
+        *,
+        deadline: float,
+    ) -> ForceRestartOutcome:
+        connection = self._connect()
+        counts: dict[str, int] = {}
+        transition_id = f"service-force-restart:{uuid.uuid4()}"
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            intent_targets = self._restart_intent_targets(connection)
+            connection.executemany(
+                """
+                INSERT INTO service_restart_intents(
+                    intent_id, restart_id, kind, sdk_session_id, target_id,
+                    state, outcome, detail, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, 'requested', 'unknown', ?, ?, ?)
+                """,
+                [
+                    (
+                        str(uuid.uuid4()),
+                        transition_id,
+                        kind,
+                        sdk_session_id,
+                        target_id,
+                        json.dumps(
+                            {"reason": "service_force_restart"},
+                            sort_keys=True,
+                            separators=(",", ":"),
+                        ),
+                        snapshot.captured_at,
+                        snapshot.captured_at,
+                    )
+                    for kind, sdk_session_id, target_id in intent_targets
+                ],
+            )
+            counts["intents"] = len(intent_targets)
+            counts["submissions"] = self._update(
+                connection,
+                f"""
+                UPDATE submissions
+                SET state = 'outcome_unknown'
+                WHERE state NOT IN ({",".join("?" for _ in _TERMINAL_SUBMISSION_STATES)})
+                """,
+                tuple(sorted(_TERMINAL_SUBMISSION_STATES)),
+            )
+            counts["operations"] = self._update(
+                connection,
+                """
+                UPDATE session_operations
+                SET state = 'unknown',
+                    error_code = 'service_force_restart',
+                    settled_at = ?
+                WHERE state IN ('pending', 'started')
+                """,
+                (snapshot.captured_at,),
+            )
+            counts["interactions"] = self._update(
+                connection,
+                """
+                UPDATE pending_interactions
+                SET state = 'expired',
+                    response = COALESCE(response, 'Cancelled by forced service restart.'),
+                    updated_at = ?
+                WHERE state = 'pending'
+                """,
+                (snapshot.captured_at,),
+            )
+            counts["remote"] = self._update(
+                connection,
+                """
+                UPDATE session_bindings
+                SET runtime_remote_mode = 'unknown',
+                    pending_remote_target = 'off',
+                    pending_remote_transition_id = ?,
+                    updated_at = ?,
+                    row_version = row_version + 1
+                WHERE runtime_remote_mode IN ('on', 'unknown')
+                   OR pending_remote_transition_id IS NOT NULL
+                """,
+                (transition_id, snapshot.captured_at),
+            )
+            counts["schedules"] = self._update(
+                connection,
+                """
+                UPDATE runtime_schedules
+                SET state = 'unknown', updated_at = ?
+                WHERE state IN ('active', 'unknown')
+                """,
+                (snapshot.captured_at,),
+            )
+            terminal_placeholders = ",".join("?" for _ in _TERMINAL_SCHEDULE_RUN_STATES)
+            counts["triggers"] = self._update(
+                connection,
+                f"""
+                UPDATE schedule_runs
+                SET status = 'outcome_unknown', updated_at = ?
+                WHERE status NOT IN ({terminal_placeholders})
+                  AND (
+                    claimed_at IS NOT NULL
+                    OR session_create_started_at IS NOT NULL
+                    OR send_started_at IS NOT NULL
+                  )
+                """,
+                (snapshot.captured_at, *sorted(_TERMINAL_SCHEDULE_RUN_STATES)),
+            )
+            counts["leases"] = self._update(
+                connection,
+                """
+                UPDATE liveness_leases
+                SET state = 'orphaned',
+                    refreshed_at = ?,
+                    released_at = ?
+                WHERE state = 'active'
+                  AND EXISTS (
+                    SELECT 1 FROM session_bindings AS b
+                    WHERE b.sdk_session_id = liveness_leases.sdk_session_id
+                      AND b.runtime_generation = liveness_leases.runtime_generation
+                      AND b.owner_fence_token = liveness_leases.owner_fence_token
+                  )
+                """,
+                (snapshot.captured_at, snapshot.captured_at),
+            )
+            connection.commit()
+        except sqlite3.Error as error:
+            connection.rollback()
+            raise ServiceError(f"could not durably prepare forced restart: {error}") from error
+        finally:
+            connection.close()
+        bounded = time.time() <= deadline
+        return ForceRestartOutcome(
+            submissions_unknown=counts["submissions"],
+            operations_unknown=counts["operations"],
+            interactions_cancelled=counts["interactions"],
+            remote_unknown=counts["remote"],
+            native_schedules_unknown=counts["schedules"],
+            native_triggers_unknown=counts["triggers"],
+            leases_orphaned=counts["leases"],
+            bounded=bounded,
+            detail=(
+                "durable disable/stop/drain intents recorded"
+                if bounded
+                else "durable outcomes recorded after the drain deadline"
+            ),
+            intents_recorded=counts["intents"],
+        )
+
+    def prepare_replay_restart(
+        self,
+        snapshot: RestartSafetySnapshot,
+        *,
+        deadline: float,
+    ) -> bool:
+        if time.time() > deadline:
+            return False
+        connection = self._connect()
+        restart_id = f"service-replay-restart:{uuid.uuid4()}"
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            sessions = connection.execute(
+                """
+                SELECT sdk_session_id
+                FROM session_bindings
+                WHERE attachment_state = 'attached'
+                ORDER BY sdk_session_id
+                """
+            ).fetchall()
+            connection.executemany(
+                """
+                INSERT INTO service_restart_intents(
+                    intent_id, restart_id, kind, sdk_session_id, target_id,
+                    state, outcome, detail, created_at, updated_at
+                ) VALUES (?, ?, 'checkpoint_replay', ?, ?, 'requested',
+                          'replay_required', ?, ?, ?)
+                """,
+                [
+                    (
+                        str(uuid.uuid4()),
+                        restart_id,
+                        str(row["sdk_session_id"]),
+                        str(row["sdk_session_id"]),
+                        json.dumps(
+                            {
+                                "captured_at": snapshot.captured_at,
+                                "reason": "watchdog_stale_with_verified_replay",
+                            },
+                            sort_keys=True,
+                            separators=(",", ":"),
+                        ),
+                        snapshot.captured_at,
+                        snapshot.captured_at,
+                    )
+                    for row in sessions
+                ],
+            )
+            connection.commit()
+        except sqlite3.Error as error:
+            connection.rollback()
+            raise ServiceError(f"could not checkpoint replay restart: {error}") from error
+        finally:
+            connection.close()
+        return time.time() <= deadline
+
+    def _connect(self) -> sqlite3.Connection:
+        if not self._database_path.is_file():
+            raise ServiceError(f"durable database is missing: {self._database_path}")
+        connection = sqlite3.connect(self._database_path, timeout=5)
+        connection.row_factory = sqlite3.Row
+        return connection
+
+    @staticmethod
+    def _count(
+        connection: sqlite3.Connection,
+        query: str,
+        parameters: Sequence[object] = (),
+    ) -> int:
+        row = connection.execute(query, tuple(parameters)).fetchone()
+        return 0 if row is None else int(row[0])
+
+    @staticmethod
+    def _update(
+        connection: sqlite3.Connection,
+        query: str,
+        parameters: Sequence[object] = (),
+    ) -> int:
+        cursor = connection.execute(query, tuple(parameters))
+        return cursor.rowcount
+
+    @staticmethod
+    def _restart_intent_targets(
+        connection: sqlite3.Connection,
+    ) -> list[tuple[str, str | None, str | None]]:
+        targets: list[tuple[str, str | None, str | None]] = []
+        targets.extend(
+            ("disable_remote", str(row["sdk_session_id"]), str(row["thread_id"]))
+            for row in connection.execute(
+                """
+                SELECT sdk_session_id, thread_id
+                FROM session_bindings
+                WHERE runtime_remote_mode IN ('on', 'unknown')
+                   OR pending_remote_transition_id IS NOT NULL
+                """
+            ).fetchall()
+        )
+        targets.extend(
+            (
+                "stop_native_schedule",
+                str(row["sdk_session_id"]),
+                str(row["runtime_schedule_id"]),
+            )
+            for row in connection.execute(
+                """
+                SELECT sdk_session_id, runtime_schedule_id
+                FROM runtime_schedules
+                WHERE state IN ('active', 'unknown')
+                """
+            ).fetchall()
+        )
+        targets.extend(
+            (
+                "drain_session",
+                str(row["sdk_session_id"]),
+                str(row["sdk_session_id"]),
+            )
+            for row in connection.execute(
+                """
+                SELECT DISTINCT l.sdk_session_id
+                FROM liveness_leases AS l
+                JOIN session_bindings AS b USING (sdk_session_id)
+                WHERE l.state = 'active'
+                  AND l.runtime_generation = b.runtime_generation
+                  AND l.owner_fence_token = b.owner_fence_token
+                """
+            ).fetchall()
+        )
+        terminal_placeholders = ",".join("?" for _ in _TERMINAL_SCHEDULE_RUN_STATES)
+        targets.extend(
+            (
+                "stop_native_trigger",
+                None if row["sdk_session_id"] is None else str(row["sdk_session_id"]),
+                str(row["run_id"]),
+            )
+            for row in connection.execute(
+                f"""
+                SELECT run_id, result_session_id AS sdk_session_id
+                FROM schedule_runs
+                WHERE status NOT IN ({terminal_placeholders})
+                  AND (
+                    claimed_at IS NOT NULL
+                    OR session_create_started_at IS NOT NULL
+                    OR send_started_at IS NOT NULL
+                  )
+                """,
+                tuple(sorted(_TERMINAL_SCHEDULE_RUN_STATES)),
+            ).fetchall()
+        )
+        return targets
+
+
+class Notifier(Protocol):
+    def notify(self, title: str, message: str) -> None: ...
+
+
+class PlatformNotifier:
+    def __init__(self, platform_name: str, runner: CommandRunner) -> None:
+        self._platform = platform_name
+        self._runner = runner
+
+    def notify(self, title: str, message: str) -> None:
+        try:
+            if self._platform == "darwin":
+                script = (
+                    f"display notification {_applescript_string(message)} "
+                    f"with title {_applescript_string(title)}"
+                )
+                self._runner.run(["osascript", "-e", script], check=False)
+            elif self._platform == "win32":
+                script = _windows_toast_script(title, message)
+                self._runner.run(
+                    [
+                        "powershell.exe",
+                        "-NoProfile",
+                        "-NonInteractive",
+                        "-Command",
+                        script,
+                    ],
+                    check=False,
+                )
+        except (OSError, ServiceError):
+            return
+
+
+@dataclass(frozen=True, slots=True)
+class StormDecision:
+    suppress: bool
+    count: int
+    reason: str
+
+
+class RestartStormStore:
+    """A lock-protected, fail-closed restart history retained across uninstall."""
+
+    def __init__(
+        self,
+        path: Path,
+        *,
+        window_seconds: float = RESTART_STORM_WINDOW_SECONDS,
+        limit: int = RESTART_STORM_LIMIT,
+    ) -> None:
+        self._path = path
+        self._lock_path = path.with_suffix(path.suffix + ".lock")
+        self._window_seconds = window_seconds
+        self._limit = limit
+
+    def check_and_record(self, now: float) -> StormDecision:
+        descriptor = self._acquire_lock()
+        try:
+            try:
+                payload = self._read()
+            except (OSError, TypeError, ValueError, json.JSONDecodeError) as error:
+                return StormDecision(True, self._limit, f"corrupt restart state: {error}")
+            restarts = [
+                float(value)
+                for value in payload.get("restarts", [])
+                if -5 <= now - float(value) <= self._window_seconds
+            ]
+            if len(restarts) >= self._limit:
+                return StormDecision(True, len(restarts), "restart threshold reached")
+            restarts.append(now)
+            _atomic_write_text(
+                self._path,
+                json.dumps(
+                    {
+                        "schema_version": 1,
+                        "restarts": restarts,
+                    },
+                    sort_keys=True,
+                    separators=(",", ":"),
+                )
+                + "\n",
+                private=True,
+            )
+            return StormDecision(False, len(restarts), "restart recorded")
+        finally:
+            os.close(descriptor)
+            self._lock_path.unlink(missing_ok=True)
+
+    def _read(self) -> dict[str, Any]:
+        if not self._path.exists():
+            return {"schema_version": 1, "restarts": []}
+        payload = json.loads(self._path.read_text(encoding="utf-8"))
+        if payload.get("schema_version") != 1 or not isinstance(payload.get("restarts"), list):
+            raise ValueError("unsupported watchdog state schema")
+        return payload
+
+    def _acquire_lock(self) -> int:
+        self._lock_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        deadline = time.monotonic() + 2
+        while True:
+            try:
+                return os.open(
+                    self._lock_path,
+                    os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                    0o600,
+                )
+            except FileExistsError:
+                try:
+                    stale = time.time() - self._lock_path.stat().st_mtime > 30
+                except FileNotFoundError:
+                    continue
+                if stale:
+                    self._lock_path.unlink(missing_ok=True)
+                    continue
+                if time.monotonic() >= deadline:
+                    raise ServiceError("watchdog restart-state lock is busy") from None
+                time.sleep(0.02)
 
 
 class ServiceManager:
-    """Installs the conservative bundled-runtime bot and watchdog topology."""
-
     def __init__(
         self,
         settings: Settings,
         *,
         entrypoint: Path | None = None,
+        working_directory: Path | None = None,
         platform: str | None = None,
         launch_agents_dir: Path | None = None,
+        topology: Topology | None = None,
+        runtime_argv: Sequence[str] | None = None,
+        command_runner: CommandRunner | None = None,
+        restart_coordinator: RestartCoordinator | None = None,
+        resume_provider: ResumeTimestampProvider | None = None,
+        notifier: Notifier | None = None,
+        uid: int | None = None,
+        windows_user_id: str | None = None,
+        now: Callable[[], float] = time.time,
+        sleep: Callable[[float], None] = time.sleep,
     ) -> None:
         self.settings = settings
         self.platform = sys.platform if platform is None else platform
+        persisted = _read_json_optional(settings.service_state_path)
+        persisted_working_directory = persisted.get("working_directory") if persisted else None
+        persisted_runtime_argv = persisted.get("runtime_argv") if persisted else None
         self.entrypoint = (
-            Path(sys.argv[0]).expanduser().resolve()
-            if entrypoint is None
-            else entrypoint.expanduser().resolve()
+            (
+                Path(entrypoint)
+                if entrypoint is not None
+                else Path(sys.argv[0])
+            )
+            .expanduser()
+            .resolve()
+        )
+        self.working_directory = (
+            (
+                Path(working_directory)
+                if working_directory is not None
+                else Path(persisted_working_directory)
+                if persisted_working_directory
+                else settings.resolved_home
+            )
+            .expanduser()
+            .resolve()
         )
         self.launch_agents_dir = (
-            Path.home() / "Library" / "LaunchAgents"
+            settings.resolved_home / "Library" / "LaunchAgents"
             if launch_agents_dir is None
-            else launch_agents_dir
+            else launch_agents_dir.expanduser().resolve()
         )
-        self.topology: Topology = "bundled-runtime"
+        self.topology = _resolve_topology(settings, topology, persisted)
+        selected_runtime_argv = runtime_argv or persisted_runtime_argv
+        self._runtime_argv_configured = selected_runtime_argv is not None
+        self.runtime_argv = tuple(
+            str(value)
+            for value in (selected_runtime_argv or (str(self.entrypoint), "runtime", "--headless"))
+        )
+        self._runner = command_runner or SubprocessCommandRunner()
+        self._coordinator = restart_coordinator or SqliteRestartCoordinator(settings.database_path)
+        self._resume_provider = resume_provider or resume_timestamp_provider(self.platform)
+        self._notifier = notifier or PlatformNotifier(self.platform, self._runner)
+        self._uid = os.getuid() if uid is None and hasattr(os, "getuid") else (uid or 0)
+        self._windows_user_id = windows_user_id or _current_windows_user()
+        self._now = now
+        self._sleep = sleep
+        self._storm_store = RestartStormStore(settings.watchdog_state_path)
+
+    @property
+    def expected_unit_names(self) -> tuple[str, ...]:
+        names = ["bot", "watchdog"]
+        if self.topology == "sidecar":
+            names.insert(0, "runtime")
+        return tuple(names)
 
     def macos_plists(self) -> dict[str, bytes]:
         environment = self._service_environment()
         base = {
-            "WorkingDirectory": str(Path.cwd().resolve()),
+            "WorkingDirectory": str(self.working_directory),
             "EnvironmentVariables": environment,
             "ThrottleInterval": 30,
             "LowPriorityBackgroundIO": False,
         }
-        bot = {
+        definitions: dict[str, dict[str, Any]] = {}
+        if self.topology == "sidecar":
+            definitions[_MAC_RUNTIME_LABEL] = {
+                **base,
+                "Label": _MAC_RUNTIME_LABEL,
+                "ProgramArguments": [
+                    str(self.entrypoint),
+                    "service",
+                    "runtime",
+                ],
+                "RunAtLoad": True,
+                "KeepAlive": True,
+                "StandardOutPath": str(self.settings.log_paths["boot"]),
+                "StandardErrorPath": str(self.settings.log_paths["boot"]),
+            }
+        definitions[_MAC_BOT_LABEL] = {
             **base,
             "Label": _MAC_BOT_LABEL,
             "ProgramArguments": [str(self.entrypoint), "run", "--foreground"],
             "RunAtLoad": True,
             "KeepAlive": True,
-            "StandardOutPath": str(self.settings.log_dir / "copilotd.log"),
-            "StandardErrorPath": str(self.settings.log_dir / "boot.log"),
+            "StandardOutPath": str(self.settings.log_paths["boot"]),
+            "StandardErrorPath": str(self.settings.log_paths["boot"]),
         }
-        watchdog = {
+        definitions[_MAC_WATCHDOG_LABEL] = {
             **base,
             "Label": _MAC_WATCHDOG_LABEL,
             "ProgramArguments": [str(self.entrypoint), "service", "watchdog"],
             "RunAtLoad": True,
-            "StartInterval": 300,
-            "StandardOutPath": str(self.settings.log_dir / "watchdog.log"),
-            "StandardErrorPath": str(self.settings.log_dir / "watchdog.log"),
+            "StartInterval": WATCHDOG_INTERVAL_SECONDS,
+            "StandardOutPath": str(self.settings.log_paths["watchdog"]),
+            "StandardErrorPath": str(self.settings.log_paths["watchdog"]),
         }
         return {
-            f"{_MAC_BOT_LABEL}.plist": plistlib.dumps(bot, sort_keys=True),
-            f"{_MAC_WATCHDOG_LABEL}.plist": plistlib.dumps(
-                watchdog,
-                sort_keys=True,
-            ),
+            f"{label}.plist": plistlib.dumps(definition, sort_keys=True)
+            for label, definition in definitions.items()
         }
 
     def windows_task_xml(self) -> dict[str, str]:
         runner = self.settings.data_dir / "runtime" / "copilotd-service.ps1"
-        return {
-            _WINDOWS_BOT_TASK: _windows_task_xml(
+        tasks: dict[str, str] = {}
+        if self.topology == "sidecar":
+            tasks[_WINDOWS_RUNTIME_TASK] = _windows_task_xml(
                 command="powershell.exe",
-                arguments=f'-NoProfile -ExecutionPolicy Bypass -File "{runner}" run',
+                arguments=(
+                    f'-NoProfile -NonInteractive -ExecutionPolicy Bypass -File "{runner}" runtime'
+                ),
+                working_directory=str(self.working_directory),
+                user_id=self._windows_user_id,
                 watchdog=False,
+            )
+        tasks[_WINDOWS_BOT_TASK] = _windows_task_xml(
+            command="powershell.exe",
+            arguments=(f'-NoProfile -NonInteractive -ExecutionPolicy Bypass -File "{runner}" run'),
+            working_directory=str(self.working_directory),
+            user_id=self._windows_user_id,
+            watchdog=False,
+        )
+        tasks[_WINDOWS_WATCHDOG_TASK] = _windows_task_xml(
+            command="powershell.exe",
+            arguments=(
+                f'-NoProfile -NonInteractive -ExecutionPolicy Bypass -File "{runner}" watchdog'
             ),
-            _WINDOWS_WATCHDOG_TASK: _windows_task_xml(
-                command="powershell.exe",
-                arguments=f'-NoProfile -ExecutionPolicy Bypass -File "{runner}" watchdog',
-                watchdog=True,
+            working_directory=str(self.working_directory),
+            user_id=self._windows_user_id,
+            watchdog=True,
+        )
+        return tasks
+
+    def windows_runner(self) -> str:
+        self._assert_runtime_argv_has_no_secrets()
+        environment_lines = [
+            f"$env:{key} = '{_powershell_quote(value)}'"
+            for key, value in sorted(self._service_environment().items())
+        ]
+        secret_path = _powershell_quote(str(self.settings.service_secrets_path))
+        entrypoint = _powershell_quote(str(self.entrypoint))
+        working_directory = _powershell_quote(str(self.working_directory))
+        boot_log = _powershell_quote(str(self.settings.log_paths["boot"]))
+        watchdog_log = _powershell_quote(str(self.settings.log_paths["watchdog"]))
+        runtime_command = " ".join(
+            f"'{_powershell_quote(argument)}'" for argument in self.runtime_argv
+        )
+        return "\n".join(
+            [
+                "param([Parameter(Mandatory=$true)][ValidateSet('run','runtime','watchdog')]"
+                "[string]$Action)",
+                "$ErrorActionPreference = 'Stop'",
+                "$ProgressPreference = 'SilentlyContinue'",
+                *environment_lines,
+                f"$secretPath = '{secret_path}'",
+                "if (-not (Test-Path -LiteralPath $secretPath -PathType Leaf)) {",
+                '  throw "copilotD service secret file is missing: $secretPath"',
+                "}",
+                "$secrets = Get-Content -LiteralPath $secretPath -Raw -Encoding UTF8 "
+                "| ConvertFrom-Json",
+                "if ($null -ne $secrets.discord_token) { "
+                "$env:COPILOTD_DISCORD_TOKEN = [string]$secrets.discord_token }",
+                "if ($null -ne $secrets.runtime_connection_token) { "
+                "$env:COPILOTD_RUNTIME_CONNECTION_TOKEN = "
+                "[string]$secrets.runtime_connection_token; "
+                "$env:COPILOT_CONNECTION_TOKEN = "
+                "[string]$secrets.runtime_connection_token }",
+                f"Set-Location -LiteralPath '{working_directory}'",
+                "if ($Action -eq 'run') {",
+                f"  & '{entrypoint}' run --foreground 1>> '{boot_log}' 2>&1",
+                "} elseif ($Action -eq 'watchdog') {",
+                f"  & '{entrypoint}' service watchdog 1>> '{watchdog_log}' 2>&1",
+                "} elseif ($Action -eq 'runtime') {",
+                f"  & {runtime_command} 1>> '{boot_log}' 2>&1",
+                "} else {",
+                '  throw "Unknown copilotD service action: $Action"',
+                "}",
+                "exit $LASTEXITCODE",
+                "",
+            ]
+        )
+
+    def windows_installer(self) -> str:
+        task_paths = self._windows_task_paths()
+        task_map = ",\n".join(
+            "  " + f"'{_powershell_quote(name)}' = " + f"'{_powershell_quote(str(path))}'"
+            for name, path in task_paths.items()
+        )
+        secret_path = _powershell_quote(str(self.settings.service_secrets_path))
+        runner_path = _powershell_quote(
+            str(self.settings.data_dir / "runtime" / "copilotd-service.ps1")
+        )
+        return "\n".join(
+            [
+                "param([Parameter(Mandatory=$true)]"
+                "[ValidateSet('Install','Status','Restart','Uninstall')]"
+                "[string]$Action)",
+                "$ErrorActionPreference = 'Stop'",
+                "$identity = [Security.Principal.WindowsIdentity]::GetCurrent()",
+                "if ($identity.IsSystem) { "
+                "throw 'copilotD must be installed by the signed-in user' }",
+                "$taskFiles = [ordered]@{",
+                task_map,
+                "}",
+                f"$secretPath = '{secret_path}'",
+                f"$runnerPath = '{runner_path}'",
+                "function Get-CopilotDStatus {",
+                "  $rows = @()",
+                "  foreach ($taskName in $taskFiles.Keys) {",
+                "    try {",
+                "      $task = Get-ScheduledTask -TaskName $taskName -ErrorAction Stop",
+                "      $xml = Export-ScheduledTask -TaskName $taskName -ErrorAction Stop",
+                "      $needle = if ($taskName -eq 'copilotD Bot') { ' run' } "
+                "elseif ($taskName -eq 'copilotD Runtime') { ' runtime' } else { $null }",
+                "      $pid = $null",
+                "      if ($null -ne $needle) {",
+                "        $hostProcess = Get-CimInstance Win32_Process | Where-Object { "
+                '$_.CommandLine -like "*$runnerPath*" -and $_.CommandLine -like "*$needle*" '
+                "} | Select-Object -First 1",
+                "        if ($null -ne $hostProcess) {",
+                "          $process = Get-CimInstance Win32_Process | Where-Object { "
+                "$_.ParentProcessId -eq $hostProcess.ProcessId } | Select-Object -First 1",
+                "          if ($null -ne $process) { $pid = [int]$process.ProcessId }",
+                "        }",
+                "      }",
+                "      $rows += [ordered]@{ "
+                "name=$taskName; state=[string]$task.State; pid=$pid; xml=$xml; "
+                "current_user_sid=$identity.User.Value }",
+                "    } catch {",
+                "      $rows += [ordered]@{ "
+                "name=$taskName; state='Missing'; pid=$null; xml=$null; "
+                "current_user_sid=$identity.User.Value }",
+                "    }",
+                "  }",
+                "  return ,$rows",
+                "}",
+                "if ($Action -eq 'Install') {",
+                "  if (-not (Test-Path -LiteralPath $secretPath -PathType Leaf)) { "
+                'throw "Missing service secret file: $secretPath" }',
+                "  $sid = $identity.User.Value",
+                "  & icacls.exe $secretPath '/inheritance:r' "
+                '"/grant:r" "*$($sid):(R,W)" | Out-Null',
+                "  if ($LASTEXITCODE -ne 0) { throw 'Could not restrict service secret ACL' }",
+                "  foreach ($taskName in $taskFiles.Keys) {",
+                "    Unregister-ScheduledTask -TaskName $taskName -Confirm:$false "
+                "-ErrorAction SilentlyContinue",
+                "  }",
+                "  foreach ($taskName in $taskFiles.Keys) {",
+                "    $xml = Get-Content -LiteralPath $taskFiles[$taskName] -Raw -Encoding UTF8",
+                "    Register-ScheduledTask -TaskName $taskName -Xml $xml "
+                "-Force -ErrorAction Stop | Out-Null",
+                "    Start-ScheduledTask -TaskName $taskName -ErrorAction Stop",
+                "  }",
+                "  $status = Get-CopilotDStatus",
+                "  if (($status | Where-Object { $_.state -eq 'Missing' }).Count -ne 0) { "
+                "throw 'One or more copilotD tasks were not registered' }",
+                "  $status | ConvertTo-Json -Depth 8 -Compress",
+                "} elseif ($Action -eq 'Status') {",
+                "  (Get-CopilotDStatus) | ConvertTo-Json -Depth 8 -Compress",
+                "} elseif ($Action -eq 'Restart') {",
+                "  Stop-ScheduledTask -TaskName 'copilotD Bot' -ErrorAction SilentlyContinue",
+                "  Start-ScheduledTask -TaskName 'copilotD Bot' -ErrorAction Stop",
+                "} elseif ($Action -eq 'Uninstall') {",
+                "  foreach ($taskName in $taskFiles.Keys) {",
+                "    Unregister-ScheduledTask -TaskName $taskName -Confirm:$false "
+                "-ErrorAction SilentlyContinue",
+                "  }",
+                "}",
+                "",
+            ]
+        )
+
+    def validate_windows_powershell(self) -> dict[str, tuple[str, ...]]:
+        return {
+            "runner": _powershell_contract_errors(
+                self.windows_runner(),
+                required=(
+                    "ConvertFrom-Json",
+                    "COPILOTD_DISCORD_TOKEN",
+                    "Set-Location -LiteralPath",
+                    "boot.log",
+                    "watchdog.log",
+                ),
+            ),
+            "installer": _powershell_contract_errors(
+                self.windows_installer(),
+                required=(
+                    "Unregister-ScheduledTask",
+                    "Register-ScheduledTask",
+                    "Export-ScheduledTask",
+                    "Start-ScheduledTask",
+                    "Stop-ScheduledTask",
+                    "Get-CimInstance Win32_Process",
+                    "icacls.exe",
+                ),
             ),
         }
 
-    def windows_runner(self) -> str:
-        lines = [
-            "$ErrorActionPreference = 'Stop'",
-            *[
-                f"$env:{key} = '{_powershell_quote(value)}'"
-                for key, value in sorted(self._service_environment().items())
-            ],
-            "$action = $args[0]",
-            "if ($action -eq 'run') {",
-            f"  & '{_powershell_quote(str(self.entrypoint))}' run --foreground",
-            "} elseif ($action -eq 'watchdog') {",
-            f"  & '{_powershell_quote(str(self.entrypoint))}' service watchdog",
-            "} else { throw \"Unknown copilotD service action: $action\" }",
-            "exit $LASTEXITCODE",
-            "",
-        ]
-        return "\n".join(lines)
-
-    def install(self) -> None:
+    def install(self) -> InstallReceipt:
+        if self.platform not in {"darwin", "win32"}:
+            raise ServiceError(f"service installation is unsupported on {self.platform}")
+        if self.settings.discord_token is None:
+            raise ServiceError("COPILOTD_DISCORD_TOKEN is required for service install")
+        if self.topology == "sidecar":
+            missing = []
+            if not self._runtime_argv_configured:
+                missing.append("runtime argv")
+            if self.settings.runtime_uri is None:
+                missing.append("COPILOTD_RUNTIME_URI")
+            if self.settings.runtime_connection_token is None:
+                missing.append("COPILOTD_RUNTIME_CONNECTION_TOKEN")
+            if missing:
+                raise ServiceError(
+                    "sidecar topology is missing: " + ", ".join(missing)
+                )
         self.settings.ensure_directories()
+        self._assert_runtime_argv_has_no_secrets()
+        self.settings.write_service_secrets()
+        previous = _read_heartbeat_optional(self.settings.heartbeat_path)
+        installed_at = self._now()
         if self.platform == "darwin":
-            self._install_macos()
-        elif self.platform == "win32":
-            self._install_windows()
+            hashes = self._install_macos()
         else:
-            raise RuntimeError(f"service installation is unsupported on {self.platform}")
+            hashes = self._install_windows()
+        self._persist_service_state(installed_at, hashes)
+        return InstallReceipt(
+            installed_at=installed_at,
+            topology=self.topology,
+            previous_pid=None if previous is None else previous.pid,
+            previous_generation=(None if previous is None else previous.process_generation),
+            expected_units=self.expected_unit_names,
+            definition_hashes=hashes,
+        )
+
+    def verify_post_install(
+        self,
+        receipt: InstallReceipt,
+        *,
+        timeout_seconds: float | None = None,
+    ) -> ServiceStatus:
+        timeout = (
+            self.settings.setup_verify_timeout_seconds
+            if timeout_seconds is None
+            else timeout_seconds
+        )
+        deadline = time.monotonic() + timeout
+        last_status: ServiceStatus | None = None
+        while True:
+            status = self.status()
+            last_status = status
+            fresh_process = (
+                status.pid is not None
+                and status.process_generation is not None
+                and (
+                    receipt.previous_pid is None
+                    or status.pid != receipt.previous_pid
+                    or status.process_generation != receipt.previous_generation
+                )
+            )
+            written_after_install = False
+            if status.heartbeat_written_at is not None:
+                written_after_install = (
+                    _parse_rfc3339(status.heartbeat_written_at) >= receipt.installed_at - 1
+                )
+            if status.ready and fresh_process and written_after_install:
+                return status
+            if time.monotonic() >= deadline:
+                detail = status_dict(last_status) if last_status is not None else {}
+                raise ServiceVerificationError(
+                    "service installed but no fresh ready heartbeat matched the effective "
+                    f"PID/generation within {timeout:g} seconds: "
+                    f"{json.dumps(detail, sort_keys=True, default=str)}"
+                )
+            self._sleep(0.25)
 
     def uninstall(self) -> None:
         if self.platform == "darwin":
-            domain = f"gui/{os.getuid()}"
-            for label in (_MAC_BOT_LABEL, _MAC_WATCHDOG_LABEL):
-                _run_optional(["launchctl", "bootout", f"{domain}/{label}"])
+            domain = self._mac_domain
+            for label in self._mac_labels:
+                self._runner.run(
+                    ["launchctl", "bootout", f"{domain}/{label}"],
+                    check=False,
+                )
                 (self.launch_agents_dir / f"{label}.plist").unlink(missing_ok=True)
         elif self.platform == "win32":
-            for task in (_WINDOWS_BOT_TASK, _WINDOWS_WATCHDOG_TASK):
-                _run_optional(["schtasks.exe", "/Delete", "/TN", task, "/F"])
+            installer = self.settings.data_dir / "runtime" / "install-service.ps1"
+            if installer.exists():
+                self._runner.run(
+                    [
+                        "powershell.exe",
+                        "-NoProfile",
+                        "-NonInteractive",
+                        "-ExecutionPolicy",
+                        "Bypass",
+                        "-File",
+                        str(installer),
+                        "-Action",
+                        "Uninstall",
+                    ],
+                    check=True,
+                )
+            else:
+                for task in self._windows_task_names:
+                    self._runner.run(
+                        ["schtasks.exe", "/Delete", "/TN", task, "/F"],
+                        check=False,
+                    )
         else:
-            raise RuntimeError(f"service uninstallation is unsupported on {self.platform}")
+            raise ServiceError(f"service uninstallation is unsupported on {self.platform}")
+        self._mark_uninstalled()
 
     def status(self) -> ServiceStatus:
-        heartbeat_age = None
-        gateway = None
-        runtime = None
-        protected = None
-        try:
-            snapshot = read_heartbeat(self.settings.heartbeat_path)
-        except (OSError, ValueError, TypeError, json.JSONDecodeError):
-            pass
-        else:
-            heartbeat_age = heartbeat_age_seconds(snapshot)
-            gateway = snapshot.gateway_state
-            runtime = snapshot.runtime_state
-            protected = snapshot.protected_work
-
+        heartbeat, heartbeat_error = self._heartbeat_status()
+        age = None if heartbeat is None else heartbeat_age_seconds(heartbeat, now=self._now())
+        heartbeat_fresh = age is not None and age <= self.settings.heartbeat_stale_seconds
         if self.platform == "darwin":
-            domain = f"gui/{os.getuid()}"
-            bot_loaded = _command_succeeds(
-                ["launchctl", "print", f"{domain}/{_MAC_BOT_LABEL}"]
-            )
-            watchdog_loaded = _command_succeeds(
-                ["launchctl", "print", f"{domain}/{_MAC_WATCHDOG_LABEL}"]
-            )
-            installed = all(
-                (self.launch_agents_dir / f"{label}.plist").exists()
-                for label in (_MAC_BOT_LABEL, _MAC_WATCHDOG_LABEL)
-            )
+            units = self._macos_unit_statuses()
         elif self.platform == "win32":
-            bot_loaded = _command_succeeds(
-                ["schtasks.exe", "/Query", "/TN", _WINDOWS_BOT_TASK]
-            )
-            watchdog_loaded = _command_succeeds(
-                ["schtasks.exe", "/Query", "/TN", _WINDOWS_WATCHDOG_TASK]
-            )
-            installed = bot_loaded and watchdog_loaded
+            units = self._windows_unit_statuses()
         else:
-            installed = bot_loaded = watchdog_loaded = False
+            units = ()
 
+        unit_by_name = {unit.name: unit for unit in units}
+        bot = unit_by_name.get("bot")
+        watchdog = unit_by_name.get("watchdog")
+        runtime = unit_by_name.get("runtime")
+        leases, queues, exposure = self._durable_metrics()
+        if heartbeat is not None:
+            queues = QueueMetrics(
+                ingress_queue_depth=heartbeat.ingress_queue_depth,
+                max_reducer_lag_ms=heartbeat.max_reducer_lag_ms,
+                local_pending=queues.local_pending,
+                render_pending=queues.render_pending,
+                last_callback_at=heartbeat.last_callback_at,
+                last_reducer_progress_at=heartbeat.last_reducer_progress_at,
+            )
+
+        definition_drift = tuple(
+            unit.name for unit in units if unit.installed_definition and not unit.definition_matches
+        )
+        expected_units = [unit_by_name.get(name) for name in self.expected_unit_names]
+        installed = bool(expected_units) and all(
+            unit is not None and unit.installed_definition and unit.effective_state != "missing"
+            for unit in expected_units
+        )
+        process_identity_matches: bool | None
+        if heartbeat is None or bot is None or bot.pid is None:
+            process_identity_matches = None
+        else:
+            process_identity_matches = heartbeat.pid == bot.pid
+        units_effective = all(
+            unit is not None
+            and (
+                unit.effective_state == "running"
+                if unit.name in {"bot", "runtime"}
+                else unit.effective_state in {"running", "loaded", "stopped"}
+            )
+            for unit in expected_units
+        )
+        ready = (
+            installed
+            and units_effective
+            and not definition_drift
+            and heartbeat_fresh
+            and heartbeat is not None
+            and heartbeat.gateway_state == "ready"
+            and heartbeat.runtime_state == "ready"
+            and process_identity_matches is True
+        )
+        effective_state = "ready" if ready else "not-installed" if not installed else "degraded"
+        durable_protected = bool(
+            leases.total
+            or exposure.remote_steerable_or_unknown_sessions
+            or exposure.active_or_unknown_native_schedules
+        )
         return ServiceStatus(
+            schema_version=SERVICE_STATUS_SCHEMA_VERSION,
             platform=self.platform,
             topology=self.topology,
             installed=installed,
-            bot_loaded=bot_loaded,
-            watchdog_loaded=watchdog_loaded,
-            heartbeat_age_seconds=heartbeat_age,
-            gateway_state=gateway,
-            runtime_state=runtime,
-            protected_work=protected,
+            effective_state=effective_state,
+            ready=ready,
+            bot_loaded=bot is not None and bot.loaded,
+            watchdog_loaded=watchdog is not None and watchdog.loaded,
+            runtime_loaded=(
+                self.topology == "bundled-runtime" or (runtime is not None and runtime.loaded)
+            ),
+            pid=None if heartbeat is None else heartbeat.pid,
+            process_generation=(None if heartbeat is None else heartbeat.process_generation),
+            process_identity_matches=process_identity_matches,
+            heartbeat_age_seconds=age,
+            heartbeat_written_at=(None if heartbeat is None else heartbeat.written_at),
+            heartbeat_fresh=heartbeat_fresh,
+            heartbeat_frozen=(False if heartbeat is None else heartbeat.heartbeat_frozen),
+            heartbeat_error=heartbeat_error,
+            gateway_state=None if heartbeat is None else heartbeat.gateway_state,
+            runtime_state=None if heartbeat is None else heartbeat.runtime_state,
+            protected_work=(
+                (heartbeat.protected_work or durable_protected)
+                if heartbeat is not None
+                else durable_protected
+            ),
+            active_leases=leases,
+            queue=queues,
+            exposure=exposure,
+            units=units,
+            definition_drift=definition_drift,
+            last_resume_at=None if heartbeat is None else heartbeat.last_resume_at,
+            wake_suppression_until=(
+                None if heartbeat is None else heartbeat.wake_suppression_until
+            ),
         )
 
-    def restart(self, *, force: bool = False) -> None:
-        snapshot = None
-        try:
-            snapshot = read_heartbeat(self.settings.heartbeat_path)
-        except (OSError, ValueError, TypeError, json.JSONDecodeError):
-            pass
-        if snapshot is not None and snapshot.protected_work and not force:
-            raise RuntimeError("protected work is active; use --force to restart")
+    def restart(self, *, force: bool = False) -> RestartReceipt:
+        requested_at = self._now()
+        status = self.status()
+        if status.heartbeat_error is not None or status.pid is None:
+            raise RestartBlocked([f"heartbeat_unavailable:{status.heartbeat_error or 'missing'}"])
+        if not status.heartbeat_fresh:
+            raise RestartBlocked(["heartbeat_stale"])
+        if status.process_generation is None:
+            raise RestartBlocked(["process_generation_missing"])
+        if status.process_identity_matches is not True:
+            raise RestartBlocked(["os_pid_heartbeat_mismatch"])
+        snapshot = self._coordinator.snapshot(now=requested_at)
+        if requested_at - snapshot.captured_at > 2:
+            raise RestartBlocked(["durable_snapshot_stale"])
+        if snapshot.blockers and not force:
+            raise RestartBlocked(snapshot.blockers)
+        force_outcome = None
+        if force:
+            force_outcome = self._prepare_force_bounded(
+                snapshot,
+                timeout_seconds=self.settings.restart_drain_timeout_seconds,
+            )
         self._restart_bot()
+        return RestartReceipt(
+            requested_at=requested_at,
+            force=force,
+            previous_pid=status.pid,
+            previous_generation=status.process_generation,
+            safety_snapshot=snapshot,
+            force_outcome=force_outcome,
+        )
+
+    def run_runtime(self) -> None:
+        if self.topology != "sidecar":
+            raise ServiceError("independent runtime is unavailable in bundled topology")
+        if self.settings.runtime_connection_token is None:
+            raise ServiceError("COPILOTD_RUNTIME_CONNECTION_TOKEN is required for sidecar topology")
+        environment = {
+            **os.environ,
+            "COPILOT_CONNECTION_TOKEN": (self.settings.runtime_connection_token.get_secret_value()),
+        }
+        try:
+            os.execvpe(
+                self.runtime_argv[0],
+                list(self.runtime_argv),
+                environment,
+            )
+        except OSError as error:
+            raise ServiceError(
+                f"could not start sidecar runtime {self.runtime_argv[0]}: {error}"
+            ) from error
+
+    def _prepare_force_bounded(
+        self,
+        snapshot: RestartSafetySnapshot,
+        *,
+        timeout_seconds: float,
+    ) -> ForceRestartOutcome:
+        deadline = time.time() + timeout_seconds
+        outcomes: queue.Queue[ForceRestartOutcome | BaseException] = queue.Queue(maxsize=1)
+
+        def prepare() -> None:
+            try:
+                outcomes.put(
+                    self._coordinator.prepare_force(
+                        snapshot,
+                        deadline=deadline,
+                    )
+                )
+            except BaseException as error:
+                outcomes.put(error)
+
+        worker = threading.Thread(
+            target=prepare,
+            name="copilotd-force-restart-coordinator",
+            daemon=True,
+        )
+        worker.start()
+        try:
+            result = outcomes.get(timeout=timeout_seconds)
+        except queue.Empty:
+            fallback = SqliteRestartCoordinator(self.settings.database_path).prepare_force(
+                snapshot, deadline=time.time()
+            )
+            return replace(
+                fallback,
+                bounded=False,
+                detail=("restart coordinator timed out; durable fallback marked outcomes unknown"),
+            )
+        if isinstance(result, BaseException):
+            fallback = SqliteRestartCoordinator(self.settings.database_path).prepare_force(
+                snapshot, deadline=time.time()
+            )
+            return replace(
+                fallback,
+                bounded=False,
+                detail=(
+                    "restart coordinator failed; durable fallback marked outcomes unknown: "
+                    f"{type(result).__name__}: {result}"
+                ),
+            )
+        if time.time() > deadline or not result.bounded:
+            return replace(
+                result,
+                bounded=False,
+                detail=f"{result.detail}; drain deadline exceeded",
+            )
+        return result
+
+    def verify_restart(
+        self,
+        receipt: RestartReceipt,
+        *,
+        timeout_seconds: float | None = None,
+    ) -> ServiceStatus:
+        install_receipt = InstallReceipt(
+            installed_at=receipt.requested_at,
+            topology=self.topology,
+            previous_pid=receipt.previous_pid,
+            previous_generation=receipt.previous_generation,
+            expected_units=self.expected_unit_names,
+            definition_hashes={},
+        )
+        return self.verify_post_install(
+            install_receipt,
+            timeout_seconds=timeout_seconds,
+        )
 
     def watchdog(self, *, now: float | None = None) -> str:
-        current = time.time() if now is None else now
+        current = self._now() if now is None else now
+        try:
+            last_resume = self._resume_provider()
+        except (OSError, RuntimeError, ValueError):
+            last_resume = None
+        if (
+            last_resume is not None
+            and 0 <= current - last_resume <= self.settings.resume_suppression_seconds
+        ):
+            return "recent-wake"
+
         try:
             snapshot = read_heartbeat(self.settings.heartbeat_path)
             age = heartbeat_age_seconds(snapshot, now=current)
-        except (OSError, ValueError, TypeError, json.JSONDecodeError):
-            snapshot = None
-            age = float("inf")
-
-        if age <= 120:
-            return "healthy"
-        if snapshot is not None and snapshot.protected_work:
+        except (OSError, TypeError, ValueError, json.JSONDecodeError) as error:
             self._write_alert(
-                "heartbeat stale with protected work; bundled runtime cannot be replayed safely"
+                "watchdog_heartbeat_invalid",
+                "watchdog failed closed because heartbeat is missing or malformed",
+                error=str(error),
             )
-            return "protected-no-restart"
-        if self._restart_storm(current):
-            self._write_alert("watchdog restart suppressed after 3 attempts in 5 minutes")
+            return "heartbeat-invalid"
+
+        gateway_down_for = _gateway_down_seconds(snapshot, current)
+        gateway_restart = (
+            snapshot.gateway_state == "down"
+            and gateway_down_for is not None
+            and gateway_down_for >= self.settings.gateway_down_restart_seconds
+        )
+        if self.topology == "sidecar" and snapshot.runtime_state == "down":
+            durable = self._coordinator.snapshot(now=current)
+            outcome = self._prepare_force_bounded(
+                durable,
+                timeout_seconds=self.settings.restart_drain_timeout_seconds,
+            )
+            self._write_alert(
+                "watchdog_runtime_loss",
+                "runtime sidecar loss marked in-flight outcomes unknown",
+                force_outcome=asdict(outcome),
+            )
+            return "runtime-loss-marked-unknown"
+        if age <= self.settings.heartbeat_stale_seconds and not gateway_restart:
+            return "healthy"
+        try:
+            durable = self._coordinator.snapshot(now=current)
+        except ServiceError as error:
+            self._write_alert(
+                "watchdog_durable_state_invalid",
+                "watchdog failed closed because durable restart state is unavailable",
+                error=str(error),
+            )
+            return "durable-state-invalid"
+        if snapshot.protected_work or durable.blockers:
+            if snapshot.durable_replay_capable and self.topology == "sidecar":
+                if self._coordinator.prepare_replay_restart(
+                    durable,
+                    deadline=time.time() + FORCE_RESTART_DRAIN_SECONDS,
+                ):
+                    return self._watchdog_restart(current)
+            event = (
+                "watchdog_gateway_down_protected" if gateway_restart else "watchdog_stale_protected"
+            )
+            self._write_alert(
+                event,
+                "protected work prevents an unsafe automatic restart",
+                heartbeat_age_seconds=age,
+                gateway_down_seconds=gateway_down_for,
+                durable_blockers=list(durable.blockers),
+            )
+            return "protected-gateway-down" if gateway_restart else "protected-no-restart"
+        return self._watchdog_restart(current)
+
+    def _watchdog_restart(self, now: float) -> str:
+        try:
+            decision = self._storm_store.check_and_record(now)
+        except ServiceError as error:
+            decision = StormDecision(True, RESTART_STORM_LIMIT, str(error))
+        if decision.suppress:
+            self._write_alert(
+                "watchdog_restart_storm",
+                "watchdog restart suppressed after repeated attempts",
+                restart_count=decision.count,
+                reason=decision.reason,
+            )
+            self._notifier.notify(
+                "copilotD restart storm",
+                "Automatic restarts were suppressed; inspect alerts.log.",
+            )
             return "restart-storm"
-        self._record_restart(current)
         self._restart_bot()
         return "restarted"
 
-    def _install_macos(self) -> None:
-        self.launch_agents_dir.mkdir(parents=True, exist_ok=True)
+    def _install_macos(self) -> dict[str, str]:
+        self.launch_agents_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
         definitions = self.macos_plists()
+        hashes: dict[str, str] = {}
         for filename, content in definitions.items():
-            _atomic_write_bytes(self.launch_agents_dir / filename, content)
-        domain = f"gui/{os.getuid()}"
-        for label in (_MAC_BOT_LABEL, _MAC_WATCHDOG_LABEL):
-            _run_optional(["launchctl", "bootout", f"{domain}/{label}"])
-        for label in (_MAC_BOT_LABEL, _MAC_WATCHDOG_LABEL):
-            path = self.launch_agents_dir / f"{label}.plist"
-            _run_required(["launchctl", "bootstrap", domain, str(path)])
-            _run_required(["launchctl", "enable", f"{domain}/{label}"])
-            _run_required(["launchctl", "kickstart", f"{domain}/{label}"])
-
-    def _install_windows(self) -> None:
-        runner = self.settings.data_dir / "runtime" / "copilotd-service.ps1"
-        _atomic_write_text(runner, self.windows_runner())
-        task_directory = self.settings.data_dir / "runtime" / "tasks"
-        task_directory.mkdir(parents=True, exist_ok=True)
-        for task, xml in self.windows_task_xml().items():
-            path = task_directory / f"{task.replace(' ', '-')}.xml"
-            _atomic_write_text(path, xml)
-            _run_required(
-                ["schtasks.exe", "/Create", "/TN", task, "/XML", str(path), "/F"]
+            path = self.launch_agents_dir / filename
+            _atomic_write_bytes(path, content, private=False)
+            self._runner.run(["plutil", "-lint", str(path)], check=True)
+            hashes[filename] = _sha256_bytes(content)
+        watchdog_path = self.launch_agents_dir / f"{_MAC_WATCHDOG_LABEL}.plist"
+        interval = self._runner.run(
+            [
+                "plutil",
+                "-extract",
+                "StartInterval",
+                "raw",
+                "-o",
+                "-",
+                str(watchdog_path),
+            ],
+            check=True,
+        ).stdout.strip()
+        if interval != str(WATCHDOG_INTERVAL_SECONDS):
+            raise ServiceVerificationError(
+                f"watchdog plist interval is {interval}, expected {WATCHDOG_INTERVAL_SECONDS}"
             )
-            _run_required(["schtasks.exe", "/Run", "/TN", task])
+        domain = self._mac_domain
+        for label in self._mac_labels:
+            self._runner.run(
+                ["launchctl", "bootout", f"{domain}/{label}"],
+                check=False,
+            )
+        for label in self._mac_labels:
+            path = self.launch_agents_dir / f"{label}.plist"
+            self._runner.run(
+                ["launchctl", "bootstrap", domain, str(path)],
+                check=True,
+            )
+            self._runner.run(
+                ["launchctl", "enable", f"{domain}/{label}"],
+                check=True,
+            )
+            self._runner.run(
+                ["launchctl", "kickstart", f"{domain}/{label}"],
+                check=True,
+            )
+        self._verify_macos_effective()
+        return hashes
+
+    def _install_windows(self) -> dict[str, str]:
+        runtime_dir = self.settings.data_dir / "runtime"
+        runner_path = runtime_dir / "copilotd-service.ps1"
+        installer_path = runtime_dir / "install-service.ps1"
+        runner_script = self.windows_runner()
+        installer_script = self.windows_installer()
+        validation = self.validate_windows_powershell()
+        failures = [f"{name}: {', '.join(errors)}" for name, errors in validation.items() if errors]
+        if failures:
+            raise ServiceVerificationError(
+                "generated PowerShell failed static validation: " + "; ".join(failures)
+            )
+        _atomic_write_bytes(
+            runner_path,
+            runner_script.encode("utf-8-sig"),
+            private=True,
+        )
+        _atomic_write_bytes(
+            installer_path,
+            installer_script.encode("utf-8-sig"),
+            private=True,
+        )
+        hashes: dict[str, str] = {}
+        for task, xml in self.windows_task_xml().items():
+            path = self._windows_task_paths()[task]
+            _atomic_write_text(path, xml, private=True)
+            hashes[path.name] = _sha256_text(xml)
+        self._runner.run(
+            [
+                "powershell.exe",
+                "-NoProfile",
+                "-NonInteractive",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-File",
+                str(installer_path),
+                "-Action",
+                "Install",
+            ],
+            check=True,
+        )
+        units = self._windows_unit_statuses()
+        bad = [unit.name for unit in units if not unit.loaded or not unit.definition_matches]
+        if bad:
+            raise ServiceVerificationError(
+                "Windows effective task verification failed: " + ", ".join(bad)
+            )
+        return hashes
+
+    def _verify_macos_effective(self) -> None:
+        deadline = time.monotonic() + 10
+        while True:
+            units = self._macos_unit_statuses()
+            bad = [
+                unit.name
+                for unit in units
+                if not unit.loaded
+                or not unit.definition_matches
+                or (
+                    unit.name in {"bot", "runtime"}
+                    and (unit.effective_state != "running" or unit.pid is None)
+                )
+            ]
+            if not bad:
+                return
+            if time.monotonic() >= deadline:
+                raise ServiceVerificationError(
+                    "macOS effective LaunchAgent verification failed: " + ", ".join(bad)
+                )
+            self._sleep(0.1)
+
+    def _macos_unit_statuses(self) -> tuple[ServiceUnitStatus, ...]:
+        definitions = self.macos_plists()
+        statuses: list[ServiceUnitStatus] = []
+        label_to_name = {
+            _MAC_RUNTIME_LABEL: "runtime",
+            _MAC_BOT_LABEL: "bot",
+            _MAC_WATCHDOG_LABEL: "watchdog",
+        }
+        for label in self._mac_labels:
+            name = label_to_name[label]
+            filename = f"{label}.plist"
+            expected = definitions[filename]
+            path = self.launch_agents_dir / filename
+            disk_matches = path.is_file() and path.read_bytes() == expected
+            result = self._runner.run(
+                ["launchctl", "print", f"{self._mac_domain}/{label}"],
+                check=False,
+            )
+            if result.returncode != 0:
+                state: EffectiveState = "missing"
+                pid = None
+                effective_matches = False
+                effective_hash = None
+                detail = result.stderr.strip() or result.stdout.strip() or None
+            else:
+                state = _parse_launchctl_state(result.stdout)
+                pid = _parse_launchctl_pid(result.stdout)
+                expected_plist = plistlib.loads(expected)
+                effective_matches = _launchctl_definition_matches(
+                    result.stdout,
+                    expected_plist,
+                )
+                effective_hash = _sha256_text(_normalize_manager_output(result.stdout))
+                detail = None
+            statuses.append(
+                ServiceUnitStatus(
+                    name=name,
+                    manager_id=label,
+                    definition_path=str(path),
+                    installed_definition=path.is_file(),
+                    effective_state=state,
+                    pid=pid,
+                    definition_matches=disk_matches and effective_matches,
+                    expected_definition_hash=_sha256_bytes(expected),
+                    effective_definition_hash=effective_hash,
+                    detail=detail,
+                )
+            )
+        return tuple(statuses)
+
+    def _windows_unit_statuses(self) -> tuple[ServiceUnitStatus, ...]:
+        expected_xml = self.windows_task_xml()
+        task_paths = self._windows_task_paths()
+        installer = self.settings.data_dir / "runtime" / "install-service.ps1"
+        effective: dict[str, dict[str, Any]] = {}
+        error: str | None = None
+        if installer.exists():
+            result = self._runner.run(
+                [
+                    "powershell.exe",
+                    "-NoProfile",
+                    "-NonInteractive",
+                    "-ExecutionPolicy",
+                    "Bypass",
+                    "-File",
+                    str(installer),
+                    "-Action",
+                    "Status",
+                ],
+                check=False,
+            )
+            if result.returncode == 0:
+                try:
+                    payload = json.loads(result.stdout or "[]")
+                    rows = payload if isinstance(payload, list) else [payload]
+                    effective = {str(row["name"]): row for row in rows}
+                except (KeyError, TypeError, ValueError, json.JSONDecodeError) as parse_error:
+                    error = f"could not parse Task Scheduler status: {parse_error}"
+            else:
+                error = result.stderr.strip() or result.stdout.strip() or "status failed"
+        else:
+            error = f"installer script missing: {installer}"
+
+        name_map = {
+            _WINDOWS_RUNTIME_TASK: "runtime",
+            _WINDOWS_BOT_TASK: "bot",
+            _WINDOWS_WATCHDOG_TASK: "watchdog",
+        }
+        statuses: list[ServiceUnitStatus] = []
+        for task in self._windows_task_names:
+            name = name_map[task]
+            path = task_paths[task]
+            expected = expected_xml[task]
+            disk_matches = False
+            if path.is_file():
+                try:
+                    disk_matches = _windows_xml_contract(path.read_text(encoding="utf-8")) == (
+                        _windows_xml_contract(expected)
+                    )
+                except (OSError, ET.ParseError, ValueError):
+                    disk_matches = False
+            row = effective.get(task)
+            exported = None if row is None else row.get("xml")
+            if row is None or str(row.get("state", "")).lower() == "missing":
+                state: EffectiveState = "missing"
+                pid = None
+                effective_matches = False
+                effective_hash = None
+            else:
+                state = _normalize_windows_task_state(str(row.get("state", "")))
+                pid_value = row.get("pid")
+                pid = None if pid_value is None else int(pid_value)
+                try:
+                    effective_matches = isinstance(
+                        exported,
+                        str,
+                    ) and _windows_contract_matches(
+                        expected,
+                        exported,
+                        current_user_sid=(
+                            None
+                            if row.get("current_user_sid") is None
+                            else str(row["current_user_sid"])
+                        ),
+                    )
+                except (ET.ParseError, ValueError):
+                    effective_matches = False
+                effective_hash = (
+                    _sha256_text(_normalize_manager_output(exported))
+                    if isinstance(exported, str)
+                    else None
+                )
+            statuses.append(
+                ServiceUnitStatus(
+                    name=name,
+                    manager_id=task,
+                    definition_path=str(path),
+                    installed_definition=path.is_file(),
+                    effective_state=state,
+                    pid=pid,
+                    definition_matches=disk_matches and effective_matches,
+                    expected_definition_hash=_sha256_text(expected),
+                    effective_definition_hash=effective_hash,
+                    detail=error,
+                )
+            )
+        return tuple(statuses)
+
+    def _durable_metrics(
+        self,
+    ) -> tuple[LeaseMetrics, QueueMetrics, ExposureMetrics]:
+        if not self.settings.database_path.is_file():
+            return LeaseMetrics(), QueueMetrics(), ExposureMetrics()
+        try:
+            connection = sqlite3.connect(self.settings.database_path, timeout=2)
+            connection.row_factory = sqlite3.Row
+            rows = connection.execute(
+                """
+                SELECT l.kind, COUNT(*) AS count
+                FROM liveness_leases AS l
+                JOIN session_bindings AS b USING (sdk_session_id)
+                WHERE l.state = 'active'
+                  AND l.runtime_generation = b.runtime_generation
+                  AND l.owner_fence_token = b.owner_fence_token
+                GROUP BY l.kind
+                """
+            ).fetchall()
+            counts = {str(row["kind"]): int(row["count"]) for row in rows}
+            leases = LeaseMetrics(
+                active_submissions=counts.get("submission", 0),
+                observed_background_tasks=counts.get("observed_background", 0),
+                pending_interactions=counts.get("interaction", 0),
+                total=sum(counts.values()),
+            )
+            local_pending = int(
+                connection.execute(
+                    """
+                    SELECT COUNT(*) FROM message_queue
+                    WHERE state NOT IN ('cancelled', 'submitted', 'failed')
+                    """
+                ).fetchone()[0]
+            )
+            render_pending = int(
+                connection.execute(
+                    """
+                    SELECT COUNT(*) FROM render_outbox
+                    WHERE state IN ('pending', 'retry')
+                    """
+                ).fetchone()[0]
+            )
+            remote = int(
+                connection.execute(
+                    """
+                    SELECT COUNT(*) FROM session_bindings
+                    WHERE attachment_state = 'attached'
+                      AND runtime_remote_mode IN ('on', 'unknown')
+                    """
+                ).fetchone()[0]
+            )
+            schedules = int(
+                connection.execute(
+                    """
+                    SELECT COUNT(*) FROM runtime_schedules
+                    WHERE state IN ('active', 'unknown')
+                    """
+                ).fetchone()[0]
+            )
+        except sqlite3.Error:
+            return LeaseMetrics(), QueueMetrics(), ExposureMetrics()
+        finally:
+            if "connection" in locals():
+                connection.close()
+        return (
+            leases,
+            QueueMetrics(local_pending=local_pending, render_pending=render_pending),
+            ExposureMetrics(
+                remote_steerable_or_unknown_sessions=remote,
+                active_or_unknown_native_schedules=schedules,
+            ),
+        )
 
     def _restart_bot(self) -> None:
         if self.platform == "darwin":
-            _run_required(
+            self._runner.run(
                 [
                     "launchctl",
                     "kickstart",
                     "-k",
-                    f"gui/{os.getuid()}/{_MAC_BOT_LABEL}",
-                ]
+                    f"{self._mac_domain}/{_MAC_BOT_LABEL}",
+                ],
+                check=True,
             )
         elif self.platform == "win32":
-            _run_required(["schtasks.exe", "/Run", "/TN", _WINDOWS_BOT_TASK])
+            installer = self.settings.data_dir / "runtime" / "install-service.ps1"
+            self._runner.run(
+                [
+                    "powershell.exe",
+                    "-NoProfile",
+                    "-NonInteractive",
+                    "-ExecutionPolicy",
+                    "Bypass",
+                    "-File",
+                    str(installer),
+                    "-Action",
+                    "Restart",
+                ],
+                check=True,
+            )
         else:
-            raise RuntimeError(f"service restart is unsupported on {self.platform}")
+            raise ServiceError(f"service restart is unsupported on {self.platform}")
 
     def _service_environment(self) -> dict[str, str]:
         environment = {
             "HOME": str(self.settings.resolved_home),
             "PATH": os.environ.get("PATH", ""),
+            "PYTHONUNBUFFERED": "1",
             "COPILOTD_DATA_DIR": str(self.settings.data_dir),
             "COPILOTD_CACHE_DIR": str(self.settings.cache_dir),
             "COPILOTD_LOG_DIR": str(self.settings.log_dir),
             "COPILOTD_RESOLVED_HOME": str(self.settings.resolved_home),
             "COPILOTD_LOG_LEVEL": self.settings.log_level,
             "COPILOTD_SDK_LOG_LEVEL": self.settings.sdk_log_level,
+            "COPILOTD_SERVICE_SECRETS": str(self.settings.service_secrets_path),
+            "COPILOTD_MENTION_REQUIRED": str(self.settings.mention_required).lower(),
         }
-        if self.settings.discord_token is not None:
-            environment["COPILOTD_DISCORD_TOKEN"] = (
-                self.settings.discord_token.get_secret_value()
-            )
         if self.settings.discord_guild_id is not None:
-            environment["COPILOTD_DISCORD_GUILD_ID"] = str(
-                self.settings.discord_guild_id
-            )
+            environment["COPILOTD_DISCORD_GUILD_ID"] = str(self.settings.discord_guild_id)
         if self.settings.runtime_uri is not None:
             environment["COPILOTD_RUNTIME_URI"] = self.settings.runtime_uri
-        if self.settings.runtime_connection_token is not None:
-            environment["COPILOTD_RUNTIME_CONNECTION_TOKEN"] = (
-                self.settings.runtime_connection_token.get_secret_value()
-            )
-        environment["COPILOTD_MENTION_REQUIRED"] = str(
-            self.settings.mention_required
-        ).lower()
         return environment
 
-    def _restart_storm(self, now: float) -> bool:
-        history = self._restart_history()
-        recent = [value for value in history if now - value <= 300]
-        return len(recent) >= 3
+    def _assert_runtime_argv_has_no_secrets(self) -> None:
+        serialized = "\0".join(self.runtime_argv)
+        secrets = (
+            self.settings.discord_token,
+            self.settings.runtime_connection_token,
+        )
+        if any(
+            secret is not None
+            and secret.get_secret_value()
+            and secret.get_secret_value() in serialized
+            for secret in secrets
+        ):
+            raise ServiceError("runtime argv must not contain Discord or runtime connection tokens")
 
-    def _record_restart(self, now: float) -> None:
-        history = [value for value in self._restart_history() if now - value <= 300]
-        history.append(now)
+    def _heartbeat_status(self) -> tuple[HeartbeatSnapshot | None, str | None]:
+        try:
+            return read_heartbeat(self.settings.heartbeat_path), None
+        except (OSError, TypeError, ValueError, json.JSONDecodeError) as error:
+            return None, f"{type(error).__name__}: {error}"
+
+    def _persist_service_state(
+        self,
+        installed_at: float,
+        definition_hashes: dict[str, str],
+    ) -> None:
         _atomic_write_text(
-            self.settings.cache_dir / "watchdog-state.json",
-            json.dumps({"restarts": history}, separators=(",", ":")) + "\n",
+            self.settings.service_state_path,
+            json.dumps(
+                {
+                    "schema_version": SERVICE_STATE_SCHEMA_VERSION,
+                    "installed": True,
+                    "installed_at": installed_at,
+                    "platform": self.platform,
+                    "topology": self.topology,
+                    "entrypoint": str(self.entrypoint),
+                    "working_directory": str(self.working_directory),
+                    "runtime_argv": list(self.runtime_argv),
+                    "definition_hashes": definition_hashes,
+                    "settings": {
+                        "discord_guild_id": self.settings.discord_guild_id,
+                        "mention_required": self.settings.mention_required,
+                        "log_level": self.settings.log_level,
+                        "sdk_log_level": self.settings.sdk_log_level,
+                        "runtime_uri": self.settings.runtime_uri,
+                    },
+                },
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            + "\n",
+            private=True,
         )
 
-    def _restart_history(self) -> list[float]:
-        try:
-            payload = json.loads(
-                (self.settings.cache_dir / "watchdog-state.json").read_text(
-                    encoding="utf-8"
-                )
+    def _mark_uninstalled(self) -> None:
+        state = _read_json_optional(self.settings.service_state_path) or {}
+        state.update(
+            {
+                "schema_version": SERVICE_STATE_SCHEMA_VERSION,
+                "installed": False,
+                "uninstalled_at": self._now(),
+                "topology": self.topology,
+                "entrypoint": str(self.entrypoint),
+                "working_directory": str(self.working_directory),
+                "runtime_argv": list(self.runtime_argv),
+            }
+        )
+        _atomic_write_text(
+            self.settings.service_state_path,
+            json.dumps(
+                state,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
             )
-            return [float(value) for value in payload.get("restarts", [])]
-        except (OSError, ValueError, TypeError, json.JSONDecodeError):
-            return []
+            + "\n",
+            private=True,
+        )
 
-    def _write_alert(self, message: str) -> None:
-        timestamp = datetime.now(UTC).isoformat().replace("+00:00", "Z")
-        self.settings.log_dir.mkdir(parents=True, exist_ok=True)
-        with (self.settings.log_dir / "alerts.log").open("a", encoding="utf-8") as stream:
-            stream.write(f"{timestamp} {message}\n")
+    def _write_alert(self, event: str, message: str, **detail: object) -> None:
+        self.settings.log_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+        payload = {
+            "timestamp": datetime.now(UTC).isoformat().replace("+00:00", "Z"),
+            "level": "warning",
+            "event": event,
+            "message": message,
+            "platform": self.platform,
+            **detail,
+        }
+        line = (
+            json.dumps(
+                payload,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            + "\n"
+        )
+        path = self.settings.log_paths["alerts"]
+        descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+        try:
+            os.write(descriptor, line.encode("utf-8"))
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+        if os.name == "posix":
+            path.chmod(0o600)
+
+    @property
+    def _mac_domain(self) -> str:
+        return f"gui/{self._uid}"
+
+    @property
+    def _mac_labels(self) -> tuple[str, ...]:
+        labels = [_MAC_BOT_LABEL, _MAC_WATCHDOG_LABEL]
+        if self.topology == "sidecar":
+            labels.insert(0, _MAC_RUNTIME_LABEL)
+        return tuple(labels)
+
+    @property
+    def _windows_task_names(self) -> tuple[str, ...]:
+        names = [_WINDOWS_BOT_TASK, _WINDOWS_WATCHDOG_TASK]
+        if self.topology == "sidecar":
+            names.insert(0, _WINDOWS_RUNTIME_TASK)
+        return tuple(names)
+
+    def _windows_task_paths(self) -> dict[str, Path]:
+        directory = self.settings.data_dir / "runtime" / "tasks"
+        return {
+            task: directory / f"{task.replace(' ', '-')}.xml" for task in self._windows_task_names
+        }
 
 
-def _windows_task_xml(*, command: str, arguments: str, watchdog: bool) -> str:
+def _windows_task_xml(
+    *,
+    command: str,
+    arguments: str,
+    working_directory: str,
+    user_id: str,
+    watchdog: bool,
+) -> str:
     ET.register_namespace("", _TASK_NAMESPACE)
     task = ET.Element(f"{{{_TASK_NAMESPACE}}}Task", {"version": "1.4"})
+    registration = ET.SubElement(task, f"{{{_TASK_NAMESPACE}}}RegistrationInfo")
+    ET.SubElement(registration, f"{{{_TASK_NAMESPACE}}}Author").text = "copilotD"
     triggers = ET.SubElement(task, f"{{{_TASK_NAMESPACE}}}Triggers")
     logon = ET.SubElement(triggers, f"{{{_TASK_NAMESPACE}}}LogonTrigger")
     ET.SubElement(logon, f"{{{_TASK_NAMESPACE}}}Enabled").text = "true"
+    ET.SubElement(logon, f"{{{_TASK_NAMESPACE}}}UserId").text = user_id
     if watchdog:
         repetition = ET.SubElement(logon, f"{{{_TASK_NAMESPACE}}}Repetition")
         ET.SubElement(repetition, f"{{{_TASK_NAMESPACE}}}Interval").text = "PT5M"
         ET.SubElement(repetition, f"{{{_TASK_NAMESPACE}}}StopAtDurationEnd").text = "false"
+        registration_trigger = ET.SubElement(
+            triggers,
+            f"{{{_TASK_NAMESPACE}}}RegistrationTrigger",
+        )
+        ET.SubElement(
+            registration_trigger,
+            f"{{{_TASK_NAMESPACE}}}Enabled",
+        ).text = "true"
+        registration_repetition = ET.SubElement(
+            registration_trigger,
+            f"{{{_TASK_NAMESPACE}}}Repetition",
+        )
+        ET.SubElement(
+            registration_repetition,
+            f"{{{_TASK_NAMESPACE}}}Interval",
+        ).text = "PT5M"
+        ET.SubElement(
+            registration_repetition,
+            f"{{{_TASK_NAMESPACE}}}StopAtDurationEnd",
+        ).text = "false"
+
+    principals = ET.SubElement(task, f"{{{_TASK_NAMESPACE}}}Principals")
+    principal = ET.SubElement(
+        principals,
+        f"{{{_TASK_NAMESPACE}}}Principal",
+        {"id": "Author"},
+    )
+    ET.SubElement(principal, f"{{{_TASK_NAMESPACE}}}UserId").text = user_id
+    ET.SubElement(principal, f"{{{_TASK_NAMESPACE}}}LogonType").text = "InteractiveToken"
+    ET.SubElement(principal, f"{{{_TASK_NAMESPACE}}}RunLevel").text = "LeastPrivilege"
 
     settings = ET.SubElement(task, f"{{{_TASK_NAMESPACE}}}Settings")
     values = {
         "MultipleInstancesPolicy": "IgnoreNew",
         "DisallowStartIfOnBatteries": "false",
         "StopIfGoingOnBatteries": "false",
+        "AllowHardTerminate": "true",
         "StartWhenAvailable": "true" if watchdog else "false",
+        "RunOnlyIfNetworkAvailable": "false",
+        "WakeToRun": "false",
         "ExecutionTimeLimit": "PT0S",
         "Enabled": "true",
     }
@@ -370,37 +2131,312 @@ def _windows_task_xml(*, command: str, arguments: str, watchdog: bool) -> str:
     execute = ET.SubElement(actions, f"{{{_TASK_NAMESPACE}}}Exec")
     ET.SubElement(execute, f"{{{_TASK_NAMESPACE}}}Command").text = command
     ET.SubElement(execute, f"{{{_TASK_NAMESPACE}}}Arguments").text = arguments
+    ET.SubElement(
+        execute,
+        f"{{{_TASK_NAMESPACE}}}WorkingDirectory",
+    ).text = working_directory
     return ET.tostring(task, encoding="unicode", xml_declaration=True)
 
 
-def _run_required(command: list[str]) -> None:
-    subprocess.run(command, check=True, capture_output=True, text=True)
+def _windows_xml_contract(xml: str) -> dict[str, str | None]:
+    root = ET.fromstring(xml)
+    namespace = {"t": _TASK_NAMESPACE}
+
+    def text(path: str) -> str | None:
+        return root.findtext(path, namespaces=namespace)
+
+    return {
+        "task_version": root.attrib.get("version"),
+        "logon_enabled": text(".//t:LogonTrigger/t:Enabled"),
+        "logon_user": text(".//t:LogonTrigger/t:UserId"),
+        "repetition_interval": text(".//t:LogonTrigger/t:Repetition/t:Interval"),
+        "repetition_stop": text(        ".//t:LogonTrigger/t:Repetition/t:StopAtDurationEnd"
+        ),
+        "registration_interval": text(
+        ".//t:RegistrationTrigger/t:Repetition/t:Interval"),
+        "multiple_instances": text(".//t:Settings/t:MultipleInstancesPolicy"),
+        "disallow_battery": text(".//t:Settings/t:DisallowStartIfOnBatteries"),
+        "stop_on_battery": text(".//t:Settings/t:StopIfGoingOnBatteries"),
+        "allow_hard_terminate": text(".//t:Settings/t:AllowHardTerminate"),
+        "start_when_available": text(".//t:Settings/t:StartWhenAvailable"),
+        "network_required": text(".//t:Settings/t:RunOnlyIfNetworkAvailable"),
+        "wake_to_run": text(".//t:Settings/t:WakeToRun"),
+        "execution_limit": text(".//t:Settings/t:ExecutionTimeLimit"),
+        "enabled": text(".//t:Settings/t:Enabled"),
+        "restart_interval": text(".//t:Settings/t:RestartOnFailure/t:Interval"),
+        "restart_count": text(".//t:Settings/t:RestartOnFailure/t:Count"),
+        "principal_user": text(".//t:Principals/t:Principal/t:UserId"),
+        "principal_logon": text(".//t:Principals/t:Principal/t:LogonType"),
+        "principal_run_level": text(".//t:Principals/t:Principal/t:RunLevel"),
+        "command": text(".//t:Actions/t:Exec/t:Command"),
+        "arguments": text(".//t:Actions/t:Exec/t:Arguments"),
+        "working_directory": text(".//t:Actions/t:Exec/t:WorkingDirectory"),
+    }
 
 
-def _run_optional(command: list[str]) -> None:
-    subprocess.run(command, check=False, capture_output=True, text=True)
+def _windows_contract_matches(
+    expected_xml: str,
+    effective_xml: str,
+    *,
+    current_user_sid: str | None,
+) -> bool:
+    expected = _windows_xml_contract(expected_xml)
+    effective = _windows_xml_contract(effective_xml)
+    user_fields = {"logon_user", "principal_user"}
+    if any(expected[key] != effective[key] for key in expected.keys() - user_fields):
+        return False
+    effective_logon = effective["logon_user"]
+    effective_principal = effective["principal_user"]
+    if effective_logon != effective_principal or effective_logon is None:
+        return False
+    return effective_logon in {
+        expected["logon_user"],
+        expected["principal_user"],
+        current_user_sid,
+    }
 
 
-def _command_succeeds(command: list[str]) -> bool:
-    return subprocess.run(command, check=False, capture_output=True).returncode == 0
+def _restart_blockers(
+    *,
+    leases: LeaseMetrics,
+    local_pending: int,
+    pending_operations: int,
+    remote_sessions: int,
+    native_schedules: int,
+    native_trigger_windows: int,
+) -> list[str]:
+    blockers: list[str] = []
+    if leases.total:
+        blockers.append(f"active_liveness:{leases.total}")
+    if local_pending:
+        blockers.append(f"local_queue:{local_pending}")
+    if pending_operations:
+        blockers.append(f"pending_operations:{pending_operations}")
+    if remote_sessions:
+        blockers.append(f"remote_exposure:{remote_sessions}")
+    if native_schedules:
+        blockers.append(f"runtime_schedules:{native_schedules}")
+    if native_trigger_windows:
+        blockers.append(f"native_trigger_windows:{native_trigger_windows}")
+    return blockers
 
 
-def _atomic_write_text(path: Path, content: str) -> None:
-    _atomic_write_bytes(path, content.encode("utf-8"))
+def _resolve_topology(
+    settings: Settings,
+    explicit: Topology | None,
+    persisted: dict[str, Any] | None,
+) -> Topology:
+    if explicit is not None:
+        return explicit
+    if persisted and persisted.get("topology") in {"bundled-runtime", "sidecar"}:
+        return persisted["topology"]
+    capabilities = _read_json_optional(settings.capability_path)
+    if capabilities and capabilities.get("topology") == "sidecar":
+        return "sidecar"
+    return "bundled-runtime"
 
 
-def _atomic_write_bytes(path: Path, content: bytes) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+def _read_heartbeat_optional(path: Path) -> HeartbeatSnapshot | None:
     try:
-        temporary.write_bytes(content)
+        return read_heartbeat(path)
+    except (OSError, TypeError, ValueError, json.JSONDecodeError):
+        return None
+
+
+def _read_json_optional(path: Path) -> dict[str, Any] | None:
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, TypeError, ValueError, json.JSONDecodeError):
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+def _parse_launchctl_state(output: str) -> EffectiveState:
+    match = re.search(r"^\s*state\s*=\s*(\S+)", output, flags=re.MULTILINE)
+    if match is None:
+        return "loaded"
+    state = match.group(1).lower()
+    if state == "running":
+        return "running"
+    if state in {"waiting", "exited", "spawn scheduled"}:
+        return "stopped"
+    return "loaded"
+
+
+def _parse_launchctl_pid(output: str) -> int | None:
+    match = re.search(r"^\s*pid\s*=\s*(\d+)", output, flags=re.MULTILINE)
+    return None if match is None else int(match.group(1))
+
+
+def _launchctl_definition_matches(
+    output: str,
+    expected: dict[str, Any],
+) -> bool:
+    arguments = [str(value) for value in expected["ProgramArguments"]]
+    if not all(argument in output for argument in arguments):
+        return False
+    if "ProcessType" in expected or re.search(
+        r"process type\s*=\s*(?:Background|Interactive)",
+        output,
+        flags=re.IGNORECASE,
+    ):
+        return False
+    interval = expected.get("StartInterval")
+    if (
+        interval is not None
+        and re.search(
+            rf"run interval\s*=\s*{int(interval)}(?:\s+seconds)?",
+            output,
+        )
+        is None
+    ):
+        return False
+    return True
+
+
+def _normalize_windows_task_state(value: str) -> EffectiveState:
+    state = value.strip().lower()
+    if state == "running":
+        return "running"
+    if state in {"ready", "queued"}:
+        return "loaded"
+    if state in {"disabled"}:
+        return "stopped"
+    if state in {"missing", ""}:
+        return "missing"
+    return "unknown"
+
+
+def _gateway_down_seconds(
+    snapshot: HeartbeatSnapshot,
+    now: float,
+) -> float | None:
+    if snapshot.gateway_down_since is None:
+        return None
+    return max(0.0, now - _parse_rfc3339(snapshot.gateway_down_since))
+
+
+def _parse_rfc3339(value: str) -> float:
+    return datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp()
+
+
+def _normalize_manager_output(output: str) -> str:
+    return "\n".join(line.rstrip() for line in output.replace("\r\n", "\n").splitlines()).strip()
+
+
+def _atomic_write_text(path: Path, content: str, *, private: bool) -> None:
+    _atomic_write_bytes(path, content.encode("utf-8"), private=private)
+
+
+def _atomic_write_bytes(path: Path, content: bytes, *, private: bool) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700 if private else 0o755)
+    temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+    descriptor = os.open(
+        temporary,
+        os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+        0o600 if private else 0o644,
+    )
+    try:
+        with os.fdopen(descriptor, "wb") as stream:
+            stream.write(content)
+            stream.flush()
+            os.fsync(stream.fileno())
         os.replace(temporary, path)
+        if os.name == "posix":
+            path.chmod(0o600 if private else 0o644)
     finally:
         temporary.unlink(missing_ok=True)
 
 
+def _sha256_bytes(content: bytes) -> str:
+    return hashlib.sha256(content).hexdigest()
+
+
+def _sha256_text(content: str) -> str:
+    return _sha256_bytes(content.encode("utf-8"))
+
+
 def _powershell_quote(value: str) -> str:
     return value.replace("'", "''")
+
+
+def _powershell_contract_errors(
+    script: str,
+    *,
+    required: Sequence[str],
+) -> tuple[str, ...]:
+    errors: list[str] = []
+    if "\x00" in script:
+        errors.append("contains NUL")
+    for value in required:
+        if value not in script:
+            errors.append(f"missing {value}")
+    if not _powershell_delimiters_balanced(script):
+        errors.append("unbalanced delimiters")
+    try:
+        script.encode("utf-8")
+    except UnicodeEncodeError:
+        errors.append("is not UTF-8 encodable")
+    return tuple(errors)
+
+
+def _powershell_delimiters_balanced(script: str) -> bool:
+    pairs = {"(": ")", "{": "}", "[": "]"}
+    closing = set(pairs.values())
+    stack: list[str] = []
+    quote: str | None = None
+    index = 0
+    while index < len(script):
+        character = script[index]
+        if quote is not None:
+            if character == quote:
+                if quote == "'" and index + 1 < len(script) and script[index + 1] == "'":
+                    index += 2
+                    continue
+                quote = None
+            elif character == "`":
+                index += 2
+                continue
+            index += 1
+            continue
+        if character in {"'", '"'}:
+            quote = character
+        elif character in pairs:
+            stack.append(pairs[character])
+        elif character in closing:
+            if not stack or stack.pop() != character:
+                return False
+        index += 1
+    return quote is None and not stack
+
+
+def _applescript_string(value: str) -> str:
+    escaped = value.replace("\\", "\\\\").replace('"', '\\"')
+    return f'"{escaped}"'
+
+
+def _windows_toast_script(title: str, message: str) -> str:
+    safe_title = _powershell_quote(title)
+    safe_message = _powershell_quote(message)
+    return (
+        "[Windows.UI.Notifications.ToastNotificationManager, "
+        "Windows.UI.Notifications, ContentType = WindowsRuntime] > $null; "
+        "$xml = [Windows.UI.Notifications.ToastNotificationManager]::"
+        "GetTemplateContent([Windows.UI.Notifications.ToastTemplateType]::ToastText02); "
+        f"$xml.GetElementsByTagName('text')[0].AppendChild($xml.CreateTextNode('{safe_title}')) "
+        "> $null; "
+        f"$xml.GetElementsByTagName('text')[1].AppendChild($xml.CreateTextNode('{safe_message}')) "
+        "> $null; "
+        "$toast = [Windows.UI.Notifications.ToastNotification]::new($xml); "
+        "[Windows.UI.Notifications.ToastNotificationManager]::"
+        "CreateToastNotifier('copilotD').Show($toast)"
+    )
+
+
+def _current_windows_user() -> str:
+    domain = os.environ.get("USERDOMAIN")
+    user = os.environ.get("USERNAME") or getpass.getuser()
+    return f"{domain}\\{user}" if domain else user
 
 
 def status_dict(status: ServiceStatus) -> dict[str, Any]:

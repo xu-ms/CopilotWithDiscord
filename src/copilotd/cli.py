@@ -5,19 +5,48 @@ import asyncio
 import json
 import platform
 import sys
-from importlib.metadata import version
+from dataclasses import asdict
+from importlib.metadata import PackageNotFoundError, version
 from typing import Any
 
-from copilotd.config import Settings
+from pydantic import ValidationError
+
+from copilotd import __version__
+from copilotd.config import Settings, load_settings
 from copilotd.discord_app import run_discord_bot
 from copilotd.logging import configure_logging
-from copilotd.ops.service import ServiceManager, status_dict
+from copilotd.ops.contracts import (
+    EXPECTED_RUNTIME_VERSION,
+    EXPECTED_SDK_VERSION,
+    LATEST_MIGRATION_VERSION,
+    SERVICE_STATUS_SCHEMA_VERSION,
+)
+from copilotd.ops.preflight import PreflightFailed, SetupPreflight
+from copilotd.ops.service import (
+    RestartBlocked,
+    ServiceError,
+    ServiceManager,
+    status_dict,
+)
 from copilotd.sdk.probe import SdkProbe, _to_jsonable
 from copilotd.storage.database import Database
 
+CLI_SCHEMA_VERSION = 1
+
+
+class JsonArgumentParser(argparse.ArgumentParser):
+    def error(self, message: str) -> None:
+        _print_error(
+            code="usage_error",
+            message=message,
+            exit_code=2,
+        )
+        raise SystemExit(2)
+
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(prog="copilotd")
+    parser = JsonArgumentParser(prog="copilotd")
+    parser.add_argument("--version", action="version", version=f"copilotd {__version__}")
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     subparsers.add_parser("db-init", help="create or migrate the durable SQLite database")
@@ -38,6 +67,7 @@ def build_parser() -> argparse.ArgumentParser:
     service_commands.add_parser("uninstall", help="unregister services but retain state")
     service_commands.add_parser("watchdog", help="run one protected-work-aware health check")
     service_commands.add_parser("logs", help="show service log paths")
+    service_commands.add_parser("runtime", help=argparse.SUPPRESS)
 
     probe = subparsers.add_parser("sdk-probe", help="record the Copilot SDK capability matrix")
     probe.add_argument("--live", action="store_true", help="start the runtime and run a live turn")
@@ -60,15 +90,24 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-async def run_command(args: argparse.Namespace) -> int:
-    settings = Settings()
+async def run_command(
+    args: argparse.Namespace,
+    *,
+    settings: Settings | None = None,
+    preflight: SetupPreflight | None = None,
+    manager: ServiceManager | None = None,
+) -> int:
+    settings = load_settings() if settings is None else settings
     settings.ensure_directories()
-    configure_logging(settings.log_level)
+    configure_logging(settings.log_level, settings.log_dir)
 
     if args.command == "db-init":
         async with Database(settings.database_path):
             pass
-        _print_json({"database": str(settings.database_path), "migrated": True})
+        _print_success(
+            "db-init",
+            {"database": str(settings.database_path), "migrated": True},
+        )
         return 0
 
     if args.command == "doctor":
@@ -76,8 +115,9 @@ async def run_command(args: argparse.Namespace) -> int:
             migrations = await database.fetchall(
                 "SELECT version, name, applied_at FROM schema_migrations ORDER BY version"
             )
+        latest_migration = max((int(row["version"]) for row in migrations), default=0)
         result = {
-            "copilotd_version": version("copilotd"),
+            "copilotd_version": _installed_version("copilotd", __version__),
             "sdk_version": version("github-copilot-sdk"),
             "python": platform.python_version(),
             "data_dir": str(settings.data_dir),
@@ -85,65 +125,111 @@ async def run_command(args: argparse.Namespace) -> int:
             "database": str(settings.database_path),
             "migrations": [dict(row) for row in migrations],
             "sdk": SdkProbe(settings).static_matrix(),
+            "gates": {
+                "sdk_version": EXPECTED_SDK_VERSION,
+                "runtime_version": EXPECTED_RUNTIME_VERSION,
+                "service_status_schema": SERVICE_STATUS_SCHEMA_VERSION,
+                "latest_migration": LATEST_MIGRATION_VERSION,
+                "migration_gate_ok": latest_migration == LATEST_MIGRATION_VERSION,
+            },
         }
-        _print_json(result)
+        _print_success("doctor", result)
         return 0
 
     if args.command == "run":
         if not args.foreground:
             raise ValueError("use `copilotd run --foreground`; service mode is installed by setup")
+        if settings.discord_token is None:
+            raise ValueError("COPILOTD_DISCORD_TOKEN is required")
         await run_discord_bot(settings)
         return 0
 
     if args.command == "setup":
-        if settings.discord_token is None:
-            raise ValueError("COPILOTD_DISCORD_TOKEN is required for setup")
-        manager = ServiceManager(settings)
-        await asyncio.to_thread(manager.install)
-        deadline = asyncio.get_running_loop().time() + 45
-        while True:
-            status = await asyncio.to_thread(manager.status)
-            if (
-                status.bot_loaded
-                and status.watchdog_loaded
-                and status.heartbeat_age_seconds is not None
-                and status.heartbeat_age_seconds <= 45
-            ):
-                _print_json(status_dict(status))
-                return 0
-            if asyncio.get_running_loop().time() >= deadline:
-                raise RuntimeError(
-                    "service installed but did not produce a healthy heartbeat within 45 seconds"
-                )
-            await asyncio.sleep(1)
+        async with Database(settings.database_path):
+            pass
+        selected_preflight = preflight or SetupPreflight(settings)
+        report = await selected_preflight.run()
+        report.require_success()
+        selected_manager = manager or ServiceManager(settings)
+        receipt = await asyncio.to_thread(selected_manager.install)
+        status = await asyncio.to_thread(
+            selected_manager.verify_post_install,
+            receipt,
+        )
+        _print_success(
+            "setup",
+            {
+                "preflight": report.as_dict(),
+                "install": asdict(receipt),
+                "status": status_dict(status),
+            },
+        )
+        return 0
 
     if args.command == "service":
-        manager = ServiceManager(settings)
+        selected_manager = manager or ServiceManager(settings)
         if args.service_command == "install":
-            if settings.discord_token is None:
-                raise ValueError("COPILOTD_DISCORD_TOKEN is required for service install")
-            await asyncio.to_thread(manager.install)
-            _print_json(status_dict(await asyncio.to_thread(manager.status)))
-        elif args.service_command == "status":
-            _print_json(status_dict(await asyncio.to_thread(manager.status)))
-        elif args.service_command == "restart":
-            await asyncio.to_thread(manager.restart, force=args.force)
-            _print_json({"restarted": True, "force": args.force})
-        elif args.service_command == "uninstall":
-            await asyncio.to_thread(manager.uninstall)
-            _print_json({"uninstalled": True, "state_retained": str(settings.data_dir)})
-        elif args.service_command == "watchdog":
-            outcome = await asyncio.to_thread(manager.watchdog)
-            _print_json({"watchdog": outcome})
-        elif args.service_command == "logs":
-            _print_json(
-                {
-                    "app": str(settings.log_dir / "copilotd.log"),
-                    "boot": str(settings.log_dir / "boot.log"),
-                    "watchdog": str(settings.log_dir / "watchdog.log"),
-                    "alerts": str(settings.log_dir / "alerts.log"),
-                }
+            async with Database(settings.database_path):
+                pass
+            selected_preflight = preflight or SetupPreflight(settings)
+            report = await selected_preflight.run()
+            report.require_success()
+            receipt = await asyncio.to_thread(selected_manager.install)
+            status = await asyncio.to_thread(
+                selected_manager.verify_post_install,
+                receipt,
             )
+            _print_success(
+                "service.install",
+                {
+                    "preflight": report.as_dict(),
+                    "install": asdict(receipt),
+                    "status": status_dict(status),
+                },
+            )
+        elif args.service_command == "status":
+            _print_success(
+                "service.status",
+                status_dict(await asyncio.to_thread(selected_manager.status)),
+            )
+        elif args.service_command == "restart":
+            receipt = await asyncio.to_thread(
+                selected_manager.restart,
+                force=args.force,
+            )
+            status = await asyncio.to_thread(
+                selected_manager.verify_restart,
+                receipt,
+            )
+            _print_success(
+                "service.restart",
+                {
+                    "restarted": True,
+                    "force": args.force,
+                    "restart": asdict(receipt),
+                    "status": status_dict(status),
+                },
+            )
+        elif args.service_command == "uninstall":
+            await asyncio.to_thread(selected_manager.uninstall)
+            _print_success(
+                "service.uninstall",
+                {
+                    "uninstalled": True,
+                    "state_retained": [str(path) for path in settings.durable_directories],
+                    "logs_retained": str(settings.log_dir),
+                },
+            )
+        elif args.service_command == "watchdog":
+            outcome = await asyncio.to_thread(selected_manager.watchdog)
+            _print_success("service.watchdog", {"watchdog": outcome})
+        elif args.service_command == "logs":
+            _print_success(
+                "service.logs",
+                {name: str(path) for name, path in settings.log_paths.items()},
+            )
+        elif args.service_command == "runtime":
+            await asyncio.to_thread(selected_manager.run_runtime)
         else:
             raise AssertionError(f"unhandled service command: {args.service_command}")
         return 0
@@ -160,22 +246,102 @@ async def run_command(args: argparse.Namespace) -> int:
             )
         else:
             result = probe.static_matrix()
-        _print_json(result)
+        _print_success("sdk-probe", result)
         return 0
 
     raise AssertionError(f"unhandled command: {args.command}")
 
 
-def main() -> None:
+def main(argv: list[str] | None = None) -> None:
     parser = build_parser()
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
     try:
         exit_code = asyncio.run(run_command(args))
     except KeyboardInterrupt:
         exit_code = 130
+    except ValidationError as error:
+        _print_error("configuration_error", str(error), exit_code=2)
+        exit_code = 2
+    except ValueError as error:
+        _print_error("configuration_error", str(error), exit_code=2)
+        exit_code = 2
+    except OSError as error:
+        _print_error("configuration_error", str(error), exit_code=2)
+        exit_code = 2
+    except PreflightFailed as error:
+        _print_error(
+            "preflight_failed",
+            str(error),
+            exit_code=3,
+            detail={"failures": error.failures},
+        )
+        exit_code = 3
+    except RestartBlocked as error:
+        _print_error(
+            "restart_blocked",
+            str(error),
+            exit_code=4,
+            detail={"blockers": list(error.blockers)},
+        )
+        exit_code = 4
+    except ServiceError as error:
+        _print_error("service_error", str(error), exit_code=4)
+        exit_code = 4
+    except Exception as error:
+        _print_error(
+            "internal_error",
+            f"{type(error).__name__}: {error}",
+            exit_code=70,
+        )
+        exit_code = 70
     raise SystemExit(exit_code)
 
 
 def _print_json(value: Any) -> None:
     json.dump(value, sys.stdout, default=_to_jsonable, ensure_ascii=False, indent=2, sort_keys=True)
     sys.stdout.write("\n")
+
+
+def _print_success(command: str, result: Any) -> None:
+    _print_json(
+        {
+            "schema_version": CLI_SCHEMA_VERSION,
+            "ok": True,
+            "command": command,
+            "result": result,
+        }
+    )
+
+
+def _print_error(
+    code: str,
+    message: str,
+    *,
+    exit_code: int,
+    detail: dict[str, Any] | None = None,
+) -> None:
+    payload = {
+        "schema_version": CLI_SCHEMA_VERSION,
+        "ok": False,
+        "error": {
+            "code": code,
+            "message": message,
+            "exit_code": exit_code,
+            "detail": detail or {},
+        },
+    }
+    json.dump(
+        payload,
+        sys.stderr,
+        ensure_ascii=False,
+        indent=2,
+        sort_keys=True,
+    )
+    sys.stderr.write("\n")
+
+
+def _installed_version(package: str, fallback: str) -> str:
+    try:
+        return version(package)
+    except PackageNotFoundError:
+        return fallback

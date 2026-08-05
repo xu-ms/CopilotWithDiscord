@@ -2353,15 +2353,15 @@ claudeD issue 回归门禁：
 | 已实现 | 当前边界 |
 |---|---|
 | 官方 `github-copilot-sdk==1.0.8` + bundled runtime 1.0.73，stdio `--yolo`，create/resume 后 full allow-all 对账 | sidecar client transport 断开后 session retention 实测失败，因此不声明 detached continuation；crash window 保守标 outcome unknown |
-| 7 个 SQLite migration、project `$HOME` fallback/cwd snapshot、owner fence、creation saga、bounded ingress、单 reducer、event journal、CommandMailbox、liveness leases、eager resume；共享连接事务隔离；`background_tasks_changed` 后 `tasks.refresh/list`，缺 terminal 消失转 UNKNOWN | eventLog durable replay reconciler 仍未接入 production supervisor；experimental task action RPC 继续 gated |
+| 8 个 SQLite migration、project `$HOME` fallback/cwd snapshot、owner fence、creation saga、bounded ingress、单 reducer、event journal、CommandMailbox、liveness leases、eager resume；共享连接事务隔离；`background_tasks_changed` 后 `tasks.refresh/list`，缺 terminal 消失转 UNKNOWN；force restart intent/outcome durable journal | eventLog durable replay reconciler 仍未接入 production supervisor；experimental task action RPC 继续 gated |
 | durable app FIFO；每次用 `metadata.is_processing()`、`metadata.activity()` 与 `queue.pending_items()` readiness snapshot 只派发队首；`/queue add/list/remove/clear` | native queue entry 没有稳定 host ID 时不做虚假一一镜像；transport ambiguity 不自动重放 |
 | Discord core `/session`、`/project`、`/model`、bare `/autopilot`、bare/optional-prompt `/plan`、`/steer`、`/context`、`/usage`；user-input/Plan-exit/auto-mode-switch 使用 durable exactly-once interaction + select/modal 原位结算；Plan 退出 mode 精确关联并消费 | `/session delete`、compact/fork 和 Native-Gated commands 尚未实现，因而不注册；elicitation/MCP OAuth 仍待接入 |
 | durable input attachment manifest、hash/size 复验、图片 blob 压缩；stream/final RenderOutbox；table hold 与 code/PNG/MD/CSV assets；Discord HTTP/rate-limit 错误分类，超上限 artifact 按序无损分片 | Discord archived/locked thread、attachment edit、exact 429 retry-after 仍需真实 gateway fixture |
 | tool/subagent/agent-scoped output 归并为原 thread 的单条 TaskDeck；4 秒 cadence、pending coalescing、terminal flush、select/expand/collapse/prev/next；>=8000 字符 tool result/error 逐字附件化；usage、warning/error、intent、workspace change 与 compaction 状态有非空 lane；raw chain-of-thought 永不展示；零 child-thread 路径 | typed Tasks/Fleet action buttons、完整 reasoning summary/diff artifact lane 尚未实现 |
-| 结构化 heartbeat、protected-work watchdog、macOS bot/watchdog LaunchAgent 与 Windows bot/watchdog Scheduled Task definitions | 当前拓扑没有独立 runtime service；macOS definition/CLI smoke 已验证，真实安装、sleep/wake 和 Windows 实机仍待验证 |
+| 完整 setup preflight、fresh PID/generation heartbeat、current-fence status、bounded restart saga、restart-storm alert、10 MiB × 7 JSON log、macOS 2/3 LaunchAgent 与 Windows 2/3 Scheduled Task install/status/uninstall/effective-definition contract | 当前验证 topology 为 bundled-runtime；macOS/Windows definitions、wake/restart/storm simulations 与 wheel/sdist isolated install 已验证，真实 credentialed install、sleep/wake、60-minute macOS soak 和 Windows 实机仍由显式 acceptance lane 验证 |
 
-当前验证基线：`ruff check src tests`、83 个 pytest、CLI `db-init`/`doctor` smoke、service
-definition parse 与 wheel build 均通过。这个快照用于区分“已验证实现”和后续设计，不降低以下
+当前验证基线：`ruff check src tests scripts`、full pytest、CLI JSON/error contract、service
+definition/effective-state simulations 与 wheel/sdist isolated install 均通过。这个快照用于区分“已验证实现”和后续设计，不降低以下
 章节对最终产品的契约要求。
 
 ### HTML 交付要求
