@@ -11,7 +11,7 @@ import ssl
 import tempfile
 import time
 import uuid
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
@@ -20,103 +20,23 @@ import aiohttp
 import discord
 from PIL import Image
 
-try:
-    from copilotd.core.bindings import SessionBindingRepository
-    from copilotd.core.models import AdaptedEvent
-    from copilotd.core.reducer import JournalReducer
-    from copilotd.render.outbox import RenderOutboxDispatcher
-
-    _PRODUCTION_PIPELINE_FALLBACK = False
-except Exception:
-    _PRODUCTION_PIPELINE_FALLBACK = True
-
-    @dataclass
-    class AdaptedEvent:
-        sdk_session_id: str
-        generation: int
-        fence_token: int
-        inbox_seq: int
-        source: str
-        raw_type: str
-        raw_payload: dict[str, Any]
-        reducer_hash: str
-        persistence_class: str
-        received_at: float
-        internal_event_id: str | None = None
-        event_id: str | None = None
-        ephemeral: bool | None = None
-        parent_id: str | None = None
-        agent_id: str | None = None
-        message_id: str | None = None
-        turn_id: str | None = None
-        interaction_id: str | None = None
-        request_id: str | None = None
-
-    class SessionBindingRepository:
-        def __init__(self, database: Any) -> None:
-            self._database = database
-
-        async def create(self, **kwargs: Any) -> None:
-            return None
-
-    class JournalReducer:
-        def __init__(self, database: Any, artifact_root: Path | None = None) -> None:
-            self._database = database
-            self._artifact_root = artifact_root
-
-        async def persist(self, events: list[AdaptedEvent]) -> int:
-            return len(events)
-
-    class RenderOutboxDispatcher:
-        def __init__(self, database: Any, transport: Any, **kwargs: Any) -> None:
-            self._database = database
-            self._transport = transport
-
-        async def drain(self, *args: Any, **kwargs: Any) -> int:
-            return 0
-
+from copilotd.config import Settings
+from copilotd.core.bindings import SessionBindingRepository
+from copilotd.core.models import AdaptedEvent
+from copilotd.core.reducer import JournalReducer
+from copilotd.discord_app import (
+    CopilotDiscordBot,
+    _discord_files,
+    _discord_render_plan,
+    _taskdeck_view,
+)
+from copilotd.ops.surface import redact_sensitive_text
+from copilotd.render.outbox import RenderOutboxDispatcher
 
 try:
     import certifi
 except Exception:
     certifi = None
-
-try:
-    from copilotd.config import Settings
-except Exception:
-
-    @dataclass
-    class Settings:
-        data_dir: Path
-        cache_dir: Path
-        log_dir: Path
-        resolved_home: Path
-
-
-try:
-    from copilotd.discord_app import (
-        CopilotDiscordBot,
-        _discord_files,
-        _discord_render_plan,
-        _taskdeck_view,
-    )
-except Exception:
-
-    class _MissingDiscordApp:
-        def __init__(self, *args, **kwargs) -> None:
-            raise RuntimeError("discord_app dependencies are unavailable in this environment")
-
-    CopilotDiscordBot = _MissingDiscordApp
-
-    def _discord_files(*args, **kwargs):
-        raise RuntimeError("discord_app dependencies are unavailable in this environment")
-
-    def _discord_render_plan(*args, **kwargs):
-        raise RuntimeError("discord_app dependencies are unavailable in this environment")
-
-    def _taskdeck_view(*args, **kwargs):
-        raise RuntimeError("discord_app dependencies are unavailable in this environment")
-
 
 DEFAULT_ENV_FILE = Path("/Users/xu/Downloads/.testbot.env.txt")
 REQUIRED_ENV_KEY = "testbot"
@@ -127,15 +47,6 @@ _SENSITIVE_KEY = re.compile(
     r"(?i)(token|secret|password|authorization|cookie|private.?key|access.?key)"
 )
 
-try:
-    from copilotd.ops.surface import redact_sensitive_text
-except Exception:
-
-    def redact_sensitive_text(value: Any) -> Any:
-        if isinstance(value, str):
-            return _SENSITIVE_KEY.sub("[redacted]", value)
-        return value
-
 
 class DiscordE2EError(RuntimeError):
     pass
@@ -145,26 +56,12 @@ class DiscordE2EConfigurationError(DiscordE2EError):
     pass
 
 
-class DiscordE2EAggregateError(DiscordE2EError):
-    def __init__(self, errors: list[BaseException]) -> None:
-        self.errors = list(errors)
-        super().__init__("; ".join(f"{type(error).__name__}: {error}" for error in self.errors))
-
-
-try:
-    _EXCEPTION_GROUP_TYPE = ExceptionGroup  # type: ignore[name-defined]
-except NameError:
-    _EXCEPTION_GROUP_TYPE = None
-
-
 def _raise_run_errors(errors: list[BaseException]) -> None:
     if not errors:
         return
     if len(errors) == 1:
         raise errors[0]
-    if _EXCEPTION_GROUP_TYPE is not None:
-        raise _EXCEPTION_GROUP_TYPE("Discord E2E run failed", errors)
-    raise DiscordE2EAggregateError(errors) from errors[0]
+    raise BaseExceptionGroup("Discord E2E run failed", errors)
 
 
 @dataclass
@@ -498,10 +395,7 @@ class DiscordRealHarness:
                     connector = aiohttp.TCPConnector(ssl=ssl_context)
                     trace = aiohttp.TraceConfig()
                     trace.on_request_end.append(self._trace_request_end)
-                    if hasattr(bot, "http") and hasattr(bot.http, "connector"):
-                        bot.http.connector = connector
-                    if hasattr(bot, "http") and hasattr(bot.http, "trace_configs"):
-                        bot.http.trace_configs = [trace]
+                    _wire_discord_http_trace(bot, connector, trace)
 
                     async def setup_hook() -> None:
                         await bot.database.open()
@@ -717,6 +611,9 @@ class DiscordRealHarness:
 
         image_path = root / "local-image.png"
         Image.new("RGB", (8, 8), "purple").save(image_path)
+        image_snapshot = root / "durable-local-image.png"
+        image_snapshot.write_bytes(image_path.read_bytes())
+        image_snapshot_bytes = image_snapshot.read_bytes()
         markdown = (
             "Paragraph before.\n\n"
             "- list item\n"
@@ -731,6 +628,14 @@ class DiscordRealHarness:
                 "finalized": True,
                 "trusted_local_images": True,
                 "trusted_local_image_paths": [str(image_path)],
+                "trusted_local_image_artifacts": [
+                    {
+                        "source_path": str(image_path),
+                        "snapshot_path": str(image_snapshot),
+                        "byte_size": len(image_snapshot_bytes),
+                        "sha256": _hash_bytes(image_snapshot_bytes),
+                    }
+                ],
             },
             allowed_roots=(root,),
             max_bytes=7 * 1024 * 1024,
@@ -1159,131 +1064,10 @@ class DiscordRealHarness:
             cwd_snapshot=root,
             project_source="implicit-home",
         )
-        marker = f"PRODUCTION-PIPELINE::{self._run_id}"
+        marker_prefix = "DRY-RUN-PIPELINE" if self._dry_run else "PRODUCTION-PIPELINE"
+        marker = f"{marker_prefix}::{self._run_id}"
         exact_artifact = ("artifact-" + self._run_id).encode() * 600
         exact_text = exact_artifact.decode()
-        if _PRODUCTION_PIPELINE_FALLBACK:
-            marker_message = await thread.send(marker, silent=True)
-            artifact_message = await thread.send(
-                "**Exact tool output**",
-                file=discord.File(io.BytesIO(exact_artifact), filename="artifact.bin"),
-                silent=True,
-            )
-            self._created_messages.extend([marker_message, artifact_message])
-            await bot.database.execute(
-                """
-                INSERT INTO event_journal(
-                    sdk_session_id, generation, inbox_seq, source, sdk_receive_seq,
-                    event_id, internal_event_id, ephemeral, persistence_class, raw_type,
-                    parent_id, agent_id, message_id, turn_id, interaction_id, request_id,
-                    reducer_hash, raw_payload, received_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    session_id,
-                    0,
-                    1,
-                    "internal",
-                    None,
-                    None,
-                    f"{self._run_id}:assistant",
-                    None,
-                    "internal",
-                    "assistant.message",
-                    None,
-                    None,
-                    "e2e-production-message",
-                    None,
-                    None,
-                    None,
-                    "e2e-production-message",
-                    json.dumps(
-                        {
-                            "type": "assistant.message",
-                            "data": {"messageId": "e2e-production-message", "content": marker},
-                        },
-                        ensure_ascii=False,
-                        sort_keys=True,
-                    ),
-                    time.time(),
-                ),
-            )
-            await bot.database.execute(
-                """
-                INSERT INTO event_journal(
-                    sdk_session_id, generation, inbox_seq, source, sdk_receive_seq,
-                    event_id, internal_event_id, ephemeral, persistence_class, raw_type,
-                    parent_id, agent_id, message_id, turn_id, interaction_id, request_id,
-                    reducer_hash, raw_payload, received_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    session_id,
-                    0,
-                    2,
-                    "internal",
-                    None,
-                    None,
-                    f"{self._run_id}:tool",
-                    None,
-                    "internal",
-                    "tool.execution_complete",
-                    None,
-                    None,
-                    None,
-                    None,
-                    None,
-                    None,
-                    "e2e-production-tool",
-                    json.dumps(
-                        {
-                            "type": "tool.execution_complete",
-                            "data": {
-                                "toolCallId": "e2e-production-tool",
-                                "toolName": "e2e tool",
-                                "success": True,
-                                "result": {"detailedContent": exact_text},
-                            },
-                        },
-                        ensure_ascii=False,
-                        sort_keys=True,
-                    ),
-                    time.time(),
-                ),
-            )
-            await bot.database.execute(
-                """
-                INSERT INTO render_messages(
-                    session_id, logical_key, discord_message_id, content_hash, finalized
-                ) VALUES (?, ?, ?, ?, 1)
-                """,
-                (session_id, "marker", str(marker_message.id), _hash_bytes(marker.encode())),
-            )
-            await bot.database.execute(
-                """
-                INSERT INTO render_messages(
-                    session_id, logical_key, discord_message_id, content_hash, finalized
-                ) VALUES (?, ?, ?, ?, 1)
-                """,
-                (
-                    session_id,
-                    "artifact",
-                    str(artifact_message.id),
-                    _hash_bytes(exact_artifact),
-                ),
-            )
-            messages = [marker_message, artifact_message]
-            expected_hash = _hash_bytes(exact_artifact)
-            evidence = await self.record_ordered_delivery_probe(
-                messages,
-                expected_contents=[marker, "**Exact tool output**"],
-                expected_filenames=["artifact.bin"],
-                expected_sha256=[expected_hash],
-            )
-            evidence.feature = "production reducer/outbox exact delivery"
-            evidence.transport = "JournalReducer -> RenderOutboxDispatcher -> real Discord"
-            self.evidence.features.append(evidence)
-            return
         events = [
             AdaptedEvent(
                 sdk_session_id=session_id,
@@ -1389,8 +1173,14 @@ class DiscordRealHarness:
             expected_filenames=expected_filenames,
             expected_sha256=expected_sha256,
         )
-        evidence.feature = "production reducer/outbox exact delivery"
-        evidence.transport = "JournalReducer -> RenderOutboxDispatcher -> real Discord"
+        if self._dry_run:
+            evidence.feature = "dry-run reducer/outbox exact delivery"
+            evidence.transport = (
+                "JournalReducer -> RenderOutboxDispatcher -> in-memory Discord double"
+            )
+        else:
+            evidence.feature = "production reducer/outbox exact delivery"
+            evidence.transport = "JournalReducer -> RenderOutboxDispatcher -> real Discord"
         self.evidence.features.append(evidence)
 
     async def _cleanup(self) -> list[BaseException]:
@@ -1632,6 +1422,18 @@ def _hash_bytes(content: bytes) -> str:
     return hashlib.sha256(content).hexdigest()
 
 
+def _wire_discord_http_trace(
+    bot: Any,
+    connector: aiohttp.BaseConnector,
+    trace: aiohttp.TraceConfig,
+) -> None:
+    http = getattr(bot, "http", None)
+    if http is None:
+        raise DiscordE2EError("Discord bot HTTP client is unavailable before start")
+    http.connector = connector
+    http.http_trace = trace
+
+
 def _asset_bytes(asset: Any) -> bytes:
     content = getattr(asset, "content", None)
     if isinstance(content, bytes):
@@ -1652,37 +1454,20 @@ def _asset_bytes(asset: Any) -> bytes:
 
 
 def _clone_json_value(value: Any) -> Any:
-    if isinstance(value, dict):
+    if isinstance(value, Mapping):
         return {str(key): _clone_json_value(item) for key, item in value.items()}
-    if isinstance(value, list):
+    if isinstance(value, (list, tuple, set)):
         return [_clone_json_value(item) for item in value]
-    if isinstance(value, tuple):
-        return [_clone_json_value(item) for item in value]
+    to_dict = getattr(value, "to_dict", None)
+    if callable(to_dict):
+        return _clone_json_value(to_dict())
+    enum_value = getattr(value, "value", None)
+    if isinstance(enum_value, (str, int, float, bool)):
+        return enum_value
     return value
 
 
 def _command_manifest_entry(command: Any) -> dict[str, Any]:
-    if isinstance(command, dict):
-        payload = dict(command)
-    else:
-        to_dict = getattr(command, "to_dict", None)
-        payload = dict(to_dict()) if callable(to_dict) else {}
-        if not payload:
-            for field_name in (
-                "name",
-                "type",
-                "description",
-                "name_localizations",
-                "description_localizations",
-                "default_member_permissions",
-                "dm_permission",
-                "nsfw",
-                "options",
-                "contexts",
-                "integration_types",
-            ):
-                if hasattr(command, field_name):
-                    payload[field_name] = getattr(command, field_name)
     mutable_fields = (
         "name",
         "type",
@@ -1696,7 +1481,24 @@ def _command_manifest_entry(command: Any) -> dict[str, Any]:
         "options",
         "contexts",
         "integration_types",
+        "handler",
     )
+    if isinstance(command, dict):
+        payload = dict(command)
+    else:
+        to_dict = getattr(command, "to_dict", None)
+        payload = dict(to_dict()) if callable(to_dict) else {}
+        raw_payload = getattr(command, "_data", None)
+        if isinstance(raw_payload, Mapping):
+            payload.update(raw_payload)
+        for field_name in mutable_fields:
+            if field_name not in payload and hasattr(command, field_name):
+                payload[field_name] = getattr(command, field_name)
+    permissions = payload.get("default_member_permissions")
+    if permissions is not None and not isinstance(permissions, (str, int)):
+        permissions = getattr(permissions, "value", permissions)
+    if isinstance(permissions, int):
+        payload["default_member_permissions"] = str(permissions)
     return {
         field: _clone_json_value(payload[field]) for field in mutable_fields if field in payload
     }

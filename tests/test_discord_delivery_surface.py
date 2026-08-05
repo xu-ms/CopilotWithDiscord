@@ -169,6 +169,81 @@ async def test_post_send_crash_reconciles_nonce_without_duplicate(
 
 
 @pytest.mark.asyncio
+async def test_new_payload_revision_recovers_prior_family_message(
+    tmp_path: Path,
+) -> None:
+    bot = CopilotDiscordBot(Settings(data_dir=tmp_path))
+    thread = FakeThread()
+    async with Database(tmp_path / "delivery-family.sqlite3") as database:
+        bot.database = database
+        first_id = await bot._deliver_render_plan(
+            thread=thread,
+            session_id="session-family",
+            payload={"finalized": False},
+            plan=DiscordRenderPlan((DiscordRenderBatch("progress"),)),
+            delivery_id="artifact:family:payload:1:1111111111111111",
+        )
+        recovered_id = await bot._deliver_render_plan(
+            thread=thread,
+            session_id="session-family",
+            payload={"finalized": True},
+            plan=DiscordRenderPlan((DiscordRenderBatch("final"),)),
+            delivery_id="artifact:family:payload:2:2222222222222222",
+        )
+        family_rows = await database.fetchall(
+            """
+            SELECT delivery_family, discord_message_id
+            FROM render_batch_intents
+            WHERE session_id = 'session-family'
+            ORDER BY render_message_id
+            """
+        )
+
+    assert first_id == recovered_id == "101"
+    assert thread.send_calls == 1
+    assert thread.messages[101].edits[-1]["content"] == "final"
+    assert [dict(row) for row in family_rows] == [
+        {"delivery_family": "artifact:family", "discord_message_id": "101"},
+    ]
+
+
+@pytest.mark.asyncio
+async def test_new_revision_recovers_prior_post_send_crash_without_duplicate(
+    tmp_path: Path,
+) -> None:
+    bot = CopilotDiscordBot(Settings(data_dir=tmp_path))
+    thread = FakeThread()
+
+    async def crash_after_send(_index: int, _message_id: str) -> None:
+        raise RuntimeError("simulated family crash")
+
+    async with Database(tmp_path / "delivery-family-crash.sqlite3") as database:
+        bot.database = database
+        bot._after_render_send_hook = crash_after_send
+        with pytest.raises(RuntimeError, match="simulated family crash"):
+            await bot._deliver_render_plan(
+                thread=thread,
+                session_id="session-family-crash",
+                payload={"finalized": False},
+                plan=DiscordRenderPlan((DiscordRenderBatch("progress"),)),
+                delivery_id="artifact:crash:payload:1:1111111111111111",
+            )
+
+        bot._after_render_send_hook = None
+        recovered_id = await bot._deliver_render_plan(
+            thread=thread,
+            session_id="session-family-crash",
+            payload={"finalized": True},
+            plan=DiscordRenderPlan((DiscordRenderBatch("final"),)),
+            delivery_id="artifact:crash:payload:2:2222222222222222",
+        )
+
+    assert recovered_id == "101"
+    assert thread.send_calls == 1
+    assert thread.messages[101].edits[-1]["content"] == "final"
+
+
+@pytest.mark.asyncio
 async def test_edit_followup_crash_reconciles_without_orphan_duplicate(
     tmp_path: Path,
 ) -> None:

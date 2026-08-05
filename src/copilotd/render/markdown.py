@@ -3,7 +3,7 @@ from __future__ import annotations
 import hashlib
 import re
 import shlex
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -304,10 +304,22 @@ def extract_local_markdown_images(
     *,
     allowed_roots: Sequence[Path | str],
     trusted_paths: Sequence[Path | str] | None = None,
+    trusted_artifacts: Mapping[Path | str, Path | str] | None = None,
 ) -> MarkdownImageExtractionPlan:
     roots = tuple(Path(root).resolve() for root in allowed_roots)
-    trusted = (
+    artifact_paths = (
         None
+        if trusted_artifacts is None
+        else {
+            source_candidate: Path(snapshot_path).resolve(strict=False)
+            for source_path, snapshot_path in trusted_artifacts.items()
+            for source_candidate in _trusted_path_candidates(Path(source_path), roots)
+        }
+    )
+    trusted = (
+        set(artifact_paths)
+        if artifact_paths is not None
+        else None
         if trusted_paths is None
         else {
             resolved
@@ -389,6 +401,7 @@ def extract_local_markdown_images(
             attachments,
             inline_code_delim,
             trusted,
+            artifact_paths,
         )
         if previous_inline_delim is None and inline_code_delim is not None:
             inline_container_path = container_path
@@ -433,6 +446,7 @@ def _extract_images_from_line(
     attachments: list[MarkdownImageAttachmentPlan],
     inline_code_delim: int | None,
     trusted_paths: set[Path] | None,
+    trusted_artifacts: dict[Path, Path] | None,
 ) -> tuple[str, int | None]:
     pieces: list[str] = []
     index = 0
@@ -505,7 +519,10 @@ def _extract_images_from_line(
                 pieces.append(source_text)
                 index = end
                 continue
-            if not resolved.is_file():
+            materialized = (
+                resolved if trusted_artifacts is None else trusted_artifacts.get(resolved, resolved)
+            )
+            if not materialized.is_file():
                 warnings.append(
                     MarkdownImageWarning(
                         kind="missing-image",
@@ -516,7 +533,7 @@ def _extract_images_from_line(
                 pieces.append(source_text)
                 index = end
                 continue
-            if not _is_supported_image(resolved):
+            if not _is_supported_image(materialized):
                 warnings.append(
                     MarkdownImageWarning(
                         kind="unsupported-image",
@@ -531,7 +548,7 @@ def _extract_images_from_line(
                 MarkdownImageAttachmentPlan(
                     source=source_text,
                     path=path_text,
-                    resolved_path=str(resolved),
+                    resolved_path=str(materialized),
                     alt_text=alt_text,
                     title=title,
                     filename=resolved.name,

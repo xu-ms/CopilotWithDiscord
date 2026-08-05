@@ -15,6 +15,7 @@ from copilot.session_events import (
     SubagentCompletedData,
     SubagentStartedData,
 )
+from PIL import Image
 
 from copilotd.core.bindings import SessionBindingRepository
 from copilotd.core.event_adapter import EventAdapter
@@ -25,6 +26,7 @@ from copilotd.core.reducer import (
     JournalReducer,
     _diff_render_payload,
 )
+from copilotd.discord_app import _discord_render_plan
 from copilotd.storage.database import Database
 
 
@@ -329,6 +331,11 @@ async def test_reducer_materializes_nonempty_status_and_usage_payloads(
 async def test_sdk_workspace_event_authorizes_matching_local_image_path(
     tmp_path: Path,
 ) -> None:
+    cwd = tmp_path / "workspace"
+    image_path = cwd / "artifacts" / "chart.png"
+    image_path.parent.mkdir(parents=True)
+    Image.new("RGB", (4, 4), "green").save(image_path)
+    original_bytes = image_path.read_bytes()
     events = [
         AdaptedEvent(
             sdk_session_id="session-trusted-image",
@@ -387,6 +394,12 @@ async def test_sdk_workspace_event_authorizes_matching_local_image_path(
         ),
     ]
     async with Database(tmp_path / "trusted-image.sqlite3") as database:
+        await SessionBindingRepository(database).create(
+            thread_id="thread-trusted-image",
+            sdk_session_id="session-trusted-image",
+            cwd_snapshot=cwd,
+            project_source="explicit",
+        )
         assert await JournalReducer(database).persist(events) == 3
         row = await database.fetchone(
             """
@@ -398,6 +411,22 @@ async def test_sdk_workspace_event_authorizes_matching_local_image_path(
     payload = json.loads(row["payload"])
     assert payload["trusted_local_images"] is True
     assert payload["trusted_local_image_paths"] == ["artifacts/chart.png"]
+    artifacts = payload["trusted_local_image_artifacts"]
+    assert len(artifacts) == 1
+    snapshot_path = Path(artifacts[0]["snapshot_path"])
+    assert await asyncio.to_thread(snapshot_path.read_bytes) == original_bytes
+    assert artifacts[0]["byte_size"] == len(original_bytes)
+    assert artifacts[0]["sha256"] == hashlib.sha256(original_bytes).hexdigest()
+
+    Image.new("RGB", (4, 4), "red").save(image_path)
+    first_render = await _discord_render_plan(payload, allowed_roots=(cwd,))
+    second_render = await _discord_render_plan(payload, allowed_roots=(cwd,))
+    assert [asset.content for batch in first_render.batches for asset in batch.assets] == [
+        original_bytes
+    ]
+    assert [asset.content for batch in second_render.batches for asset in batch.assets] == [
+        original_bytes
+    ]
 
 
 @pytest.mark.asyncio
@@ -851,6 +880,67 @@ async def test_canonical_tool_completion_does_not_duplicate_spilled_stream(
     assert content == canonical
     assert artifact["byte_size"] == len(canonical.encode())
     assert artifact["sha256"] == hashlib.sha256(canonical.encode()).hexdigest()
+
+
+@pytest.mark.timeout(60)
+@pytest.mark.asyncio
+async def test_completion_only_100mib_spills_without_large_outbox_payload(
+    tmp_path: Path,
+) -> None:
+    completion = "q" * (100 * 1024 * 1024)
+    event = EventAdapter().adapt(
+        InboxEnvelope(
+            sdk_session_id="session-completion-only",
+            generation=1,
+            fence_token=1,
+            inbox_seq=1,
+            source="internal",
+            payload={
+                "type": "tool.execution_complete",
+                "data": {
+                    "toolCallId": "completion-only",
+                    "success": True,
+                    "result": {"detailedContent": completion},
+                },
+            },
+            received_at=100,
+            internal_event_id="completion-only",
+        )
+    )
+    database_path = tmp_path / "completion-only.sqlite3"
+    async with Database(database_path) as database:
+        assert await JournalReducer(database).persist([event]) == 1
+        artifact = await database.fetchone(
+            """
+            SELECT local_path, byte_size, sha256, finalized
+            FROM tool_spill_artifacts
+            WHERE session_id = 'session-completion-only'
+              AND tool_call_id = 'completion-only'
+            """
+        )
+        outbox = await database.fetchone(
+            """
+            SELECT LENGTH(payload) AS payload_bytes
+            FROM render_outbox WHERE lane = 'artifact'
+            """
+        )
+        stream = await database.fetchone(
+            """
+            SELECT content, spilled, finalized FROM tool_output_streams
+            WHERE session_id = 'session-completion-only'
+            """
+        )
+
+    artifact_path = Path(str(artifact["local_path"]))
+    artifact_size = await asyncio.to_thread(lambda: artifact_path.stat().st_size)
+    artifact_digest = await asyncio.to_thread(_sha256_file, artifact_path)
+    assert artifact_size == len(completion)
+    assert artifact["byte_size"] == len(completion)
+    assert artifact["sha256"] == artifact_digest
+    assert artifact["finalized"] == 1
+    assert outbox["payload_bytes"] < 200_000
+    assert dict(stream) == {"content": "", "spilled": 1, "finalized": 1}
+    assert database_path.stat().st_size < 160 * 1024 * 1024
 
 
 @pytest.mark.asyncio

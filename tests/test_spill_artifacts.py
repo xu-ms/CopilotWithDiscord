@@ -5,6 +5,7 @@ from pathlib import Path
 
 import pytest
 
+from copilotd.core.bindings import SessionBindingRepository
 from copilotd.core.spill_artifacts import (
     confirm_and_collect_tool_spills,
     garbage_collect_tool_spills,
@@ -98,7 +99,7 @@ async def test_spill_gc_handles_expiry_and_forced_session_delete(
             tool_call_id="active",
             path=active,
             finalized=False,
-            retention_until=50,
+            retention_until=200,
         )
 
         assert await garbage_collect_tool_spills(database, now=100) == 1
@@ -115,6 +116,39 @@ async def test_spill_gc_handles_expiry_and_forced_session_delete(
 
     assert not await asyncio.to_thread(expired.exists)
     assert not await asyncio.to_thread(active.exists)
+
+
+@pytest.mark.asyncio
+async def test_confirmed_deleted_session_collects_nonfinal_spill(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "deleted-session.txt"
+    await asyncio.to_thread(_write, path, b"deleted")
+    async with Database(tmp_path / "deleted-session.sqlite3") as database:
+        await SessionBindingRepository(database).create(
+            thread_id="deleted-thread",
+            sdk_session_id="deleted-session",
+            cwd_snapshot=tmp_path,
+            project_source="explicit",
+        )
+        await _insert_artifact(
+            database,
+            session_id="deleted-session",
+            tool_call_id="nonfinal",
+            path=path,
+            finalized=False,
+            retention_until=999,
+        )
+        await database.execute(
+            """
+            UPDATE session_bindings SET binding_intent = 'deleted'
+            WHERE sdk_session_id = 'deleted-session'
+            """
+        )
+
+        assert await garbage_collect_tool_spills(database, now=100) == 1
+
+    assert not await asyncio.to_thread(path.exists)
 
 
 @pytest.mark.asyncio

@@ -8,6 +8,7 @@ import pytest
 
 from copilotd.render.outbox import (
     RenderOutboxDispatcher,
+    RenderPermanentError,
     RenderRateLimited,
     RenderTransientError,
 )
@@ -88,6 +89,35 @@ class BlockingSuccessTransport(FakeTransport):
         self.started.set()
         await self.release.wait()
         return "discord-stable"
+
+
+class BlockingFailureTransport(FakeTransport):
+    def __init__(self, failure: Exception) -> None:
+        super().__init__()
+        self.failure = failure
+        self.started = asyncio.Event()
+        self.release = asyncio.Event()
+        self.failed = False
+
+    async def send(
+        self,
+        *,
+        session_id: str,
+        lane: str,
+        payload: dict[str, Any],
+        idempotency_key: str,
+    ) -> str:
+        if not self.failed:
+            self.failed = True
+            self.started.set()
+            await self.release.wait()
+            raise self.failure
+        return await super().send(
+            session_id=session_id,
+            lane=lane,
+            payload=payload,
+            idempotency_key=idempotency_key,
+        )
 
 
 class PausingClaimDispatcher(RenderOutboxDispatcher):
@@ -383,6 +413,65 @@ async def test_stable_outbox_update_during_send_requeues_same_row(
     assert dict(final) == {"state": "sent", "payload_revision": 2, "row_count": 1}
 
 
+@pytest.mark.parametrize(
+    "failure",
+    [
+        RenderPermanentError("stale permanent failure"),
+        RenderRateLimited(30),
+    ],
+)
+@pytest.mark.asyncio
+async def test_stale_failure_requeues_newer_payload_revision(
+    tmp_path: Path,
+    failure: Exception,
+) -> None:
+    async with Database(tmp_path / "stale-failure.sqlite3") as database:
+        await _insert_outbox(
+            database,
+            item_id="stable",
+            sequence=1,
+            payload={"content": "progress", "finalized": False},
+            coalesce_key="tool-spill:one",
+            lane="artifact",
+        )
+        transport = BlockingFailureTransport(failure)
+        dispatcher = RenderOutboxDispatcher(database, transport)
+        first = asyncio.create_task(dispatcher.dispatch_once(now=100))
+        await transport.started.wait()
+        await database.execute(
+            """
+            UPDATE render_outbox
+            SET logical_seq = 2,
+                payload = ?,
+                payload_revision = payload_revision + 1,
+                updated_at = 101
+            WHERE id = 'stable' AND state = 'sending'
+            """,
+            (json.dumps({"content": "final", "finalized": True}),),
+        )
+        transport.release.set()
+
+        assert await first == 0
+        pending = await database.fetchone(
+            """
+            SELECT state, payload_revision, next_attempt_at
+            FROM render_outbox WHERE id = 'stable'
+            """
+        )
+        assert dict(pending) == {
+            "state": "pending",
+            "payload_revision": 2,
+            "next_attempt_at": 0,
+        }
+        assert await dispatcher.dispatch_once(now=101) == 1
+        final = await database.fetchone(
+            "SELECT state, payload_revision FROM render_outbox WHERE id = 'stable'"
+        )
+
+    assert dict(final) == {"state": "sent", "payload_revision": 2}
+    assert transport.sent[-1][2] == {"content": "final", "finalized": True}
+
+
 @pytest.mark.asyncio
 async def test_final_spill_survives_retry_then_is_collected_after_delivery(
     tmp_path: Path,
@@ -429,6 +518,38 @@ async def test_final_spill_survives_retry_then_is_collected_after_delivery(
         assert await dispatcher.dispatch_once(now=101) == 1
         row = await database.fetchone(
             "SELECT 1 FROM tool_spill_artifacts WHERE tool_call_id = 'tool-1'"
+        )
+
+    assert not artifact.exists()
+    assert row is None
+
+
+@pytest.mark.asyncio
+async def test_dispatch_periodically_collects_abandoned_nonfinal_spill(
+    tmp_path: Path,
+) -> None:
+    artifact = tmp_path / "abandoned.txt"
+    content = b"abandoned"
+    artifact.write_bytes(content)
+    async with Database(tmp_path / "periodic-spill-gc.sqlite3") as database:
+        await database.execute(
+            """
+            INSERT INTO tool_spill_artifacts(
+                session_id, tool_call_id, local_path, byte_size,
+                sha256, finalized, retention_until, updated_at
+            ) VALUES ('abandoned-session', 'abandoned-tool', ?, ?, NULL, 0, 50, 0)
+            """,
+            (str(artifact), len(content)),
+        )
+        dispatcher = RenderOutboxDispatcher(
+            database,
+            FakeTransport(),
+            spill_gc_interval_seconds=60,
+        )
+
+        assert await dispatcher.dispatch_once(now=100) == 0
+        row = await database.fetchone(
+            "SELECT 1 FROM tool_spill_artifacts WHERE tool_call_id = 'abandoned-tool'"
         )
 
     assert not artifact.exists()

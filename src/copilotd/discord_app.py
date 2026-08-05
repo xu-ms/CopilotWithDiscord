@@ -601,6 +601,7 @@ class CopilotDiscordBot(commands.Bot):
         first_message: discord.Message | None = None,
     ) -> str:
         agent_id = str(payload.get("agent_id") or "")
+        delivery_family = _render_delivery_family(delivery_id)
         checkpoint = await self.database.fetchone(
             """
             SELECT first_discord_message_id FROM render_attachment_checkpoints
@@ -609,6 +610,28 @@ class CopilotDiscordBot(commands.Bot):
             (session_id, delivery_id, agent_id),
         )
         first_message_id = None if checkpoint is None else checkpoint["first_discord_message_id"]
+        if first_message is not None:
+            first_message_id = str(first_message.id)
+        elif first_message_id is None:
+            family_checkpoint = await self.database.fetchone(
+                """
+                SELECT discord_message_id
+                FROM render_batch_intents
+                WHERE session_id = ? AND delivery_family = ? AND agent_id = ?
+                  AND batch_index = 0 AND discord_message_id IS NOT NULL
+                ORDER BY updated_at DESC LIMIT 1
+                """,
+                (session_id, delivery_family, agent_id),
+            )
+            if family_checkpoint is not None:
+                try:
+                    first_message = await thread.fetch_message(
+                        int(family_checkpoint["discord_message_id"])
+                    )
+                except (discord.NotFound, KeyError):
+                    first_message = None
+                else:
+                    first_message_id = str(first_message.id)
         delivered = await self.database.fetchall(
             """
             SELECT batch_index, discord_message_id
@@ -633,6 +656,22 @@ class CopilotDiscordBot(commands.Bot):
                 index,
             )
             payload_hash = _render_batch_hash(batch)
+            previous_intent = await self.database.fetchone(
+                """
+                SELECT nonce, payload_hash, discord_message_id, created_at
+                FROM render_batch_intents
+                WHERE session_id = ? AND delivery_family = ? AND agent_id = ?
+                  AND batch_index = ? AND render_message_id != ?
+                ORDER BY updated_at DESC LIMIT 1
+                """,
+                (
+                    session_id,
+                    delivery_family,
+                    agent_id,
+                    index,
+                    delivery_id,
+                ),
+            )
             intent = await self.database.fetchone(
                 """
                 SELECT nonce, payload_hash, state, discord_message_id, created_at
@@ -647,8 +686,9 @@ class CopilotDiscordBot(commands.Bot):
                     """
                     INSERT INTO render_batch_intents(
                         session_id, render_message_id, agent_id, batch_index,
-                        nonce, payload_hash, state, created_at, updated_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, 'prepared', ?, ?)
+                        nonce, payload_hash, state, delivery_family,
+                        created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, 'prepared', ?, ?, ?)
                     """,
                     (
                         session_id,
@@ -657,6 +697,7 @@ class CopilotDiscordBot(commands.Bot):
                         index,
                         nonce,
                         payload_hash,
+                        delivery_family,
                         now,
                         now,
                     ),
@@ -664,18 +705,8 @@ class CopilotDiscordBot(commands.Bot):
             elif str(intent["nonce"]) != nonce or str(intent["payload_hash"]) != payload_hash:
                 raise RenderPermanentError(f"render batch intent changed for {delivery_id}:{index}")
 
-            reconciled_message_id: str | None = None
             if intent is not None and intent["discord_message_id"] is not None:
                 reconciled_message_id = str(intent["discord_message_id"])
-            elif intent is not None and (first_message is None or index > 0):
-                reconciled = await self._find_message_by_nonce(
-                    thread,
-                    nonce,
-                    created_at=float(intent["created_at"]),
-                )
-                if reconciled is not None:
-                    reconciled_message_id = str(reconciled.id)
-            if reconciled_message_id is not None:
                 if first_message_id is None:
                     first_message_id = reconciled_message_id
                 await self._checkpoint_render_batch(
@@ -690,16 +721,46 @@ class CopilotDiscordBot(commands.Bot):
                 )
                 continue
 
+            recovery_message: discord.Message | None = None
             if index == 0 and first_message is not None:
-                await first_message.edit(
+                recovery_message = first_message
+            elif intent is not None:
+                recovery_message = await self._find_message_by_nonce(
+                    thread,
+                    nonce,
+                    created_at=float(intent["created_at"]),
+                )
+            if recovery_message is None and previous_intent is not None:
+                if previous_intent["discord_message_id"] is not None:
+                    try:
+                        recovery_message = await thread.fetch_message(
+                            int(previous_intent["discord_message_id"])
+                        )
+                    except (discord.NotFound, KeyError):
+                        recovery_message = None
+                else:
+                    recovery_message = await self._find_message_by_nonce(
+                        thread,
+                        str(previous_intent["nonce"]),
+                        created_at=float(previous_intent["created_at"]),
+                    )
+
+            if recovery_message is not None:
+                await recovery_message.edit(
                     content=batch.content or "\u200b",
                     attachments=_discord_files(list(batch.assets)),
-                    view=_render_view(
-                        payload,
-                        enable_task_actions=self.task_action_adapter is not None,
+                    view=(
+                        _render_view(
+                            payload,
+                            enable_task_actions=self.task_action_adapter is not None,
+                        )
+                        if index == 0
+                        else None
                     ),
                 )
-                discord_message_id = str(first_message.id)
+                discord_message_id = str(recovery_message.id)
+                if index == 0:
+                    first_message = recovery_message
             else:
                 sent = await thread.send(
                     content=batch.content or "\u200b",
@@ -881,6 +942,14 @@ class CopilotDiscordBot(commands.Bot):
         old_keys = [
             (str(row["render_message_id"]), str(row["agent_id"])) for row in old_checkpoints
         ]
+        current_batches = await self.database.fetchall(
+            """
+            SELECT discord_message_id FROM render_attachment_batches
+            WHERE session_id = ? AND render_message_id = ?
+            """,
+            (session_id, current_delivery_id),
+        )
+        current_message_ids = {str(row["discord_message_id"]) for row in current_batches}
         for render_message_id, agent_id in old_keys:
             batches = await self.database.fetchall(
                 """
@@ -892,6 +961,8 @@ class CopilotDiscordBot(commands.Bot):
                 (session_id, render_message_id, agent_id),
             )
             for batch in batches:
+                if str(batch["discord_message_id"]) in current_message_ids:
+                    continue
                 try:
                     message = await thread.fetch_message(int(batch["discord_message_id"]))
                     await message.delete()
@@ -2884,27 +2955,61 @@ async def _discord_render_plan(
 
     local_image_assets: list[TableAsset] = []
     image_warnings: list[str] = []
-    trusted_local_paths = payload.get("trusted_local_image_paths")
+    trusted_local_artifacts = payload.get("trusted_local_image_artifacts")
     if (
         allowed_roots
         and payload.get("trusted_local_images") is True
-        and isinstance(trusted_local_paths, list)
+        and isinstance(trusted_local_artifacts, list)
     ):
+        artifact_paths: dict[str, str] = {}
+        artifact_metadata: dict[str, tuple[int, str]] = {}
+        for artifact in trusted_local_artifacts:
+            if not isinstance(artifact, dict):
+                continue
+            source_path = artifact.get("source_path")
+            snapshot_path = artifact.get("snapshot_path")
+            byte_size = artifact.get("byte_size")
+            digest = artifact.get("sha256")
+            if (
+                isinstance(source_path, str)
+                and isinstance(snapshot_path, str)
+                and isinstance(byte_size, int)
+                and isinstance(digest, str)
+            ):
+                resolved_snapshot = str(
+                    await asyncio.to_thread(
+                        Path(snapshot_path).resolve,
+                        strict=False,
+                    )
+                )
+                artifact_paths[source_path] = resolved_snapshot
+                artifact_metadata[resolved_snapshot] = (byte_size, digest)
         extraction = await asyncio.to_thread(
             lambda: extract_local_markdown_images(
                 content,
                 allowed_roots=allowed_roots,
-                trusted_paths=[str(path) for path in trusted_local_paths if isinstance(path, str)],
+                trusted_artifacts=artifact_paths,
             )
         )
         content = extraction.content
         image_warnings.extend(warning.message for warning in extraction.warnings)
         for attachment in extraction.attachments:
+            snapshot_path = Path(attachment.resolved_path)
             try:
-                image_content = await asyncio.to_thread(Path(attachment.resolved_path).read_bytes)
-            except OSError:
-                image_warnings.append(f"local image disappeared before upload: {attachment.path}")
-                continue
+                image_content = await asyncio.to_thread(snapshot_path.read_bytes)
+            except OSError as error:
+                raise RenderPermanentError(
+                    f"trusted local image snapshot disappeared: {snapshot_path}"
+                ) from error
+            expected_size, expected_digest = artifact_metadata[str(snapshot_path)]
+            if len(image_content) != expected_size:
+                raise RenderPermanentError(
+                    f"trusted local image snapshot size changed: {snapshot_path}"
+                )
+            if hashlib.sha256(image_content).hexdigest() != expected_digest:
+                raise RenderPermanentError(
+                    f"trusted local image snapshot digest changed: {snapshot_path}"
+                )
             local_image_assets.append(
                 TableAsset(
                     filename=attachment.filename,
@@ -3304,6 +3409,14 @@ def _render_batch_nonce(
         f"copilotd:{session_id}:{delivery_id}:{agent_id}:{index}",
     )
     return str(value.int & ((1 << 63) - 1))
+
+
+def _render_delivery_family(delivery_id: str) -> str:
+    match = re.fullmatch(
+        r"(?P<family>.+):payload:\d+:[0-9a-f]{16}",
+        delivery_id,
+    )
+    return delivery_id if match is None else match.group("family")
 
 
 def _render_batch_hash(batch: DiscordRenderBatch) -> str:

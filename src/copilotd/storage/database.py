@@ -11,7 +11,7 @@ from typing import Any
 
 import aiosqlite
 
-_CORE_MIGRATION_VERSION = 14
+_CORE_MIGRATION_VERSION = 15
 
 
 class Database:
@@ -175,6 +175,9 @@ class Database:
             "render_outbox": {
                 "payload_revision": "INTEGER NOT NULL DEFAULT 1",
             },
+            "render_batch_intents": {
+                "delivery_family": "TEXT NOT NULL DEFAULT ''",
+            },
             "session_creation_intents": {
                 "project_config_snapshot": "TEXT NOT NULL DEFAULT '{}'",
                 "channel_config_snapshot": "TEXT NOT NULL DEFAULT '{}'",
@@ -218,6 +221,22 @@ class Database:
                 UPDATE tool_spill_artifacts
                 SET retention_until = updated_at + 604800
                 WHERE retention_until = 0
+                """
+            )
+        if await self._table_exists("render_batch_intents"):
+            await self.execute(
+                """
+                UPDATE render_batch_intents
+                SET delivery_family = render_message_id
+                WHERE delivery_family = ''
+                """
+            )
+            await self.execute(
+                """
+                CREATE INDEX IF NOT EXISTS render_batch_intents_family_idx
+                ON render_batch_intents(
+                    session_id, delivery_family, agent_id, batch_index, updated_at
+                )
                 """
             )
         if await self._table_exists("session_creation_intents"):

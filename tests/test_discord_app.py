@@ -206,6 +206,15 @@ async def test_local_image_warning_flood_stays_within_discord_limit(
             "finalized": True,
             "trusted_local_images": True,
             "trusted_local_image_paths": [f"missing-{index}.png" for index in range(80)],
+            "trusted_local_image_artifacts": [
+                {
+                    "source_path": f"missing-{index}.png",
+                    "snapshot_path": str(tmp_path / f"snapshot-{index}.png"),
+                    "byte_size": 0,
+                    "sha256": hashlib.sha256(b"").hexdigest(),
+                }
+                for index in range(80)
+            ],
         },
         allowed_roots=(tmp_path,),
     )
@@ -239,6 +248,9 @@ async def test_verified_relative_assistant_image_is_uploaded(
     local = tmp_path / "artifacts" / "chart.png"
     local.parent.mkdir()
     Image.new("RGB", (4, 4), "green").save(local)
+    snapshot = tmp_path / "snapshot.png"
+    snapshot.write_bytes(local.read_bytes())
+    snapshot_content = snapshot.read_bytes()
 
     plan = await _discord_render_plan(
         {
@@ -246,6 +258,14 @@ async def test_verified_relative_assistant_image_is_uploaded(
             "finalized": True,
             "trusted_local_images": True,
             "trusted_local_image_paths": ["artifacts/chart.png"],
+            "trusted_local_image_artifacts": [
+                {
+                    "source_path": "artifacts/chart.png",
+                    "snapshot_path": str(snapshot),
+                    "byte_size": len(snapshot_content),
+                    "sha256": hashlib.sha256(snapshot_content).hexdigest(),
+                }
+            ],
         },
         allowed_roots=(tmp_path,),
     )

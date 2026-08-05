@@ -44,34 +44,48 @@ async def garbage_collect_tool_spills(
     force_session: bool = False,
 ) -> int:
     timestamp = time.time() if now is None else now
-    retry_paths = (
-        set() if force_session else await _active_retry_paths(database, session_id=session_id)
+    forced = force_session and session_id is not None
+    retry_paths = set() if forced else await _active_retry_paths(database, session_id=session_id)
+    deleted_rows = await database.fetchall(
+        """
+        SELECT sdk_session_id FROM session_bindings
+        WHERE binding_intent = 'deleted'
+          AND (? IS NULL OR sdk_session_id = ?)
+        """,
+        (session_id, session_id),
     )
+    deleted_sessions = {str(row["sdk_session_id"]) for row in deleted_rows}
     rows = await database.fetchall(
         """
         SELECT session_id, tool_call_id, local_path
         FROM tool_spill_artifacts
-        WHERE (? = 1 OR finalized = 1)
-          AND (? IS NULL OR session_id = ?)
+        WHERE (? IS NULL OR session_id = ?)
           AND (
             delivery_confirmed_at IS NOT NULL
             OR retention_until <= ?
             OR ? = 1
+            OR session_id IN (
+                SELECT sdk_session_id FROM session_bindings
+                WHERE binding_intent = 'deleted'
+            )
           )
         ORDER BY session_id, tool_call_id
         """,
         (
-            int(force_session and session_id is not None),
             session_id,
             session_id,
             timestamp,
-            int(force_session and session_id is not None),
+            int(forced),
         ),
     )
     removed = 0
     for row in rows:
         path = Path(str(row["local_path"]))
-        if str(path) in retry_paths:
+        if (
+            not forced
+            and str(row["session_id"]) not in deleted_sessions
+            and str(path) in retry_paths
+        ):
             continue
         try:
             await asyncio.to_thread(path.unlink, missing_ok=True)

@@ -352,7 +352,10 @@ def _redact_assignment_values(text: str) -> str:
         if char in "\"'":
             value_end = _consume_quoted_value(text, value_start)
             if value_end is None:
-                output.append(text[value_start:])
+                if _is_sensitive_key(key):
+                    output.append(char + "[redacted]" + char)
+                else:
+                    output.append(char + _redact_assignment_values(text[value_start + 1 :]))
                 break
             value = text[value_start:value_end]
             output.append(_redact_assignment_value(key, value, quoted=True))
@@ -361,7 +364,10 @@ def _redact_assignment_values(text: str) -> str:
         if char in "[{":
             value_end = _consume_balanced_json(text, value_start)
             if value_end is None:
-                output.append(text[value_start:])
+                if _is_sensitive_key(key):
+                    output.append("[redacted]")
+                else:
+                    output.append(char + _redact_assignment_values(text[value_start + 1 :]))
                 break
             value = text[value_start:value_end]
             output.append(_redact_assignment_value(key, value, quoted=False))

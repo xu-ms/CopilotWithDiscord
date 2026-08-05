@@ -55,6 +55,7 @@ async def test_initial_migration_creates_full_schema(tmp_path: Path) -> None:
         "tool_output_streams",
         "tool_spill_artifacts",
         "trusted_local_artifacts",
+        "trusted_local_artifact_snapshots",
         "usage_samples",
     }
 
@@ -87,7 +88,7 @@ async def test_migrations_are_idempotent(tmp_path: Path) -> None:
     async with Database(database_path) as database:
         rows = await database.fetchall("SELECT version FROM schema_migrations")
 
-    assert [row["version"] for row in rows] == list(range(1, 15))
+    assert [row["version"] for row in rows] == list(range(1, 16))
 
 
 @pytest.mark.asyncio

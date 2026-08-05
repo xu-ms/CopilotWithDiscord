@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import io
 import json
@@ -7,6 +8,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from types import SimpleNamespace
 
+import aiohttp
 import discord
 import pytest
 
@@ -440,6 +442,49 @@ async def test_manifest_restoration_uses_exact_snapshot(tmp_path: Path) -> None:
     assert bot.closed is True
 
 
+def test_manifest_merges_mutable_access_controls_from_attributes() -> None:
+    command = SimpleNamespace(
+        type=SimpleNamespace(value=1),
+        name="restricted",
+        description="restricted command",
+        default_member_permissions=SimpleNamespace(value=8),
+        default_permission=False,
+        dm_permission=False,
+        nsfw=True,
+        contexts=[SimpleNamespace(value=0), SimpleNamespace(value=1)],
+        integration_types=[SimpleNamespace(value=0)],
+        to_dict=lambda: {
+            "name": "restricted",
+            "type": 1,
+            "description": "restricted command",
+            "options": [],
+        },
+    )
+
+    manifest = harness_module._command_manifest_entry(command)
+
+    assert manifest["default_member_permissions"] == "8"
+    assert manifest["default_permission"] is False
+    assert manifest["dm_permission"] is False
+    assert manifest["nsfw"] is True
+    assert manifest["contexts"] == [0, 1]
+    assert manifest["integration_types"] == [0]
+
+
+@pytest.mark.asyncio
+async def test_http_trace_is_wired_to_discord_http_client_before_start() -> None:
+    connector = aiohttp.TCPConnector()
+    trace = aiohttp.TraceConfig()
+    bot = SimpleNamespace(http=SimpleNamespace())
+    try:
+        harness_module._wire_discord_http_trace(bot, connector, trace)
+
+        assert bot.http.connector is connector
+        assert bot.http.http_trace is trace
+    finally:
+        await connector.close()
+
+
 @pytest.mark.asyncio
 async def test_cleanup_aggregates_not_found_and_writes_sanitized_evidence_on_failure(
     tmp_path: Path,
@@ -664,6 +709,9 @@ async def test_dry_run_traverses_snapshot_sync_channel_probe_cleanup_without_net
     assert evidence.channel_id == "30"
     assert http.restore_calls == [(10, 20, tree.snapshot)]
     assert any(
+        feature.feature == "dry-run reducer/outbox exact delivery" for feature in evidence.features
+    )
+    assert not any(
         feature.feature == "production reducer/outbox exact delivery"
         for feature in evidence.features
     )
@@ -788,6 +836,60 @@ async def test_run_aggregates_original_cleanup_restore_and_write_errors(
 
 
 @pytest.mark.asyncio
+async def test_run_preserves_cancellation_with_cleanup_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database = Database(tmp_path / "cancel.sqlite3")
+    channel = DryRunChannel(id=30)
+    guild = DryRunGuild(id=20, channel=channel)
+    http = DryRunHttp()
+
+    async def failing_restore(*args, **kwargs):
+        raise RuntimeError("restore after cancellation failed")
+
+    http.bulk_upsert_guild_commands = failing_restore  # type: ignore[assignment]
+
+    def bot_factory(settings):
+        return DryRunBot(
+            application_id=10,
+            database=database,
+            guilds=[guild],
+            tree=DryRunTree(),
+            http=http,
+        )
+
+    harness = DiscordRealHarness(
+        token="not-used",
+        evidence_path=tmp_path / "cancel-evidence.json",
+        guild_id=20,
+        application_id=10,
+        channel_id=30,
+        dry_run=True,
+        bot_factory=bot_factory,
+    )
+
+    async def cancel_pipeline(bot, root):
+        harness._guild_object = discord.Object(id=20)
+        harness._original_manifest = [{"name": "existing", "type": 1}]
+        raise asyncio.CancelledError("original cancellation")
+
+    monkeypatch.setattr(harness, "_execute_ready_pipeline", cancel_pipeline)
+
+    with pytest.raises(BaseExceptionGroup) as exc_info:
+        await harness.run()
+
+    errors = exc_info.value.exceptions
+    assert any(isinstance(error, asyncio.CancelledError) for error in errors)
+    assert any("restore after cancellation failed" in str(error) for error in errors)
+    assert (tmp_path / "cancel-evidence.json").is_file()
+
+
+def test_production_imports_do_not_install_direct_delivery_fallback() -> None:
+    assert not hasattr(harness_module, "_PRODUCTION_PIPELINE_FALLBACK")
+
+
+@pytest.mark.asyncio
 async def test_rate_case_pends_without_actual_429_and_passes_only_on_probe(tmp_path: Path) -> None:
     harness = DiscordRealHarness(
         token="not-used",
@@ -801,7 +903,17 @@ async def test_rate_case_pends_without_actual_429_and_passes_only_on_probe(tmp_p
     pending = harness._rate_limit_feature(burst)
     assert pending.status == "pending_not_observed"
 
-    harness.record_http_response(status=429, retry_after=1.25, url="https://discord.test")
+    await harness._trace_request_end(
+        None,
+        None,
+        SimpleNamespace(
+            response=SimpleNamespace(
+                status=429,
+                headers={"Retry-After": "1.25"},
+                url="https://discord.test",
+            )
+        ),
+    )
     passed = harness._rate_limit_feature(burst)
     assert passed.status == "passed"
     assert "retry_after=1.25" in passed.detail

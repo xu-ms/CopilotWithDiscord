@@ -8,7 +8,10 @@ import time
 from dataclasses import dataclass
 from typing import Any, Protocol
 
-from copilotd.core.spill_artifacts import confirm_and_collect_tool_spills
+from copilotd.core.spill_artifacts import (
+    confirm_and_collect_tool_spills,
+    garbage_collect_tool_spills,
+)
 from copilotd.storage.database import Database
 
 
@@ -72,11 +75,14 @@ class RenderOutboxDispatcher:
         *,
         claim_timeout_seconds: float = 60,
         max_transient_attempts: int = 3,
+        spill_gc_interval_seconds: float = 60 * 60,
     ) -> None:
         self._database = database
         self._transport = transport
         self._claim_timeout_seconds = claim_timeout_seconds
         self._max_transient_attempts = max_transient_attempts
+        self._spill_gc_interval_seconds = spill_gc_interval_seconds
+        self._next_spill_gc = 0.0
         self._last_delivery: dict[tuple[str, str], float] = {}
         self._dispatch_lock = asyncio.Lock()
         self._restore_tasks: set[asyncio.Task[None]] = set()
@@ -91,6 +97,10 @@ class RenderOutboxDispatcher:
         async with self._dispatch_lock:
             live_clock = now is None
             timestamp = time.time() if live_clock else now
+            monotonic_now = time.monotonic()
+            if monotonic_now >= self._next_spill_gc:
+                await garbage_collect_tool_spills(self._database, now=timestamp)
+                self._next_spill_gc = monotonic_now + self._spill_gc_interval_seconds
             claimed_ids: list[str] = []
             try:
                 items = await self._claim(
@@ -400,17 +410,21 @@ class RenderOutboxDispatcher:
         except RenderTransientError:
             retry_now = time.time() if live_clock else now
             if item.attempts >= self._max_transient_attempts:
-                await self._block(item, now=retry_now)
+                blocked = await self._block(item, now=retry_now)
+                return False, not blocked
             else:
                 await self._retry(
                     item,
                     next_attempt_at=retry_now + min(2 ** (item.attempts - 1), 30),
                     now=retry_now,
                 )
-            return False, item.attempts < self._max_transient_attempts
+                return False, True
         except RenderPermanentError:
-            await self._block(item, now=time.time() if live_clock else now)
-            return False, False
+            blocked = await self._block(
+                item,
+                now=time.time() if live_clock else now,
+            )
+            return False, not blocked
 
         self._last_delivery[delivery_key] = time.monotonic()
         async with self._database.transaction() as connection:
@@ -477,25 +491,77 @@ class RenderOutboxDispatcher:
         *,
         next_attempt_at: float,
         now: float,
-    ) -> None:
-        await self._database.execute(
-            """
-            UPDATE render_outbox
-            SET state = 'pending', next_attempt_at = ?, updated_at = ?
-            WHERE id = ? AND state = 'sending'
-            """,
-            (next_attempt_at, now, item.id),
+    ) -> bool:
+        return await self._transition_failed_claim(
+            item,
+            state="pending",
+            next_attempt_at=next_attempt_at,
+            now=now,
         )
 
-    async def _block(self, item: OutboxItem, *, now: float) -> None:
-        await self._database.execute(
-            """
-            UPDATE render_outbox
-            SET state = 'blocked', updated_at = ?
-            WHERE id = ? AND state = 'sending'
-            """,
-            (now, item.id),
+    async def _block(self, item: OutboxItem, *, now: float) -> bool:
+        return await self._transition_failed_claim(
+            item,
+            state="blocked",
+            next_attempt_at=None,
+            now=now,
         )
+
+    async def _transition_failed_claim(
+        self,
+        item: OutboxItem,
+        *,
+        state: str,
+        next_attempt_at: float | None,
+        now: float,
+    ) -> bool:
+        async with self._database.transaction() as connection:
+            if next_attempt_at is None:
+                cursor = await connection.execute(
+                    """
+                    UPDATE render_outbox
+                    SET state = ?, updated_at = ?
+                    WHERE id = ? AND state = 'sending'
+                      AND payload_revision = ?
+                    """,
+                    (state, now, item.id, item.payload_revision),
+                )
+            else:
+                cursor = await connection.execute(
+                    """
+                    UPDATE render_outbox
+                    SET state = ?, next_attempt_at = ?, updated_at = ?
+                    WHERE id = ? AND state = 'sending'
+                      AND payload_revision = ?
+                    """,
+                    (
+                        state,
+                        next_attempt_at,
+                        now,
+                        item.id,
+                        item.payload_revision,
+                    ),
+                )
+            transitioned = cursor.rowcount == 1
+            await cursor.close()
+            if transitioned:
+                return True
+            cursor = await connection.execute(
+                """
+                UPDATE render_outbox
+                SET state = 'pending',
+                    next_attempt_at = MIN(next_attempt_at, ?),
+                    updated_at = ?
+                WHERE id = ? AND state = 'sending'
+                  AND payload_revision > ?
+                """,
+                (now, now, item.id, item.payload_revision),
+            )
+            requeued = cursor.rowcount == 1
+            await cursor.close()
+            if not requeued:
+                raise RuntimeError(f"render outbox claim was lost: {item.id}")
+            return False
 
 
 def _payload_hash(payload: dict[str, Any]) -> str:

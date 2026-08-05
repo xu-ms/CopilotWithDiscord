@@ -20,6 +20,15 @@ from copilotd.storage.database import Database
 FenceValidator = Callable[[int, int], Awaitable[bool]]
 _DIFF_OUTPUT_LIMIT = 8 * 1024 * 1024
 _TOOL_SPILL_RETENTION_SECONDS = 7 * 24 * 60 * 60
+_TRUSTED_LOCAL_IMAGE_SUFFIXES = {
+    ".bmp",
+    ".gif",
+    ".jpeg",
+    ".jpg",
+    ".png",
+    ".tiff",
+    ".webp",
+}
 
 
 class RenderPlanner:
@@ -731,12 +740,18 @@ class JournalReducer:
         await cursor.close()
         trusted_cursor = await connection.execute(
             """
-            SELECT path FROM trusted_local_artifacts
-            WHERE session_id = ? ORDER BY observed_at, path
+            SELECT trusted.path, snapshots.snapshot_path,
+                   snapshots.byte_size, snapshots.sha256
+            FROM trusted_local_artifacts AS trusted
+            JOIN trusted_local_artifact_snapshots AS snapshots
+              ON snapshots.session_id = trusted.session_id
+             AND snapshots.source_path = trusted.path
+            WHERE trusted.session_id = ?
+            ORDER BY trusted.observed_at, trusted.path
             """,
             (event.sdk_session_id,),
         )
-        trusted_paths = [str(row["path"]) for row in await trusted_cursor.fetchall()]
+        trusted_rows = await trusted_cursor.fetchall()
         await trusted_cursor.close()
         payload = {
             "type": event.raw_type,
@@ -745,9 +760,18 @@ class JournalReducer:
             "agent_id": event.agent_id,
             "finalized": bool(stream["finalized"]),
         }
-        if trusted_paths:
+        if trusted_rows:
             payload["trusted_local_images"] = True
-            payload["trusted_local_image_paths"] = trusted_paths
+            payload["trusted_local_image_paths"] = [str(row["path"]) for row in trusted_rows]
+            payload["trusted_local_image_artifacts"] = [
+                {
+                    "source_path": str(row["path"]),
+                    "snapshot_path": str(row["snapshot_path"]),
+                    "byte_size": int(row["byte_size"]),
+                    "sha256": str(row["sha256"]),
+                }
+                for row in trusted_rows
+            ]
         return payload
 
     async def _accumulate_render_stream(
@@ -958,7 +982,29 @@ class JournalReducer:
         row = await cursor.fetchone()
         await cursor.close()
         if row is None:
-            return False, None
+            if event.raw_type != "tool.execution_complete":
+                return False, None
+            await connection.execute(
+                """
+                INSERT INTO tool_output_streams(
+                    session_id, tool_call_id, content, spilled,
+                    artifact_emitted, finalized, updated_at
+                ) VALUES (?, ?, '', 0, 0, 0, ?)
+                """,
+                (event.sdk_session_id, tool_call_id, now),
+            )
+            cursor = await connection.execute(
+                """
+                SELECT content, spilled, artifact_emitted, finalized
+                FROM tool_output_streams
+                WHERE session_id = ? AND tool_call_id = ?
+                """,
+                (event.sdk_session_id, tool_call_id),
+            )
+            row = await cursor.fetchone()
+            await cursor.close()
+            if row is None:
+                raise RuntimeError("completion stream initialization failed")
         if event.raw_type == "tool.execution_progress" and bool(row["finalized"]):
             return True, None
         if event.raw_type == "tool.execution_complete" and bool(row["finalized"]):
@@ -989,8 +1035,10 @@ class JournalReducer:
                 verbatim = completion_verbatim
                 canonical_bytes = completion.encode()
                 if artifact is None:
-                    completion_matches_stream = str(row["content"]).encode() == canonical_bytes
+                    stream_bytes = str(row["content"]).encode()
+                    completion_matches_stream = stream_bytes == canonical_bytes
                 else:
+                    stream_bytes = b""
                     completion_matches_stream = await asyncio.to_thread(
                         _spill_matches_bytes,
                         Path(str(artifact["local_path"])),
@@ -999,10 +1047,17 @@ class JournalReducer:
                     )
                 if not completion_matches_stream:
                     completion_bytes = (
-                        f"\n\n--- completion payload ({completion_source}) ---\n{completion}"
-                    ).encode()
+                        canonical_bytes
+                        if artifact is None and not stream_bytes
+                        else (
+                            f"\n\n--- completion payload ({completion_source}) ---\n{completion}"
+                        ).encode()
+                    )
         if artifact is None and event.raw_type == "tool.execution_complete":
-            combined = str(row["content"]).encode() + completion_bytes
+            accumulated_bytes = str(row["content"]).encode()
+            combined = (
+                completion_bytes if not accumulated_bytes else accumulated_bytes + completion_bytes
+            )
             if len(combined) >= 64 * 1024:
                 path = _tool_spill_path(
                     self._artifact_root,
@@ -1140,6 +1195,13 @@ class JournalReducer:
                         """,
                         (event.sdk_session_id, path),
                     )
+                    await connection.execute(
+                        """
+                        DELETE FROM trusted_local_artifact_snapshots
+                        WHERE session_id = ? AND source_path = ?
+                        """,
+                        (event.sdk_session_id, path),
+                    )
                 else:
                     await connection.execute(
                         """
@@ -1151,6 +1213,58 @@ class JournalReducer:
                         """,
                         (event.sdk_session_id, path, event.received_at),
                     )
+                    binding_cursor = await connection.execute(
+                        """
+                        SELECT cwd_snapshot FROM session_bindings
+                        WHERE sdk_session_id = ?
+                        """,
+                        (event.sdk_session_id,),
+                    )
+                    binding = await binding_cursor.fetchone()
+                    await binding_cursor.close()
+                    snapshot = None
+                    if binding is not None:
+                        try:
+                            snapshot = await asyncio.to_thread(
+                                _snapshot_trusted_local_artifact,
+                                self._artifact_root,
+                                Path(str(binding["cwd_snapshot"])),
+                                event.sdk_session_id,
+                                path,
+                            )
+                        except OSError:
+                            snapshot = None
+                    if snapshot is None:
+                        await connection.execute(
+                            """
+                            DELETE FROM trusted_local_artifact_snapshots
+                            WHERE session_id = ? AND source_path = ?
+                            """,
+                            (event.sdk_session_id, path),
+                        )
+                    else:
+                        snapshot_path, byte_size, digest = snapshot
+                        await connection.execute(
+                            """
+                            INSERT INTO trusted_local_artifact_snapshots(
+                                session_id, source_path, snapshot_path,
+                                byte_size, sha256, observed_at
+                            ) VALUES (?, ?, ?, ?, ?, ?)
+                            ON CONFLICT(session_id, source_path) DO UPDATE SET
+                                snapshot_path = excluded.snapshot_path,
+                                byte_size = excluded.byte_size,
+                                sha256 = excluded.sha256,
+                                observed_at = excluded.observed_at
+                            """,
+                            (
+                                event.sdk_session_id,
+                                path,
+                                str(snapshot_path),
+                                byte_size,
+                                digest,
+                                event.received_at,
+                            ),
+                        )
         stream_content: str | None = None
         if (
             event.raw_type in {"assistant.message_delta", "assistant.message"}
@@ -3064,6 +3178,53 @@ def _tool_spill_path(root: Path, session_id: str, tool_call_id: str) -> Path:
     session_token = uuid.uuid5(uuid.NAMESPACE_URL, f"session:{session_id}").hex[:16]
     tool_token = uuid.uuid5(uuid.NAMESPACE_URL, f"tool:{tool_call_id}").hex[:16]
     return root / session_token / "artifacts" / f"tool-{tool_token}.txt"
+
+
+def _snapshot_trusted_local_artifact(
+    root: Path,
+    cwd: Path,
+    session_id: str,
+    source_path: str,
+) -> tuple[Path, int, str] | None:
+    resolved_cwd = cwd.resolve(strict=False)
+    candidate = Path(source_path)
+    source = (
+        candidate.resolve(strict=False)
+        if candidate.is_absolute()
+        else (resolved_cwd / candidate).resolve(strict=False)
+    )
+    try:
+        source.relative_to(resolved_cwd)
+    except ValueError:
+        return None
+    if source.suffix.lower() not in _TRUSTED_LOCAL_IMAGE_SUFFIXES or not source.is_file():
+        return None
+
+    session_token = uuid.uuid5(uuid.NAMESPACE_URL, f"session:{session_id}").hex[:16]
+    source_token = uuid.uuid5(uuid.NAMESPACE_URL, f"local-image:{source_path}").hex[:16]
+    snapshot_root = root / session_token / "artifacts" / "local-images"
+    snapshot_root.mkdir(parents=True, exist_ok=True)
+    temporary = snapshot_root / f".{source_token}.{uuid.uuid4().hex}.tmp"
+    digest = hashlib.sha256()
+    byte_size = 0
+    try:
+        with source.open("rb") as input_file, temporary.open("xb") as output_file:
+            for chunk in iter(lambda: input_file.read(1024 * 1024), b""):
+                output_file.write(chunk)
+                digest.update(chunk)
+                byte_size += len(chunk)
+            output_file.flush()
+            os.fsync(output_file.fileno())
+        digest_text = digest.hexdigest()
+        suffix = source.suffix.lower()
+        snapshot_path = snapshot_root / f"{source_token}-{digest_text}{suffix}"
+        if snapshot_path.exists():
+            temporary.unlink(missing_ok=True)
+        else:
+            os.replace(temporary, snapshot_path)
+        return snapshot_path, byte_size, digest_text
+    finally:
+        temporary.unlink(missing_ok=True)
 
 
 def _write_spill_bytes(path: Path, content: bytes) -> None:

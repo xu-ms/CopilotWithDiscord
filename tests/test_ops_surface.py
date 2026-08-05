@@ -127,6 +127,21 @@ def test_redact_structure_redacts_entire_sensitive_containers() -> None:
     assert redacted["public_metadata"] == "visible"
 
 
+@pytest.mark.parametrize(
+    "value",
+    [
+        'payload={"nested":{"password":"truncated-secret',
+        'payload={"nested":{"password":{"value":"truncated-secret',
+        'password="truncated-secret',
+    ],
+)
+def test_redact_text_redacts_unterminated_sensitive_fragments(value: str) -> None:
+    redacted = _redact_text(value)
+
+    assert "truncated-secret" not in redacted
+    assert "[redacted]" in redacted
+
+
 @pytest.mark.asyncio
 async def test_ops_surface_redacts_diagnostics_log_tail_and_event_dump(
     tmp_path: Path,
