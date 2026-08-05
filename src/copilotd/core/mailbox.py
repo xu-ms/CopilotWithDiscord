@@ -12,6 +12,8 @@ from enum import Enum, StrEnum
 from pathlib import Path
 from typing import Any
 
+from copilotd.core.inbox import ReducerInbox
+from copilotd.core.task_registry import TaskRegistry
 from copilotd.storage.database import Database
 
 OperationCallable = Callable[[], Awaitable[Any]]
@@ -56,8 +58,9 @@ class _MailboxItem:
 
 
 class OperationStore:
-    def __init__(self, database: Database) -> None:
+    def __init__(self, database: Database, inbox: ReducerInbox) -> None:
         self._database = database
+        self._inbox = inbox
 
     async def begin(
         self,
@@ -70,53 +73,50 @@ class OperationStore:
         input_payload: Any,
     ) -> tuple[OperationRecord, bool]:
         input_hash = _input_hash(input_payload)
-        async with self._database.transaction() as connection:
-            cursor = await connection.execute(
-                """
-                SELECT * FROM session_operations
-                WHERE sdk_session_id = ? AND idempotency_key = ?
-                """,
-                (sdk_session_id, idempotency_key),
-            )
-            row = await cursor.fetchone()
-            await cursor.close()
-            if row is not None:
-                record = _row_to_record(row)
-                if record.input_hash != input_hash or record.kind != kind:
-                    raise ValueError("idempotency key was reused with different input")
-                return record, False
+        row = await self._database.fetchone(
+            """
+            SELECT * FROM session_operations
+            WHERE sdk_session_id = ? AND idempotency_key = ?
+            """,
+            (sdk_session_id, idempotency_key),
+        )
+        if row is not None:
+            record = _row_to_record(row)
+            if record.input_hash != input_hash or record.kind != kind:
+                raise ValueError("idempotency key was reused with different input")
+            return record, False
 
-            record = OperationRecord(
-                operation_id=str(uuid.uuid4()),
-                sdk_session_id=sdk_session_id,
-                runtime_generation=runtime_generation,
-                owner_fence_token=owner_fence_token,
-                kind=kind,
-                idempotency_key=idempotency_key,
-                input_hash=input_hash,
-                state=OperationState.PENDING,
+        operation_id = str(
+            uuid.uuid5(
+                uuid.NAMESPACE_URL,
+                f"copilotd:{sdk_session_id}:operation:{idempotency_key}",
             )
-            await connection.execute(
-                """
-                INSERT INTO session_operations(
-                    operation_id, sdk_session_id, runtime_generation,
-                    owner_fence_token, kind, idempotency_key, input_hash,
-                    state, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    record.operation_id,
-                    record.sdk_session_id,
-                    record.runtime_generation,
-                    record.owner_fence_token,
-                    record.kind,
-                    record.idempotency_key,
-                    record.input_hash,
-                    record.state.value,
-                    time.time(),
-                ),
-            )
-            return record, True
+        )
+        await self._inbox.commit_internal(
+            {
+                "type": "copilotd.operation.pending",
+                "data": {
+                    "operation_id": operation_id,
+                    "runtime_generation": runtime_generation,
+                    "owner_fence_token": owner_fence_token,
+                    "kind": kind,
+                    "idempotency_key": idempotency_key,
+                    "input_hash": input_hash,
+                    "created_at": time.time(),
+                },
+            },
+            internal_event_id=f"operation:{operation_id}:pending",
+        )
+        row = await self._database.fetchone(
+            "SELECT * FROM session_operations WHERE operation_id = ?",
+            (operation_id,),
+        )
+        if row is None:
+            raise RuntimeError(f"reducer did not persist operation {operation_id}")
+        record = _row_to_record(row)
+        if record.input_hash != input_hash or record.kind != kind:
+            raise ValueError("idempotency key was reused with different input")
+        return record, True
 
     async def transition(
         self,
@@ -137,45 +137,27 @@ class OperationStore:
         if state not in allowed.get(record.state, set()):
             raise ValueError(f"invalid operation transition {record.state} -> {state}")
         result_ref = None if result is None else json.dumps(_jsonable(result), sort_keys=True)
-        timestamp = time.time()
-        async with self._database.transaction() as connection:
-            cursor = await connection.execute(
-                """
-                UPDATE session_operations
-                SET state = ?, result_ref = ?, error_code = ?,
-                    started_at = CASE WHEN ? = 'started' THEN ? ELSE started_at END,
-                    settled_at = CASE WHEN ? IN ('confirmed', 'rejected', 'unknown')
-                                      THEN ? ELSE settled_at END
-                WHERE operation_id = ? AND state = ?
-                """,
-                (
-                    state.value,
-                    result_ref,
-                    error_code,
-                    state.value,
-                    timestamp,
-                    state.value,
-                    timestamp,
-                    record.operation_id,
-                    record.state.value,
-                ),
-            )
-            if cursor.rowcount != 1:
-                await cursor.close()
-                raise RuntimeError(f"operation state changed concurrently: {record.operation_id}")
-            await cursor.close()
-        return OperationRecord(
-            operation_id=record.operation_id,
-            sdk_session_id=record.sdk_session_id,
-            runtime_generation=record.runtime_generation,
-            owner_fence_token=record.owner_fence_token,
-            kind=record.kind,
-            idempotency_key=record.idempotency_key,
-            input_hash=record.input_hash,
-            state=state,
-            result_ref=result_ref,
-            error_code=error_code,
+        await self._inbox.commit_internal(
+            {
+                "type": "copilotd.operation.transition",
+                "data": {
+                    "operation_id": record.operation_id,
+                    "from_state": record.state.value,
+                    "to_state": state.value,
+                    "result_ref": result_ref,
+                    "error_code": error_code,
+                    "transitioned_at": time.time(),
+                },
+            },
+            internal_event_id=f"operation:{record.operation_id}:{state.value}",
         )
+        row = await self._database.fetchone(
+            "SELECT * FROM session_operations WHERE operation_id = ?",
+            (record.operation_id,),
+        )
+        if row is None:
+            raise RuntimeError(f"operation disappeared: {record.operation_id}")
+        return _row_to_record(row)
 
     async def mark_unsettled_unknown(
         self,
@@ -185,19 +167,19 @@ class OperationStore:
         owner_fence_token: int,
         error_code: str,
     ) -> None:
-        await self._database.execute(
-            """
-            UPDATE session_operations
-            SET state = 'unknown', error_code = ?, settled_at = ?
-            WHERE sdk_session_id = ? AND runtime_generation = ?
-              AND owner_fence_token = ? AND state IN ('pending', 'started')
-            """,
-            (
-                error_code,
-                time.time(),
-                sdk_session_id,
-                runtime_generation,
-                owner_fence_token,
+        await self._inbox.commit_internal(
+            {
+                "type": "copilotd.operation.unsettled_unknown",
+                "data": {
+                    "runtime_generation": runtime_generation,
+                    "owner_fence_token": owner_fence_token,
+                    "error_code": error_code,
+                    "settled_at": time.time(),
+                },
+            },
+            internal_event_id=(
+                f"operations:{sdk_session_id}:{runtime_generation}:"
+                f"{owner_fence_token}:unknown:{error_code}"
             ),
         )
 
@@ -213,6 +195,7 @@ class CommandMailbox:
         runtime_generation: int,
         owner_fence_token: int,
         fence_validator: FenceValidator,
+        task_registry: TaskRegistry | None = None,
         capacity: int = 1024,
     ) -> None:
         self._store = store
@@ -220,6 +203,7 @@ class CommandMailbox:
         self._runtime_generation = runtime_generation
         self._owner_fence_token = owner_fence_token
         self._fence_validator = fence_validator
+        self._task_registry = task_registry or TaskRegistry()
         self._queue: asyncio.Queue[_MailboxItem | None] = asyncio.Queue(maxsize=capacity)
         self._futures: dict[str, asyncio.Future[Any]] = {}
         self._submission_lock = asyncio.Lock()
@@ -230,9 +214,12 @@ class CommandMailbox:
         if self._worker is not None:
             raise RuntimeError("command mailbox already started")
         self._accepting = True
-        self._worker = asyncio.create_task(
+        self._worker = self._task_registry.create(
             self._run(),
             name=f"mailbox:{self._sdk_session_id}",
+            source="command-mailbox",
+            session_id=self._sdk_session_id,
+            runtime_generation=self._runtime_generation,
         )
 
     def freeze(self) -> None:

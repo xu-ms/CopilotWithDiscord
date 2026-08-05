@@ -7,6 +7,7 @@ from typing import Any, Literal, cast
 
 from copilot import CopilotClient, RuntimeConnection
 from copilot.generated.rpc import (
+    EventLogReadRequest,
     MetadataContextInfoRequest,
     ModeSetRequest,
     PermissionsAllowAllMode,
@@ -14,6 +15,7 @@ from copilot.generated.rpc import (
     PermissionsSetAllowAllRequest,
     PermissionsSetApproveAllRequest,
     SessionMode,
+    SessionsCheckInUseRequest,
 )
 from copilot.session import CopilotSession, PermissionHandler
 from copilot.session_events import SessionEvent
@@ -29,6 +31,15 @@ class PermissionPostureError(RuntimeError):
 class PermissionPosture:
     enabled: bool
     mode: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class EventLogBatch:
+    cursor: str
+    cursor_status: str
+    events: tuple[SessionEvent, ...]
+    has_more: bool
+    filtered_ephemeral: int
 
 
 class CopilotBridge:
@@ -252,6 +263,70 @@ class CopilotBridge:
         await session.rpc.tasks.refresh(timeout=10)
         tasks = await session.rpc.tasks.list(timeout=10)
         return [cast(dict[str, Any], task.to_dict()) for task in tasks.tasks]
+
+    async def get_native_schedules(self, session: CopilotSession) -> list[dict[str, Any]]:
+        schedules = await session.rpc.schedule.list(timeout=10)
+        return [cast(dict[str, Any], entry.to_dict()) for entry in schedules.entries]
+
+    async def get_remote_state(self, session: CopilotSession) -> dict[str, Any]:
+        snapshot = cast(dict[str, Any], (await session.rpc.metadata.snapshot(timeout=10)).to_dict())
+        return {
+            "mode": "unknown" if snapshot.get("isRemote") else "off",
+            "url": snapshot.get("remoteUrl"),
+            "metadata": snapshot,
+        }
+
+    async def get_current_agent(self, session: CopilotSession) -> str:
+        current = await session.rpc.agent.get_current(timeout=10)
+        if current.agent is None:
+            return "default"
+        payload = cast(dict[str, Any], current.agent.to_dict())
+        return str(payload.get("name") or payload.get("displayName") or "default")
+
+    async def tail_event_log(self, session: CopilotSession) -> str:
+        return (await session.rpc.event_log.tail(timeout=10)).cursor
+
+    async def read_event_log(
+        self,
+        session: CopilotSession,
+        *,
+        cursor: str | None,
+        max_events: int = 500,
+        wait_ms: int = 0,
+        include_ephemeral: bool = False,
+    ) -> EventLogBatch:
+        if include_ephemeral:
+            raise ValueError("durable recovery never requests ephemeral event replay")
+        result = await session.rpc.event_log.read(
+            EventLogReadRequest(
+                cursor=cursor,
+                max=max_events,
+                wait_ms=wait_ms,
+            ),
+            timeout=max(10, wait_ms / 1000 + 5),
+        )
+        durable = tuple(event for event in result.events if event.ephemeral is not True)
+        return EventLogBatch(
+            cursor=result.cursor,
+            cursor_status=result.cursor_status.value,
+            events=durable,
+            has_more=result.has_more,
+            filtered_ephemeral=len(result.events) - len(durable),
+        )
+
+    async def check_session_in_use(self, session_id: str) -> bool:
+        result = await self.client.rpc.sessions.check_in_use(
+            SessionsCheckInUseRequest(session_ids=[session_id]),
+            timeout=10,
+        )
+        return session_id in result.in_use
+
+    async def transport_ping(self) -> dict[str, object]:
+        result = await self.client.ping("copilotd-stall-monitor")
+        return {
+            "status": "ok",
+            "protocol_version": result.protocol_version,
+        }
 
     async def runtime_identity(self) -> dict[str, Any]:
         status = await self.client.get_status()

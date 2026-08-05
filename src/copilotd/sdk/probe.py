@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import os
 import re
@@ -30,7 +31,14 @@ from copilot.session_events import SessionEvent, SessionEventType
 from pydantic import SecretStr
 
 from copilotd.config import Settings
+from copilotd.core.task_registry import TaskRegistry
 from copilotd.sdk.bridge import CopilotBridge
+from copilotd.sdk.capabilities import (
+    MAIN_BRANCH_ONLY_EVENTS,
+    PINNED_GENERATED_EVENT_COUNT,
+    PINNED_GENERATED_EVENT_SHA256,
+    CapabilityRegistry,
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -76,35 +84,13 @@ class SdkProbe:
         self._settings = settings
 
     def static_matrix(self) -> dict[str, Any]:
-        event_types = sorted(item.value for item in SessionEventType)
-        return {
-            "sdk_version": version("github-copilot-sdk"),
-            "python": os.sys.version.split()[0],
-            "event_count": len(event_types),
-            "event_types": event_types,
-            "audited_main_event_count": 116,
-            "audited_main_only_events": [
-                "factory.run_updated",
-                "session.context_cleared",
-            ],
-            "capabilities": {
-                "pre_registered_on_event": CapabilityResult(True, "create/resume on_event kwarg"),
-                "persistent_history": CapabilityResult(True, "CopilotSession.get_events"),
-                "session_mode": CapabilityResult(True, "session.rpc.mode.get/set"),
-                "permission_allow_all": CapabilityResult(
-                    True, "session.rpc.permissions get/set allow-all"
-                ),
-                "activity_snapshot": CapabilityResult(
-                    True, "session.rpc.metadata is_processing/activity"
-                ),
-                "task_snapshot": CapabilityResult(True, "session.rpc.tasks refresh/list"),
-                "native_queue_snapshot": CapabilityResult(True, "session.rpc.queue.pending_items"),
-                "event_log": CapabilityResult(True, "session.rpc.event_log read/tail"),
-                "builtin_commands": CapabilityResult(True, "session.rpc.commands list/invoke"),
-                "native_schedule": CapabilityResult(True, "session.rpc.schedule list/stop"),
-                "remote": CapabilityResult(True, "session.rpc.remote enable/disable"),
-            },
-        }
+        matrix = CapabilityRegistry(self._settings).load_checked().to_dict()
+        matrix["python"] = os.sys.version.split()[0]
+        matrix["sdk_version"] = matrix["identity"]["sdk_version"]
+        matrix["event_count"] = matrix["generated_events"]["count"]
+        matrix["event_types"] = sorted(item.value for item in SessionEventType)
+        matrix["main_branch_only_events"] = matrix["generated_events"]["main_branch_only"]
+        return matrix
 
     async def run_live(
         self,
@@ -144,6 +130,11 @@ class SdkProbe:
                 await bridge.start()
                 bridge_started = True
                 live["runtime"] = await bridge.runtime_identity()
+                live["sessions_check_in_use"] = await self._probe_call(
+                    "sessions.check_in_use",
+                    lambda: bridge.check_session_in_use(session_id),
+                    transform=lambda in_use: {"in_use": in_use},
+                )
                 live["transport_frames"] = await self._probe_transport_frames(bridge)
                 live["models"] = await self._probe_call(
                     "models",
@@ -321,10 +312,184 @@ class SdkProbe:
                     await bridge.stop()
 
         fixture_path = self._write_fixture(session_id, all_events)
+        fixture_sha256 = _sha256_file(fixture_path)
         live["fixture_path"] = str(fixture_path)
+        live["fixture_sha256"] = fixture_sha256
         live["recorded_event_count"] = len(all_events)
+        accepted_ids = {
+            str(item)
+            for item in (
+                live.get("accepted_message_id"),
+                live.get("followup_message_id"),
+            )
+            if item is not None
+        }
+        user_event_ids = {
+            str(event.get("id"))
+            for event in all_events
+            if event.get("type") == SessionEventType.USER_MESSAGE.value
+        }
+        live["accepted_user_event_id_mapping"] = bool(accepted_ids) and accepted_ids.issubset(
+            user_event_ids
+        )
+        matrix = self._live_matrix(live, fixture_path, fixture_sha256)
+        matrix["live"] = live
         self._write_matrix(matrix)
         return matrix
+
+    def _live_matrix(
+        self,
+        live: dict[str, Any],
+        fixture_path: Path,
+        fixture_sha256: str,
+    ) -> dict[str, Any]:
+        runtime = live["runtime"]
+        native_schedule = live.get("native_schedule_direct")
+        sidecar = live.get("sidecar_replay")
+        commands = live.get("commands")
+        event_log_read = live.get("event_log_read")
+        event_log_tail = live.get("event_log_tail")
+        capabilities = {
+            "accepted_user_event_id_mapping": _evidence(
+                live.get("accepted_user_event_id_mapping") is True,
+                "live-callback-probe",
+                {
+                    "accepted_message_id": live.get("accepted_message_id"),
+                    "followup_message_id": live.get("followup_message_id"),
+                    "matched": live.get("accepted_user_event_id_mapping"),
+                },
+            ),
+            "activity_snapshot": _evidence(
+                _supported(live.get("activity")) and _supported(live.get("processing")),
+                "live-rpc-probe",
+                {"activity": live.get("activity"), "processing": live.get("processing")},
+            ),
+            "builtin_commands": _evidence(
+                _supported(commands) and _supported(native_schedule),
+                "live-command-probe",
+                {"list": commands, "disposable_invoke": native_schedule},
+            ),
+            "context_info": _evidence(
+                _supported(live.get("context_info")),
+                "live-rpc-probe",
+                live.get("context_info"),
+            ),
+            "detached_continuation": _evidence(
+                _supported(sidecar),
+                "live-sidecar-probe",
+                sidecar or {"reason": "sidecar probe not requested"},
+            ),
+            "event_log": _evidence(
+                _supported(event_log_read) and _supported(event_log_tail),
+                "live-rpc-probe",
+                {"read": event_log_read, "tail": event_log_tail},
+            ),
+            "model_config": _evidence(
+                False,
+                "unprobed",
+                "live probe did not mutate model configuration",
+            ),
+            "models": _evidence(
+                _supported(live.get("models")),
+                "live-rpc-probe",
+                live.get("models"),
+            ),
+            "native_queue_snapshot": _evidence(
+                _supported(live.get("queue")),
+                "live-rpc-probe",
+                live.get("queue"),
+            ),
+            "native_schedule": _evidence(
+                _supported(native_schedule),
+                "live-command-probe",
+                native_schedule or {"reason": "native schedule probe not requested"},
+            ),
+            "permission_allow_all": _evidence(
+                bool((live.get("permission_posture") or {}).get("enabled"))
+                and (live.get("permission_posture") or {}).get("mode") == "on",
+                "live-rpc-probe",
+                live.get("permission_posture"),
+            ),
+            "persistent_history": _evidence(
+                live.get("durable_history_recovered") is True,
+                "live-resume-probe",
+                {
+                    "before_disconnect": live.get("history_before_disconnect"),
+                    "after_resume": live.get("history_after_resume"),
+                },
+            ),
+            "pre_registered_on_event": _evidence(
+                live.get("session_id_matches") is True
+                and live.get("resume_session_id_matches") is True
+                and live.get("callback_survived_idle") is True,
+                "live-callback-probe",
+                {
+                    "create_id_matches": live.get("session_id_matches"),
+                    "resume_id_matches": live.get("resume_session_id_matches"),
+                    "callback_survived_idle": live.get("callback_survived_idle"),
+                },
+            ),
+            "reasoning_summary_readback": _evidence(
+                False,
+                "unprobed",
+                "no durable reasoning-summary readback was exercised",
+            ),
+            "remote": _evidence(
+                False,
+                "unprobed",
+                "remote enable/disable was not exercised",
+            ),
+            "selected_agent": _evidence(
+                _supported(live.get("agents")) and _supported(live.get("agent_current")),
+                "live-rpc-probe",
+                {"list": live.get("agents"), "current": live.get("agent_current")},
+            ),
+            "session_mode": _evidence(
+                _supported(live.get("mode_initial"))
+                and _supported(live.get("mode_autopilot")),
+                "live-rpc-probe",
+                {
+                    "initial": live.get("mode_initial"),
+                    "round_trip": live.get("mode_autopilot"),
+                },
+            ),
+            "sessions_check_in_use": _evidence(
+                _supported(live.get("sessions_check_in_use")),
+                "live-rpc-probe",
+                live.get("sessions_check_in_use"),
+            ),
+            "task_snapshot": _evidence(
+                _supported(live.get("tasks")) and _supported(live.get("task_list")),
+                "live-rpc-probe",
+                {"refresh": live.get("tasks"), "list": live.get("task_list")},
+            ),
+            "usage": _evidence(
+                _supported(live.get("usage_metrics")),
+                "live-rpc-probe",
+                live.get("usage_metrics"),
+            ),
+        }
+        return {
+            "schema_version": 1,
+            "source": "live-probe",
+            "generated_at": datetime.now(UTC).isoformat(),
+            "identity": {
+                "sdk_version": version("github-copilot-sdk"),
+                "runtime_version": runtime["runtime_version"],
+                "protocol_version": runtime["protocol_version"],
+                "ping_protocol_version": runtime["ping_protocol_version"],
+            },
+            "generated_events": {
+                "count": PINNED_GENERATED_EVENT_COUNT,
+                "sha256": PINNED_GENERATED_EVENT_SHA256,
+                "main_branch_only": list(MAIN_BRANCH_ONLY_EVENTS),
+            },
+            "capabilities": capabilities,
+            "fixture": {
+                "path": str(fixture_path),
+                "sha256": fixture_sha256,
+            },
+        }
 
     async def _probe_mode_round_trip(self, session: CopilotSession) -> CapabilityResult:
         try:
@@ -434,6 +599,7 @@ class SdkProbe:
         resumed: CopilotSession | None = None
         session_id = f"copilotd-sidecar-{uuid.uuid4()}"
         detail: dict[str, Any] = {"session_id": session_id}
+        probe_tasks = TaskRegistry()
 
         try:
             runtime_path = _resolve_runtime_path()
@@ -459,8 +625,16 @@ class SdkProbe:
             detail["runtime_path"] = runtime_path
             assert sidecar.stdout is not None
             assert sidecar.stderr is not None
-            stdout_task = asyncio.create_task(_drain_stream(sidecar.stdout, stdout_tail))
-            stderr_task = asyncio.create_task(_drain_stream(sidecar.stderr, stderr_tail))
+            stdout_task = probe_tasks.create(
+                _drain_stream(sidecar.stdout, stdout_tail),
+                name="sdk-probe-sidecar-stdout",
+                source="sdk-probe",
+            )
+            stderr_task = probe_tasks.create(
+                _drain_stream(sidecar.stderr, stderr_tail),
+                name="sdk-probe-sidecar-stderr",
+                source="sdk-probe",
+            )
 
             uri = f"127.0.0.1:{port}"
             sidecar_settings = self._settings.model_copy(
@@ -692,6 +866,30 @@ def _summarize_event_log(value: Any) -> dict[str, Any]:
         "has_more": payload.get("hasMore"),
         "cursor_expired": payload.get("cursorExpired"),
     }
+
+
+def _supported(value: Any) -> bool:
+    if isinstance(value, CapabilityResult):
+        return value.supported
+    if isinstance(value, dict):
+        return value.get("supported") is True
+    return False
+
+
+def _evidence(supported: bool, evidence_kind: str, detail: Any) -> dict[str, Any]:
+    return {
+        "supported": supported,
+        "evidence_kind": evidence_kind,
+        "detail": _to_jsonable(detail),
+    }
+
+
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 def _resolve_runtime_path() -> str:

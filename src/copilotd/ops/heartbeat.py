@@ -36,6 +36,7 @@ class HeartbeatSnapshot:
     last_callback_at: str | None
     last_reducer_progress_at: str | None
     durable_replay_capable: bool
+    suspect_executions: int = 0
 
     @property
     def protected_work(self) -> bool:
@@ -75,6 +76,14 @@ class HeartbeatWriter:
             self.gateway_down_since = time.time()
         self.gateway_state = state
 
+    @property
+    def durable_replay_capable(self) -> bool:
+        return self._durable_replay_capable
+
+    @durable_replay_capable.setter
+    def durable_replay_capable(self, value: bool) -> None:
+        self._durable_replay_capable = value
+
     async def run(self) -> None:
         while True:
             snapshot = await self.snapshot()
@@ -104,11 +113,11 @@ class HeartbeatWriter:
               (SELECT COUNT(*) FROM runtime_schedules
                WHERE state IN ('active', 'unknown')) AS native_schedules,
               (SELECT COUNT(*) FROM session_bindings
-               WHERE runtime_remote_mode = 'on'
-                  OR (runtime_remote_mode = 'unknown'
-                      AND pending_remote_transition_id IS NOT NULL)) AS remote_sessions,
+               WHERE runtime_remote_mode IN ('on', 'unknown')) AS remote_sessions,
               (SELECT COUNT(*) FROM pending_interactions
-               WHERE state = 'pending') AS pending_interactions
+               WHERE state = 'pending') AS pending_interactions,
+              (SELECT COUNT(*) FROM execution_health
+               WHERE state = 'suspect') AS suspect_executions
             """
         )
         latest = await self._database.fetchone(
@@ -143,6 +152,7 @@ class HeartbeatWriter:
                 latest["last_reducer_progress_at"]
             ),
             durable_replay_capable=self._durable_replay_capable,
+            suspect_executions=int(counts["suspect_executions"]),
         )
 
 

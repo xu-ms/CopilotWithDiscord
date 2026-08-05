@@ -73,6 +73,9 @@ class FakeBridge:
             "steeringMessages": [],
         }
 
+    async def get_tasks(self, _session: FakeHandle) -> list[dict[str, Any]]:
+        return []
+
 
 class FakeThreads:
     def __init__(self, *, ambiguous_first_create: bool = False) -> None:

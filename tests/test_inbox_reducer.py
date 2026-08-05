@@ -1,8 +1,11 @@
 import asyncio
+import hashlib
 import json
 import threading
 from datetime import UTC, datetime
 from pathlib import Path
+from types import SimpleNamespace
+from typing import Any
 from uuid import UUID, uuid4
 
 import pytest
@@ -16,6 +19,11 @@ from copilot.session_events import (
 )
 
 from copilotd.core.event_adapter import EventAdapter
+from copilotd.core.event_inventory import (
+    EVENT_DISPOSITIONS,
+    MAIN_BRANCH_ONLY_DISPOSITIONS,
+    disposition_for,
+)
 from copilotd.core.inbox import ReducerInbox
 from copilotd.core.models import AdaptedEvent, InboxEnvelope
 from copilotd.core.reducer import EventReducerWorker, JournalReducer
@@ -41,6 +49,75 @@ def _message_final(content: str) -> SessionEvent:
         timestamp=datetime.now(UTC),
         type=SessionEventType.ASSISTANT_MESSAGE,
     )
+
+
+def _adapted(
+    raw_type: str,
+    data: dict[str, Any],
+    inbox_seq: int,
+    *,
+    source: str = "sdk",
+    session_id: str = "session-projection",
+) -> AdaptedEvent:
+    event_id = str(uuid4()) if source == "sdk" else None
+    return AdaptedEvent(
+        sdk_session_id=session_id,
+        generation=1,
+        fence_token=7,
+        inbox_seq=inbox_seq,
+        source=source,
+        raw_type=raw_type,
+        raw_payload={"type": raw_type, "data": data},
+        reducer_hash=f"hash-{inbox_seq}",
+        persistence_class="durable" if source == "sdk" else "internal",
+        received_at=100 + inbox_seq,
+        event_id=event_id,
+        internal_event_id=None if source == "sdk" else f"{raw_type}:{inbox_seq}",
+        turn_id=None if data.get("turnId") is None else str(data["turnId"]),
+        interaction_id=(
+            None if data.get("interactionId") is None else str(data["interactionId"])
+        ),
+    )
+
+
+async def _insert_projection_binding(database: Database, session_id: str) -> None:
+    await database.execute(
+        """
+        INSERT INTO session_bindings(
+            thread_id, project_source, cwd_snapshot, sdk_session_id,
+            runtime_generation, owner_fence_token, created_at, updated_at
+        ) VALUES ('thread-projection', 'home', '/tmp', ?, 1, 7, 1, 1)
+        """,
+        (session_id,),
+    )
+
+
+@pytest.mark.parametrize("event_type", list(SessionEventType))
+def test_every_sdk_1_0_8_generated_event_has_an_explicit_disposition(
+    event_type: SessionEventType,
+) -> None:
+    disposition = disposition_for(event_type.value)
+
+    assert event_type.value in EVENT_DISPOSITIONS
+    assert disposition.state in {"audit", "fallback", "journal", "reconcile", "reduce"}
+    assert disposition.render in {"content", "gated", "none", "status"}
+    assert disposition.liveness in {
+        "correlate",
+        "diagnostic",
+        "interaction",
+        "none",
+        "snapshot",
+    }
+    assert disposition.rationale
+
+
+def test_event_inventory_tracks_main_only_events_without_claiming_them_for_sdk_1_0_8() -> None:
+    assert len(EVENT_DISPOSITIONS) == 114
+    assert set(MAIN_BRANCH_ONLY_DISPOSITIONS) == {
+        "factory.run_updated",
+        "session.context_cleared",
+    }
+    assert not set(MAIN_BRANCH_ONLY_DISPOSITIONS).intersection(EVENT_DISPOSITIONS)
 
 
 @pytest.mark.asyncio
@@ -75,6 +152,21 @@ def _submit(inbox: ReducerInbox) -> None:
 
 
 @pytest.mark.asyncio
+async def test_internal_receipts_require_caller_owned_ids() -> None:
+    inbox = ReducerInbox(
+        sdk_session_id="session-1",
+        generation=1,
+        fence_token=7,
+        capacity=2,
+    )
+
+    with pytest.raises(ValueError, match="explicit internal_event_id"):
+        inbox.submit_internal({"type": "copilotd.test"})
+    with pytest.raises(ValueError, match="explicit internal_event_id"):
+        await inbox.commit_internal({"type": "copilotd.test"})
+
+
+@pytest.mark.asyncio
 async def test_inbox_overflow_is_explicit_and_keeps_first_lost_sequence() -> None:
     inbox = ReducerInbox(
         sdk_session_id="session-1",
@@ -95,6 +187,105 @@ async def test_inbox_overflow_is_explicit_and_keeps_first_lost_sequence() -> Non
 
     envelope = await inbox.get()
     inbox.acknowledge(envelope)
+
+
+def test_adapter_carries_complete_internal_envelope_fields() -> None:
+    timestamp = datetime(2026, 8, 5, 12, 30, tzinfo=UTC)
+    event = SessionEvent(
+        data=SimpleNamespace(
+            to_dict=lambda: {
+                "messageId": "message-1",
+                "turnId": "turn-1",
+                "interactionId": "interaction-1",
+                "taskId": "task-1",
+                "toolCallId": "tool-1",
+                "requestId": "request-1",
+                "correlationId": "correlation-1",
+            }
+        ),  # type: ignore[arg-type]
+        id=uuid4(),
+        timestamp=timestamp,
+        type=SessionEventType.UNKNOWN,
+        agent_id="agent-1",
+    )
+    adapted = EventAdapter().adapt(
+        InboxEnvelope(
+            sdk_session_id="session-1",
+            generation=2,
+            fence_token=9,
+            inbox_seq=4,
+            source="sdk",
+            payload=event,
+            received_at=123,
+            thread_id="thread-1",
+            sdk_receive_seq=3,
+        )
+    )
+
+    assert adapted.schema_version == 1
+    assert adapted.thread_id == "thread-1"
+    assert adapted.sdk_timestamp == timestamp.timestamp()
+    assert adapted.message_id == "message-1"
+    assert adapted.turn_id == "turn-1"
+    assert adapted.interaction_id == "interaction-1"
+    assert adapted.task_id == "task-1"
+    assert adapted.tool_call_id == "tool-1"
+    assert adapted.request_id == "request-1"
+    assert adapted.correlation_id == "correlation-1"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("event_id", "expected_kind"),
+    [(None, "missing_event_id"), ("not-a-uuid", "invalid_event_id")],
+)
+async def test_invalid_sdk_event_ids_become_durable_incidents(
+    tmp_path: Path,
+    event_id: Any,
+    expected_kind: str,
+) -> None:
+    async with Database(tmp_path / f"{expected_kind}.sqlite3") as database:
+        now = datetime.now(UTC).timestamp()
+        await database.execute(
+            """
+            INSERT INTO session_bindings(
+                thread_id, project_source, cwd_snapshot, sdk_session_id,
+                runtime_generation, owner_fence_token, created_at, updated_at
+            ) VALUES ('thread-1', 'home', '/tmp', 'session-1', 1, 7, ?, ?)
+            """,
+            (now, now),
+        )
+        inbox = ReducerInbox(
+            sdk_session_id="session-1",
+            generation=1,
+            fence_token=7,
+            capacity=4,
+            thread_id="thread-1",
+        )
+        reducer = JournalReducer(database)
+        worker = EventReducerWorker(inbox=inbox, reducer=reducer, batch_size=4)
+        worker.start()
+        invalid = SessionEvent(
+            data=AssistantMessageDeltaData(delta_content="lost", message_id="message-1"),
+            id=event_id,  # type: ignore[arg-type]
+            timestamp=datetime.now(UTC),
+            type=SessionEventType.ASSISTANT_MESSAGE_DELTA,
+        )
+        assert inbox.submit_sdk(invalid)
+        await inbox.join()
+        await worker.stop()
+        incidents = await database.fetchall(
+            "SELECT kind, last_inbox_seq, detail FROM runtime_incidents"
+        )
+        sdk_rows = await database.fetchall(
+            "SELECT event_id FROM event_journal WHERE source = 'sdk'"
+        )
+
+    assert len(incidents) == 1
+    assert incidents[0]["kind"] == expected_kind
+    assert incidents[0]["last_inbox_seq"] == 1
+    assert "SDK event event_id" in json.loads(incidents[0]["detail"])["reason"]
+    assert sdk_rows == []
 
 
 @pytest.mark.asyncio
@@ -574,3 +765,517 @@ async def test_taskdeck_view_change_expands_the_selected_card_in_place(
     assert expanded["taskdeck"]["expanded"] is True
     assert "**Parser investigator details**" in expanded["content"]
     assert "Investigate the parser" in expanded["content"]
+
+
+@pytest.mark.asyncio
+async def test_user_message_correlation_retains_facts_and_creates_runtime_observed_rows(
+    tmp_path: Path,
+) -> None:
+    session_id = "session-correlation"
+    prompt = "same prompt"
+    async with Database(tmp_path / "correlation.sqlite3") as database:
+        await _insert_projection_binding(database, session_id)
+        queued = _adapted(
+            "copilotd.submission.queued",
+            {
+                "submission_id": "submission-app",
+                "thread_id": "thread-projection",
+                "origin": "app_message",
+                "prompt": prompt,
+                "prompt_hash": hashlib.sha256(prompt.encode()).hexdigest(),
+                "requested_mode": "interactive",
+                "requested_delivery": "enqueue",
+                "attachment_count": 0,
+            },
+            1,
+            source="internal",
+            session_id=session_id,
+        )
+        accepted = _adapted(
+            "copilotd.submission.accepted",
+            {"submission_id": "submission-app", "message_id": "accepted-not-event-id"},
+            2,
+            source="internal",
+            session_id=session_id,
+        )
+        observed = _adapted(
+            "user.message",
+            {"content": prompt, "agentMode": "interactive", "delivery": "queued"},
+            3,
+            session_id=session_id,
+        )
+        external = _adapted(
+            "user.message",
+            {
+                "content": "remote message",
+                "agentMode": "interactive",
+                "delivery": "idle",
+            },
+            4,
+            session_id=session_id,
+        )
+        assert await JournalReducer(database).persist(
+            [queued, accepted, observed, external]
+        ) == 4
+        submissions = await database.fetchall(
+            """
+            SELECT origin, state, observed_user_event_id, correlation_basis
+            FROM submissions WHERE sdk_session_id = ? ORDER BY origin
+            """,
+            (session_id,),
+        )
+        segments = await database.fetchall(
+            """
+            SELECT submission_id, segment_index, user_event_id
+            FROM submission_segments ORDER BY observed_at
+            """
+        )
+
+    assert [dict(row) for row in submissions] == [
+        {
+            "origin": "app_message",
+            "state": "observed_active",
+            "observed_user_event_id": observed.event_id,
+            "correlation_basis": "single_candidate_facts",
+        },
+        {
+            "origin": "runtime_observed",
+            "state": "observed_active",
+            "observed_user_event_id": external.event_id,
+            "correlation_basis": "runtime_observed",
+        },
+    ]
+    assert [row["segment_index"] for row in segments] == [1, 1]
+    assert [row["user_event_id"] for row in segments] == [
+        observed.event_id,
+        external.event_id,
+    ]
+
+
+@pytest.mark.asyncio
+async def test_ambiguous_duplicate_prompt_does_not_pollute_app_submissions(
+    tmp_path: Path,
+) -> None:
+    session_id = "session-ambiguous"
+    prompt = "duplicate"
+    async with Database(tmp_path / "ambiguous.sqlite3") as database:
+        await _insert_projection_binding(database, session_id)
+        events: list[AdaptedEvent] = []
+        for index, submission_id in enumerate(("submission-a", "submission-b"), start=1):
+            events.extend(
+                [
+                    _adapted(
+                        "copilotd.submission.queued",
+                        {
+                            "submission_id": submission_id,
+                            "thread_id": "thread-projection",
+                            "origin": "app_message",
+                            "prompt": prompt,
+                            "prompt_hash": hashlib.sha256(prompt.encode()).hexdigest(),
+                            "requested_mode": "interactive",
+                            "requested_delivery": "enqueue",
+                        },
+                        index * 2 - 1,
+                        source="internal",
+                        session_id=session_id,
+                    ),
+                    _adapted(
+                        "copilotd.submission.accepted",
+                        {
+                            "submission_id": submission_id,
+                            "message_id": f"accepted-{index}",
+                        },
+                        index * 2,
+                        source="internal",
+                        session_id=session_id,
+                    ),
+                ]
+            )
+        observed = _adapted(
+            "user.message",
+            {"content": prompt, "agentMode": "interactive"},
+            5,
+            session_id=session_id,
+        )
+        assert await JournalReducer(database).persist([*events, observed]) == 5
+        app_states = await database.fetchall(
+            """
+            SELECT state FROM submissions
+            WHERE sdk_session_id = ? AND origin = 'app_message' ORDER BY submission_id
+            """,
+            (session_id,),
+        )
+        runtime_row = await database.fetchone(
+            """
+            SELECT state FROM submissions
+            WHERE sdk_session_id = ? AND origin = 'runtime_observed'
+            """,
+            (session_id,),
+        )
+        incident = await database.fetchone(
+            """
+            SELECT kind FROM runtime_incidents
+            WHERE session_id = ? ORDER BY id DESC LIMIT 1
+            """,
+            (session_id,),
+        )
+
+    assert [row["state"] for row in app_states] == ["submitted", "submitted"]
+    assert runtime_row["state"] == "observed_active"
+    assert incident["kind"] == "user_message_correlation_ambiguous"
+
+
+@pytest.mark.asyncio
+async def test_model_turn_projection_and_interactive_idle_are_semantically_terminal(
+    tmp_path: Path,
+) -> None:
+    session_id = "session-turns"
+    events = [
+        _adapted(
+            "user.message",
+            {
+                "content": "runtime root",
+                "agentMode": "interactive",
+                "interactionId": "interaction-1",
+            },
+            1,
+            session_id=session_id,
+        ),
+        _adapted(
+            "assistant.turn_start",
+            {"turnId": "turn-1", "interactionId": "interaction-1"},
+            2,
+            session_id=session_id,
+        ),
+        _adapted(
+            "assistant.turn_retry",
+            {"turnId": "turn-1", "reason": "rate_limit"},
+            3,
+            session_id=session_id,
+        ),
+        _adapted(
+            "assistant.turn_end",
+            {"turnId": "turn-1"},
+            4,
+            session_id=session_id,
+        ),
+        _adapted("session.idle", {"aborted": False}, 5, session_id=session_id),
+    ]
+    async with Database(tmp_path / "turns.sqlite3") as database:
+        assert await JournalReducer(database).persist(events) == len(events)
+        turn = await database.fetchone(
+            """
+            SELECT submission_id, state, retry_count, started_at, ended_at
+            FROM model_turns WHERE sdk_turn_id = 'turn-1'
+            """
+        )
+        submission = await database.fetchone(
+            """
+            SELECT state, completion_basis, terminal_at FROM submissions
+            WHERE sdk_session_id = ?
+            """,
+            (session_id,),
+        )
+        segment = await database.fetchone(
+            "SELECT state, idle_at FROM submission_segments"
+        )
+        lease = await database.fetchone(
+            "SELECT state FROM liveness_leases WHERE sdk_session_id = ?",
+            (session_id,),
+        )
+
+    assert turn["submission_id"] is not None
+    assert turn["state"] == "observed_end"
+    assert turn["retry_count"] == 1
+    assert turn["ended_at"] >= turn["started_at"]
+    assert dict(submission) == {
+        "state": "semantic_complete",
+        "completion_basis": "loop_idle",
+        "terminal_at": 105,
+    }
+    assert dict(segment) == {"state": "semantic_complete", "idle_at": 105}
+    assert lease["state"] == "released"
+
+
+@pytest.mark.asyncio
+async def test_autopilot_continue_reopens_then_blocked_idle_settles(
+    tmp_path: Path,
+) -> None:
+    session_id = "session-autopilot"
+    events = [
+        _adapted(
+            "user.message",
+            {"content": "autopilot root", "agentMode": "autopilot"},
+            1,
+            session_id=session_id,
+        ),
+        _adapted(
+            "session.autopilot_objective_changed",
+            {"operation": "create", "id": 42, "status": "active"},
+            2,
+            session_id=session_id,
+        ),
+        _adapted(
+            "session.task_complete",
+            {"outcome": "continue", "objectiveId": "42"},
+            3,
+            session_id=session_id,
+        ),
+        _adapted("session.idle", {"aborted": False}, 4, session_id=session_id),
+        _adapted(
+            "user.message",
+            {
+                "content": "autopilot continuation",
+                "agentMode": "autopilot",
+                "isAutopilotContinuation": True,
+            },
+            5,
+            session_id=session_id,
+        ),
+        _adapted(
+            "session.task_complete",
+            {"outcome": "blocked", "objectiveId": "42"},
+            6,
+            session_id=session_id,
+        ),
+        _adapted("session.idle", {"aborted": False}, 7, session_id=session_id),
+    ]
+    async with Database(tmp_path / "autopilot.sqlite3") as database:
+        assert await JournalReducer(database).persist(events) == len(events)
+        submission = await database.fetchone(
+            """
+            SELECT submission_id, state, task_completion_outcome, completion_basis,
+                   autopilot_objective_id, continuation_count
+            FROM submissions WHERE sdk_session_id = ?
+            """,
+            (session_id,),
+        )
+        segments = await database.fetchall(
+            """
+            SELECT segment_index, is_continuation, state
+            FROM submission_segments ORDER BY segment_index
+            """
+        )
+        objective = await database.fetchone(
+            """
+            SELECT objective_id, status, submission_id
+            FROM autopilot_objectives WHERE sdk_session_id = ?
+            """,
+            (session_id,),
+        )
+
+    assert dict(submission) == {
+        "submission_id": submission["submission_id"],
+        "state": "semantic_blocked",
+        "task_completion_outcome": "blocked",
+        "completion_basis": "task_complete_blocked",
+        "autopilot_objective_id": "42",
+        "continuation_count": 1,
+    }
+    assert [dict(row) for row in segments] == [
+        {"segment_index": 1, "is_continuation": 0, "state": "continuation_expected"},
+        {"segment_index": 2, "is_continuation": 1, "state": "semantic_blocked"},
+    ]
+    assert objective["objective_id"] == "42"
+    assert objective["status"] == "active"
+    assert objective["submission_id"] == submission["submission_id"]
+
+
+@pytest.mark.asyncio
+async def test_abort_projection_waits_for_aborted_idle_and_closes_turn(
+    tmp_path: Path,
+) -> None:
+    session_id = "session-abort"
+    events = [
+        _adapted(
+            "user.message",
+            {"content": "runtime root", "agentMode": "interactive"},
+            1,
+            session_id=session_id,
+        ),
+        _adapted(
+            "assistant.turn_start",
+            {"turnId": "turn-abort"},
+            2,
+            session_id=session_id,
+        ),
+        _adapted("abort", {"reason": "user"}, 3, session_id=session_id),
+        _adapted("session.idle", {"aborted": True}, 4, session_id=session_id),
+    ]
+    async with Database(tmp_path / "abort.sqlite3") as database:
+        assert await JournalReducer(database).persist(events) == len(events)
+        submission = await database.fetchone(
+            """
+            SELECT state, abort_event_id, completion_basis
+            FROM submissions WHERE sdk_session_id = ?
+            """,
+            (session_id,),
+        )
+        turn = await database.fetchone(
+            "SELECT state, ended_at FROM model_turns WHERE sdk_turn_id = 'turn-abort'"
+        )
+
+    assert submission["state"] == "observed_aborted"
+    assert submission["abort_event_id"] == events[2].event_id
+    assert submission["completion_basis"] == "session_idle_aborted"
+    assert turn["state"] == "aborted"
+    assert turn["ended_at"] == 103
+
+
+@pytest.mark.asyncio
+async def test_snapshot_epochs_suppress_stale_negative_and_keep_terminal_monotonic(
+    tmp_path: Path,
+) -> None:
+    session_id = "session-snapshot-order"
+    events = [
+        _adapted(
+            "copilotd.snapshot.requested",
+            {"topic": "tasks"},
+            1,
+            source="internal",
+            session_id=session_id,
+        ),
+        _adapted(
+            "copilotd.snapshot.observed",
+            {
+                "topic": "tasks",
+                "epoch": 1,
+                "snapshot_id": "snapshot-1",
+                "query_start_sdk_receive_seq": 0,
+                "query_end_sdk_receive_seq": 0,
+                "payload": {
+                    "tasks": [
+                        {
+                            "id": "task-1",
+                            "status": "running",
+                            "type": "agent",
+                            "description": "Worker",
+                        }
+                    ]
+                },
+            },
+            2,
+            source="internal",
+            session_id=session_id,
+        ),
+        _adapted(
+            "copilotd.snapshot.requested",
+            {"topic": "tasks"},
+            3,
+            source="internal",
+            session_id=session_id,
+        ),
+        _adapted(
+            "copilotd.snapshot.requested",
+            {"topic": "tasks"},
+            4,
+            source="internal",
+            session_id=session_id,
+        ),
+        _adapted(
+            "copilotd.snapshot.observed",
+            {
+                "topic": "tasks",
+                "epoch": 2,
+                "snapshot_id": "snapshot-stale-empty",
+                "query_start_sdk_receive_seq": 0,
+                "query_end_sdk_receive_seq": 0,
+                "payload": {"tasks": []},
+            },
+            5,
+            source="internal",
+            session_id=session_id,
+        ),
+        _adapted(
+            "copilotd.snapshot.observed",
+            {
+                "topic": "tasks",
+                "epoch": 3,
+                "snapshot_id": "snapshot-terminal",
+                "query_start_sdk_receive_seq": 0,
+                "query_end_sdk_receive_seq": 0,
+                "payload": {
+                    "tasks": [
+                        {
+                            "id": "task-1",
+                            "status": "completed",
+                            "type": "agent",
+                            "description": "Worker",
+                        }
+                    ]
+                },
+            },
+            6,
+            source="internal",
+            session_id=session_id,
+        ),
+        _adapted(
+            "copilotd.snapshot.requested",
+            {"topic": "tasks"},
+            7,
+            source="internal",
+            session_id=session_id,
+        ),
+        _adapted(
+            "copilotd.snapshot.observed",
+            {
+                "topic": "tasks",
+                "epoch": 4,
+                "snapshot_id": "snapshot-late-running",
+                "query_start_sdk_receive_seq": 0,
+                "query_end_sdk_receive_seq": 0,
+                "payload": {
+                    "tasks": [
+                        {
+                            "id": "task-1",
+                            "status": "running",
+                            "type": "agent",
+                            "description": "Worker",
+                        }
+                    ]
+                },
+            },
+            8,
+            source="internal",
+            session_id=session_id,
+        ),
+    ]
+    async with Database(tmp_path / "snapshot-order.sqlite3") as database:
+        await _insert_projection_binding(database, session_id)
+        assert await JournalReducer(database).persist(events) == len(events)
+        card = await database.fetchone(
+            "SELECT state, terminal_at FROM task_card_projections WHERE task_id = 'task-1'"
+        )
+        observation = await database.fetchone(
+            """
+            SELECT observed_state, terminal_evidence
+            FROM background_observations WHERE task_id = 'task-1'
+            """
+        )
+        reconciliation = await database.fetchone(
+            """
+            SELECT requested_epoch, applied_epoch, status
+            FROM reconciliation_state
+            WHERE sdk_session_id = ? AND topic = 'tasks'
+            """,
+            (session_id,),
+        )
+        stale = await database.fetchone(
+            """
+            SELECT negative_applied FROM snapshot_observations
+            WHERE snapshot_id = 'snapshot-stale-empty'
+            """
+        )
+
+    assert card["state"] == "completed"
+    assert card["terminal_at"] is not None
+    assert dict(observation) == {
+        "observed_state": "completed",
+        "terminal_evidence": "task_snapshot",
+    }
+    assert dict(reconciliation) == {
+        "requested_epoch": 4,
+        "applied_epoch": 4,
+        "status": "idle",
+    }
+    assert stale["negative_applied"] == 0

@@ -9,14 +9,20 @@ The implementation follows [`docs/copilotD-detailed-design.md`](docs/copilotD-de
 
 ## Implemented
 
+- Exact SDK/runtime/protocol startup assertion (`1.0.8` / `1.0.73` / `3`) backed
+  by persisted, hash-checked capability evidence rather than generated method presence.
 - Bundled Copilot runtime launched with `--yolo`, with allow-all verified on every
   create/resume and reconciled again after runtime permission-change events.
 - One long-lived SDK session per Discord thread, eager resume, owner fencing, and
   conservative unknown outcomes across crash windows.
 - Explicit channel project bindings with immutable cwd snapshots; unbound channels
   always resolve to the service user's `$HOME`.
-- Durable SQLite event journal, app FIFO, command mailbox, liveness leases, readiness
-  snapshots, render outbox, and attachment manifests.
+- Durable SQLite event journal with strict UUID SDK IDs, app FIFO, reducer-owned
+  operation receipts, liveness leases, epoch/watermark snapshots, render outbox,
+  and attachment manifests.
+- Durable event-log backfill with cursor rebase/gap diagnostics and ingress-overflow
+  freeze/backfill/generation replacement; unrecoverable ephemeral gaps remain
+  explicitly outcome-unknown.
 - Streaming replies, file/image attachments, table-aware Markdown rendering, and one
   in-thread TaskDeck for tool/subagent activity with select, expand/collapse, and
   pagination controls.
@@ -26,10 +32,11 @@ The implementation follows [`docs/copilotD-detailed-design.md`](docs/copilotD-de
 - Background task `refresh/list` reconciliation, disappearance-to-unknown handling,
   usage/status rendering, and lossless attachment delivery for tool output at or above
   8000 characters; oversized Discord uploads are split into ordered lossless parts.
-- Core `/session`, `/project`, `/model`, `/autopilot`, `/plan`, `/steer`, `/context`,
-  `/usage`, and `/queue` commands.
+- Capability-backed registration for core `/session`, `/project`, `/model`,
+  `/autopilot`, `/plan`, `/steer`, `/context`, `/usage`, and `/queue` commands.
 - Default always-on definitions for macOS LaunchAgents and Windows Scheduled Tasks,
-  plus a protected-work-aware watchdog.
+  plus a protected-work-aware watchdog, shared task-failure supervision, and a
+  non-destructive active-execution SUSPECT monitor.
 
 Native-gated commands such as Fleet, Tasks, quick ask, runtime schedules, and remote
 sessions are intentionally not registered until their pinned-runtime fixtures are
@@ -74,7 +81,8 @@ python3.11 -m venv .venv
 .venv/bin/pytest
 ```
 
-The live SDK probe uses the currently logged-in Copilot account and creates a
+Deterministic tests consume the bundled hash-checked fixture. Live acceptance is
+separate: the SDK probe uses the currently logged-in Copilot account and creates a
 disposable persistent session:
 
 ```bash

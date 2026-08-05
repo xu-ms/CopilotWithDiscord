@@ -89,8 +89,11 @@ async def test_heartbeat_is_structured_and_reflects_durable_work(tmp_path: Path)
             """
             INSERT INTO session_bindings(
                 thread_id, project_source, cwd_snapshot, sdk_session_id,
-                attachment_state, created_at, updated_at
-            ) VALUES ('thread-1', 'home', '/tmp', 'session-1', 'attached', 0, 0)
+                attachment_state, runtime_remote_mode, created_at, updated_at
+            ) VALUES (
+                'thread-1', 'home', '/tmp', 'session-1',
+                'attached', 'off', 0, 0
+            )
             """
         )
         writer = HeartbeatWriter(database, settings.heartbeat_path, interval_seconds=0.01)

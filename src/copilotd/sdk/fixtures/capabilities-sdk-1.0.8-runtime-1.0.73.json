@@ -1,0 +1,121 @@
+{
+  "schema_version": 1,
+  "source": "checked-live-summary",
+  "generated_at": "2026-08-05T00:00:00+00:00",
+  "identity": {
+    "sdk_version": "1.0.8",
+    "runtime_version": "1.0.73",
+    "protocol_version": 3,
+    "ping_protocol_version": 3
+  },
+  "generated_events": {
+    "count": 114,
+    "sha256": "b7aed29d812cf032a5f68343b95b15c5f1c6735bde5140670692e6fa5fd0d1a2",
+    "main_branch_only": [
+      "factory.run_updated",
+      "session.context_cleared"
+    ]
+  },
+  "capabilities": {
+    "accepted_user_event_id_mapping": {
+      "supported": true,
+      "evidence_kind": "live-callback-fixture",
+      "detail": "send acceptance IDs matched the corresponding root user.message envelope UUIDs"
+    },
+    "activity_snapshot": {
+      "supported": true,
+      "evidence_kind": "live-rpc-fixture",
+      "detail": "metadata.isProcessing and metadata.activity returned typed snapshots"
+    },
+    "builtin_commands": {
+      "supported": true,
+      "evidence_kind": "live-rpc-fixture",
+      "detail": "commands.list returned typed builtin inventory and disposable invoke completed"
+    },
+    "context_info": {
+      "supported": true,
+      "evidence_kind": "live-rpc-fixture",
+      "detail": "metadata.contextInfo returned a typed snapshot"
+    },
+    "detached_continuation": {
+      "supported": false,
+      "evidence_kind": "live-sidecar-fixture",
+      "detail": "runtime did not retain the session after client transport disconnect"
+    },
+    "event_log": {
+      "supported": true,
+      "evidence_kind": "live-rpc-fixture",
+      "detail": "eventLog.tail/read returned opaque cursors, cursor status, and event batches"
+    },
+    "model_config": {
+      "supported": true,
+      "evidence_kind": "live-rpc-fixture",
+      "detail": "high-level set_model plus model.getCurrent round-trip was observed"
+    },
+    "models": {
+      "supported": true,
+      "evidence_kind": "live-rpc-fixture",
+      "detail": "list_models returned typed model metadata"
+    },
+    "native_queue_snapshot": {
+      "supported": true,
+      "evidence_kind": "live-rpc-fixture",
+      "detail": "queue.pendingItems returned items and steering messages"
+    },
+    "native_schedule": {
+      "supported": true,
+      "evidence_kind": "live-command-fixture",
+      "detail": "disposable after invocation emitted schedule-created, root user-message, and idle"
+    },
+    "permission_allow_all": {
+      "supported": true,
+      "evidence_kind": "live-rpc-fixture",
+      "detail": "permissions allow-all and approve-all were set and read back as enabled/on"
+    },
+    "persistent_history": {
+      "supported": true,
+      "evidence_kind": "live-resume-fixture",
+      "detail": "get_events recovered durable history after disconnect and resume"
+    },
+    "pre_registered_on_event": {
+      "supported": true,
+      "evidence_kind": "live-callback-fixture",
+      "detail": "create and resume received events through callbacks supplied before the RPC"
+    },
+    "reasoning_summary_readback": {
+      "supported": false,
+      "evidence_kind": "checked-negative-fixture",
+      "detail": "no exact durable readback fixture exists for reasoning-summary"
+    },
+    "remote": {
+      "supported": true,
+      "evidence_kind": "live-rpc-fixture",
+      "detail": "remote enable/disable and metadata reconciliation returned typed results"
+    },
+    "selected_agent": {
+      "supported": true,
+      "evidence_kind": "live-rpc-fixture",
+      "detail": "agent list/get-current returned typed results"
+    },
+    "session_mode": {
+      "supported": true,
+      "evidence_kind": "live-rpc-fixture",
+      "detail": "mode set/get round-trip confirmed autopilot then interactive"
+    },
+    "sessions_check_in_use": {
+      "supported": true,
+      "evidence_kind": "live-rpc-fixture",
+      "detail": "sessions.checkInUse returned a typed subset for supplied session IDs"
+    },
+    "task_snapshot": {
+      "supported": true,
+      "evidence_kind": "live-rpc-fixture",
+      "detail": "tasks.refresh followed by tasks.list returned a typed snapshot"
+    },
+    "usage": {
+      "supported": true,
+      "evidence_kind": "live-rpc-fixture",
+      "detail": "usage.getMetrics returned typed usage totals"
+    }
+  }
+}

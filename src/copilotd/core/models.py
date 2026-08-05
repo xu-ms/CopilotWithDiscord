@@ -14,6 +14,7 @@ class InboxEnvelope:
     source: Literal["sdk", "internal", "snapshot"]
     payload: Any
     received_at: float
+    thread_id: str | None = None
     sdk_receive_seq: int | None = None
     internal_event_id: str | None = None
     commit_ack: Future[None] | None = None
@@ -42,6 +43,9 @@ class AdaptedEvent:
     reducer_hash: str
     persistence_class: Literal["durable", "ephemeral", "internal"]
     received_at: float
+    schema_version: int = 1
+    thread_id: str | None = None
+    sdk_timestamp: float | None = None
     sdk_receive_seq: int | None = None
     event_id: str | None = None
     internal_event_id: str | None = None
@@ -51,7 +55,10 @@ class AdaptedEvent:
     message_id: str | None = None
     turn_id: str | None = None
     interaction_id: str | None = None
+    task_id: str | None = None
+    tool_call_id: str | None = None
     request_id: str | None = None
+    correlation_id: str | None = None
 
 
 @dataclass(frozen=True, slots=True)

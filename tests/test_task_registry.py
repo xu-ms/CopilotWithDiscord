@@ -32,8 +32,9 @@ async def test_task_registry_surfaces_background_exception() -> None:
         raise RuntimeError("heartbeat failed")
 
     registry.create(fail(), name="heartbeat")
-    error = await registry.errors.get()
+    failure = await registry.errors.get()
     await registry.wait_empty()
-    assert isinstance(error, RuntimeError)
-    assert str(error) == "heartbeat failed"
-    assert str(error) == "heartbeat failed"
+    assert failure.name == "heartbeat"
+    assert failure.source == "app"
+    assert isinstance(failure.error, RuntimeError)
+    assert str(failure.error) == "heartbeat failed"

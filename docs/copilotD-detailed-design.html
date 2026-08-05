@@ -662,14 +662,16 @@ copilotD 扩展</a></li>
 </nav>
 <h1 id="copilotd-详细设计与实施计划">copilotD 详细设计与实施计划</h1>
 <blockquote>
-<p>当前阶段：详细设计 v2.5 已批准，SDK/runtime 原型、首个 Discord
-MVP、durable interaction router 与 background-task reconciliation
-已实现；当前继续按 capability gate 补齐后续能力并做真实平台验证。</p>
+<p>当前阶段：详细设计 v2.5 已批准，durable/capability foundation、Discord
+core、interaction router 与 background-task reconciliation
+已实现；当前继续按 capability gate 补齐产品能力并做真实平台验收。</p>
 <p>本版固定前提：单用户、私有部署、Copilot runtime 全程
 <code>--yolo</code>，不设计多用户共享、
 工具确认流程、安全沙箱或租户隔离。</p>
-<p>2026-08-05 实测 SDK 1.0.8 / runtime 1.0.73：stdio
-<code>--yolo</code>、full allow-all、 create/resume 预注册 callback、跨
+<p>2026-08-05 实测 SDK 1.0.8 / runtime 1.0.73 / protocol 3，generated
+event 为 <strong>114</strong> 个；<code>factory.run_updated</code> 与
+<code>session.context_cleared</code> 仅存在于 main branch，不归入
+1.0.8。stdio <code>--yolo</code>、full allow-all、 create/resume 预注册 callback、跨
 idle 回调、history/eventLog、usage/context、native <code>/after</code>
 和 1/5/10 MiB frame 可用；sidecar client transport 断开后 session
 retention 不成立，因此 当前固定 bundled-runtime topology，不宣称
@@ -919,8 +921,9 @@ ID，禁止第二次 create</td>
 <td>Event envelope</td>
 <td>native 字段是
 <code>id/timestamp/type/agent_id/ephemeral/parent_id/raw_type</code>；没有
-<code>persisted</code>；当前 generated enum 共 116 个值（含
-<code>unknown</code>）</td>
+<code>persisted</code>；SDK 1.0.8 generated enum 共 114 个值（含
+<code>unknown</code>），main branch 另有
+<code>factory.run_updated</code>、<code>session.context_cleared</code></td>
 <td><code>ephemeral is True</code> 才归 ephemeral，否则归
 durable；unknown type 保留 raw_type/raw payload；升级必须全量 diff
 enum</td>
@@ -3263,8 +3266,11 @@ session-wide idle handler。</li>
 <li>Fallback：<code>UnknownSdkEvent</code></li>
 </ul>
 <h4 id="完整-raw-event-处置">完整 raw event 处置</h4>
-<p>下表逐项覆盖当前 Python generated <code>SessionEventType</code> 的
-116 个 enum value（含 <code>unknown</code>）。只有官方 streaming
+<p>下表逐项覆盖 SDK 1.0.8 Python generated
+<code>SessionEventType</code> 的 <strong>114</strong> 个 enum value（含
+<code>unknown</code>）；main branch 额外的
+<code>factory.run_updated</code> 与
+<code>session.context_cleared</code> 单独跟踪，不计入 pinned SDK。只有官方 streaming
 文档事件作为首版 稳定渲染契约；generated-only 事件需 fixture
 后再提升。“UI 无”仍会更新状态或审计。</p>
 <table>
@@ -5281,20 +5287,28 @@ model、<code>/mode</code>、<code>/goal</code>、<code>/bare</code>、<code>/to
 unknown</td>
 </tr>
 <tr>
-<td>7 个 SQLite migration、project <code>$HOME</code> fallback/cwd
-snapshot、owner fence、creation saga、bounded ingress、单 reducer、event
-journal、CommandMailbox、liveness leases、eager
-resume；共享连接事务隔离；<code>background_tasks_changed</code> 后
-<code>tasks.refresh/list</code>，缺 terminal 消失转 UNKNOWN</td>
-<td>eventLog durable replay reconciler 仍未接入 production
-supervisor；experimental task action RPC 继续 gated</td>
+<td>8 个 SQLite migration、project <code>$HOME</code> fallback/cwd
+snapshot、owner fence、creation saga、strict-UUID event
+journal、reducer-owned operation/submission receipts、liveness leases、startup
+recovery inventory 与 eager resume</td>
+<td>bundled runtime 进程死亡后的 in-flight execution 仍只能标 outcome
+unknown；experimental task action RPC 继续 gated</td>
 </tr>
 <tr>
-<td>durable app FIFO；每次用
-<code>metadata.is_processing()</code>、<code>metadata.activity()</code>
-与 <code>queue.pending_items()</code> readiness snapshot
-只派发队首；<code>/queue add/list/remove/clear</code></td>
-<td>native queue entry 没有稳定 host ID 时不做虚假一一镜像；transport
+<td>eventLog <code>read/tail</code> durable backfill（固定过滤
+ephemeral）、cursor epoch/rebase/predecessor-gap diagnostics、overflow
+freeze/backfill/generation replacement；activity/queue/task/remote/schedule
+snapshot requested/applied epoch 与 query watermark</td>
+<td>ephemeral idle/delta 离开 live window 后不可恢复，不从 transcript 猜
+terminal</td>
+</tr>
+<tr>
+<td>durable app FIFO；fresh readiness snapshot、reducer
+caught-up、config/agent/remote/schedule/task known gate 后只派发队首；attachment
+manifest READY + hash/size 复验，无 attachment-free
+fallback；<code>/queue add/list/remove/clear</code></td>
+<td>native queue entry 没有 stable opaque ID 时只以 snapshot-local opaque key
+诊断；transport
 ambiguity 不自动重放</td>
 </tr>
 <tr>
@@ -5326,18 +5340,20 @@ child-thread 路径</td>
 artifact lane 尚未实现</td>
 </tr>
 <tr>
-<td>结构化 heartbeat、protected-work watchdog、macOS bot/watchdog
-LaunchAgent 与 Windows bot/watchdog Scheduled Task definitions</td>
-<td>当前拓扑没有独立 runtime service；macOS definition/CLI smoke
-已验证，真实安装、sleep/wake 和 Windows 实机仍待验证</td>
+<td>共享 TaskRegistry、failure consumer、10 分钟 active-execution SUSPECT +
+non-destructive ping、结构化 heartbeat、protected-work watchdog、macOS
+bot/watchdog LaunchAgent 与 Windows Scheduled Task definitions</td>
+<td>当前拓扑没有独立 runtime service；真实 service 安装、sleep/wake 和
+Windows 实机仍待验证</td>
 </tr>
 </tbody>
 </table>
-<p>当前验证基线：<code>ruff check src tests</code>、83 个 pytest、CLI
-<code>db-init</code>/<code>doctor</code> smoke、service definition parse
-与 wheel build
-均通过。这个快照用于区分“已验证实现”和后续设计，不降低以下
-章节对最终产品的契约要求。</p>
+<p>当前 deterministic 验证基线：<code>ruff check .</code>、237 个 pytest
+全部通过。仓库内 hash-checked fixture 固定 SDK 1.0.8 / runtime 1.0.73 /
+protocol 3、114-event inventory 与 capability evidence；<code>copilotd
+sdk-probe --live</code> 使用当前登录账号创建 disposable session，属于独立的
+release/live acceptance，不由 deterministic fixture
+冒充。这个快照用于区分“已验证实现”和后续设计，不降低以下章节对最终产品的契约要求。</p>
 <h3 id="html-交付要求">HTML 交付要求</h3>
 <ul>
 <li>以本文件“目标、调研结论、详细设计、实施阶段、风险和官方依据”为唯一内容源。</li>

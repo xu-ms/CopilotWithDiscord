@@ -1,15 +1,45 @@
 import asyncio
+from collections.abc import Awaitable, Callable
 from pathlib import Path
 
 import pytest
 
+from copilotd.core.inbox import ReducerInbox
 from copilotd.core.mailbox import (
     CommandMailbox,
     OperationAmbiguous,
     OperationRejected,
     OperationStore,
 )
+from copilotd.core.reducer import EventReducerWorker, JournalReducer
 from copilotd.storage.database import Database
+
+
+def _start_mailbox(
+    database: Database,
+    validate: Callable[[], Awaitable[bool]],
+) -> tuple[CommandMailbox, EventReducerWorker]:
+    inbox = ReducerInbox(
+        sdk_session_id="session-1",
+        generation=1,
+        fence_token=5,
+        capacity=128,
+    )
+    reducer = EventReducerWorker(
+        inbox=inbox,
+        reducer=JournalReducer(database),
+        batch_size=16,
+    )
+    reducer.start()
+    mailbox = CommandMailbox(
+        store=OperationStore(database, inbox),
+        sdk_session_id="session-1",
+        runtime_generation=1,
+        owner_fence_token=5,
+        fence_validator=validate,
+    )
+    mailbox.start()
+    return mailbox, reducer
 
 
 @pytest.mark.asyncio
@@ -22,14 +52,7 @@ async def test_mailbox_serializes_and_deduplicates_operations(tmp_path: Path) ->
         async def validate() -> bool:
             return True
 
-        mailbox = CommandMailbox(
-            store=OperationStore(database),
-            sdk_session_id="session-1",
-            runtime_generation=1,
-            owner_fence_token=5,
-            fence_validator=validate,
-        )
-        mailbox.start()
+        mailbox, reducer = _start_mailbox(database, validate)
 
         async def operation(value: str) -> str:
             nonlocal active, peak_active, calls
@@ -67,6 +90,7 @@ async def test_mailbox_serializes_and_deduplicates_operations(tmp_path: Path) ->
             operation=lambda: operation("must-not-run"),
         )
         await mailbox.stop()
+        await reducer.stop()
         rows = await database.fetchall(
             "SELECT idempotency_key, state, result_ref FROM session_operations "
             "ORDER BY idempotency_key"
@@ -91,14 +115,7 @@ async def test_mailbox_never_replays_rejected_or_ambiguous_operation(tmp_path: P
         async def validate() -> bool:
             return True
 
-        mailbox = CommandMailbox(
-            store=OperationStore(database),
-            sdk_session_id="session-1",
-            runtime_generation=1,
-            owner_fence_token=5,
-            fence_validator=validate,
-        )
-        mailbox.start()
+        mailbox, reducer = _start_mailbox(database, validate)
 
         async def fail_unknown() -> None:
             nonlocal calls
@@ -130,6 +147,7 @@ async def test_mailbox_never_replays_rejected_or_ambiguous_operation(tmp_path: P
                 operation=reject,
             )
         await mailbox.stop()
+        await reducer.stop()
         states = await database.fetchall(
             "SELECT idempotency_key, state FROM session_operations ORDER BY idempotency_key"
         )
@@ -156,14 +174,7 @@ async def test_mailbox_checks_fence_again_immediately_before_dispatch(tmp_path: 
             nonlocal called
             called = True
 
-        mailbox = CommandMailbox(
-            store=OperationStore(database),
-            sdk_session_id="session-1",
-            runtime_generation=1,
-            owner_fence_token=5,
-            fence_validator=validate,
-        )
-        mailbox.start()
+        mailbox, reducer = _start_mailbox(database, validate)
 
         with pytest.raises(OperationAmbiguous, match="owner fence lost"):
             await mailbox.submit(
@@ -173,6 +184,7 @@ async def test_mailbox_checks_fence_again_immediately_before_dispatch(tmp_path: 
                 operation=operation,
             )
         await mailbox.stop()
+        await reducer.stop()
         row = await database.fetchone(
             "SELECT state, error_code FROM session_operations WHERE idempotency_key = 'abort-1'"
         )
@@ -199,14 +211,7 @@ async def test_mailbox_stop_cancels_hung_operation_and_marks_it_unknown(
             started.set()
             await never.wait()
 
-        mailbox = CommandMailbox(
-            store=OperationStore(database),
-            sdk_session_id="session-1",
-            runtime_generation=1,
-            owner_fence_token=5,
-            fence_validator=validate,
-        )
-        mailbox.start()
+        mailbox, reducer = _start_mailbox(database, validate)
         submission = asyncio.create_task(
             mailbox.submit(
                 kind="send",
@@ -220,6 +225,7 @@ async def test_mailbox_stop_cancels_hung_operation_and_marks_it_unknown(
         await mailbox.stop(timeout_seconds=0.01)
         with pytest.raises(OperationAmbiguous, match="interrupted"):
             await submission
+        await reducer.stop()
         row = await database.fetchone(
             "SELECT state, error_code FROM session_operations WHERE idempotency_key = 'hung'"
         )

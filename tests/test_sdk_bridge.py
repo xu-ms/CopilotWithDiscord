@@ -155,3 +155,72 @@ async def test_bridge_stop_force_stops_after_graceful_timeout() -> None:
     assert client.stop_started.is_set()
     assert client.force_stop_calls == 1
     assert bridge._client is None
+
+
+class FakeEventLog:
+    def __init__(self) -> None:
+        self.read_request: object | None = None
+
+    async def tail(self, *, timeout: float) -> object:  # noqa: ASYNC109
+        assert timeout == 10
+        return SimpleNamespace(cursor="tail-cursor")
+
+    async def read(self, request: object, *, timeout: float) -> object:  # noqa: ASYNC109
+        assert timeout == 10
+        self.read_request = request
+        return SimpleNamespace(
+            cursor="next-cursor",
+            cursor_status=SimpleNamespace(value="expired"),
+            events=[
+                SimpleNamespace(ephemeral=False, id="durable"),
+                SimpleNamespace(ephemeral=None, id="durable-omitted"),
+                SimpleNamespace(ephemeral=True, id="ephemeral"),
+            ],
+            has_more=True,
+        )
+
+
+class FakeServerSessions:
+    def __init__(self) -> None:
+        self.request: object | None = None
+
+    async def check_in_use(self, request: object, *, timeout: float) -> object:  # noqa: ASYNC109
+        assert timeout == 10
+        self.request = request
+        return SimpleNamespace(in_use=["session-1"])
+
+
+@pytest.mark.asyncio
+async def test_event_log_recovery_filters_ephemeral_and_preserves_cursor_status() -> None:
+    event_log = FakeEventLog()
+    session = SimpleNamespace(rpc=SimpleNamespace(event_log=event_log))
+    bridge = object.__new__(CopilotBridge)
+
+    assert await bridge.tail_event_log(session) == "tail-cursor"
+    batch = await bridge.read_event_log(
+        session,
+        cursor="old-cursor",
+        max_events=25,
+        include_ephemeral=False,
+    )
+
+    assert batch.cursor == "next-cursor"
+    assert batch.cursor_status == "expired"
+    assert [event.id for event in batch.events] == ["durable", "durable-omitted"]
+    assert batch.filtered_ephemeral == 1
+    assert batch.has_more
+    assert event_log.read_request.cursor == "old-cursor"
+    assert event_log.read_request.max == 25
+
+    with pytest.raises(ValueError, match="never requests ephemeral"):
+        await bridge.read_event_log(session, cursor=None, include_ephemeral=True)
+
+
+@pytest.mark.asyncio
+async def test_check_session_in_use_uses_generated_server_rpc() -> None:
+    sessions = FakeServerSessions()
+    bridge = object.__new__(CopilotBridge)
+    bridge._client = SimpleNamespace(rpc=SimpleNamespace(sessions=sessions))
+
+    assert await bridge.check_session_in_use("session-1")
+    assert sessions.request.session_ids == ["session-1"]

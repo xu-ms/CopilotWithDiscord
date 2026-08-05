@@ -30,6 +30,7 @@ def test_settings_resolve_paths_and_create_layout(tmp_path: Path) -> None:
     ("field", "value"),
     [
         ("owner_lease_ttl_seconds", 9),
+        ("owner_lease_ttl_seconds", 39),
         ("owner_lease_renew_seconds", 0),
         ("ingress_capacity", 0),
         ("reducer_batch_size", 0),

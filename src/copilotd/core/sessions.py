@@ -230,13 +230,26 @@ class SessionRegistry:
                 await runtime.attach_resume()
             except Exception as error:
                 failures[binding.thread_id] = str(error)
+                self._runtimes.pop(binding.thread_id, None)
+                try:
+                    await runtime.shutdown()
+                except Exception as cleanup_error:
+                    failures[binding.thread_id] = (
+                        f"{error}; cleanup failed: {cleanup_error}"
+                    )
         return failures
 
     async def shutdown(self) -> None:
         runtimes = list(self._runtimes.values())
         self._runtimes.clear()
+        errors: list[Exception] = []
         for runtime in runtimes:
-            await runtime.shutdown()
+            try:
+                await runtime.shutdown()
+            except Exception as error:
+                errors.append(error)
+        if errors:
+            raise ExceptionGroup("one or more session runtimes failed to shut down", errors)
 
 
 class SessionCreationService:

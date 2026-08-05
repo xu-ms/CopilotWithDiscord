@@ -1,3 +1,4 @@
+from dataclasses import replace
 from pathlib import Path
 
 import discord
@@ -19,6 +20,7 @@ from copilotd.render.outbox import (
     RenderTransientError,
 )
 from copilotd.render.tables import TableAsset
+from copilotd.sdk.capabilities import CapabilityRegistry
 
 
 def test_discord_command_manifest_has_core_modes_and_no_deleted_roots(tmp_path: Path) -> None:
@@ -51,6 +53,25 @@ def test_discord_command_manifest_has_core_modes_and_no_deleted_roots(tmp_path: 
         "pr",
         "delegate",
     } & roots
+
+
+def test_discord_registration_omits_commands_without_capability_evidence(
+    tmp_path: Path,
+) -> None:
+    bot = CopilotDiscordBot(Settings(data_dir=tmp_path))
+    manifest = CapabilityRegistry(bot.settings).load_checked()
+    capabilities = dict(manifest.capabilities)
+    for capability in ("context_info", "model_config", "models", "session_mode", "usage"):
+        capabilities[capability] = replace(
+            capabilities[capability],
+            supported=False,
+        )
+    bot.capabilities = replace(manifest, capabilities=capabilities)
+
+    bot._register_application_commands()
+    roots = {command.name for command in bot.tree.get_commands()}
+
+    assert roots == {"project", "queue", "session", "steer"}
 
 
 def test_streaming_table_is_held_before_discord_edit() -> None:

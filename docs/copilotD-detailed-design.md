@@ -1,13 +1,15 @@
 # copilotD 详细设计与实施计划
 
-> 当前阶段：详细设计 v2.5 已批准，SDK/runtime 原型、首个 Discord MVP、durable
+> 当前阶段：详细设计 v2.5 已批准，durable/capability foundation、Discord core、
 > interaction router 与 background-task reconciliation 已实现；当前继续按 capability
-> gate 补齐后续能力并做真实平台验证。
+> gate 补齐产品能力并做真实平台验收。
 >
 > 本版固定前提：单用户、私有部署、Copilot runtime 全程 `--yolo`，不设计多用户共享、
 > 工具确认流程、安全沙箱或租户隔离。
 >
-> 2026-08-05 实测 SDK 1.0.8 / runtime 1.0.73：stdio `--yolo`、full allow-all、
+> 2026-08-05 实测 SDK 1.0.8 / runtime 1.0.73 / protocol 3，generated event 为
+> **114** 个；`factory.run_updated` 与 `session.context_cleared` 仅存在于 main branch，
+> 不归入 1.0.8。stdio `--yolo`、full allow-all、
 > create/resume 预注册 callback、跨 idle 回调、history/eventLog、usage/context、native `/after`
 > 和 1/5/10 MiB frame 可用；sidecar client transport 断开后 session retention 不成立，因此
 > 当前固定 bundled-runtime topology，不宣称 detached continuation。
@@ -99,7 +101,7 @@ generated session events、文档和 E2E 测试交叉审计。实现时仍以最
 |---|---|---|
 | create/resume registration | local create 与 resume 都在 RPC 前注册 session handlers 和 `on_event`；cloud server-ID create 在 reader 收到 response 时 inline 注册 | app 必须把唯一 ingress 直接传入 create/resume，不得 return 后补订阅 |
 | post-create options patch | create/resume server RPC 成功后，SDK 还可能调用 `session.options.update`；patch 失败会移除 local registration、best-effort disconnect 后抛错 | 从发起 create/resume 起，除非错误明确证明 server side effect 未发生，否则都按 attachment unknown 对账；create 只 reconcile 预分配 ID，禁止第二次 create |
-| Event envelope | native 字段是 `id/timestamp/type/agent_id/ephemeral/parent_id/raw_type`；没有 `persisted`；当前 generated enum 共 116 个值（含 `unknown`） | `ephemeral is True` 才归 ephemeral，否则归 durable；unknown type 保留 raw_type/raw payload；升级必须全量 diff enum |
+| Event envelope | native 字段是 `id/timestamp/type/agent_id/ephemeral/parent_id/raw_type`；没有 `persisted`；SDK 1.0.8 generated enum 共 114 个值（含 `unknown`），main branch 另有 `factory.run_updated`、`session.context_cleared` | `ephemeral is True` 才归 ephemeral，否则归 durable；unknown type 保留 raw_type/raw payload；升级必须全量 diff enum，不能把 main-only 事件计入 1.0.8 |
 | `parentId` | 文档定义为“前一个 event”的 linked-list predecessor | 用于链完整性与 replay order；语义关联使用 explicit IDs |
 | `send()` | 返回 server `messageId`，官方说明可用于 event correlation；generated `QueuePendingItems` 有 stable opaque `id`，但 `UserMessageData` 没有 messageId，只有 envelope event UUID | acceptance/native-queue/user-event ID 分列持久化；fixture 固定三者关系，未证明时仅严格单候选 fallback；crash gap/歧义进入 submitted unknown |
 | queue delivery | `mode` 省略时默认 `enqueue`；immediate 若错过 current turn 会移入普通 queue | app FIFO 是唯一 durable queue，但每次只 dispatch 一项，并 query native pending snapshot |
@@ -1246,8 +1248,9 @@ InternalEvent {
 
 #### 完整 raw event 处置
 
-下表逐项覆盖当前 Python generated `SessionEventType` 的 116 个 enum value（含
-`unknown`）。只有官方 streaming 文档事件作为首版
+下表逐项覆盖 SDK 1.0.8 Python generated `SessionEventType` 的 **114** 个 enum value（含
+`unknown`）；main branch 额外的 `factory.run_updated` 与 `session.context_cleared`
+单独跟踪，不计入 pinned SDK。只有官方 streaming 文档事件作为首版
 稳定渲染契约；generated-only 事件需 fixture 后再提升。“UI 无”仍会更新状态或审计。
 
 | Raw event(s) | Internal/处理 | Discord UI |
@@ -2353,16 +2356,19 @@ claudeD issue 回归门禁：
 | 已实现 | 当前边界 |
 |---|---|
 | 官方 `github-copilot-sdk==1.0.8` + bundled runtime 1.0.73，stdio `--yolo`，create/resume 后 full allow-all 对账 | sidecar client transport 断开后 session retention 实测失败，因此不声明 detached continuation；crash window 保守标 outcome unknown |
-| 7 个 SQLite migration、project `$HOME` fallback/cwd snapshot、owner fence、creation saga、bounded ingress、单 reducer、event journal、CommandMailbox、liveness leases、eager resume；共享连接事务隔离；`background_tasks_changed` 后 `tasks.refresh/list`，缺 terminal 消失转 UNKNOWN | eventLog durable replay reconciler 仍未接入 production supervisor；experimental task action RPC 继续 gated |
-| durable app FIFO；每次用 `metadata.is_processing()`、`metadata.activity()` 与 `queue.pending_items()` readiness snapshot 只派发队首；`/queue add/list/remove/clear` | native queue entry 没有稳定 host ID 时不做虚假一一镜像；transport ambiguity 不自动重放 |
+| 8 个 SQLite migration、project `$HOME` fallback/cwd snapshot、owner fence、creation saga、strict-UUID event journal、reducer-owned operation/submission receipts、liveness leases、startup recovery inventory 与 eager resume | bundled runtime 进程死亡后的 in-flight execution 仍只能标 outcome unknown；experimental task action RPC 继续 gated |
+| eventLog `read/tail` durable backfill（固定过滤 ephemeral）、cursor epoch/rebase/predecessor-gap diagnostics、overflow freeze/backfill/generation replacement；activity/queue/task/remote/schedule snapshot requested/applied epoch 与 query watermark | ephemeral idle/delta 离开 live window 后不可恢复，不从 transcript 猜 terminal |
+| durable app FIFO；fresh readiness snapshot、reducer caught-up、config/agent/remote/schedule/task known gate 后只派发队首；attachment manifest READY + hash/size 复验，无 attachment-free fallback；`/queue add/list/remove/clear` | native queue entry 没有 stable opaque ID 时只以 snapshot-local opaque key 诊断；transport ambiguity 不自动重放 |
 | Discord core `/session`、`/project`、`/model`、bare `/autopilot`、bare/optional-prompt `/plan`、`/steer`、`/context`、`/usage`；user-input/Plan-exit/auto-mode-switch 使用 durable exactly-once interaction + select/modal 原位结算；Plan 退出 mode 精确关联并消费 | `/session delete`、compact/fork 和 Native-Gated commands 尚未实现，因而不注册；elicitation/MCP OAuth 仍待接入 |
 | durable input attachment manifest、hash/size 复验、图片 blob 压缩；stream/final RenderOutbox；table hold 与 code/PNG/MD/CSV assets；Discord HTTP/rate-limit 错误分类，超上限 artifact 按序无损分片 | Discord archived/locked thread、attachment edit、exact 429 retry-after 仍需真实 gateway fixture |
 | tool/subagent/agent-scoped output 归并为原 thread 的单条 TaskDeck；4 秒 cadence、pending coalescing、terminal flush、select/expand/collapse/prev/next；>=8000 字符 tool result/error 逐字附件化；usage、warning/error、intent、workspace change 与 compaction 状态有非空 lane；raw chain-of-thought 永不展示；零 child-thread 路径 | typed Tasks/Fleet action buttons、完整 reasoning summary/diff artifact lane 尚未实现 |
-| 结构化 heartbeat、protected-work watchdog、macOS bot/watchdog LaunchAgent 与 Windows bot/watchdog Scheduled Task definitions | 当前拓扑没有独立 runtime service；macOS definition/CLI smoke 已验证，真实安装、sleep/wake 和 Windows 实机仍待验证 |
+| 共享 TaskRegistry、failure consumer、10 分钟 active-execution SUSPECT + non-destructive ping、结构化 heartbeat、protected-work watchdog、macOS bot/watchdog LaunchAgent 与 Windows Scheduled Task definitions | 当前拓扑没有独立 runtime service；真实 service 安装、sleep/wake 和 Windows 实机仍待验证 |
 
-当前验证基线：`ruff check src tests`、83 个 pytest、CLI `db-init`/`doctor` smoke、service
-definition parse 与 wheel build 均通过。这个快照用于区分“已验证实现”和后续设计，不降低以下
-章节对最终产品的契约要求。
+当前 deterministic 验证基线：`ruff check .`、237 个 pytest 全部通过。仓库内 hash-checked
+fixture 固定 SDK 1.0.8 / runtime 1.0.73 / protocol 3、114-event inventory 与 capability
+evidence；`copilotd sdk-probe --live` 使用当前登录账号创建 disposable session，属于独立的
+release/live acceptance，不由 deterministic fixture 冒充。这个快照用于区分“已验证实现”和后续
+设计，不降低以下章节对最终产品的契约要求。
 
 ### HTML 交付要求
 

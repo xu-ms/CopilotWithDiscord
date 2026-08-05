@@ -27,6 +27,7 @@ class AttachmentState(StrEnum):
     ATTACHED = "attached"
     DISCONNECTING = "disconnecting"
     RECOVERY_UNKNOWN = "recovery_unknown"
+    OWNER_CONFLICT = "owner_conflict"
     TERMINAL = "terminal"
 
 
@@ -173,6 +174,7 @@ class SessionBindingRepository:
             attachable_states = {
                 AttachmentState.ABSENT,
                 AttachmentState.RECOVERY_UNKNOWN,
+                AttachmentState.OWNER_CONFLICT,
             }
             stale_attached = (
                 binding.attachment_state == AttachmentState.ATTACHED
@@ -191,7 +193,8 @@ class SessionBindingRepository:
                     permission_verified_at = NULL, runtime_generation = ?,
                     owner_fence_token = ?, runtime_mode = 'unknown',
                     runtime_processing = NULL, runtime_has_active_work = NULL,
-                    runtime_abortable = NULL, updated_at = ?,
+                    runtime_abortable = NULL, last_inbox_seq = 0,
+                    last_sdk_receive_seq = NULL, updated_at = ?,
                     row_version = row_version + 1
                 WHERE thread_id = ? AND row_version = ?
                 """,
@@ -283,6 +286,22 @@ class SessionBindingRepository:
         return await self._transition_attachment(
             binding,
             state=AttachmentState.RECOVERY_UNKNOWN,
+            permission_posture=PermissionPosture.UNKNOWN,
+            permission_verified_at=None,
+            now=timestamp,
+            expected_states=(AttachmentState.CREATING, AttachmentState.RESUMING),
+        )
+
+    async def mark_owner_conflict(
+        self,
+        binding: SessionBinding,
+        *,
+        now: float | None = None,
+    ) -> SessionBinding:
+        timestamp = time.time() if now is None else now
+        return await self._transition_attachment(
+            binding,
+            state=AttachmentState.OWNER_CONFLICT,
             permission_posture=PermissionPosture.UNKNOWN,
             permission_verified_at=None,
             now=timestamp,

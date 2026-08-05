@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import asyncio
 import io
+import json
 import re
+import time
 import uuid
 from pathlib import Path
 from typing import Any
@@ -16,6 +18,7 @@ from copilotd.config import Settings
 from copilotd.core.attachments import AttachmentError, AttachmentService
 from copilotd.core.bindings import SessionBinding, SessionBindingRepository
 from copilotd.core.projects import ProjectRegistry
+from copilotd.core.recovery import RecoveryInventoryReport, StartupRecoveryInventory
 from copilotd.core.session_runtime import SessionRuntime
 from copilotd.core.sessions import (
     CreationIntentRepository,
@@ -23,6 +26,7 @@ from copilotd.core.sessions import (
     SessionRegistry,
     ThreadReference,
 )
+from copilotd.core.supervisor import ExecutionStallMonitor
 from copilotd.core.task_registry import TaskRegistry
 from copilotd.ops.heartbeat import HeartbeatWriter
 from copilotd.render.markdown import MarkdownAssembler, TableBlock, TextBlock
@@ -35,6 +39,7 @@ from copilotd.render.outbox import (
 )
 from copilotd.render.tables import TableAsset, render_table
 from copilotd.sdk.bridge import CopilotBridge
+from copilotd.sdk.capabilities import CapabilityManifest, CapabilityRegistry
 from copilotd.storage.database import Database
 from copilotd.storage.leases import OwnerLeaseStore
 
@@ -50,6 +55,10 @@ class CopilotDiscordBot(commands.Bot):
         self.settings = settings
         self.database = Database(settings.database_path)
         self.bridge = CopilotBridge(settings)
+        self.capability_registry = CapabilityRegistry(settings)
+        self.capabilities: CapabilityManifest = self.capability_registry.load_checked()
+        self.recovery_inventory: RecoveryInventoryReport | None = None
+        self.stall_monitor: ExecutionStallMonitor | None = None
         self.attachment_service = AttachmentService(
             self.database,
             settings.data_dir,
@@ -80,6 +89,20 @@ class CopilotDiscordBot(commands.Bot):
             ttl_seconds=self.settings.owner_lease_ttl_seconds,
         )
         await self.bridge.start()
+        try:
+            self.capabilities = await self.capability_registry.activate(
+                self.database,
+                await self.bridge.runtime_identity(),
+            )
+        except BaseException:
+            await self.bridge.stop()
+            raise
+        self.recovery_inventory = await StartupRecoveryInventory(self.database).run()
+        self.heartbeat.durable_replay_capable = self.capabilities.supports("event_log")
+        self.stall_monitor = ExecutionStallMonitor(
+            self.database,
+            self.bridge.transport_ping,
+        )
         self.heartbeat.runtime_state = "ready"
 
         def runtime_factory(binding: SessionBinding) -> SessionRuntime:
@@ -94,6 +117,8 @@ class CopilotDiscordBot(commands.Bot):
                 reducer_batch_size=self.settings.reducer_batch_size,
                 owner_renew_seconds=self.settings.owner_lease_renew_seconds,
                 attachment_resolver=self.attachment_service.sdk_attachments,
+                capabilities=self.capabilities,
+                task_registry=self._tasks,
             )
 
         self.sessions = SessionRegistry(self.bindings, runtime_factory)
@@ -104,6 +129,16 @@ class CopilotDiscordBot(commands.Bot):
             sessions=self.sessions,
             threads=DiscordThreadGateway(self),
         )
+        self._tasks.create(
+            self._task_failure_loop(),
+            name="task-failure-supervisor",
+            source="supervisor",
+        )
+        self._tasks.create(
+            self.stall_monitor.run(),
+            name="active-execution-stall-monitor",
+            source="stall-monitor",
+        )
         failures = await self.sessions.eager_resume()
         for thread_id, error in failures.items():
             await logger.awarning(
@@ -112,8 +147,16 @@ class CopilotDiscordBot(commands.Bot):
                 error=error,
             )
         self.dispatcher = RenderOutboxDispatcher(self.database, self)
-        self._tasks.create(self._render_loop(), name="discord-render-outbox")
-        self._tasks.create(self.heartbeat.run(), name="copilotd-heartbeat")
+        self._tasks.create(
+            self._render_loop(),
+            name="discord-render-outbox",
+            source="render-outbox",
+        )
+        self._tasks.create(
+            self.heartbeat.run(),
+            name="copilotd-heartbeat",
+            source="heartbeat",
+        )
         self._register_application_commands()
         if self.settings.discord_guild_id is not None:
             guild = discord.Object(id=self.settings.discord_guild_id)
@@ -125,12 +168,67 @@ class CopilotDiscordBot(commands.Bot):
     async def close(self) -> None:
         self.heartbeat.set_gateway("down")
         self.heartbeat.runtime_state = "down"
-        await self._tasks.cancel_all()
+        errors: list[Exception] = []
         if self.sessions is not None:
-            await self.sessions.shutdown()
-        await self.bridge.stop()
-        await self.database.close()
+            try:
+                await self.sessions.shutdown()
+            except Exception as error:
+                errors.append(error)
+        try:
+            await self._tasks.cancel_all()
+        except Exception as error:
+            errors.append(error)
+        try:
+            await self.bridge.stop()
+        except Exception as error:
+            errors.append(error)
+        try:
+            await self.database.close()
+        except Exception as error:
+            errors.append(error)
         await super().close()
+        if errors:
+            raise ExceptionGroup("copilotD shutdown failed", errors)
+
+    async def _task_failure_loop(self) -> None:
+        while True:
+            failure = await self._tasks.errors.get()
+            try:
+                self.heartbeat.runtime_state = "down"
+                await logger.aerror(
+                    "background_task_failed",
+                    task_name=failure.name,
+                    source=failure.source,
+                    session_id=failure.session_id,
+                    runtime_generation=failure.runtime_generation,
+                    error_type=type(failure.error).__name__,
+                    error=str(failure.error),
+                )
+                if failure.session_id is not None:
+                    await self.database.execute(
+                        """
+                        INSERT INTO runtime_incidents(
+                            timestamp, runtime_generation, session_id,
+                            kind, detail
+                        ) VALUES (?, ?, ?, 'background_task_failed', ?)
+                        """,
+                        (
+                            time.time(),
+                            failure.runtime_generation or 0,
+                            failure.session_id,
+                            json.dumps(
+                                {
+                                    "task_name": failure.name,
+                                    "source": failure.source,
+                                    "error_type": type(failure.error).__name__,
+                                    "message": str(failure.error),
+                                },
+                                sort_keys=True,
+                            ),
+                        ),
+                    )
+            finally:
+                self._tasks.errors.task_done()
 
     async def on_ready(self) -> None:
         self.heartbeat.set_gateway("ready")
@@ -819,10 +917,18 @@ class CopilotDiscordBot(commands.Bot):
                 error=str(cause),
             )
 
+        manifest = self.command_manifest()
         self.tree.add_command(session)
         self.tree.add_command(project)
-        self.tree.add_command(model)
+        if "model" in manifest:
+            self.tree.add_command(model)
         self.tree.add_command(queue)
+        for command_name in ("autopilot", "context", "plan", "usage"):
+            if command_name not in manifest:
+                self.tree.remove_command(command_name)
+
+    def command_manifest(self) -> frozenset[str]:
+        return self.capabilities.discord_command_roots()
 
     async def _interaction_binding(self, interaction: discord.Interaction) -> SessionBinding:
         if not isinstance(interaction.channel, discord.Thread):

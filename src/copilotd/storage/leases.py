@@ -3,7 +3,7 @@ from __future__ import annotations
 import time
 from dataclasses import dataclass
 
-from aiosqlite import Row
+from aiosqlite import Connection, Row
 
 from copilotd.storage.database import Database
 
@@ -115,27 +115,12 @@ class OwnerLeaseStore:
                 ),
             )
             if fence_token != current.fence_token:
-                await connection.execute(
-                    """
-                    UPDATE session_operations
-                    SET state = 'unknown',
-                        error_code = 'owner_fence_takeover',
-                        settled_at = ?
-                    WHERE sdk_session_id = ?
-                      AND owner_fence_token != ?
-                      AND state IN ('pending', 'started')
-                    """,
-                    (timestamp, sdk_session_id, fence_token),
-                )
-                await connection.execute(
-                    """
-                    UPDATE liveness_leases
-                    SET state = 'orphaned', released_at = ?
-                    WHERE sdk_session_id = ?
-                      AND owner_fence_token != ?
-                      AND state = 'active'
-                    """,
-                    (timestamp, sdk_session_id, fence_token),
+                await _orphan_previous_owners(
+                    connection,
+                    sdk_session_id=sdk_session_id,
+                    current_fence_token=fence_token,
+                    timestamp=timestamp,
+                    error_code="owner_fence_takeover",
                 )
             return lease
 
@@ -213,6 +198,102 @@ class OwnerLeaseStore:
             and current.fence_token == lease.fence_token
             and current.expires_at > timestamp
         )
+
+    async def has_mutation_headroom(
+        self,
+        lease: OwnerLease,
+        *,
+        minimum_seconds: float = 40,
+        now: float | None = None,
+    ) -> bool:
+        timestamp = time.time() if now is None else now
+        current = await self.current(lease.sdk_session_id)
+        return (
+            current is not None
+            and current.owner_id == lease.owner_id
+            and current.fence_token == lease.fence_token
+            and current.expires_at - timestamp >= minimum_seconds
+        )
+
+
+async def _orphan_previous_owners(
+    connection: Connection,
+    *,
+    sdk_session_id: str,
+    current_fence_token: int,
+    timestamp: float,
+    error_code: str,
+) -> None:
+    await connection.execute(
+        """
+        UPDATE session_operations
+        SET state = 'unknown', error_code = ?, settled_at = ?
+        WHERE sdk_session_id = ? AND owner_fence_token != ?
+          AND state IN ('pending', 'started')
+        """,
+        (error_code, timestamp, sdk_session_id, current_fence_token),
+    )
+    await connection.execute(
+        """
+        UPDATE submissions
+        SET state = CASE
+                WHEN state IN ('submitting', 'submitted') THEN 'submitted_unknown'
+                ELSE 'outcome_unknown'
+            END,
+            terminal_at = COALESCE(terminal_at, ?)
+        WHERE sdk_session_id = ?
+          AND state IN (
+              'submitting', 'submitted', 'submitted_unknown',
+              'observed_active', 'loop_idle', 'continuation_expected'
+          )
+        """,
+        (timestamp, sdk_session_id),
+    )
+    await connection.execute(
+        """
+        UPDATE message_queue
+        SET state = 'submitted_unknown', updated_at = ?
+        WHERE id IN (
+            SELECT submission_id FROM submissions
+            WHERE sdk_session_id = ? AND state = 'submitted_unknown'
+        ) AND state = 'submitting'
+        """,
+        (timestamp, sdk_session_id),
+    )
+    await connection.execute(
+        """
+        UPDATE background_observations
+        SET observed_state = 'unknown', last_progress_at = ?
+        WHERE sdk_session_id = ? AND terminal_evidence IS NULL
+          AND observed_state IN ('running', 'idle')
+        """,
+        (timestamp, sdk_session_id),
+    )
+    await connection.execute(
+        """
+        UPDATE pending_interactions
+        SET state = 'expired', updated_at = ?
+        WHERE sdk_session_id = ? AND state = 'pending'
+          AND owner_fence_token != ?
+        """,
+        (timestamp, sdk_session_id, current_fence_token),
+    )
+    await connection.execute(
+        """
+        UPDATE runtime_schedules
+        SET state = 'unknown', updated_at = ?
+        WHERE sdk_session_id = ? AND state = 'active'
+        """,
+        (timestamp, sdk_session_id),
+    )
+    await connection.execute(
+        """
+        UPDATE liveness_leases
+        SET state = 'orphaned', refreshed_at = ?, released_at = ?
+        WHERE sdk_session_id = ? AND owner_fence_token != ? AND state = 'active'
+        """,
+        (timestamp, timestamp, sdk_session_id, current_fence_token),
+    )
 
 
 def _row_to_lease(row: Row) -> OwnerLease:

@@ -50,8 +50,8 @@ class Settings(BaseSettings):
     @field_validator("owner_lease_ttl_seconds")
     @classmethod
     def validate_lease_ttl(cls, value: int) -> int:
-        if value < 10:
-            raise ValueError("owner lease TTL must be at least 10 seconds")
+        if value < 40:
+            raise ValueError("owner lease TTL must be at least 40 seconds")
         return value
 
     @field_validator("owner_lease_renew_seconds")

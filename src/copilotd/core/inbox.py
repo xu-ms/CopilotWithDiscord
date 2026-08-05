@@ -3,7 +3,6 @@ from __future__ import annotations
 import asyncio
 import threading
 import time
-import uuid
 from collections.abc import Callable
 from typing import Any
 
@@ -22,6 +21,7 @@ class ReducerInbox:
         generation: int,
         fence_token: int,
         capacity: int,
+        thread_id: str | None = None,
         loop: asyncio.AbstractEventLoop | None = None,
     ) -> None:
         if capacity < 1:
@@ -29,6 +29,7 @@ class ReducerInbox:
         self.sdk_session_id = sdk_session_id
         self.generation = generation
         self.fence_token = fence_token
+        self.thread_id = thread_id
         self._capacity = capacity
         self._loop = loop or asyncio.get_running_loop()
         self._loop_thread_id = threading.get_ident()
@@ -55,6 +56,16 @@ class ReducerInbox:
         with self._lock:
             return self._overflow
 
+    @property
+    def last_reserved_inbox_seq(self) -> int:
+        with self._lock:
+            return self._next_inbox_seq
+
+    @property
+    def last_sdk_receive_seq(self) -> int:
+        with self._lock:
+            return self._next_sdk_receive_seq
+
     def submit_sdk(self, event: SessionEvent) -> bool:
         with self._lock:
             if self._sdk_closed:
@@ -71,6 +82,7 @@ class ReducerInbox:
             source="sdk",
             payload=event,
             received_at=time.time(),
+            thread_id=self.thread_id,
             sdk_receive_seq=sdk_receive_seq,
         )
         return self._schedule(envelope)
@@ -84,6 +96,8 @@ class ReducerInbox:
     ) -> bool:
         if source not in {"internal", "snapshot"}:
             raise ValueError(f"invalid internal source: {source}")
+        if not internal_event_id:
+            raise ValueError("durable internal receipts require an explicit internal_event_id")
         reservation = self._reserve(source=source)
         if reservation is None:
             return False
@@ -96,7 +110,8 @@ class ReducerInbox:
             source=source,
             payload=payload,
             received_at=time.time(),
-            internal_event_id=internal_event_id or str(uuid.uuid4()),
+            thread_id=self.thread_id,
+            internal_event_id=internal_event_id,
         )
         return self._schedule(envelope)
 
@@ -109,6 +124,8 @@ class ReducerInbox:
     ) -> None:
         if source not in {"internal", "snapshot"}:
             raise ValueError(f"invalid internal source: {source}")
+        if not internal_event_id:
+            raise ValueError("durable internal receipts require an explicit internal_event_id")
         reservation = self._reserve(source=source, record_overflow=False)
         while reservation is None:
             with self._lock:
@@ -126,11 +143,38 @@ class ReducerInbox:
             source=source,
             payload=payload,
             received_at=time.time(),
-            internal_event_id=internal_event_id or str(uuid.uuid4()),
+            thread_id=self.thread_id,
+            internal_event_id=internal_event_id,
             commit_ack=commit_ack,
         )
         if not self._schedule(envelope):
             raise RuntimeError("failed to schedule reducer receipt")
+        await commit_ack
+
+    async def commit_recovered_sdk(self, event: SessionEvent) -> None:
+        reservation = self._reserve(source="sdk", record_overflow=False)
+        while reservation is None:
+            with self._lock:
+                if self._closed:
+                    raise RuntimeError("reducer inbox is closed")
+            await self._space_available.wait()
+            reservation = self._reserve(source="sdk", record_overflow=False)
+        inbox_seq, sdk_receive_seq = reservation
+        commit_ack = self._loop.create_future()
+        envelope = InboxEnvelope(
+            sdk_session_id=self.sdk_session_id,
+            generation=self.generation,
+            fence_token=self.fence_token,
+            inbox_seq=inbox_seq,
+            source="sdk",
+            payload=event,
+            received_at=time.time(),
+            thread_id=self.thread_id,
+            sdk_receive_seq=sdk_receive_seq,
+            commit_ack=commit_ack,
+        )
+        if not self._schedule(envelope):
+            raise RuntimeError("failed to schedule recovered SDK event")
         await commit_ack
 
     async def get(self) -> InboxEnvelope:

@@ -12,6 +12,8 @@ from copilotd.config import Settings
 from copilotd.discord_app import run_discord_bot
 from copilotd.logging import configure_logging
 from copilotd.ops.service import ServiceManager, status_dict
+from copilotd.sdk.bridge import CopilotBridge
+from copilotd.sdk.capabilities import CapabilityRegistry
 from copilotd.sdk.probe import SdkProbe, _to_jsonable
 from copilotd.storage.database import Database
 
@@ -72,7 +74,17 @@ async def run_command(args: argparse.Namespace) -> int:
         return 0
 
     if args.command == "doctor":
+        bridge = CopilotBridge(settings)
         async with Database(settings.database_path) as database:
+            await bridge.start()
+            try:
+                runtime_identity = await bridge.runtime_identity()
+                capabilities = await CapabilityRegistry(settings).activate(
+                    database,
+                    runtime_identity,
+                )
+            finally:
+                await bridge.stop()
             migrations = await database.fetchall(
                 "SELECT version, name, applied_at FROM schema_migrations ORDER BY version"
             )
@@ -84,7 +96,8 @@ async def run_command(args: argparse.Namespace) -> int:
             "resolved_home": str(settings.resolved_home),
             "database": str(settings.database_path),
             "migrations": [dict(row) for row in migrations],
-            "sdk": SdkProbe(settings).static_matrix(),
+            "runtime": runtime_identity,
+            "sdk": capabilities.to_dict(),
         }
         _print_json(result)
         return 0

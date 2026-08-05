@@ -1,4 +1,7 @@
 import asyncio
+import sqlite3
+import time
+from importlib import resources
 from pathlib import Path
 
 import pytest
@@ -12,16 +15,19 @@ async def test_initial_migration_creates_full_schema(tmp_path: Path) -> None:
     expected_tables = {
         "attachment_items",
         "attachment_manifests",
+        "autopilot_objectives",
         "background_observations",
         "capabilities",
         "channel_settings",
         "custom_agents",
         "event_journal",
+        "execution_health",
         "global_config",
         "liveness_leases",
         "mcp_servers",
         "message_queue",
         "model_turns",
+        "native_queue_items",
         "pending_interactions",
         "plugin_dirs",
         "project_env",
@@ -41,7 +47,10 @@ async def test_initial_migration_creates_full_schema(tmp_path: Path) -> None:
         "session_operations",
         "session_owner_leases",
         "skill_dirs",
+        "startup_recovery_runs",
+        "snapshot_observations",
         "submissions",
+        "submission_segments",
         "task_card_projections",
         "taskdeck_panel_state",
         "usage_samples",
@@ -72,7 +81,62 @@ async def test_migrations_are_idempotent(tmp_path: Path) -> None:
     async with Database(database_path) as database:
         rows = await database.fetchall("SELECT version FROM schema_migrations")
 
-    assert [row["version"] for row in rows] == [1, 2, 3, 4, 5, 6, 7]
+    assert [row["version"] for row in rows] == [1, 2, 3, 4, 5, 6, 7, 8]
+
+
+@pytest.mark.asyncio
+async def test_foundation_migration_upgrades_existing_v7_database(tmp_path: Path) -> None:
+    database_path = tmp_path / "upgrade-v7.sqlite3"
+    connection = sqlite3.connect(database_path)
+    connection.execute(
+        """
+        CREATE TABLE schema_migrations (
+            version INTEGER PRIMARY KEY,
+            name TEXT NOT NULL,
+            applied_at REAL NOT NULL
+        )
+        """
+    )
+    migration_root = resources.files("copilotd.storage.migrations")
+    for migration in sorted(
+        item
+        for item in migration_root.iterdir()
+        if item.name.endswith(".sql") and int(item.name.partition("_")[0]) <= 7
+    ):
+        connection.executescript(migration.read_text(encoding="utf-8"))
+        version = int(migration.name.partition("_")[0])
+        connection.execute(
+            "INSERT INTO schema_migrations VALUES (?, ?, ?)",
+            (version, migration.name, time.time()),
+        )
+    connection.commit()
+    connection.close()
+
+    async with Database(database_path) as database:
+        versions = await database.fetchall(
+            "SELECT version FROM schema_migrations ORDER BY version"
+        )
+        capability_columns = await database.fetchall("PRAGMA table_info(capabilities)")
+        event_columns = await database.fetchall("PRAGMA table_info(event_journal)")
+        tables = await database.fetchall(
+            "SELECT name FROM sqlite_master WHERE type = 'table'"
+        )
+
+    assert [row["version"] for row in versions] == list(range(1, 9))
+    assert "protocol_version" in {row["name"] for row in capability_columns}
+    assert {
+        "schema_version",
+        "sdk_timestamp",
+        "task_id",
+        "tool_call_id",
+        "correlation_id",
+    } <= {row["name"] for row in event_columns}
+    assert {
+        "execution_health",
+        "snapshot_observations",
+        "startup_recovery_runs",
+        "submission_segments",
+    } <= {row["name"] for row in tables}
 
 
 @pytest.mark.asyncio
