@@ -1,0 +1,1 @@
+"""Durable Discord rendering primitives."""

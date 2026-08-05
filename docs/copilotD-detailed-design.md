@@ -1,11 +1,18 @@
 # copilotD 详细设计与实施计划
 
-> 当前阶段：详细设计 v2.5，待审批。审批前不执行 SDK 原型、不创建项目代码。
+> 当前阶段：详细设计 v2.5 已批准，SDK/runtime 原型、首个 Discord MVP、durable
+> interaction router 与 background-task reconciliation 已实现；当前继续按 capability
+> gate 补齐后续能力并做真实平台验证。
 >
 > 本版固定前提：单用户、私有部署、Copilot runtime 全程 `--yolo`，不设计多用户共享、
 > 工具确认流程、安全沙箱或租户隔离。
 >
-> 审批交付格式：仓库 `docs/` 内同时提交 Markdown 内容源和 standalone HTML。
+> 2026-08-05 实测 SDK 1.0.8 / runtime 1.0.73：stdio `--yolo`、full allow-all、
+> create/resume 预注册 callback、跨 idle 回调、history/eventLog、usage/context、native `/after`
+> 和 1/5/10 MiB frame 可用；sidecar client transport 断开后 session retention 不成立，因此
+> 当前固定 bundled-runtime topology，不宣称 detached continuation。
+>
+> 交付格式：仓库 `docs/` 内同时提交 Markdown 内容源和 standalone HTML。
 
 ## 目标
 
@@ -2339,20 +2346,38 @@ claudeD issue 回归门禁：
   `/limits`、`/pr`、`/delegate` 不进入命令面；`/unbound-fallback` 不存在，因为 `$HOME`
   行为固定启用。
 
+### 当前实现快照（2026-08-05）
+
+首个可运行 slice 已按本设计开始落地，当前不是“全部能力完成”：
+
+| 已实现 | 当前边界 |
+|---|---|
+| 官方 `github-copilot-sdk==1.0.8` + bundled runtime 1.0.73，stdio `--yolo`，create/resume 后 full allow-all 对账 | sidecar client transport 断开后 session retention 实测失败，因此不声明 detached continuation；crash window 保守标 outcome unknown |
+| 7 个 SQLite migration、project `$HOME` fallback/cwd snapshot、owner fence、creation saga、bounded ingress、单 reducer、event journal、CommandMailbox、liveness leases、eager resume；共享连接事务隔离；`background_tasks_changed` 后 `tasks.refresh/list`，缺 terminal 消失转 UNKNOWN | eventLog durable replay reconciler 仍未接入 production supervisor；experimental task action RPC 继续 gated |
+| durable app FIFO；每次用 `metadata.is_processing()`、`metadata.activity()` 与 `queue.pending_items()` readiness snapshot 只派发队首；`/queue add/list/remove/clear` | native queue entry 没有稳定 host ID 时不做虚假一一镜像；transport ambiguity 不自动重放 |
+| Discord core `/session`、`/project`、`/model`、bare `/autopilot`、bare/optional-prompt `/plan`、`/steer`、`/context`、`/usage`；user-input/Plan-exit/auto-mode-switch 使用 durable exactly-once interaction + select/modal 原位结算；Plan 退出 mode 精确关联并消费 | `/session delete`、compact/fork 和 Native-Gated commands 尚未实现，因而不注册；elicitation/MCP OAuth 仍待接入 |
+| durable input attachment manifest、hash/size 复验、图片 blob 压缩；stream/final RenderOutbox；table hold 与 code/PNG/MD/CSV assets；Discord HTTP/rate-limit 错误分类，超上限 artifact 按序无损分片 | Discord archived/locked thread、attachment edit、exact 429 retry-after 仍需真实 gateway fixture |
+| tool/subagent/agent-scoped output 归并为原 thread 的单条 TaskDeck；4 秒 cadence、pending coalescing、terminal flush、select/expand/collapse/prev/next；>=8000 字符 tool result/error 逐字附件化；usage、warning/error、intent、workspace change 与 compaction 状态有非空 lane；raw chain-of-thought 永不展示；零 child-thread 路径 | typed Tasks/Fleet action buttons、完整 reasoning summary/diff artifact lane 尚未实现 |
+| 结构化 heartbeat、protected-work watchdog、macOS bot/watchdog LaunchAgent 与 Windows bot/watchdog Scheduled Task definitions | 当前拓扑没有独立 runtime service；macOS definition/CLI smoke 已验证，真实安装、sleep/wake 和 Windows 实机仍待验证 |
+
+当前验证基线：`ruff check src tests`、83 个 pytest、CLI `db-init`/`doctor` smoke、service
+definition parse 与 wheel build 均通过。这个快照用于区分“已验证实现”和后续设计，不降低以下
+章节对最终产品的契约要求。
+
 ### HTML 交付要求
 
 - 以本文件“目标、调研结论、详细设计、实施阶段、风险和官方依据”为唯一内容源。
 - 输出 UTF-8、standalone HTML，内嵌响应式 CSS、目录、打印样式和代码/表格样式。
 - 不依赖远程字体、CSS、JavaScript 或图片；Mermaid 源码在无本地 renderer 时以可读
   流程块保留，避免把设计内容发送给第三方。
-- 页面头部标记“设计 v2.5、待审批、single-user --yolo”，突出 Copilot-backed commands、
+- 页面头部标记“设计 v2.5、实现中、single-user --yolo”，突出 Copilot-backed commands、
   `$HOME` 默认 cwd、macOS/Windows always-on、session liveness、table rendering、
   claudeD issue lessons 和 capability gate。
 - 文档 body 最大宽度至少 90rem；表格使用独立横向滚动容器、sticky header、长单元格
   wrap 和打印分页，确保 issue/command/event 大表可读。
 - 生成后校验 HTML 可解析、目录锚点有效、Copilot command manifest 与 raw event 表完整、
   删除项不误注册、无未完成占位标记或多租户设计残留。
-- Markdown 和 HTML 固定提交到仓库 `docs/`；仍不开始 SDK 原型或项目编码。
+- Markdown 和 HTML 固定提交到仓库 `docs/`，实现状态必须明确区分 verified、gated 与待验证。
 
 ## 实施阶段
 
@@ -2429,20 +2454,15 @@ claudeD issue 回归门禁：
 
 ## 待办
 
-1. 审批本文件的详细设计和默认选择。
-2. 验证 Copilot SDK 的 yolo、on_event callback、durable history/eventLog cursor、
-   background evidence、
-   mode RPC、sidecar/recovery 和 frame。
-3. 实现 implicit `$HOME`、explicit binding、cwd snapshot 和 bind/unbind 不影响旧 session。
-4. 搭建 SessionRuntime、CommandMailbox、SdkEventIngress、ReducerInbox、ReducerWorker、owner fence、
-   TaskRegistry 和 RenderOutbox。
-5. 实现稳定事件适配、liveness reducer 和 Discord 富渲染。
-6. 实现表格 code/PNG/MD/CSV、附件异步处理和 final flush。
-7. 实现 Core mode RPC/plan callback、Native-Gated ask/Fleet/Tasks/agents/after/every/remote/
-   review/security-review/research/rubber-duck，以及 project MCP/skills/plugins config；
-   不伪造未 gated command。
-8. 实现 macOS/Windows 默认自启动、heartbeat、watchdog 和平台安装验证。
-9. 完成 claudeD issue 回归、90 分钟 soak、恢复、故障、兼容性测试和部署文档。
+1. 补齐 eventLog backfill、elicitation/MCP OAuth、reasoning summary/diff artifact lane 与
+   crash/reconnect reconciliation。
+2. 按 capability fixture 逐项实现 Native-Gated ask/Fleet/Tasks/agents/after/every/remote/
+   review/security-review/research/rubber-duck；fixture 缺失时继续不注册。
+3. 完成 project MCP/skills/plugins/agents、durable scheduler、worktree 和 session delete/fork/compact。
+4. 在真实 Discord 验证 archive/locked thread、TaskDeck component restart、attachment edit、table
+   assets 与精确 429 retry-after。
+5. 实机安装和验证 macOS LaunchAgent、Windows Scheduled Task、sleep/wake、crash/restart storm；
+   完成 claudeD issue 回归、90 分钟 soak、恢复、故障与 forward-compatibility 测试。
 
 ## 主要风险
 

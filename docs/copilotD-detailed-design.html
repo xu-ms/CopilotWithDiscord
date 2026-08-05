@@ -6,6 +6,9 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=yes" />
   <title>copilotD 详细设计 v2.5</title>
   <style>
+    /* Default styles provided by pandoc.
+    ** See https://pandoc.org/MANUAL.html#variables-for-html for config info.
+    */
     html {
       color: #1a1a1a;
       background-color: #fdfdfd;
@@ -232,333 +235,333 @@
     code span.vs { color: #4070a0; } /* VerbatimString */
     code span.wa { color: #60a0b0; font-weight: bold; font-style: italic; } /* Warning */
   </style>
-    <style type="text/css">:root {
-  color-scheme: light dark;
-  --bg: #f7f9fc;
-  --surface: #ffffff;
-  --surface-alt: #f0f4f9;
-  --text: #172033;
-  --muted: #596780;
-  --border: #d8e0eb;
-  --accent: #0969da;
-  --accent-soft: #ddf4ff;
-  --code-bg: #eef2f7;
-  --purple: #8250df;
-  --shadow: 0 8px 28px rgba(27, 39, 51, 0.08);
-  }
-  * {
-  box-sizing: border-box;
-  }
-  html {
-  scroll-behavior: smooth;
-  scroll-padding-top: 1.25rem;
-  }
-  body {
-  max-width: 100rem;
-  margin: 0 auto;
-  padding: 3rem 2.5rem 7rem 22rem;
-  background: var(--bg);
-  color: var(--text);
-  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial,
-  "Apple Color Emoji", "Segoe UI Emoji", sans-serif;
-  font-size: 16px;
-  line-height: 1.68;
-  }
-  body > h1 {
-  margin-top: 0;
-  padding-bottom: 1rem;
-  border-bottom: 1px solid var(--border);
-  font-size: clamp(2rem, 4vw, 3rem);
-  line-height: 1.18;
-  letter-spacing: -0.035em;
-  }
-  body > h1::after {
-  display: block;
-  width: fit-content;
-  max-width: 100%;
-  margin-top: 0.9rem;
-  padding: 0.3rem 0.7rem;
-  border: 1px solid #b6d7f2;
-  border-radius: 999px;
-  background: var(--accent-soft);
-  color: var(--accent);
-  content: "DESIGN V2.5 · COPILOT SDK · $HOME DEFAULT · ALWAYS-ON MAC/WIN · LIVE SESSIONS · TABLE PNG · CAPABILITY-GATED · --YOLO · 待审批";
-  font-size: 0.76rem;
-  font-weight: 800;
-  line-height: 1.45;
-  letter-spacing: 0.08em;
-  }
-  nav#TOC {
-  position: fixed;
-  inset: 0 auto 0 0;
-  width: 19.5rem;
-  overflow-y: auto;
-  padding: 2rem 1.25rem 3rem;
-  border-right: 1px solid var(--border);
-  background: var(--surface);
-  box-shadow: var(--shadow);
-  }
-  nav#TOC::before {
-  display: block;
-  margin-bottom: 0.9rem;
-  color: var(--muted);
-  content: "COPILOTD DESIGN V2.5";
-  font-size: 0.72rem;
-  font-weight: 800;
-  letter-spacing: 0.14em;
-  }
-  nav#TOC > ul {
-  padding-left: 0;
-  }
-  nav#TOC ul {
-  list-style: none;
-  }
-  nav#TOC li {
-  margin: 0.3rem 0;
-  }
-  nav#TOC ul ul {
-  padding-left: 0.95rem;
-  border-left: 1px solid var(--border);
-  }
-  nav#TOC a {
-  color: var(--muted);
-  text-decoration: none;
-  }
-  nav#TOC a:hover,
-  nav#TOC a:focus {
-  color: var(--accent);
-  text-decoration: underline;
-  text-underline-offset: 0.18em;
-  }
-  h2 {
-  margin-top: 3.5rem;
-  padding: 0.75rem 1rem;
-  border-left: 0.3rem solid var(--accent);
-  border-radius: 0 0.45rem 0.45rem 0;
-  background: var(--surface-alt);
-  font-size: 1.65rem;
-  line-height: 1.3;
-  }
-  h3 {
-  margin-top: 2.75rem;
-  padding-bottom: 0.35rem;
-  border-bottom: 1px solid var(--border);
-  font-size: 1.3rem;
-  }
-  h4 {
-  margin-top: 2rem;
-  color: var(--accent);
-  font-size: 1.08rem;
-  }
-  h1,
-  h2,
-  h3,
-  h4 {
-  font-weight: 720;
-  }
-  p,
-  li {
-  max-width: 105ch;
-  }
-  a {
-  color: var(--accent);
-  overflow-wrap: anywhere;
-  }
-  blockquote {
-  margin: 1.5rem 0 2rem;
-  padding: 1rem 1.25rem;
-  border: 1px solid #b6d7f2;
-  border-left: 0.35rem solid var(--accent);
-  border-radius: 0.55rem;
-  background: var(--accent-soft);
-  color: #17365d;
-  }
-  blockquote p {
-  margin: 0.25rem 0;
-  }
-  code {
-  padding: 0.12em 0.35em;
-  border: 1px solid var(--border);
-  border-radius: 0.3rem;
-  background: var(--code-bg);
-  color: #7a2e8e;
-  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas,
-  "Liberation Mono", monospace;
-  font-size: 0.9em;
-  overflow-wrap: anywhere;
-  }
-  pre {
-  max-width: 100%;
-  overflow: auto;
-  padding: 1rem 1.1rem;
-  border: 1px solid var(--border);
-  border-radius: 0.55rem;
-  background: #111827;
-  color: #e5edf8;
-  line-height: 1.5;
-  }
-  pre code {
-  padding: 0;
-  border: 0;
-  background: transparent;
-  color: inherit;
-  overflow-wrap: normal;
-  }
-  pre.mermaid {
-  border-left: 0.3rem solid var(--purple);
-  background: #19152b;
-  }
-  pre.mermaid::before {
-  display: block;
-  margin-bottom: 0.65rem;
-  color: #c4a7ff;
-  content: "MERMAID FLOW";
-  font-size: 0.72rem;
-  font-weight: 800;
-  letter-spacing: 0.11em;
-  }
-  table {
-  display: block;
-  width: 100%;
-  max-width: 100%;
-  margin: 1.25rem 0 2rem;
-  overflow-x: auto;
-  border: 1px solid var(--border);
-  border-collapse: separate;
-  border-spacing: 0;
-  border-radius: 0.55rem;
-  background: var(--surface);
-  box-shadow: var(--shadow);
-  scrollbar-gutter: stable;
-  }
-  thead {
-  background: var(--surface-alt);
-  }
-  th,
-  td {
-  min-width: 9rem;
-  max-width: 36rem;
-  padding: 0.7rem 0.8rem;
-  border-right: 1px solid var(--border);
-  border-bottom: 1px solid var(--border);
-  text-align: left;
-  vertical-align: top;
-  overflow-wrap: anywhere;
-  }
-  th {
-  position: sticky;
-  top: 0;
-  z-index: 1;
-  background: var(--surface-alt);
-  }
-  th:last-child,
-  td:last-child {
-  border-right: 0;
-  }
-  tbody tr:last-child td {
-  border-bottom: 0;
-  }
-  tbody tr:nth-child(even) {
-  background: rgba(240, 244, 249, 0.55);
-  }
-  td code {
-  white-space: normal;
-  }
-  @media (prefers-color-scheme: dark) {
-  :root {
-  --bg: #0d1117;
-  --surface: #161b22;
-  --surface-alt: #202834;
-  --text: #e6edf3;
-  --muted: #9da7b3;
-  --border: #30363d;
-  --accent: #58a6ff;
-  --accent-soft: #12263a;
-  --code-bg: #202834;
-  --shadow: none;
-  }
-  blockquote {
-  border-color: #244d73;
-  background: #12263a;
-  color: #c9e6ff;
-  }
-  code {
-  color: #d2a8ff;
-  }
-  tbody tr:nth-child(even) {
-  background: rgba(32, 40, 52, 0.65);
-  }
-  }
-  @media (max-width: 1100px) {
-  body {
-  padding: 1.5rem 1rem 4rem;
-  }
-  nav#TOC {
-  position: static;
-  width: auto;
-  max-height: 28rem;
-  margin-bottom: 2rem;
-  border: 1px solid var(--border);
-  border-radius: 0.55rem;
-  }
-  }
-  @media print {
-  :root {
-  color-scheme: light;
-  --bg: #fff;
-  --surface: #fff;
-  --surface-alt: #f4f4f4;
-  --text: #111;
-  --muted: #444;
-  --border: #bbb;
-  --accent: #174ea6;
-  --accent-soft: #eef5ff;
-  --code-bg: #f3f3f3;
-  --shadow: none;
-  }
-  body {
-  max-width: none;
-  padding: 0;
-  background: #fff;
-  color: #111;
-  font-size: 9pt;
-  }
-  nav#TOC {
-  position: static;
-  width: auto;
-  box-shadow: none;
-  page-break-after: always;
-  }
-  h2,
-  h3,
-  h4 {
-  break-after: avoid;
-  }
-  table {
-  display: table;
-  width: 100%;
-  overflow: visible;
-  box-shadow: none;
-  break-inside: auto;
-  font-size: 7.5pt;
-  }
-  th {
-  position: static;
-  }
-  tr {
-  break-inside: avoid;
-  }
-  pre,
-  blockquote {
-  break-inside: avoid;
-  box-shadow: none;
-  }
-  a {
-  color: inherit;
-  text-decoration: none;
-  }
-  }
-  </style>
+  <style type="text/css">:root {
+    color-scheme: light dark;
+    --bg: #f7f9fc;
+    --surface: #ffffff;
+    --surface-alt: #f0f4f9;
+    --text: #172033;
+    --muted: #596780;
+    --border: #d8e0eb;
+    --accent: #0969da;
+    --accent-soft: #ddf4ff;
+    --code-bg: #eef2f7;
+    --purple: #8250df;
+    --shadow: 0 8px 28px rgba(27, 39, 51, 0.08);
+    }
+    * {
+    box-sizing: border-box;
+    }
+    html {
+    scroll-behavior: smooth;
+    scroll-padding-top: 1.25rem;
+    }
+    body {
+    max-width: 100rem;
+    margin: 0 auto;
+    padding: 3rem 2.5rem 7rem 22rem;
+    background: var(--bg);
+    color: var(--text);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial,
+    "Apple Color Emoji", "Segoe UI Emoji", sans-serif;
+    font-size: 16px;
+    line-height: 1.68;
+    }
+    body > h1 {
+    margin-top: 0;
+    padding-bottom: 1rem;
+    border-bottom: 1px solid var(--border);
+    font-size: clamp(2rem, 4vw, 3rem);
+    line-height: 1.18;
+    letter-spacing: -0.035em;
+    }
+    body > h1::after {
+    display: block;
+    width: fit-content;
+    max-width: 100%;
+    margin-top: 0.9rem;
+    padding: 0.3rem 0.7rem;
+    border: 1px solid #b6d7f2;
+    border-radius: 999px;
+    background: var(--accent-soft);
+    color: var(--accent);
+    content: "DESIGN V2.5 · COPILOT SDK · $HOME DEFAULT · ALWAYS-ON MAC/WIN · LIVE SESSIONS · TABLE PNG · CAPABILITY-GATED · --YOLO · 实现中";
+    font-size: 0.76rem;
+    font-weight: 800;
+    line-height: 1.45;
+    letter-spacing: 0.08em;
+    }
+    nav#TOC {
+    position: fixed;
+    inset: 0 auto 0 0;
+    width: 19.5rem;
+    overflow-y: auto;
+    padding: 2rem 1.25rem 3rem;
+    border-right: 1px solid var(--border);
+    background: var(--surface);
+    box-shadow: var(--shadow);
+    }
+    nav#TOC::before {
+    display: block;
+    margin-bottom: 0.9rem;
+    color: var(--muted);
+    content: "COPILOTD DESIGN V2.5";
+    font-size: 0.72rem;
+    font-weight: 800;
+    letter-spacing: 0.14em;
+    }
+    nav#TOC > ul {
+    padding-left: 0;
+    }
+    nav#TOC ul {
+    list-style: none;
+    }
+    nav#TOC li {
+    margin: 0.3rem 0;
+    }
+    nav#TOC ul ul {
+    padding-left: 0.95rem;
+    border-left: 1px solid var(--border);
+    }
+    nav#TOC a {
+    color: var(--muted);
+    text-decoration: none;
+    }
+    nav#TOC a:hover,
+    nav#TOC a:focus {
+    color: var(--accent);
+    text-decoration: underline;
+    text-underline-offset: 0.18em;
+    }
+    h2 {
+    margin-top: 3.5rem;
+    padding: 0.75rem 1rem;
+    border-left: 0.3rem solid var(--accent);
+    border-radius: 0 0.45rem 0.45rem 0;
+    background: var(--surface-alt);
+    font-size: 1.65rem;
+    line-height: 1.3;
+    }
+    h3 {
+    margin-top: 2.75rem;
+    padding-bottom: 0.35rem;
+    border-bottom: 1px solid var(--border);
+    font-size: 1.3rem;
+    }
+    h4 {
+    margin-top: 2rem;
+    color: var(--accent);
+    font-size: 1.08rem;
+    }
+    h1,
+    h2,
+    h3,
+    h4 {
+    font-weight: 720;
+    }
+    p,
+    li {
+    max-width: 105ch;
+    }
+    a {
+    color: var(--accent);
+    overflow-wrap: anywhere;
+    }
+    blockquote {
+    margin: 1.5rem 0 2rem;
+    padding: 1rem 1.25rem;
+    border: 1px solid #b6d7f2;
+    border-left: 0.35rem solid var(--accent);
+    border-radius: 0.55rem;
+    background: var(--accent-soft);
+    color: #17365d;
+    }
+    blockquote p {
+    margin: 0.25rem 0;
+    }
+    code {
+    padding: 0.12em 0.35em;
+    border: 1px solid var(--border);
+    border-radius: 0.3rem;
+    background: var(--code-bg);
+    color: #7a2e8e;
+    font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas,
+    "Liberation Mono", monospace;
+    font-size: 0.9em;
+    overflow-wrap: anywhere;
+    }
+    pre {
+    max-width: 100%;
+    overflow: auto;
+    padding: 1rem 1.1rem;
+    border: 1px solid var(--border);
+    border-radius: 0.55rem;
+    background: #111827;
+    color: #e5edf8;
+    line-height: 1.5;
+    }
+    pre code {
+    padding: 0;
+    border: 0;
+    background: transparent;
+    color: inherit;
+    overflow-wrap: normal;
+    }
+    pre.mermaid {
+    border-left: 0.3rem solid var(--purple);
+    background: #19152b;
+    }
+    pre.mermaid::before {
+    display: block;
+    margin-bottom: 0.65rem;
+    color: #c4a7ff;
+    content: "MERMAID FLOW";
+    font-size: 0.72rem;
+    font-weight: 800;
+    letter-spacing: 0.11em;
+    }
+    table {
+    display: block;
+    width: 100%;
+    max-width: 100%;
+    margin: 1.25rem 0 2rem;
+    overflow-x: auto;
+    border: 1px solid var(--border);
+    border-collapse: separate;
+    border-spacing: 0;
+    border-radius: 0.55rem;
+    background: var(--surface);
+    box-shadow: var(--shadow);
+    scrollbar-gutter: stable;
+    }
+    thead {
+    background: var(--surface-alt);
+    }
+    th,
+    td {
+    min-width: 9rem;
+    max-width: 36rem;
+    padding: 0.7rem 0.8rem;
+    border-right: 1px solid var(--border);
+    border-bottom: 1px solid var(--border);
+    text-align: left;
+    vertical-align: top;
+    overflow-wrap: anywhere;
+    }
+    th {
+    position: sticky;
+    top: 0;
+    z-index: 1;
+    background: var(--surface-alt);
+    }
+    th:last-child,
+    td:last-child {
+    border-right: 0;
+    }
+    tbody tr:last-child td {
+    border-bottom: 0;
+    }
+    tbody tr:nth-child(even) {
+    background: rgba(240, 244, 249, 0.55);
+    }
+    td code {
+    white-space: normal;
+    }
+    @media (prefers-color-scheme: dark) {
+    :root {
+    --bg: #0d1117;
+    --surface: #161b22;
+    --surface-alt: #202834;
+    --text: #e6edf3;
+    --muted: #9da7b3;
+    --border: #30363d;
+    --accent: #58a6ff;
+    --accent-soft: #12263a;
+    --code-bg: #202834;
+    --shadow: none;
+    }
+    blockquote {
+    border-color: #244d73;
+    background: #12263a;
+    color: #c9e6ff;
+    }
+    code {
+    color: #d2a8ff;
+    }
+    tbody tr:nth-child(even) {
+    background: rgba(32, 40, 52, 0.65);
+    }
+    }
+    @media (max-width: 1100px) {
+    body {
+    padding: 1.5rem 1rem 4rem;
+    }
+    nav#TOC {
+    position: static;
+    width: auto;
+    max-height: 28rem;
+    margin-bottom: 2rem;
+    border: 1px solid var(--border);
+    border-radius: 0.55rem;
+    }
+    }
+    @media print {
+    :root {
+    color-scheme: light;
+    --bg: #fff;
+    --surface: #fff;
+    --surface-alt: #f4f4f4;
+    --text: #111;
+    --muted: #444;
+    --border: #bbb;
+    --accent: #174ea6;
+    --accent-soft: #eef5ff;
+    --code-bg: #f3f3f3;
+    --shadow: none;
+    }
+    body {
+    max-width: none;
+    padding: 0;
+    background: #fff;
+    color: #111;
+    font-size: 9pt;
+    }
+    nav#TOC {
+    position: static;
+    width: auto;
+    box-shadow: none;
+    page-break-after: always;
+    }
+    h2,
+    h3,
+    h4 {
+    break-after: avoid;
+    }
+    table {
+    display: table;
+    width: 100%;
+    overflow: visible;
+    box-shadow: none;
+    break-inside: auto;
+    font-size: 7.5pt;
+    }
+    th {
+    position: static;
+    }
+    tr {
+    break-inside: avoid;
+    }
+    pre,
+    blockquote {
+    break-inside: avoid;
+    box-shadow: none;
+    }
+    a {
+    color: inherit;
+    text-decoration: none;
+    }
+    }
+    </style>
 </head>
 <body>
 <header id="title-block-header">
@@ -631,6 +634,8 @@ id="toc-会话存活保证与边界">会话存活保证与边界</a></li>
 <li><a href="#测试契约" id="toc-测试契约">测试契约</a></li>
 <li><a href="#已固定的关键默认"
 id="toc-已固定的关键默认">已固定的关键默认</a></li>
+<li><a href="#当前实现快照2026-08-05"
+id="toc-当前实现快照2026-08-05">当前实现快照（2026-08-05）</a></li>
 <li><a href="#html-交付要求" id="toc-html-交付要求">HTML
 交付要求</a></li>
 </ul></li>
@@ -657,12 +662,19 @@ copilotD 扩展</a></li>
 </nav>
 <h1 id="copilotd-详细设计与实施计划">copilotD 详细设计与实施计划</h1>
 <blockquote>
-<p>当前阶段：详细设计 v2.5，待审批。审批前不执行 SDK
-原型、不创建项目代码。</p>
+<p>当前阶段：详细设计 v2.5 已批准，SDK/runtime 原型、首个 Discord
+MVP、durable interaction router 与 background-task reconciliation
+已实现；当前继续按 capability gate 补齐后续能力并做真实平台验证。</p>
 <p>本版固定前提：单用户、私有部署、Copilot runtime 全程
 <code>--yolo</code>，不设计多用户共享、
 工具确认流程、安全沙箱或租户隔离。</p>
-<p>审批交付格式：仓库 <code>docs/</code> 内同时提交 Markdown 内容源和
+<p>2026-08-05 实测 SDK 1.0.8 / runtime 1.0.73：stdio
+<code>--yolo</code>、full allow-all、 create/resume 预注册 callback、跨
+idle 回调、history/eventLog、usage/context、native <code>/after</code>
+和 1/5/10 MiB frame 可用；sidecar client transport 断开后 session
+retention 不成立，因此 当前固定 bundled-runtime topology，不宣称
+detached continuation。</p>
+<p>交付格式：仓库 <code>docs/</code> 内同时提交 Markdown 内容源和
 standalone HTML。</p>
 </blockquote>
 <h2 id="目标">目标</h2>
@@ -5250,6 +5262,82 @@ model、<code>/mode</code>、<code>/goal</code>、<code>/bare</code>、<code>/to
 不进入命令面；<code>/unbound-fallback</code> 不存在，因为
 <code>$HOME</code> 行为固定启用。</li>
 </ul>
+<h3 id="当前实现快照2026-08-05">当前实现快照（2026-08-05）</h3>
+<p>首个可运行 slice 已按本设计开始落地，当前不是“全部能力完成”：</p>
+<table>
+<thead>
+<tr>
+<th>已实现</th>
+<th>当前边界</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>官方 <code>github-copilot-sdk==1.0.8</code> + bundled runtime
+1.0.73，stdio <code>--yolo</code>，create/resume 后 full allow-all
+对账</td>
+<td>sidecar client transport 断开后 session retention
+实测失败，因此不声明 detached continuation；crash window 保守标 outcome
+unknown</td>
+</tr>
+<tr>
+<td>7 个 SQLite migration、project <code>$HOME</code> fallback/cwd
+snapshot、owner fence、creation saga、bounded ingress、单 reducer、event
+journal、CommandMailbox、liveness leases、eager
+resume；共享连接事务隔离；<code>background_tasks_changed</code> 后
+<code>tasks.refresh/list</code>，缺 terminal 消失转 UNKNOWN</td>
+<td>eventLog durable replay reconciler 仍未接入 production
+supervisor；experimental task action RPC 继续 gated</td>
+</tr>
+<tr>
+<td>durable app FIFO；每次用
+<code>metadata.is_processing()</code>、<code>metadata.activity()</code>
+与 <code>queue.pending_items()</code> readiness snapshot
+只派发队首；<code>/queue add/list/remove/clear</code></td>
+<td>native queue entry 没有稳定 host ID 时不做虚假一一镜像；transport
+ambiguity 不自动重放</td>
+</tr>
+<tr>
+<td>Discord core
+<code>/session</code>、<code>/project</code>、<code>/model</code>、bare
+<code>/autopilot</code>、bare/optional-prompt
+<code>/plan</code>、<code>/steer</code>、<code>/context</code>、<code>/usage</code>；user-input/Plan-exit/auto-mode-switch
+使用 durable exactly-once interaction + select/modal 原位结算；Plan 退出
+mode 精确关联并消费</td>
+<td><code>/session delete</code>、compact/fork 和 Native-Gated commands
+尚未实现，因而不注册；elicitation/MCP OAuth 仍待接入</td>
+</tr>
+<tr>
+<td>durable input attachment manifest、hash/size 复验、图片 blob
+压缩；stream/final RenderOutbox；table hold 与 code/PNG/MD/CSV
+assets；Discord HTTP/rate-limit 错误分类，超上限 artifact
+按序无损分片</td>
+<td>Discord archived/locked thread、attachment edit、exact 429
+retry-after 仍需真实 gateway fixture</td>
+</tr>
+<tr>
+<td>tool/subagent/agent-scoped output 归并为原 thread 的单条 TaskDeck；4
+秒 cadence、pending coalescing、terminal
+flush、select/expand/collapse/prev/next；&gt;=8000 字符 tool
+result/error 逐字附件化；usage、warning/error、intent、workspace change
+与 compaction 状态有非空 lane；raw chain-of-thought 永不展示；零
+child-thread 路径</td>
+<td>typed Tasks/Fleet action buttons、完整 reasoning summary/diff
+artifact lane 尚未实现</td>
+</tr>
+<tr>
+<td>结构化 heartbeat、protected-work watchdog、macOS bot/watchdog
+LaunchAgent 与 Windows bot/watchdog Scheduled Task definitions</td>
+<td>当前拓扑没有独立 runtime service；macOS definition/CLI smoke
+已验证，真实安装、sleep/wake 和 Windows 实机仍待验证</td>
+</tr>
+</tbody>
+</table>
+<p>当前验证基线：<code>ruff check src tests</code>、83 个 pytest、CLI
+<code>db-init</code>/<code>doctor</code> smoke、service definition parse
+与 wheel build
+均通过。这个快照用于区分“已验证实现”和后续设计，不降低以下
+章节对最终产品的契约要求。</p>
 <h3 id="html-交付要求">HTML 交付要求</h3>
 <ul>
 <li>以本文件“目标、调研结论、详细设计、实施阶段、风险和官方依据”为唯一内容源。</li>
@@ -5257,7 +5345,7 @@ model、<code>/mode</code>、<code>/goal</code>、<code>/bare</code>、<code>/to
 CSS、目录、打印样式和代码/表格样式。</li>
 <li>不依赖远程字体、CSS、JavaScript 或图片；Mermaid 源码在无本地
 renderer 时以可读 流程块保留，避免把设计内容发送给第三方。</li>
-<li>页面头部标记“设计 v2.5、待审批、single-user --yolo”，突出
+<li>页面头部标记“设计 v2.5、实现中、single-user --yolo”，突出
 Copilot-backed commands、 <code>$HOME</code> 默认 cwd、macOS/Windows
 always-on、session liveness、table rendering、 claudeD issue lessons 和
 capability gate。</li>
@@ -5267,8 +5355,8 @@ header、长单元格 wrap 和打印分页，确保 issue/command/event
 <li>生成后校验 HTML 可解析、目录锚点有效、Copilot command manifest 与
 raw event 表完整、
 删除项不误注册、无未完成占位标记或多租户设计残留。</li>
-<li>Markdown 和 HTML 固定提交到仓库 <code>docs/</code>；仍不开始 SDK
-原型或项目编码。</li>
+<li>Markdown 和 HTML 固定提交到仓库
+<code>docs/</code>，实现状态必须明确区分 verified、gated 与待验证。</li>
 </ul>
 <h2 id="实施阶段">实施阶段</h2>
 <h3 id="1-sdk-技术原型">1. SDK 技术原型</h3>
@@ -5376,25 +5464,19 @@ restart-storm alert。</li>
 </ul>
 <h2 id="待办">待办</h2>
 <ol type="1">
-<li>审批本文件的详细设计和默认选择。</li>
-<li>验证 Copilot SDK 的 yolo、on_event callback、durable
-history/eventLog cursor、 background evidence、 mode
-RPC、sidecar/recovery 和 frame。</li>
-<li>实现 implicit <code>$HOME</code>、explicit binding、cwd snapshot 和
-bind/unbind 不影响旧 session。</li>
-<li>搭建
-SessionRuntime、CommandMailbox、SdkEventIngress、ReducerInbox、ReducerWorker、owner
-fence、 TaskRegistry 和 RenderOutbox。</li>
-<li>实现稳定事件适配、liveness reducer 和 Discord 富渲染。</li>
-<li>实现表格 code/PNG/MD/CSV、附件异步处理和 final flush。</li>
-<li>实现 Core mode RPC/plan callback、Native-Gated
+<li>补齐 eventLog backfill、elicitation/MCP OAuth、reasoning
+summary/diff artifact lane 与 crash/reconnect reconciliation。</li>
+<li>按 capability fixture 逐项实现 Native-Gated
 ask/Fleet/Tasks/agents/after/every/remote/
-review/security-review/research/rubber-duck，以及 project
-MCP/skills/plugins config； 不伪造未 gated command。</li>
-<li>实现 macOS/Windows 默认自启动、heartbeat、watchdog
-和平台安装验证。</li>
-<li>完成 claudeD issue 回归、90 分钟
-soak、恢复、故障、兼容性测试和部署文档。</li>
+review/security-review/research/rubber-duck；fixture
+缺失时继续不注册。</li>
+<li>完成 project MCP/skills/plugins/agents、durable scheduler、worktree
+和 session delete/fork/compact。</li>
+<li>在真实 Discord 验证 archive/locked thread、TaskDeck component
+restart、attachment edit、table assets 与精确 429 retry-after。</li>
+<li>实机安装和验证 macOS LaunchAgent、Windows Scheduled
+Task、sleep/wake、crash/restart storm； 完成 claudeD issue 回归、90 分钟
+soak、恢复、故障与 forward-compatibility 测试。</li>
 </ol>
 <h2 id="主要风险">主要风险</h2>
 <ul>
