@@ -1,0 +1,3739 @@
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml" lang="zh-CN" xml:lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="generator" content="pandoc" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=yes" />
+  <title>copilotD 详细设计 v2.3</title>
+  <style>
+code{white-space: pre-wrap;}
+span.smallcaps{font-variant: small-caps;}
+div.columns{display: flex; gap: min(4vw, 1.5em);}
+div.column{flex: auto; overflow-x: auto;}
+div.hanging-indent{margin-left: 1.5em; text-indent: -1.5em;}
+
+ul.task-list[class]{list-style: none;}
+ul.task-list li input[type="checkbox"] {
+font-size: inherit;
+width: 0.8em;
+margin: 0 0.8em 0.2em -1.6em;
+vertical-align: middle;
+}
+.display.math{display: block; text-align: center; margin: 0.5rem auto;}
+
+html { -webkit-text-size-adjust: 100%; }
+pre > code.sourceCode { white-space: pre; position: relative; }
+pre > code.sourceCode > span { display: inline-block; line-height: 1.25; }
+pre > code.sourceCode > span:empty { height: 1.2em; }
+.sourceCode { overflow: visible; }
+code.sourceCode > span { color: inherit; text-decoration: inherit; }
+div.sourceCode { margin: 1em 0; }
+pre.sourceCode { margin: 0; }
+@media screen {
+div.sourceCode { overflow: auto; }
+}
+@media print {
+pre > code.sourceCode { white-space: pre-wrap; }
+pre > code.sourceCode > span { text-indent: -5em; padding-left: 5em; }
+}
+pre.numberSource code
+{ counter-reset: source-line 0; }
+pre.numberSource code > span
+{ position: relative; left: -4em; counter-increment: source-line; }
+pre.numberSource code > span > a:first-child::before
+{ content: counter(source-line);
+position: relative; left: -1em; text-align: right; vertical-align: baseline;
+border: none; display: inline-block;
+-webkit-touch-callout: none; -webkit-user-select: none;
+-khtml-user-select: none; -moz-user-select: none;
+-ms-user-select: none; user-select: none;
+padding: 0 4px; width: 4em;
+color: #aaaaaa;
+}
+pre.numberSource { margin-left: 3em; border-left: 1px solid #aaaaaa; padding-left: 4px; }
+div.sourceCode
+{ }
+@media screen {
+pre > code.sourceCode > span > a:first-child::before { text-decoration: underline; }
+}
+code span.al { color: #ff0000; font-weight: bold; }
+code span.an { color: #60a0b0; font-weight: bold; font-style: italic; }
+code span.at { color: #7d9029; }
+code span.bn { color: #40a070; }
+code span.bu { color: #008000; }
+code span.cf { color: #007020; font-weight: bold; }
+code span.ch { color: #4070a0; }
+code span.cn { color: #880000; }
+code span.co { color: #60a0b0; font-style: italic; }
+code span.cv { color: #60a0b0; font-weight: bold; font-style: italic; }
+code span.do { color: #ba2121; font-style: italic; }
+code span.dt { color: #902000; }
+code span.dv { color: #40a070; }
+code span.er { color: #ff0000; font-weight: bold; }
+code span.ex { }
+code span.fl { color: #40a070; }
+code span.fu { color: #06287e; }
+code span.im { color: #008000; font-weight: bold; }
+code span.in { color: #60a0b0; font-weight: bold; font-style: italic; }
+code span.kw { color: #007020; font-weight: bold; }
+code span.op { color: #666666; }
+code span.ot { color: #007020; }
+code span.pp { color: #bc7a00; }
+code span.sc { color: #4070a0; }
+code span.ss { color: #bb6688; }
+code span.st { color: #4070a0; }
+code span.va { color: #19177c; }
+code span.vs { color: #4070a0; }
+code span.wa { color: #60a0b0; font-weight: bold; font-style: italic; }
+</style>
+  <style type="text/css">:root {
+color-scheme: light dark;
+--bg: #f7f9fc;
+--surface: #ffffff;
+--surface-alt: #f0f4f9;
+--text: #172033;
+--muted: #596780;
+--border: #d8e0eb;
+--accent: #0969da;
+--accent-soft: #ddf4ff;
+--code-bg: #eef2f7;
+--purple: #8250df;
+--shadow: 0 8px 28px rgba(27, 39, 51, 0.08);
+}
+* {
+box-sizing: border-box;
+}
+html {
+scroll-behavior: smooth;
+scroll-padding-top: 1.25rem;
+}
+body {
+max-width: 100rem;
+margin: 0 auto;
+padding: 3rem 2.5rem 7rem 22rem;
+background: var(--bg);
+color: var(--text);
+font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial,
+"Apple Color Emoji", "Segoe UI Emoji", sans-serif;
+font-size: 16px;
+line-height: 1.68;
+}
+body > h1 {
+margin-top: 0;
+padding-bottom: 1rem;
+border-bottom: 1px solid var(--border);
+font-size: clamp(2rem, 4vw, 3rem);
+line-height: 1.18;
+letter-spacing: -0.035em;
+}
+body > h1::after {
+display: block;
+width: fit-content;
+margin-top: 0.9rem;
+padding: 0.3rem 0.7rem;
+border: 1px solid #b6d7f2;
+border-radius: 999px;
+background: var(--accent-soft);
+color: var(--accent);
+content: "DESIGN V2.3 · COPILOT NATIVE · SINGLE USER · --YOLO · 待审批";
+font-size: 0.76rem;
+font-weight: 800;
+letter-spacing: 0.08em;
+}
+nav#TOC {
+position: fixed;
+inset: 0 auto 0 0;
+width: 19.5rem;
+overflow-y: auto;
+padding: 2rem 1.25rem 3rem;
+border-right: 1px solid var(--border);
+background: var(--surface);
+box-shadow: var(--shadow);
+}
+nav#TOC::before {
+display: block;
+margin-bottom: 0.9rem;
+color: var(--muted);
+content: "COPILOTD DESIGN V2.3";
+font-size: 0.72rem;
+font-weight: 800;
+letter-spacing: 0.14em;
+}
+nav#TOC > ul {
+padding-left: 0;
+}
+nav#TOC ul {
+list-style: none;
+}
+nav#TOC li {
+margin: 0.3rem 0;
+}
+nav#TOC ul ul {
+padding-left: 0.95rem;
+border-left: 1px solid var(--border);
+}
+nav#TOC a {
+color: var(--muted);
+text-decoration: none;
+}
+nav#TOC a:hover,
+nav#TOC a:focus {
+color: var(--accent);
+text-decoration: underline;
+text-underline-offset: 0.18em;
+}
+h2 {
+margin-top: 3.5rem;
+padding: 0.75rem 1rem;
+border-left: 0.3rem solid var(--accent);
+border-radius: 0 0.45rem 0.45rem 0;
+background: var(--surface-alt);
+font-size: 1.65rem;
+line-height: 1.3;
+}
+h3 {
+margin-top: 2.75rem;
+padding-bottom: 0.35rem;
+border-bottom: 1px solid var(--border);
+font-size: 1.3rem;
+}
+h4 {
+margin-top: 2rem;
+color: var(--accent);
+font-size: 1.08rem;
+}
+h1,
+h2,
+h3,
+h4 {
+font-weight: 720;
+}
+p,
+li {
+max-width: 105ch;
+}
+a {
+color: var(--accent);
+overflow-wrap: anywhere;
+}
+blockquote {
+margin: 1.5rem 0 2rem;
+padding: 1rem 1.25rem;
+border: 1px solid #b6d7f2;
+border-left: 0.35rem solid var(--accent);
+border-radius: 0.55rem;
+background: var(--accent-soft);
+color: #17365d;
+}
+blockquote p {
+margin: 0.25rem 0;
+}
+code {
+padding: 0.12em 0.35em;
+border: 1px solid var(--border);
+border-radius: 0.3rem;
+background: var(--code-bg);
+color: #7a2e8e;
+font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas,
+"Liberation Mono", monospace;
+font-size: 0.9em;
+overflow-wrap: anywhere;
+}
+pre {
+max-width: 100%;
+overflow: auto;
+padding: 1rem 1.1rem;
+border: 1px solid var(--border);
+border-radius: 0.55rem;
+background: #111827;
+color: #e5edf8;
+line-height: 1.5;
+}
+pre code {
+padding: 0;
+border: 0;
+background: transparent;
+color: inherit;
+overflow-wrap: normal;
+}
+pre.mermaid {
+border-left: 0.3rem solid var(--purple);
+background: #19152b;
+}
+pre.mermaid::before {
+display: block;
+margin-bottom: 0.65rem;
+color: #c4a7ff;
+content: "MERMAID FLOW";
+font-size: 0.72rem;
+font-weight: 800;
+letter-spacing: 0.11em;
+}
+table {
+display: block;
+width: 100%;
+max-width: 100%;
+margin: 1.25rem 0 2rem;
+overflow-x: auto;
+border: 1px solid var(--border);
+border-collapse: separate;
+border-spacing: 0;
+border-radius: 0.55rem;
+background: var(--surface);
+box-shadow: var(--shadow);
+scrollbar-gutter: stable;
+}
+thead {
+background: var(--surface-alt);
+}
+th,
+td {
+min-width: 9rem;
+max-width: 36rem;
+padding: 0.7rem 0.8rem;
+border-right: 1px solid var(--border);
+border-bottom: 1px solid var(--border);
+text-align: left;
+vertical-align: top;
+overflow-wrap: anywhere;
+}
+th {
+position: sticky;
+top: 0;
+z-index: 1;
+background: var(--surface-alt);
+}
+th:last-child,
+td:last-child {
+border-right: 0;
+}
+tbody tr:last-child td {
+border-bottom: 0;
+}
+tbody tr:nth-child(even) {
+background: rgba(240, 244, 249, 0.55);
+}
+td code {
+white-space: normal;
+}
+@media (prefers-color-scheme: dark) {
+:root {
+--bg: #0d1117;
+--surface: #161b22;
+--surface-alt: #202834;
+--text: #e6edf3;
+--muted: #9da7b3;
+--border: #30363d;
+--accent: #58a6ff;
+--accent-soft: #12263a;
+--code-bg: #202834;
+--shadow: none;
+}
+blockquote {
+border-color: #244d73;
+background: #12263a;
+color: #c9e6ff;
+}
+code {
+color: #d2a8ff;
+}
+tbody tr:nth-child(even) {
+background: rgba(32, 40, 52, 0.65);
+}
+}
+@media (max-width: 1100px) {
+body {
+padding: 1.5rem 1rem 4rem;
+}
+nav#TOC {
+position: static;
+width: auto;
+max-height: 28rem;
+margin-bottom: 2rem;
+border: 1px solid var(--border);
+border-radius: 0.55rem;
+}
+}
+@media print {
+:root {
+color-scheme: light;
+--bg: #fff;
+--surface: #fff;
+--surface-alt: #f4f4f4;
+--text: #111;
+--muted: #444;
+--border: #bbb;
+--accent: #174ea6;
+--accent-soft: #eef5ff;
+--code-bg: #f3f3f3;
+--shadow: none;
+}
+body {
+max-width: none;
+padding: 0;
+background: #fff;
+color: #111;
+font-size: 9pt;
+}
+nav#TOC {
+position: static;
+width: auto;
+box-shadow: none;
+page-break-after: always;
+}
+h2,
+h3,
+h4 {
+break-after: avoid;
+}
+table {
+display: table;
+width: 100%;
+overflow: visible;
+box-shadow: none;
+break-inside: auto;
+font-size: 7.5pt;
+}
+th {
+position: static;
+}
+tr {
+break-inside: avoid;
+}
+pre,
+blockquote {
+break-inside: avoid;
+box-shadow: none;
+}
+a {
+color: inherit;
+text-decoration: none;
+}
+}
+</style>
+</head>
+<body>
+<nav id="TOC" role="doc-toc">
+<ul>
+<li><a href="#copilotd-详细设计与实施计划" id="toc-copilotd-详细设计与实施计划">copilotD 详细设计与实施计划</a>
+<ul>
+<li><a href="#目标" id="toc-目标">目标</a></li>
+<li><a href="#调研结论" id="toc-调研结论">调研结论</a>
+<ul>
+<li><a href="#与-clauded-的能力映射" id="toc-与-clauded-的能力映射">与
+claudeD 的能力映射</a></li>
+<li><a href="#不应照搬的-claude-语义" id="toc-不应照搬的-claude-语义">不应照搬的 Claude 语义</a></li>
+</ul></li>
+<li><a href="#推荐架构" id="toc-推荐架构">推荐架构</a></li>
+<li><a href="#单用户---yolo-与常驻部署基线" id="toc-单用户---yolo-与常驻部署基线">单用户 <code>--yolo</code>
+与常驻部署基线</a></li>
+<li><a href="#macos-windows-默认自启动与进程保活" id="toc-macos-windows-默认自启动与进程保活">macOS / Windows
+默认自启动与进程保活</a>
+<ul>
+<li><a href="#通用-service-cli" id="toc-通用-service-cli">通用 service
+CLI</a></li>
+<li><a href="#heartbeat-协议" id="toc-heartbeat-协议">Heartbeat
+协议</a></li>
+<li><a href="#macoslaunchagent" id="toc-macoslaunchagent">macOS：LaunchAgent</a></li>
+<li><a href="#windowstask-scheduler" id="toc-windowstask-scheduler">Windows：Task Scheduler</a></li>
+</ul></li>
+<li><a href="#设计门禁" id="toc-设计门禁">设计门禁</a></li>
+<li><a href="#详细设计" id="toc-详细设计">详细设计</a>
+<ul>
+<li><a href="#产品决策" id="toc-产品决策">产品决策</a></li>
+<li><a href="#产品范围与非目标" id="toc-产品范围与非目标">产品范围与非目标</a></li>
+<li><a href="#固定---yolo" id="toc-固定---yolo">固定
+<code>--yolo</code></a></li>
+<li><a href="#组件职责" id="toc-组件职责">组件职责</a></li>
+<li><a href="#持久化与目录" id="toc-持久化与目录">持久化与目录</a></li>
+<li><a href="#sessionturn-与-schedule-状态" id="toc-sessionturn-与-schedule-状态">Session、turn 与 schedule
+状态</a></li>
+<li><a href="#通用命令契约" id="toc-通用命令契约">通用命令契约</a></li>
+<li><a href="#命令设计原则" id="toc-命令设计原则">命令设计原则</a></li>
+<li><a href="#copilot-原生命令" id="toc-copilot-原生命令">Copilot
+原生命令</a></li>
+<li><a href="#copilotd-扩展命令" id="toc-copilotd-扩展命令">copilotD
+扩展命令</a></li>
+<li><a href="#明确删除不做机械映射" id="toc-明确删除不做机械映射">明确删除，不做机械映射</a></li>
+<li><a href="#事件适配" id="toc-事件适配">事件适配</a></li>
+<li><a href="#discord-renderer" id="toc-discord-renderer">Discord
+Renderer</a></li>
+<li><a href="#clauded-issues-避雷矩阵" id="toc-clauded-issues-避雷矩阵">claudeD issues 避雷矩阵</a></li>
+<li><a href="#关键事件流程" id="toc-关键事件流程">关键事件流程</a></li>
+<li><a href="#超时重试与错误分类" id="toc-超时重试与错误分类">超时、重试与错误分类</a></li>
+<li><a href="#会话存活保证与边界" id="toc-会话存活保证与边界">会话存活保证与边界</a></li>
+<li><a href="#版本兼容" id="toc-版本兼容">版本兼容</a></li>
+<li><a href="#测试契约" id="toc-测试契约">测试契约</a></li>
+<li><a href="#已固定的关键默认" id="toc-已固定的关键默认">已固定的关键默认</a></li>
+<li><a href="#html-交付要求" id="toc-html-交付要求">HTML
+交付要求</a></li>
+</ul></li>
+<li><a href="#实施阶段" id="toc-实施阶段">实施阶段</a>
+<ul>
+<li><a href="#sdk-技术原型" id="toc-sdk-技术原型">1. SDK
+技术原型</a></li>
+<li><a href="#discord-核心-mvp" id="toc-discord-核心-mvp">2. Discord
+核心 MVP</a></li>
+<li><a href="#事件后台生命周期与富渲染" id="toc-事件后台生命周期与富渲染">3. 事件、后台生命周期与富渲染</a></li>
+<li><a href="#copilot-原生能力与-copilotd-扩展" id="toc-copilot-原生能力与-copilotd-扩展">4. Copilot 原生能力与 copilotD
+扩展</a></li>
+<li><a href="#稳定性与交付" id="toc-稳定性与交付">5.
+稳定性与交付</a></li>
+</ul></li>
+<li><a href="#待办" id="toc-待办">待办</a></li>
+<li><a href="#主要风险" id="toc-主要风险">主要风险</a></li>
+<li><a href="#官方依据" id="toc-官方依据">官方依据</a></li>
+</ul></li>
+</ul>
+</nav>
+<h1 id="copilotd-详细设计与实施计划">copilotD 详细设计与实施计划</h1>
+<blockquote>
+<p>当前阶段：详细设计 v2.3，待审批。审批前不执行 SDK
+原型、不创建项目代码。</p>
+<p>本版固定前提：单用户、私有部署、Copilot runtime 全程
+<code>--yolo</code>，不设计多用户共享、
+工具确认流程、安全沙箱或租户隔离。</p>
+<p>审批交付格式：仓库 <code>docs/</code> 内同时提交 Markdown 内容源和
+standalone HTML。</p>
+</blockquote>
+<h2 id="目标">目标</h2>
+<p>新建一个 <code>copilotD</code> 项目：借鉴
+<code>HXYerror/claudeD</code> 的产品结构——Discord 频道可绑定
+本地项目、Discord 线程对应独立 Agent 会话；频道未绑定时固定以当前 OS
+用户的 <code>$HOME</code> 作为 cwd。项目不复制 claudeD 代码，也不追求
+Claude 专属功能的一比一复刻；Agent 能力、
+命令名称、计费展示和交互语义都按 GitHub Copilot SDK 重新设计。</p>
+<h2 id="调研结论">调研结论</h2>
+<p>结论：<strong>可行，且核心能力覆盖度高，但不是替换一个依赖就能完成。</strong></p>
+<p>GitHub 已提供官方 Python SDK：</p>
+<ul>
+<li>包名：<code>github-copilot-sdk</code></li>
+<li>Python：3.11+</li>
+<li>状态：GitHub 于 2026-06-02 宣布 GA</li>
+<li>许可证：MIT</li>
+<li>架构：Python SDK 通过 JSON-RPC 驱动 Copilot CLI Agent Runtime</li>
+<li>Runtime：Python wheel 对应的 CLI runtime 可自动下载，也可连接独立
+headless runtime</li>
+<li>鉴权：已登录的 Copilot 用户、GitHub token/OAuth、GitHub App 或
+BYOK</li>
+<li>主要能力：流式输出、工具调用、文件编辑、持久会话、权限回调、MCP、Hooks、
+自定义
+Agent、Skills、Plugins、图片输入、模型切换、上下文压缩、用量指标</li>
+</ul>
+<p>需要注意：官方整体已 GA，但 PyPI 元数据仍保留
+<code>Development Status :: 3 - Alpha</code>， 部分低层 RPC（例如 usage
+metrics、fork/compact 等）仍应视为需要版本固定和契约测试的
+接口。实施时必须同时固定 SDK 和 bundled runtime 的兼容版本。</p>
+<h3 id="与-clauded-的能力映射">与 claudeD 的能力映射</h3>
+<table>
+<colgroup>
+<col style="width: 33%" />
+<col style="width: 33%" />
+<col style="width: 33%" />
+</colgroup>
+<thead>
+<tr>
+<th>claudeD 能力</th>
+<th>Copilot 对应方案</th>
+<th>结论</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Discord 消息双向桥接</td>
+<td><code>session.send()</code> + session event subscription</td>
+<td>直接支持</td>
+</tr>
+<tr>
+<td>实时打字机输出</td>
+<td><code>assistant.message_delta</code></td>
+<td>直接支持</td>
+</tr>
+<tr>
+<td>Thinking 展示</td>
+<td><code>assistant.reasoning(_delta)</code></td>
+<td>支持，是否产生取决于模型</td>
+</tr>
+<tr>
+<td>工具状态、结果、Diff</td>
+<td><code>tool.execution_start/progress/complete</code>，读取 structured
+result</td>
+<td>直接支持，Renderer 要重写</td>
+</tr>
+<tr>
+<td>线程对应会话</td>
+<td>自定义 <code>session_id</code> +
+<code>create_session</code>/<code>resume_session</code></td>
+<td>直接支持</td>
+</tr>
+<tr>
+<td>重启后恢复</td>
+<td><code>~/.copilot/session-state</code> 或自定义
+<code>COPILOT_HOME</code>/session FS</td>
+<td>直接支持</td>
+</tr>
+<tr>
+<td>中断当前任务</td>
+<td><code>session.abort()</code></td>
+<td>直接支持</td>
+</tr>
+<tr>
+<td>切换模型/推理强度</td>
+<td><code>list_models()</code> + <code>session.set_model()</code></td>
+<td>直接支持</td>
+</tr>
+<tr>
+<td>自动/手动 compact</td>
+<td>infinite sessions + <code>session.rpc.history.compact()</code></td>
+<td>支持，手动 RPC 需原型验证</td>
+</tr>
+<tr>
+<td>Fork 会话</td>
+<td><code>client.rpc.sessions.fork(...)</code></td>
+<td>可实现，低层 RPC 需原型验证</td>
+</tr>
+<tr>
+<td>无确认工具执行</td>
+<td>runtime <code>--yolo</code> + SDK raw confirmation callback
+自动批准</td>
+<td>直接支持；组织托管策略仍可能拒绝</td>
+</tr>
+<tr>
+<td>交互式提问</td>
+<td><code>on_user_input_request</code> /
+<code>user_input.requested</code></td>
+<td>直接支持，可映射 Discord 按钮和菜单</td>
+</tr>
+<tr>
+<td>图片附件</td>
+<td>file/blob image attachments</td>
+<td>直接支持</td>
+</tr>
+<tr>
+<td>代码、文档附件</td>
+<td>异步落盘，再使用 SDK file attachment</td>
+<td>应用层生命周期管理</td>
+</tr>
+<tr>
+<td>MCP server</td>
+<td><code>mcp_servers</code>，支持 stdio 和 HTTP</td>
+<td>直接支持</td>
+</tr>
+<tr>
+<td>Custom Agents/Subagents</td>
+<td><code>custom_agents</code> + subagent events</td>
+<td>直接支持</td>
+</tr>
+<tr>
+<td>Skills</td>
+<td><code>skill_directories</code> / <code>disabled_skills</code></td>
+<td>直接支持</td>
+</tr>
+<tr>
+<td>Plugins</td>
+<td><code>plugin_directories</code> 或 runtime
+<code>--plugin-dir</code></td>
+<td>直接支持</td>
+</tr>
+<tr>
+<td>Hooks</td>
+<td>Copilot session hooks</td>
+<td>支持；Hook 名称和 payload 需适配</td>
+</tr>
+<tr>
+<td>Context 展示</td>
+<td><code>session.usage_info</code> / context-info RPC</td>
+<td>直接支持</td>
+</tr>
+<tr>
+<td>用量</td>
+<td><code>/usage</code>、AI Credits、premium request multiplier、account
+quota</td>
+<td>只读展示 Copilot 原生语义，不提供 limits 配置</td>
+</tr>
+<tr>
+<td>worktree</td>
+<td>应用层调用 Git 创建并绑定新工作目录</td>
+<td>copilotD durable extension</td>
+</tr>
+<tr>
+<td>Plan/Fleet/Tasks</td>
+<td><code>agent_mode=&quot;plan&quot;</code>、Fleet RPC、task RPC</td>
+<td>Copilot 专属能力；Fleet/tasks 需 capability gate</td>
+</tr>
+<tr>
+<td>Code/security review</td>
+<td>官方 Copilot CLI
+<code>/review</code>、<code>/security-review</code></td>
+<td>Copilot 原生命令；runtime command capability gate</td>
+</tr>
+<tr>
+<td>Scheduler</td>
+<td>保留应用层 scheduler，并注册 custom tool/MCP</td>
+<td>可复用产品思路</td>
+</tr>
+</tbody>
+</table>
+<h3 id="不应照搬的-claude-语义">不应照搬的 Claude 语义</h3>
+<ul>
+<li>不保留 <code>ClaudeBridge</code>、Claude message block 和 Claude
+tool name；改为 <code>CopilotBridge</code> + 统一内部事件模型。</li>
+<li><code>/cost</code>、<code>/budget</code>、<code>/limits</code> 和
+fallback-model 直接删除；只保留只读 <code>/usage</code>， model 使用
+<code>Auto</code> 或显式选择。</li>
+<li><code>/review</code>、<code>/security-review</code> 使用 Copilot
+原生术语；PR/Delegate 不进入产品面； durable scheduler/worktree 明确标为
+copilotD extension。</li>
+<li>不创建
+<code>/workflow</code>、<code>/max-turns</code>、<code>/goal</code>、<code>/bare</code>
+等无 Copilot 原生对象的命令。</li>
+<li>Claude 的可切换运行模式和审批 UI 不迁移；copilotD 固定使用
+<code>--yolo</code>，SDK raw confirmation callback
+只做自动批准和遥测。</li>
+<li>不依赖宿主机中“碰巧存在”的插件、工具或个人配置；生产配置必须显式、可复现。</li>
+</ul>
+<h2 id="推荐架构">推荐架构</h2>
+<pre class="text"><code>Discord
+  -&gt; DiscordIngress
+      -&gt; ProjectRegistry
+        channel -&gt; explicit project；无 binding -&gt; implicit $HOME project
+      -&gt; SessionRegistry
+         thread -&gt; SessionRuntime -&gt; Copilot session_id
+      -&gt; SessionRuntime（每个 thread 唯一且常驻）
+         -&gt; CommandMailbox（唯一 SDK 写入者、持久 FIFO）
+         -&gt; EventPump（整个连接生命周期唯一 SDK stream 消费者）
+         -&gt; LivenessController（foreground/background/continuation leases）
+         -&gt; TaskRegistry（强引用 asyncio tasks + SDK background task reducer）
+      -&gt; CopilotBridge
+         create/resume/send/abort/model + capability-gated compact/fleet/tasks/runtime commands
+      -&gt; EventAdapter -&gt; SessionReducer
+         raw SDK events -&gt; versioned internal events -&gt; durable state/render intents
+      -&gt; RenderScheduler -&gt; RenderOutbox
+         Markdown block assembler、表格缓冲/PNG、流式文本、任务面板、final flush
+      -&gt; InteractionGateway
+         ask_user、elicitation、plan；不处理工具确认
+      -&gt; UsageService / Scheduler / RuntimeSupervisor</code></pre>
+<p>两个核心边界：</p>
+<ol type="1">
+<li>Discord、SessionActor 或单次 turn 都不能直接读取 SDK
+stream；只有永久 <code>EventPump</code> 可以读取。这样前台 turn、后台
+task 和 continuation 不需要切换 reader，
+从结构上消除双消费者、cancel-and-forget 和 buffered frame 丢失。</li>
+<li><code>session.idle</code> 只结束当前前台 turn 的 UI，不结束
+EventPump、不 disconnect session、 不回收 Actor。SessionRuntime
+只会因显式 <code>/session close</code> 或
+<code>/session delete</code>、进程退出或 不可恢复 transport failure
+停止。</li>
+</ol>
+<h2 id="单用户---yolo-与常驻部署基线">单用户 <code>--yolo</code>
+与常驻部署基线</h2>
+<ul>
+<li>只有一个可信操作者和一个 Copilot 身份；bot 所在私有 Discord
+即操作面。</li>
+<li>runtime 固定以 <code>--yolo</code> 启动；SDK raw tool-confirmation
+request 自动返回 approve，不生成 Discord
+审批卡，也不存在任何可切换配置。</li>
+<li>不实现 guild/user/role allowlist、Owner/Admin
+区分、路径沙箱、URL/MCP policy、
+SecretStore、内容脱敏审计或多租户隔离。</li>
+<li>宿主进程用户能访问的文件、命令、网络和凭据，Agent
+都可能访问。这是明确产品前提， 不是待补安全项。</li>
+<li>每个未显式停止的 session 默认常驻；没有 idle reaper，没有“运行满 N
+分钟”的硬生命周期 上限。</li>
+<li>channel 有显式 binding 时使用绑定 cwd；没有 binding 时使用启动账号的
+resolved <code>$HOME</code>。该行为固定启用，没有 fail-closed 或
+fallback 开关。</li>
+<li>优先验证独立 headless runtime/sidecar，使 Discord bot 重启时 runtime
+和后台任务仍可 继续；若 SDK/runtime 不支持连接重放，则把“进程重启会中断
+in-flight task”明确标为 capability 限制，不伪装为无损恢复。</li>
+<li>SDK、runtime 和 protocol 固定版本；启动时做 capability、event
+replay、frame size 和 session resume 探测。</li>
+</ul>
+<h2 id="macos-windows-默认自启动与进程保活">macOS / Windows
+默认自启动与进程保活</h2>
+<p><code>copilotd setup</code> 是标准首次配置入口，默认完成平台 service
+安装、立即启动并验证状态。 只有显式
+<code>copilotd run --foreground</code>
+才以前台开发模式运行。不会要求用户另外执行保活 脚本。</p>
+<p>统一 service graph：</p>
+<pre class="text"><code>OS service manager
+  ├─ copilotd-runtime   独立 headless Copilot runtime sidecar
+  ├─ copilotd-bot       Discord gateway + SessionRuntime/EventPump
+  └─ copilotd-watchdog  每 5 分钟检查 heartbeat、gateway、runtime 和 restart loop</code></pre>
+<p>如果 SDK spike 证明 headless runtime 不能独立存活，仍安装 bot +
+watchdog，但 capability 标记为 <code>bundled-runtime</code>；watchdog
+在有 active liveness lease 时不得强杀 bot。</p>
+<h3 id="通用-service-cli">通用 service CLI</h3>
+<table>
+<colgroup>
+<col style="width: 50%" />
+<col style="width: 50%" />
+</colgroup>
+<thead>
+<tr>
+<th>命令</th>
+<th>行为</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>copilotd setup</code></td>
+<td>生成配置、安装当前 OS service、立即启动、验证
+heartbeat/runtime/Discord</td>
+</tr>
+<tr>
+<td><code>copilotd service install</code></td>
+<td>幂等安装或更新 service definition；总是先卸载旧内存定义再注册</td>
+</tr>
+<tr>
+<td><code>copilotd service status</code></td>
+<td>显示 OS manager 状态、PID/generation、heartbeat
+age、gateway、runtime、active leases</td>
+</tr>
+<tr>
+<td><code>copilotd service restart</code></td>
+<td>默认仅在无 active lease 时执行；<code>--force</code> 标记 in-flight
+outcome unknown</td>
+</tr>
+<tr>
+<td><code>copilotd service logs</code></td>
+<td>输出 app、boot、watchdog 和 alerts 日志位置</td>
+</tr>
+<tr>
+<td><code>copilotd service uninstall</code></td>
+<td>停止并注销 service；保留 SQLite、session state 和 logs</td>
+</tr>
+<tr>
+<td><code>copilotd run --foreground</code></td>
+<td>不注册 service 的显式开发入口</td>
+</tr>
+</tbody>
+</table>
+<h3 id="heartbeat-协议">Heartbeat 协议</h3>
+<p>bot 每 30 秒原子写入 heartbeat JSON；不是只 touch mtime：</p>
+<div class="sourceCode" id="cb3"><pre class="sourceCode json"><code class="sourceCode json"><span id="cb3-1"><a href="#cb3-1" aria-hidden="true" tabindex="-1"></a><span class="fu">{</span></span>
+<span id="cb3-2"><a href="#cb3-2" aria-hidden="true" tabindex="-1"></a>  <span class="dt">&quot;schema_version&quot;</span><span class="fu">:</span> <span class="dv">1</span><span class="fu">,</span></span>
+<span id="cb3-3"><a href="#cb3-3" aria-hidden="true" tabindex="-1"></a>  <span class="dt">&quot;pid&quot;</span><span class="fu">:</span> <span class="dv">1234</span><span class="fu">,</span></span>
+<span id="cb3-4"><a href="#cb3-4" aria-hidden="true" tabindex="-1"></a>  <span class="dt">&quot;process_generation&quot;</span><span class="fu">:</span> <span class="dv">7</span><span class="fu">,</span></span>
+<span id="cb3-5"><a href="#cb3-5" aria-hidden="true" tabindex="-1"></a>  <span class="dt">&quot;written_at&quot;</span><span class="fu">:</span> <span class="st">&quot;RFC3339&quot;</span><span class="fu">,</span></span>
+<span id="cb3-6"><a href="#cb3-6" aria-hidden="true" tabindex="-1"></a>  <span class="dt">&quot;gateway_state&quot;</span><span class="fu">:</span> <span class="st">&quot;ready|reconnecting|down&quot;</span><span class="fu">,</span></span>
+<span id="cb3-7"><a href="#cb3-7" aria-hidden="true" tabindex="-1"></a>  <span class="dt">&quot;runtime_state&quot;</span><span class="fu">:</span> <span class="st">&quot;ready|reconnecting|down&quot;</span><span class="fu">,</span></span>
+<span id="cb3-8"><a href="#cb3-8" aria-hidden="true" tabindex="-1"></a>  <span class="dt">&quot;connected_sessions&quot;</span><span class="fu">:</span> <span class="dv">4</span><span class="fu">,</span></span>
+<span id="cb3-9"><a href="#cb3-9" aria-hidden="true" tabindex="-1"></a>  <span class="dt">&quot;foreground_turns&quot;</span><span class="fu">:</span> <span class="dv">1</span><span class="fu">,</span></span>
+<span id="cb3-10"><a href="#cb3-10" aria-hidden="true" tabindex="-1"></a>  <span class="dt">&quot;background_tasks&quot;</span><span class="fu">:</span> <span class="dv">2</span><span class="fu">,</span></span>
+<span id="cb3-11"><a href="#cb3-11" aria-hidden="true" tabindex="-1"></a>  <span class="dt">&quot;continuation_leases&quot;</span><span class="fu">:</span> <span class="dv">1</span><span class="fu">,</span></span>
+<span id="cb3-12"><a href="#cb3-12" aria-hidden="true" tabindex="-1"></a>  <span class="dt">&quot;last_event_at&quot;</span><span class="fu">:</span> <span class="st">&quot;RFC3339&quot;</span><span class="fu">,</span></span>
+<span id="cb3-13"><a href="#cb3-13" aria-hidden="true" tabindex="-1"></a>  <span class="dt">&quot;sidecar_replay_capable&quot;</span><span class="fu">:</span> <span class="kw">true</span></span>
+<span id="cb3-14"><a href="#cb3-14" aria-hidden="true" tabindex="-1"></a><span class="fu">}</span></span></code></pre></div>
+<p>watchdog 默认每 5 分钟运行。heartbeat age &gt; 120 秒视为 event-loop
+stale；系统刚从睡眠/ 休眠恢复 60 秒内跳过一次，避免误杀。gateway 连续
+down 600 秒才进入 restart 判断，短暂 Discord reconnect storm
+不触发重启。</p>
+<table>
+<colgroup>
+<col style="width: 50%" />
+<col style="width: 50%" />
+</colgroup>
+<thead>
+<tr>
+<th>场景</th>
+<th>自动动作</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>bot 进程退出</td>
+<td>OS manager 30 秒节流后重启 bot</td>
+</tr>
+<tr>
+<td>runtime sidecar 进程退出</td>
+<td>OS manager 重启 runtime；所有 in-flight task 标 outcome
+unknown，session eager resume</td>
+</tr>
+<tr>
+<td>bot heartbeat stale、无 active lease</td>
+<td>watchdog 只重启 bot，不重启健康 runtime</td>
+</tr>
+<tr>
+<td>bot heartbeat stale、有 active lease、sidecar replay 已验证</td>
+<td>checkpoint 后只重启 bot，重连同一 runtime 并 replay</td>
+</tr>
+<tr>
+<td>bot heartbeat stale、有 active lease、无 sidecar/replay</td>
+<td>不自动强杀；写 alert，保留进程和任务，等待人工
+<code>--force</code></td>
+</tr>
+<tr>
+<td>gateway down &gt; 600 秒、无 active lease</td>
+<td>freeze heartbeat，由 watchdog 重启 bot</td>
+</tr>
+<tr>
+<td>5 分钟内重启 &gt;= 3 次</td>
+<td>停止主动 kick loop，写 alerts log，并发本机桌面通知</td>
+</tr>
+</tbody>
+</table>
+<p>这比 claudeD 的固定 hard ceiling 更保守：后台工作优先，不因 watchdog
+误杀 session。</p>
+<h3 id="macoslaunchagent">macOS：LaunchAgent</h3>
+<p>默认安装三个 user-level LaunchAgent 到
+<code>~/Library/LaunchAgents/</code>，无需 sudo：</p>
+<table>
+<colgroup>
+<col style="width: 50%" />
+<col style="width: 50%" />
+</colgroup>
+<thead>
+<tr>
+<th>Label</th>
+<th>关键配置</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>com.github.copilotd.runtime</code></td>
+<td><code>RunAtLoad=true</code>、<code>KeepAlive=true</code>、<code>ThrottleInterval=30</code></td>
+</tr>
+<tr>
+<td><code>com.github.copilotd.bot</code></td>
+<td><code>RunAtLoad=true</code>、<code>KeepAlive=true</code>、<code>ThrottleInterval=30</code>、absolute
+argv/cwd/HOME/PATH</td>
+</tr>
+<tr>
+<td><code>com.github.copilotd.watchdog</code></td>
+<td><code>StartInterval=300</code>，执行
+<code>copilotd service watchdog</code></td>
+</tr>
+</tbody>
+</table>
+<p>主 plist <strong>不写 <code>ProcessType</code></strong>，保持 launchd
+默认 <code>Standard</code>；设置
+<code>LowPriorityBackgroundIO=false</code>。claudeD <a href="https://github.com/HXYerror/claudeD/issues/232">#232</a> 实测
+<code>ProcessType=Background</code> 会令长连接 bot 每 15–25 分钟因
+“because inefficient” 被 launchd 回收，后续 <code>Interactive</code>
+也未解决；当前模板最终删除该键。</p>
+<p>安装/更新必须对三个 label 依次执行
+<code>launchctl bootout</code>（不存在可忽略）后再
+<code>bootstrap + enable + kickstart</code>，不能只覆盖磁盘
+plist。claudeD <a href="https://github.com/HXYerror/claudeD/issues/168">#168</a> 的
+healthcheck 因 launchd 保留旧 内存定义而从未按
+<code>StartInterval</code> 运行。安装完成后同时验证：</p>
+<ol type="1">
+<li><code>plutil</code> 读取 watchdog plist 的
+<code>StartInterval=300</code>；</li>
+<li><code>launchctl print gui/&lt;uid&gt;/com.github.copilotd.watchdog</code>
+包含 <code>run interval = 300</code>；</li>
+<li>bot/runtime state 为 running，heartbeat 在 45 秒内出现；</li>
+<li>运行满 60 分钟的 soak 中 launchd log 没有
+<code>because inefficient</code>。</li>
+</ol>
+<p>路径固定为：</p>
+<pre class="text"><code>~/Library/Application Support/copilotd/   SQLite/session/runtime state
+~/Library/Caches/copilotd/heartbeat.json
+~/Library/Logs/copilotd/{copilotd.log,watchdog.log,alerts.log,boot.log}</code></pre>
+<p>app log 使用 10 MiB × 7 rotating files。watchdog 读取最近一次
+<code>DarkWake/Wake</code>，60 秒内 不重启。restart loop 达阈值时使用
+<code>osascript display notification</code>，同时始终写 alerts.log。</p>
+<h3 id="windowstask-scheduler">Windows：Task Scheduler</h3>
+<p>claudeD <a href="https://github.com/HXYerror/claudeD/issues/289">#289</a> 推荐
+“Task Scheduler XML + PowerShell install script”，但 merged <a href="https://github.com/HXYerror/claudeD/pull/290">#290</a>
+只完成跨平台运行 subtasks 1–5；当前 main 没有 Windows
+自启动脚本。copilotD 首版直接 补齐该缺口，不引入 NSSM 或 pywin32
+service。</p>
+<p><code>copilotd setup</code> 调用签入的
+<code>install-service.ps1</code>，注册三个 current-user Scheduled
+Task：</p>
+<table>
+<colgroup>
+<col style="width: 50%" />
+<col style="width: 50%" />
+</colgroup>
+<thead>
+<tr>
+<th>Task</th>
+<th>Trigger/Settings</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>copilotD Runtime</code></td>
+<td>AtLogOn；失败每 30 秒重启；<code>ExecutionTimeLimit=PT0S</code></td>
+</tr>
+<tr>
+<td><code>copilotD Bot</code></td>
+<td>AtLogOn；失败每 30
+秒重启；<code>MultipleInstancesPolicy=IgnoreNew</code></td>
+</tr>
+<tr>
+<td><code>copilotD Watchdog</code></td>
+<td>AtLogOn 后每 5 分钟重复；<code>StartWhenAvailable=true</code></td>
+</tr>
+</tbody>
+</table>
+<p>runtime/bot task 统一设置
+<code>RestartCount=999</code>、<code>DisallowStartIfOnBatteries=false</code>、
+<code>StopIfGoingOnBatteries=false</code>、<code>WakeToRun=false</code>，使用安装时解析出的绝对
+Python/entrypoint 和 working directory。安装总是先
+<code>Unregister-ScheduledTask</code> 再
+<code>Register-ScheduledTask -Xml</code>，随后
+<code>Start-ScheduledTask</code> 立即启动，避免磁盘 XML 已更新 但 Task
+Scheduler 仍使用旧定义。</p>
+<p>安装后用 <code>Get-ScheduledTask</code> +
+<code>Export-ScheduledTask</code> 验证 AtLogOn、5 分钟 repetition、
+restart interval/count、无 execution time limit，并在 45 秒内看到
+heartbeat。路径固定为：</p>
+<pre class="text"><code>%LOCALAPPDATA%\copilotd\state\
+%LOCALAPPDATA%\copilotd\cache\heartbeat.json
+%LOCALAPPDATA%\copilotd\logs\{copilotd.log,watchdog.log,alerts.log,boot.log}</code></pre>
+<p>watchdog 通过 PowerShell 查询最近的
+<code>Microsoft-Windows-Power-Troubleshooter/Operational</code> resume
+event，60 秒内跳过。重启 风暴写 alerts.log，并尽力发送 Windows
+toast。TableRenderer 字体候选必须包含
+<code>C:\Windows\Fonts\msyh.ttc</code>、<code>simsun.ttc</code>、<code>arial.ttf</code>，对应
+#289 的中文表格 tofu 问题。</p>
+<h2 id="设计门禁">设计门禁</h2>
+<p>编码前必须先完成并审批本文件中的详细设计，设计内容至少覆盖：</p>
+<ul>
+<li>产品范围、非目标、单用户 <code>--yolo</code> 执行模型；</li>
+<li>组件架构、runtime 部署、SQLite 数据模型和持久化目录；</li>
+<li>全部 copilotD 命令的参数、前置条件、SDK
+映射、状态变化、响应和错误；</li>
+<li>claudeD 现有命令的保留、重命名、合并、删除或延期决策；</li>
+<li>完整 SDK event -&gt; copilotD internal event -&gt; Discord UI
+映射；</li>
+<li>connection、foreground turn、background
+task、continuation、interaction 和 scheduler 状态机；</li>
+<li>启动/eager resume、普通 turn、后台
+completion/continuation、queue/steer、ask-user、
+attachment、abort、model switch、compact、fork、subagent、scheduler 和
+runtime crash 时序；</li>
+<li>session 常驻、single-reader、timeout、retry、Discord rate
+limit、表格显示、quota、 恢复和版本兼容策略；</li>
+<li>macOS LaunchAgent、Windows Task
+Scheduler、heartbeat/watchdog、默认自启动和 active-task-safe
+restart；</li>
+<li>claudeD issues 中已验证故障的对应回归测试；</li>
+<li>event fixtures、契约测试、状态机测试和端到端验收标准。</li>
+</ul>
+<p>设计审批后，低层 RPC
+仍须通过技术原型才能从“能力候选”进入稳定命令面；不允许用近似 行为伪装
+fork、compact、usage/context 或 fleet 成功。</p>
+<h2 id="详细设计">详细设计</h2>
+<h3 id="产品决策">产品决策</h3>
+<ol type="1">
+<li>一个 Discord thread 对应一个 Copilot session；thread
+是展示、队列和渲染边界。</li>
+<li>channel cwd 解析顺序固定为：显式 <code>/project bind</code> &gt;
+resolved <code>$HOME</code>。未绑定频道可直接 创建
+thread/session；session 持久化 cwd snapshot，后续 bind/unbind 不改变旧
+session。</li>
+<li>所有会话共享一个可信 Copilot runtime，runtime 固定
+<code>--yolo</code>。</li>
+<li>每个 thread 创建一个常驻 <code>SessionRuntime</code>。其中
+<code>CommandMailbox</code> 是唯一 SDK 写入者， <code>EventPump</code>
+是唯一 SDK stream 消费者；二者从 create/resume 存活到显式 close。</li>
+<li><code>session.idle</code> 只 finalize foreground turn；EventPump
+继续等待 background completion、 task notification、continuation
+和后续用户消息。</li>
+<li>不设置绝对 max-life。任何 raw event、task set 变化、continuation
+状态变化都刷新 activity/progress
+heartbeat；长任务不会仅因运行时间长被回收。</li>
+<li>忙碌时普通消息进入持久 FIFO；显式 <code>/steer</code> 才使用 SDK
+immediate mode。</li>
+<li><code>abort</code> 取消当前 SDK turn；<code>close</code> 按顺序
+interrupt -&gt; drain -&gt; final flush -&gt; disconnect 并保留 SDK
+history；<code>delete</code> 永久删除。</li>
+<li>fork/worktree 创建新 Discord thread 和新的常驻
+SessionRuntime；worktree 默认不继承 history，只有 fork probe
+成功才允许显式继承。</li>
+<li>resume 后必须核验 runtime 返回的实际 session
+ID。失配时创建“恢复失败后新会话”记录， 不静默覆盖原映射。</li>
+<li>macOS LaunchAgent 和 Windows Scheduled Tasks 在
+<code>copilotd setup</code> 时默认安装并立即启动。</li>
+<li>表格不能直接按普通 Markdown delta
+输出；必须完整缓冲后一次性渲染。</li>
+<li>raw reasoning 默认只展示 intent/concise summary，不展示
+opaque/encrypted payload。</li>
+<li>只注册 Core 和 probe 成功的 Native-Gated commands；不为 claudeD
+命令制造近似替代。</li>
+</ol>
+<h3 id="产品范围与非目标">产品范围与非目标</h3>
+<p>首版包括可选项目绑定、未绑定 <code>$HOME</code> 默认 cwd、thread
+会话、文本/图片/文件、
+create/eager-resume/send/abort/set-model/disconnect、常驻
+EventPump、后台 task/ continuation 状态、工具/diff/usage/subagent
+渲染、表格 PNG/附件、ask-user/elicitation/ plan 交互、SQLite
+状态、render outbox、macOS/Windows 默认 service/watchdog。
+命令面优先交付 Copilot Core
+session/model/plan/steer/queue/context/usage，再按 probe 加入
+Fleet、Tasks、agents、review/security-review、research、init、instructions、MCP/skills/plugins；
+scheduler/worktree/ops 明确是 copilotD extension。</p>
+<p>明确不做：</p>
+<ul>
+<li>不复刻 Claude Code CLI 命令或 Claude message block。</li>
+<li>不执行用户提交的任意 session settings JSON。</li>
+<li>不保证所有模型都有 reasoning、vision、long context 或相同工具。</li>
+<li>不做多用户共享、资源 ownership、审批、沙箱或可切换执行模式。</li>
+<li>不承诺主机重启后 in-flight task 可继续；只有 SDK/runtime 能提供
+detached runtime + replay 时才升级为该保证。</li>
+<li>不把 <code>session.task_complete</code>、task 列表变空或第一个空
+result 单独当作会话可停止信号。</li>
+</ul>
+<h3 id="固定---yolo">固定 <code>--yolo</code></h3>
+<p>这里没有权限层：没有配置对象、审批状态机、session/project
+级切换或相关命令。唯一行为 就是 runtime 启动时启用
+<code>--yolo</code>，SDK 若仍发送工具确认事件则立即 approve。</p>
+<table>
+<colgroup>
+<col style="width: 50%" />
+<col style="width: 50%" />
+</colgroup>
+<thead>
+<tr>
+<th>项目</th>
+<th>固定行为</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Runtime 启动</td>
+<td>传递 <code>--yolo</code>；技术原型记录实际 CLI 参数和版本</td>
+</tr>
+<tr>
+<td>工具确认 callback</td>
+<td>立即 approve；只记录 event id、tool id 和 latency</td>
+</tr>
+<tr>
+<td>Discord 确认 UI</td>
+<td>不存在</td>
+</tr>
+<tr>
+<td>Tool 集合</td>
+<td>使用 runtime 全部可用工具；不提供 allow/deny/enable/disable
+命令</td>
+</tr>
+<tr>
+<td>平台强制限制</td>
+<td>若 GitHub 组织策略仍拒绝操作，原样显示为 platform limitation</td>
+</tr>
+<tr>
+<td>Ask user / plan</td>
+<td>仍需交互，因为它们是语义输入或执行方向</td>
+</tr>
+<tr>
+<td>宿主能力</td>
+<td>bot 拥有运行 <code>copilotd</code> 的 OS 用户可用的全部能力</td>
+</tr>
+</tbody>
+</table>
+<h3 id="组件职责">组件职责</h3>
+<table>
+<colgroup>
+<col style="width: 50%" />
+<col style="width: 50%" />
+</colgroup>
+<thead>
+<tr>
+<th>组件</th>
+<th>职责</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>DiscordIngress</code></td>
+<td>gateway、slash command、message/context-menu；慢命令立即 defer</td>
+</tr>
+<tr>
+<td><code>ProjectRegistry</code></td>
+<td>显式 channel binding；无 binding 时生成 implicit <code>$HOME</code>
+project snapshot</td>
+</tr>
+<tr>
+<td><code>SessionRegistry</code></td>
+<td>thread binding、metadata、eager resume 和常驻 runtime 集合</td>
+</tr>
+<tr>
+<td><code>SessionRuntime</code></td>
+<td>聚合一个 SDK
+session、CommandMailbox、EventPump、liveness/task/render 状态</td>
+</tr>
+<tr>
+<td><code>CommandMailbox</code></td>
+<td>唯一 SDK 写入者；串行 send/steer/abort/reconfigure/close 与持久
+FIFO</td>
+</tr>
+<tr>
+<td><code>EventPump</code></td>
+<td>从 create/resume 到 explicit close 持续消费唯一 SDK event
+stream</td>
+</tr>
+<tr>
+<td><code>LivenessController</code></td>
+<td>foreground/background/continuation/interaction lease 与 stall
+watchdog</td>
+</tr>
+<tr>
+<td><code>TaskRegistry</code></td>
+<td>SDK task reducer；强引用所有 app <code>asyncio.Task</code>，done
+callback 回收/报错</td>
+</tr>
+<tr>
+<td><code>RuntimeSupervisor</code></td>
+<td>runtime/transport 健康、sidecar capability、退避重连和版本探测</td>
+</tr>
+<tr>
+<td><code>CopilotBridge</code></td>
+<td>SDK public API 与 capability-gated RPC facade</td>
+</tr>
+<tr>
+<td><code>CapabilityRegistry</code></td>
+<td>public API、低层 RPC 和模型 capability 探测</td>
+</tr>
+<tr>
+<td><code>EventAdapter</code></td>
+<td>raw SDK event 到 versioned internal event</td>
+</tr>
+<tr>
+<td><code>SessionReducer</code></td>
+<td>去重、顺序、task/turn/continuation 状态和 durable render intent</td>
+</tr>
+<tr>
+<td><code>RenderScheduler</code></td>
+<td>单 session 顺序队列、coalescing、Discord rate limit 和 final
+flush</td>
+</tr>
+<tr>
+<td><code>MarkdownAssembler</code></td>
+<td>block-aware streaming；保护 fence、blockquote 和 table</td>
+</tr>
+<tr>
+<td><code>TableRenderer</code></td>
+<td>完整表格解析、code block/PNG/MD/CSV 输出和降级</td>
+</tr>
+<tr>
+<td><code>RenderOutbox</code></td>
+<td>持久化未发送/待编辑/final render，Discord 失败不重跑 Agent</td>
+</tr>
+<tr>
+<td><code>InteractionGateway</code></td>
+<td>ask-user、elicitation、plan、MCP OAuth</td>
+</tr>
+<tr>
+<td><code>AttachmentService</code></td>
+<td>异步下载/读盘/编码、临时文件和 Discord attachment batching</td>
+</tr>
+<tr>
+<td><code>ExtensionRegistry</code></td>
+<td>MCP、skills、plugins、custom agents 配置</td>
+</tr>
+<tr>
+<td><code>UsageService</code></td>
+<td>event 聚合、experimental RPC snapshot、quota、本地统计</td>
+</tr>
+<tr>
+<td><code>Scheduler</code></td>
+<td>schedule、lease、fire、catch-up、幂等</td>
+</tr>
+<tr>
+<td><code>WorktreeService</code></td>
+<td>Git worktree 创建、绑定和清理</td>
+</tr>
+<tr>
+<td><code>Diagnostics</code></td>
+<td>event pump、task、stderr tail、outbox、rate limit 和 resume
+诊断</td>
+</tr>
+</tbody>
+</table>
+<p>首选部署为常驻 bot + 独立 headless runtime sidecar。SDK spike
+必须验证 sidecar 是否在 Discord client 断开后继续运行 task、是否保留
+event buffer、重连后是否可从 sequence/ checkpoint
+replay。若不支持，首版回落为 bundled stdio，但禁止主动重启有 liveness
+lease 的进程。runtime crash 使用 <code>1s, 2s, 5s, 10s, 30s</code>
+抖动退避；恢复时 eager resume 所有 未显式 STOPPED 的
+binding，绝不自动重发结果未知的 prompt。</p>
+<h3 id="持久化与目录">持久化与目录</h3>
+<table>
+<colgroup>
+<col style="width: 50%" />
+<col style="width: 50%" />
+</colgroup>
+<thead>
+<tr>
+<th>表</th>
+<th>关键字段</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>global_config</code></td>
+<td>key, value；包含 resolved_home、default mode/mention、global
+extension config</td>
+</tr>
+<tr>
+<td><code>channel_settings</code></td>
+<td>channel_id, layout, mention_required, config_version；不等同 project
+binding</td>
+</tr>
+<tr>
+<td><code>projects</code></td>
+<td>id, channel_id, root_path, cwd, layout, mention_required,
+config_version, state(active/retired)；只存显式 binding，旧 session
+引用的 retired snapshot 不删除</td>
+</tr>
+<tr>
+<td><code>project_prompts</code></td>
+<td>project_id, prompt, version</td>
+</tr>
+<tr>
+<td><code>project_env</code></td>
+<td>project_id, name, value</td>
+</tr>
+<tr>
+<td><code>mcp_servers</code></td>
+<td>project_id, name, transport, config_json, enabled, version</td>
+</tr>
+<tr>
+<td><code>skill_dirs</code> / <code>plugin_dirs</code></td>
+<td>project_id, path, enabled</td>
+</tr>
+<tr>
+<td><code>custom_agents</code></td>
+<td>project_id, name, description, prompt, tools_json, enabled</td>
+</tr>
+<tr>
+<td><code>session_bindings</code></td>
+<td>thread_id, project_id?, project_source(explicit/home), cwd_snapshot,
+requested_session_id, actual_session_id, connection_state,
+activity_state, runtime_generation, last_event_seq, last_event_at,
+config_version, model, effort</td>
+</tr>
+<tr>
+<td><code>turns</code></td>
+<td>turn_id, session_id, discord_message_id,
+kind(foreground/continuation/scheduled), state, started_at, idle_at</td>
+</tr>
+<tr>
+<td><code>session_tags</code></td>
+<td>copilot_session_id, tag</td>
+</tr>
+<tr>
+<td><code>message_queue</code></td>
+<td>id, thread_id, discord_message_id, prompt, position, state</td>
+</tr>
+<tr>
+<td><code>background_tasks</code></td>
+<td>session_id, runtime_generation, task_id, parent_turn_id, state,
+last_progress_at, terminal_event_id</td>
+</tr>
+<tr>
+<td><code>liveness_leases</code></td>
+<td>session_id, lease_id, kind, source_id, acquired_at, refreshed_at,
+released_at</td>
+</tr>
+<tr>
+<td><code>event_journal</code></td>
+<td>session_id, generation, receive_seq, event_id, raw_type,
+reducer_hash, received_at</td>
+</tr>
+<tr>
+<td><code>render_outbox</code></td>
+<td>id, session_id, logical_seq, lane, coalesce_key, payload, state,
+attempts, next_attempt_at</td>
+</tr>
+<tr>
+<td><code>render_messages</code></td>
+<td>session_id, logical_key, discord_message_id, content_hash,
+finalized</td>
+</tr>
+<tr>
+<td><code>pending_interactions</code></td>
+<td>request_id, thread_id, kind, expires_at, state, payload</td>
+</tr>
+<tr>
+<td><code>usage_samples</code></td>
+<td>session_id, turn_id, model, token fields, nano_aiu,
+premium_requests</td>
+</tr>
+<tr>
+<td><code>schedules</code></td>
+<td>id, project_id, thread_id?, kind, expression, timezone, payload,
+state</td>
+</tr>
+<tr>
+<td><code>schedule_runs</code></td>
+<td>schedule_id, planned_at, lease_owner, status, result_session_id,
+idempotency_key</td>
+</tr>
+<tr>
+<td><code>capabilities</code></td>
+<td>runtime_version, sdk_version, capability, supported,
+probe_detail</td>
+</tr>
+<tr>
+<td><code>runtime_incidents</code></td>
+<td>timestamp, runtime_generation, session_id?, kind, stderr_tail,
+last_event_seq, detail</td>
+</tr>
+</tbody>
+</table>
+<p>SQLite 使用 WAL、foreign keys 和 migrations。EventPump
+每批事件在同一短事务中更新 <code>event_journal</code>、reducer 状态和
+<code>render_outbox</code>，先持久化再通知 Renderer；Discord API、 SDK
+调用和文件 IO 不得发生在事务内。event journal 可按 session 压缩，但
+background/ continuation/terminal/resume mismatch/runtime error
+永久保留。</p>
+<pre class="text"><code>COPILOTD_DATA_DIR/
+  copilotd.sqlite3
+  runtime/
+  sessions/&lt;session-id&gt;/{attachments,exports,renderer,tables}/
+  worktrees/&lt;project-id&gt;/&lt;session-id&gt;/
+  logs/copilotd.jsonl
+  cache/event-fixtures/</code></pre>
+<p>启动时将 <code>Path.home().expanduser().resolve()</code> 保存为
+<code>global_config.resolved_home</code>。每次 创建 session 都把最终 cwd
+写入 <code>cwd_snapshot</code>；之后 channel binding 变化不会漂移既有
+session。路径只做 resolve 以获得稳定
+cwd，不做访问限制。attachment、table image 和 export 由 session manifest
+跟踪；成功发送后按 retention 清理，失败项由 outbox 保留到 重试完成。</p>
+<h3 id="sessionturn-与-schedule-状态">Session、turn 与 schedule
+状态</h3>
+<p>三个正交状态机，禁止压成一个 <code>RUNNING/IDLE</code> 布尔值。</p>
+<p><strong>Connection</strong></p>
+<pre class="text"><code>ABSENT -&gt; STARTING -&gt; CONNECTED -&gt; RECONNECTING -&gt; CONNECTED
+                        \-&gt; STOPPING -&gt; STOPPED -&gt; STARTING
+                        \-&gt; FAILED -&gt; RECONNECTING
+STOPPED -&gt; DELETING -&gt; ABSENT</code></pre>
+<p><strong>Activity</strong></p>
+<pre class="text"><code>QUIET -&gt; FOREGROUND -&gt; WAITING_INPUT -&gt; FOREGROUND
+             |                |
+             +-&gt; BACKGROUND_PENDING -&gt; CONTINUATION_INFLIGHT -&gt; QUIET
+             +-&gt; STALLED -&gt; FOREGROUND/BACKGROUND_PENDING
+any active state -&gt; ABORTING -&gt; QUIET/BACKGROUND_PENDING</code></pre>
+<p><strong>Background task</strong></p>
+<pre class="text"><code>DISCOVERED -&gt; RUNNING -&gt; TERMINAL_NOTIFIED -&gt; CONTINUATION_EXPECTED -&gt; CLOSED
+                     \-&gt; FAILED/CANCELLED -&gt; CONTINUATION_EXPECTED -&gt; CLOSED
+UNKNOWN -&gt; RUNNING/FAILED/CLOSED</code></pre>
+<p>关键不变量：</p>
+<ol type="1">
+<li>一个 SessionRuntime 始终只有一个 EventPump；foreground/background
+不交接 reader。</li>
+<li><code>session.idle</code> 关闭当前 foreground/continuation
+turn，但不停止 EventPump。</li>
+<li>task 集合变空不代表 QUIET；若刚收到 terminal task notification 或
+assistant output， <code>continuation_expected</code> lease 仍保持，直到
+continuation 自己的 terminal + idle。</li>
+<li>liveness lease 来源至少包括 foreground turn、非终态 background
+task、 continuation window、pending interaction、正在提交的 queued
+message。</li>
+<li>没有 idle reaper。lease 只用于状态、graceful shutdown、watchdog
+和“是否允许主动升级/ 重启”判断，不用于普通空闲回收。</li>
+<li>所有 raw event、task-set hash 变化和成功 stream read 都刷新
+heartbeat。watchdog 只诊断 inactivity，不按 session 年龄终止。</li>
+</ol>
+<p>一个 CommandMailbox 同时最多提交一个 foreground turn。QUIET
+收到消息立即发送； FOREGROUND/WAITING/BACKGROUND/CONTINUATION
+收到普通消息写入 FIFO；只有观察到 foreground terminal +
+<code>session.idle</code> 且没有 continuation
+抢占时才发送下一项。<code>/steer</code> 走 SDK immediate。重启后保留
+queued 项；eager resume 成功后继续 FIFO，但绝不重发 state 为
+<code>submitted_unknown</code> 的项。</p>
+<p>Schedule 状态为：</p>
+<pre class="text"><code>enabled -&gt; leased -&gt; running -&gt; succeeded -&gt; enabled/completed
+                         \-&gt; failed -&gt; retry_wait/dead
+enabled -&gt; disabled
+enabled/disabled -&gt; deleted</code></pre>
+<p>同一 <code>(schedule_id, planned_at)</code> 只有一个 idempotency
+key。非幂等执行已开始但结果未知时 不自动重跑，标记 <code>unknown</code>
+并通知当前 thread。</p>
+<h3 id="通用命令契约">通用命令契约</h3>
+<p>所有 slash command 进入 callback 后第一步 <code>defer()</code>，目标
+500ms、硬上限 2.5 秒；之后 解析 thread/project、做参数/capability
+校验、向 CommandMailbox 提交 idempotent
+operation、持久化并返回结果。Discord
+<code>10062 Unknown interaction</code> 记 warning 并改走 thread
+follow-up；不能让 ACK 失败中止已经运行的 SDK task。</p>
+<table>
+<colgroup>
+<col style="width: 50%" />
+<col style="width: 50%" />
+</colgroup>
+<thead>
+<tr>
+<th>错误码</th>
+<th>含义</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>CD-SCOPE-001</code></td>
+<td>不在要求的 channel/thread scope</td>
+</tr>
+<tr>
+<td><code>CD-PROJECT-001</code></td>
+<td>显式 project binding 损坏/禁用；普通对话无 binding
+时不会触发此错误</td>
+</tr>
+<tr>
+<td><code>CD-PATH-001</code></td>
+<td>路径不存在或当前 OS 用户无法访问</td>
+</tr>
+<tr>
+<td><code>CD-SESSION-001</code></td>
+<td>session 不存在</td>
+</tr>
+<tr>
+<td><code>CD-SESSION-002</code></td>
+<td>当前状态不允许操作</td>
+</tr>
+<tr>
+<td><code>CD-CONFLICT-001</code></td>
+<td>operation 重复或配置版本冲突</td>
+</tr>
+<tr>
+<td><code>CD-CAP-001</code></td>
+<td>SDK/runtime/model 不支持</td>
+</tr>
+<tr>
+<td><code>CD-RUNTIME-001</code></td>
+<td>runtime unavailable/degraded</td>
+</tr>
+<tr>
+<td><code>CD-INPUT-001</code></td>
+<td>user input/plan 超时或取消</td>
+</tr>
+<tr>
+<td><code>CD-QUOTA-001</code></td>
+<td>account quota/rate limit</td>
+</tr>
+<tr>
+<td><code>CD-DISCORD-001</code></td>
+<td>Discord API 最终失败，session 结果仍保留</td>
+</tr>
+<tr>
+<td><code>CD-RESUME-001</code></td>
+<td>requested/actual session ID 不一致</td>
+</tr>
+<tr>
+<td><code>CD-LIVE-001</code></td>
+<td>EventPump/transport stalled 或后台结果状态未知</td>
+</tr>
+</tbody>
+</table>
+<h3 id="命令设计原则">命令设计原则</h3>
+<p>不再以 claudeD 命令表为模板。一个 Discord
+命令只有同时满足以下条件才存在：</p>
+<ol type="1">
+<li>是当前官方 Copilot CLI/SDK 的明确概念，或者是 copilotD 必需的
+daemon/Discord 能力；</li>
+<li>在 Discord
+中需要独立、确定的操作语义，不能用普通自然语言消息同样清楚地完成；</li>
+<li>有可验证的 SDK/CLI 映射；generated/experimental RPC 必须经过当前
+pinned runtime probe；</li>
+<li>名称使用 Copilot 当前术语，不为了“命令数量对齐”发明别名。</li>
+</ol>
+<p>命令直接使用顶层
+<code>/session</code>、<code>/model</code>、<code>/plan</code>
+等名称，不增加 <code>/copilot</code> 前缀。
+<code>/project</code>、<code>/schedule</code>、<code>/worktree</code>、<code>/ops</code>
+是明确的 copilotD 扩展。Copilot-native surface 共 23 个 top-level
+command，加 4 个 extension groups 后仍低于 Discord application command
+上限。标记含义：</p>
+<table>
+<colgroup>
+<col style="width: 50%" />
+<col style="width: 50%" />
+</colgroup>
+<thead>
+<tr>
+<th>标记</th>
+<th>注册规则</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>Core</strong></td>
+<td>官方 GA high-level SDK 可直接实现；首版固定注册</td>
+</tr>
+<tr>
+<td><strong>Native-Gated</strong></td>
+<td>官方 Copilot CLI 概念，但 SDK 为 generated/experimental、runtime
+command 或 entitlement gated；probe 成功才注册</td>
+</tr>
+<tr>
+<td><strong>Extension</strong></td>
+<td>copilotD 持久化/Discord/运维能力；名称不冒充 Copilot 原生命令</td>
+</tr>
+</tbody>
+</table>
+<p>普通 thread 消息就是主对话入口，不额外造 <code>/ask</code> 来重复
+<code>session.send()</code>；Native-Gated <code>/ask</code>
+仅指官方“不写入主 conversation history”的 side question。</p>
+<h3 id="copilot-原生命令">Copilot 原生命令</h3>
+<h4 id="core稳定-sdk-面">Core：稳定 SDK 面</h4>
+<table>
+<colgroup>
+<col style="width: 33%" />
+<col style="width: 33%" />
+<col style="width: 33%" />
+</colgroup>
+<thead>
+<tr>
+<th>命令与参数</th>
+<th>Scope/前置</th>
+<th>SDK 映射与行为</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>/session new prompt?</code></td>
+<td>channel/thread</td>
+<td><code>create_session()</code>；总是创建新 Discord thread，保存
+explicit/home cwd snapshot</td>
+</tr>
+<tr>
+<td><code>/session list</code></td>
+<td>任意</td>
+<td><code>list_sessions()</code> + app binding；显示
+active/closed、cwd、model、last event</td>
+</tr>
+<tr>
+<td><code>/session info</code></td>
+<td>thread</td>
+<td>metadata + app state；显示 actual
+ID、EventPump、tasks、continuation、queue、context、usage</td>
+</tr>
+<tr>
+<td><code>/session resume session-id?</code></td>
+<td>thread 或 channel</td>
+<td>thread 内省略 ID 时固定读取该 thread 原
+<code>requested_session_id</code>；channel 调用必须提供 ID 并创建新
+thread；核验 actual ID</td>
+</tr>
+<tr>
+<td><code>/session rename name</code></td>
+<td>thread</td>
+<td>更新 SDK/app metadata 和 Discord thread name</td>
+</tr>
+<tr>
+<td><code>/session abort clear-queue=true</code></td>
+<td>active turn</td>
+<td><code>session.abort()</code>；可清 app FIFO；EventPump 与 session
+继续存活</td>
+</tr>
+<tr>
+<td><code>/session close force=false</code></td>
+<td>thread</td>
+<td>copilotD lifecycle：drain -&gt; final flush -&gt;
+<code>disconnect()</code> -&gt; internal STOPPED/UI closed；active lease
+时拒绝，force 才标 outcome unknown；保留 SDK history</td>
+</tr>
+<tr>
+<td><code>/session delete session-id?</code></td>
+<td>closed/quiet</td>
+<td>thread 内省略 ID 使用原 session；<code>delete_session()</code>
+后永久删除；命令本身即明确删除意图</td>
+</tr>
+<tr>
+<td><code>/model list</code></td>
+<td>任意</td>
+<td><code>list_models()</code>；显示 model
+capabilities、multiplier、reasoning/context support</td>
+</tr>
+<tr>
+<td><code>/model set model effort? context-tier? reasoning-summary?</code></td>
+<td>thread QUIET</td>
+<td><code>set_model()</code>；其他字段按 stable session
+config/generation 更新，失败回滚</td>
+</tr>
+<tr>
+<td><code>/plan prompt</code></td>
+<td>thread QUIET</td>
+<td><code>send(..., agent_mode=&quot;plan&quot;)</code>；plan-exit 用 Discord
+buttons 返回 interactive/autopilot/fleet</td>
+</tr>
+<tr>
+<td><code>/steer text</code></td>
+<td>active turn</td>
+<td><code>send(text, mode=&quot;immediate&quot;)</code>；用于修正当前执行</td>
+</tr>
+<tr>
+<td><code>/queue add text</code></td>
+<td>thread</td>
+<td><code>send(text, mode=&quot;enqueue&quot;)</code>；同时写 app idempotency/FIFO
+checkpoint</td>
+</tr>
+<tr>
+<td><code>/queue list</code></td>
+<td>thread</td>
+<td>显示 queued/submitted-unknown 项；不依赖 TUI</td>
+</tr>
+<tr>
+<td><code>/queue clear</code></td>
+<td>thread</td>
+<td>只清尚未提交 SDK 的项，不撤销 current turn</td>
+</tr>
+<tr>
+<td><code>/context</code></td>
+<td>thread</td>
+<td><code>session.usage_info</code>；显示 context window 与 compaction
+状态</td>
+</tr>
+<tr>
+<td><code>/usage</code></td>
+<td>thread/runtime</td>
+<td>public usage events/checkpoints；tokens、AI Credits、premium
+requests、account quota；无 USD、无 limit 设置</td>
+</tr>
+</tbody>
+</table>
+<p><code>close</code> 是唯一非 Copilot 原生但不可省略的 session
+子命令：它停止常驻 daemon 资源而不删除 SDK
+history。<code>abort</code>、<code>close</code>、<code>delete</code>
+三者不再使用含糊的 <code>stop/clear</code> 别名。</p>
+<p><code>/session resume</code> 是 thread-first：无参数时不能打开
+picker、不能选择“最近 session”，只能恢复 当前 thread 持久化的原 session
+ID 和 cwd snapshot。若 thread 已 CONNECTED 则幂等返回当前 状态；thread
+内显式 ID 与原 ID 不同时返回
+<code>CD-CONFLICT-001</code>，不能重绑到另一 session。 resume 失败或
+actual ID 失配时保留原 mapping，不静默创建新 session。</p>
+<h4 id="native-gated有用的-copilot-专属能力">Native-Gated：有用的
+Copilot 专属能力</h4>
+<table>
+<colgroup>
+<col style="width: 33%" />
+<col style="width: 33%" />
+<col style="width: 33%" />
+</colgroup>
+<thead>
+<tr>
+<th>命令与参数</th>
+<th>官方概念</th>
+<th>注册与实现门禁</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>/session compact focus?</code></td>
+<td>CLI <code>/compact</code></td>
+<td><code>session.rpc.history.compact()</code> 为 generated RPC；probe
+后注册</td>
+</tr>
+<tr>
+<td><code>/session fork name?</code></td>
+<td>CLI experimental <code>/fork</code></td>
+<td>fork RPC 成功且 session ID 可核验后注册；新建 thread</td>
+</tr>
+<tr>
+<td><code>/ask question</code></td>
+<td>CLI <code>/ask</code> side question</td>
+<td>SDK 无 high-level “不写主历史”API；只有 runtime command dispatch
+或等价隔离语义验证后注册</td>
+</tr>
+<tr>
+<td><code>/fleet prompt</code></td>
+<td>Copilot Fleet</td>
+<td><code>session.rpc.fleet.start()</code> 明确 experimental；渲染
+parent/subagent/todo dependency panel</td>
+</tr>
+<tr>
+<td><code>/tasks list</code></td>
+<td>CLI <code>/tasks</code></td>
+<td>generated task snapshot；显示 agent/shell
+task、state、progress、parent</td>
+</tr>
+<tr>
+<td><code>/tasks show task-id</code></td>
+<td>CLI <code>/tasks</code></td>
+<td>generated detail/timeline</td>
+</tr>
+<tr>
+<td><code>/tasks message task-id text</code></td>
+<td>task messaging</td>
+<td>generated RPC；只对支持 messaging 的 active task 注册</td>
+</tr>
+<tr>
+<td><code>/tasks cancel task-id</code></td>
+<td>task control</td>
+<td>generated cancel；不映射为 abort 整个
+parent，结果事件确认后更新</td>
+</tr>
+<tr>
+<td><code>/agent list</code></td>
+<td>CLI <code>/agent</code></td>
+<td>runtime agent list probe；显示 builtin/custom/inferable 来源</td>
+</tr>
+<tr>
+<td><code>/agent select name</code></td>
+<td>CLI <code>/agent</code></td>
+<td>generated select/get-current/deselect；事件确认后更新</td>
+</tr>
+<tr>
+<td><code>/review prompt?</code></td>
+<td>CLI <code>/review</code></td>
+<td>runtime command capability；review 当前 active changes，可限定
+path/pattern</td>
+</tr>
+<tr>
+<td><code>/security-review prompt?</code></td>
+<td>CLI <code>/security-review</code></td>
+<td>runtime command capability；只描述为 active local changes
+review，不冒充全仓审计</td>
+</tr>
+<tr>
+<td><code>/research topic</code></td>
+<td>CLI <code>/research</code></td>
+<td>runtime command probe；输出引用与附件</td>
+</tr>
+<tr>
+<td><code>/rubber-duck prompt?</code></td>
+<td>CLI <code>/rubber-duck</code></td>
+<td>runtime command probe；以 constructive critic 作为第二意见</td>
+</tr>
+<tr>
+<td><code>/init</code></td>
+<td>CLI/cmd <code>copilot init</code></td>
+<td>repository 初始化 instructions/agentic files；runtime command
+probe</td>
+</tr>
+<tr>
+<td><code>/chronicle action</code></td>
+<td>CLI <code>/chronicle</code></td>
+<td><code>standup</code>、<code>tips</code>、<code>improve</code> 仅按
+installed runtime manifest 注册；guide/reference 有版本漂移</td>
+</tr>
+<tr>
+<td><code>/env</code></td>
+<td>CLI <code>/env</code></td>
+<td>只读显示 discovered
+instructions、MCP、skills、agents、hooks、plugins、LSP/extensions</td>
+</tr>
+<tr>
+<td><code>/instructions</code></td>
+<td>CLI <code>/instructions</code></td>
+<td>显示 discovered instruction files 和启用状态</td>
+</tr>
+<tr>
+<td><code>/skills action</code></td>
+<td>CLI <code>/skills</code></td>
+<td><code>list</code>、<code>info</code>、<code>add</code>、<code>remove</code>、<code>reload</code>
+按 runtime capability 注册</td>
+</tr>
+<tr>
+<td><code>/plugins action</code></td>
+<td>CLI <code>/plugin(s)</code></td>
+<td>list/install/update/uninstall/enable/disable/marketplace；显式命令直接执行</td>
+</tr>
+<tr>
+<td><code>/mcp action</code></td>
+<td>CLI <code>/mcp</code> + stable SDK config</td>
+<td><code>list</code>、<code>show</code>、<code>add</code>、<code>edit</code>、<code>delete</code>、<code>disable</code>、<code>enable</code>、<code>auth</code>、<code>reload</code>、<code>search</code>；OAuth
+用组件交互</td>
+</tr>
+<tr>
+<td><code>/remote enabled</code></td>
+<td>CLI <code>/remote</code></td>
+<td>remote session capability/auth/repo gate；Mission Control
+连接状态可见</td>
+</tr>
+</tbody>
+</table>
+<p>这些命令不是首版全部强行上线。启动时从 pinned CLI/SDK capability
+manifest 生成注册集合； probe 失败的命令从 Discord autocomplete
+中消失，而不是保留一个永远返回 unavailable 的壳。</p>
+<h3 id="copilotd-扩展命令">copilotD 扩展命令</h3>
+<h4 id="project"><code>/project</code></h4>
+<table>
+<colgroup>
+<col style="width: 50%" />
+<col style="width: 50%" />
+</colgroup>
+<thead>
+<tr>
+<th>命令与参数</th>
+<th>行为</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>/project bind path layout? mention-required?</code></td>
+<td>resolve path；原 active project retired；未来 session 使用 explicit
+cwd</td>
+</tr>
+<tr>
+<td><code>/project info</code></td>
+<td>显示 source 为 <code>explicit</code> 或
+<code>implicit-home</code>、最终 cwd、配置版本和常驻 session；thread
+另显示 immutable snapshot</td>
+</tr>
+<tr>
+<td><code>/project unbind</code></td>
+<td>active project retired；未来 session 回落 <code>$HOME</code>；已有
+SessionRuntime 不停止、不迁移</td>
+</tr>
+<tr>
+<td><code>/project layout value</code></td>
+<td>value 为 <code>text</code> 或 <code>forum</code>；只控制后续 Discord
+thread 组织，不叫 Copilot mode</td>
+</tr>
+<tr>
+<td><code>/project mention required</code></td>
+<td>更新 channel trigger；默认 false</td>
+</tr>
+<tr>
+<td><code>/project variable set name value</code></td>
+<td>保存项目进程环境变量；显式 project only</td>
+</tr>
+<tr>
+<td><code>/project variable list reveal=false</code></td>
+<td>与 Copilot 原生 <code>/env</code> diagnostics 明确区分</td>
+</tr>
+<tr>
+<td><code>/project variable remove name</code></td>
+<td>删除项目环境变量；已有 session snapshot 不热变更</td>
+</tr>
+</tbody>
+</table>
+<p>不提供 project system-prompt/add-dir 命令。仓库指令使用 Copilot 原生
+<code>.github/copilot-instructions.md</code>、<code>.github/instructions/**/*.instructions.md</code>、<code>AGENTS.md</code>
+和
+<code>/init</code>、<code>/instructions</code>，避免发明第二套指令体系。</p>
+<p><code>ProjectRegistry.resolve(channel_id)</code> 固定返回 explicit
+binding 或 synthetic <code>implicit-home</code>
+snapshot；<code>unbind</code> 只改变未来 resolve，不能停止或迁移已有
+session。</p>
+<h4 id="schedule-与-worktree"><code>/schedule</code> 与
+<code>/worktree</code></h4>
+<p>两者是 copilotD durable extension，不伪装成 CLI experimental
+<code>/after</code>、<code>/every</code>、 <code>/worktree</code> 或
+<code>/move</code>。Schedule 只接受 <code>at:&lt;RFC3339&gt;</code> 或
+<code>cron:&lt;5-field&gt;</code> + IANA timezone。</p>
+<table>
+<colgroup>
+<col style="width: 50%" />
+<col style="width: 50%" />
+</colgroup>
+<thead>
+<tr>
+<th>命令</th>
+<th>行为</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>/schedule message when text timezone</code></td>
+<td>到期向指定常驻 session enqueue；closed 时先 resume</td>
+</tr>
+<tr>
+<td><code>/schedule new-session when text timezone</code></td>
+<td>到期新建 thread/session；执行时 resolve explicit/home cwd</td>
+</tr>
+<tr>
+<td><code>/schedule action</code></td>
+<td>action 为
+<code>list</code>、<code>show</code>、<code>toggle</code>、<code>delete</code>
+或 <code>run-now</code>；durable state/lease/history；planned fire
+有唯一 idempotency key</td>
+</tr>
+<tr>
+<td><code>/worktree create name base? history?</code></td>
+<td>建 Git worktree + 新 thread；history 为 <code>none</code> 或
+<code>fork</code>，后者仅在 session fork probe 成功时可选</td>
+</tr>
+<tr>
+<td><code>/worktree list</code></td>
+<td>显示 branch/path/session/activity/lease</td>
+</tr>
+<tr>
+<td><code>/worktree close name</code></td>
+<td>仅在无 active lease 时 close session 并移除 worktree；不删除
+branch</td>
+</tr>
+</tbody>
+</table>
+<p>Catch-up 最多执行最近一次遗漏。SDK 已接受 prompt
+而结果未知时不重发。worktree 默认 <code>history=none</code>，不能在 fork
+不可用时伪装继承上下文。</p>
+<h4 id="ops-与-context-menu"><code>/ops</code> 与 context menu</h4>
+<table>
+<colgroup>
+<col style="width: 50%" />
+<col style="width: 50%" />
+</colgroup>
+<thead>
+<tr>
+<th>命令</th>
+<th>行为</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>/ops health</code></td>
+<td>uptime、gateway、runtime、EventPump、leases、tasks、queues、outbox、DB、scheduler、OS
+services</td>
+</tr>
+<tr>
+<td><code>/ops diagnostics session-id?</code></td>
+<td>capability manifest、stderr tail、last event、generation、stalled
+reason</td>
+</tr>
+<tr>
+<td><code>/ops restart-runtime force=false</code></td>
+<td>active lease 时拒绝；force 把 in-flight 标 outcome unknown</td>
+</tr>
+<tr>
+<td><code>/ops debug level duration</code></td>
+<td>level 为 <code>info</code>、<code>debug</code> 或
+<code>trace</code>，最长 30 分钟</td>
+</tr>
+<tr>
+<td><code>/ops log-dump correlation-id?</code></td>
+<td>有界日志和 event timeline 附件</td>
+</tr>
+<tr>
+<td>Context menu <code>Ask Copilot</code></td>
+<td>从消息创建 thread/session；无 binding 使用 <code>$HOME</code>；保留
+provenance/attachments</td>
+</tr>
+<tr>
+<td>Context menu <code>Pin message</code></td>
+<td>Discord 原生 pin，不经过 Copilot</td>
+</tr>
+</tbody>
+</table>
+<h3 id="明确删除不做机械映射">明确删除，不做机械映射</h3>
+<table>
+<colgroup>
+<col style="width: 50%" />
+<col style="width: 50%" />
+</colgroup>
+<thead>
+<tr>
+<th>删除项</th>
+<th>决策</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>/workflow</code></td>
+<td>Copilot 无此原生命令。并行执行用 <code>/fleet</code>，运行中工作用
+<code>/tasks</code>，规划用 <code>/plan</code>；不存在通用替代别名</td>
+</tr>
+<tr>
+<td><code>/max-turns</code></td>
+<td>直接删除。Copilot 拥有 agent loop，不提供近似替代</td>
+</tr>
+<tr>
+<td>fallback model 命令</td>
+<td>直接删除。使用 model <code>Auto</code> 或显式
+<code>/model set</code>；generated routing event 不构成公共配置</td>
+</tr>
+<tr>
+<td><code>/mode</code>、<code>/bare</code></td>
+<td>直接删除。plan/fleet 是具体行为；transport <code>agent_mode</code>
+不暴露成通用模式开关</td>
+</tr>
+<tr>
+<td><code>/goal</code></td>
+<td>直接删除。使用普通 prompt、<code>/plan</code>、tasks 或
+<code>/init</code></td>
+</tr>
+<tr>
+<td><code>/tools</code> 的
+<code>allow</code>、<code>deny</code>、<code>reset</code></td>
+<td>直接删除。runtime 固定
+<code>--yolo</code>，不再做另一套工具配置命令</td>
+</tr>
+<tr>
+<td><code>/cost</code>、<code>/budget</code>、<code>/limits</code></td>
+<td>直接删除。只保留只读 <code>/usage</code>，不显示
+USD，也不设置额度</td>
+</tr>
+<tr>
+<td><code>/pr</code> 全组、<code>/delegate</code></td>
+<td>直接删除。copilotD 不提供 PR 创建、修复、自动合并或 cloud-agent
+delegation</td>
+</tr>
+<tr>
+<td><code>/btw</code></td>
+<td>不迁移；纠正当前执行使用官方 SDK steering <code>/steer</code></td>
+</tr>
+<tr>
+<td><code>/diff</code></td>
+<td>不迁移 terminal UI；diff 自动进入 tool/review renderer</td>
+</tr>
+<tr>
+<td>session export/tag/open/history/diff/notifications</td>
+<td>不进入首版；list/resume/chronicle/Discord thread 已覆盖实际需求</td>
+</tr>
+<tr>
+<td>project system-prompt/add-dir</td>
+<td>不进入；使用 Copilot instructions 和固定 cwd</td>
+</tr>
+<tr>
+<td>terminal UI/process 命令</td>
+<td><code>/copy</code>、<code>/theme</code>、<code>/voice</code>、<code>/cwd</code>、<code>/cd</code>、<code>/ide</code>、<code>/lsp</code>、<code>/exit</code>、<code>/login</code>、<code>/update</code>、<code>/feedback</code>、<code>/help</code>、<code>/share</code>
+等不映射到 Discord</td>
+</tr>
+</tbody>
+</table>
+<p><code>factory.run_updated</code> 只是在 generated event enum 中标为
+experimental 的 ephemeral invalidation signal，不是 Factory 产品
+API，也不是命令。首版仅记录 raw type/run id/revision 到
+diagnostics，不获取 liveness lease、不渲染面板。</p>
+<h3 id="事件适配">事件适配</h3>
+<p>内部 envelope：</p>
+<pre class="text"><code>InternalEvent {
+  schema_version, event_id, raw_type, session_id, thread_id,
+  runtime_generation, receive_seq, source,
+  turn_id?, task_id?, agent_id?, tool_call_id?,
+  received_at, sdk_timestamp?, correlation_id, payload, extra
+}</code></pre>
+<ul>
+<li>SDK class 只允许出现在 <code>adapters/copilot/</code>。</li>
+<li>未知字段进入 <code>extra</code>，未知 type 转为
+<code>UnknownSdkEvent</code>，不能令 event loop 崩溃。</li>
+<li>EventPump 在读取点分配
+<code>(runtime_generation, receive_seq)</code>；这是唯一排序依据，不按
+SDK timestamp 重排。</li>
+<li>raw event ID 在同一 generation 内去重；无 ID 时使用
+<code>session/type/receive_seq/payload_hash</code>，绝不跨 generation
+猜测重复。</li>
+<li>critical event 先写 event journal/reducer/outbox 再 ACK
+到内存消费者。</li>
+<li>subagent 归属取 event envelope <code>agent_id</code>，不依赖
+deprecated <code>parentToolCallId</code>。</li>
+<li><code>reasoningOpaque</code>、<code>encryptedContent</code> 不进入
+Discord；其他 payload 在单用户 debug 模式下 可以进入本地 event
+fixture，但普通 UI 只展示摘要。</li>
+<li>foreground、background 和 continuation 共用同一个 EventPump，没有
+reader handoff。</li>
+</ul>
+<p>内部稳定事件族：</p>
+<ul>
+<li>Session：<code>SessionStarted/Resumed/Ready/Warning/Failed/Stopped/ContextUpdated/ ConfigUpdated/CompactionStarted/CompactionFinished/TaskCompleted/QueueUpdated</code></li>
+<li>Turn：<code>TurnStarted/Retrying/IntentUpdated/Ended/Aborted</code></li>
+<li>Content：<code>AssistantTextStarted/Delta/Completed/ReasoningStatus/ReasoningCompleted</code></li>
+<li>Tool：<code>ToolRequested/Started/Progress/Output/Completed</code></li>
+<li>Liveness：<code>EventPumpStarted/Heartbeat/Stalled/Reconnected</code>、
+<code>BackgroundTaskDiscovered/Updated/Terminal</code>、
+<code>ContinuationExpected/Started/Finished/LivenessLeaseChanged</code></li>
+<li>Interaction：<code>ToolConfirmationAutoApproved</code>、<code>UserInputRequested/Resolved</code>、
+<code>ElicitationRequested/Resolved</code>、<code>PlanApprovalRequested/Resolved</code>、
+<code>McpAuthRequested/Resolved</code></li>
+<li>Usage：<code>UsageSampled/ContextUsageUpdated/QuotaUpdated</code></li>
+<li>Agent/Plan：<code>AgentSelected/Deselected/SubagentStarted/SubagentFinished/SkillInvoked/ PlanUpdated/TaskSetUpdated/AgentHandoff</code></li>
+<li>Capability/Artifact：<code>CapabilitiesUpdated/ExtensionsUpdated/ArtifactAvailable/WorkspaceChanged</code></li>
+<li>Fallback：<code>UnknownSdkEvent</code></li>
+</ul>
+<h4 id="完整-raw-event-处置">完整 raw event 处置</h4>
+<p>下表覆盖当前 Python generated <code>SessionEventType</code>。只有官方
+streaming 文档事件作为首版 稳定渲染契约；generated-only 事件需 fixture
+后再提升。“UI 无”仍会更新状态或审计。</p>
+<table>
+<colgroup>
+<col style="width: 33%" />
+<col style="width: 33%" />
+<col style="width: 33%" />
+</colgroup>
+<thead>
+<tr>
+<th>Raw event(s)</th>
+<th>Internal/处理</th>
+<th>Discord UI</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>session.start</code>, <code>session.resume</code></td>
+<td>SessionStarted/Resumed；绑定 runtime generation</td>
+<td>恢复状态行</td>
+</tr>
+<tr>
+<td><code>session.error</code></td>
+<td>SessionFailed；分类和 correlation</td>
+<td>可行动错误卡；stack 隐藏</td>
+</tr>
+<tr>
+<td><code>session.idle</code></td>
+<td>SessionReady；只完成当前 foreground/continuation；不停止
+pump；仅在无 continuation lease 时 drain FIFO</td>
+<td>finalize 文本/工具/usage</td>
+</tr>
+<tr>
+<td><code>session.shutdown</code></td>
+<td>explicit close 或 unexpected failure；停止 pump 并 flush outbox</td>
+<td>routine close 静默；unexpected 显示恢复卡</td>
+</tr>
+<tr>
+<td><code>session.title_changed</code></td>
+<td>title state</td>
+<td>仅 auto-name thread 自动改名</td>
+</tr>
+<tr>
+<td><code>session.context_changed</code></td>
+<td>SessionContextUpdated</td>
+<td>branch/cwd 状态</td>
+</tr>
+<tr>
+<td><code>session.usage_info</code>,
+<code>session.usage_checkpoint</code></td>
+<td>ContextUsageUpdated/usage aggregate</td>
+<td>footer 与 <code>/usage</code></td>
+</tr>
+<tr>
+<td><code>session.session_limits_changed</code></td>
+<td>generated-only diagnostics；不保存可配置 limit</td>
+<td>UI 无</td>
+</tr>
+<tr>
+<td><code>session.compaction_start</code>,
+<code>session.compaction_complete</code></td>
+<td>compaction lifecycle</td>
+<td>rolling compact card</td>
+</tr>
+<tr>
+<td><code>session.task_complete</code></td>
+<td>best-effort task semantic completion；不释放全部 liveness</td>
+<td>task 摘要；不驱动 disconnect</td>
+</tr>
+<tr>
+<td><code>session.info</code>, <code>session.warning</code></td>
+<td>state/warning reducer</td>
+<td>warning 可见；info 合并</td>
+</tr>
+<tr>
+<td><code>session.model_change</code>,
+<code>session.mode_changed</code>,
+<code>session.permissions_changed</code></td>
+<td>SessionConfigUpdated</td>
+<td>footer/info，不刷屏</td>
+</tr>
+<tr>
+<td><code>session.context_cleared</code>,
+<code>session.truncation</code>,
+<code>session.snapshot_rewind</code></td>
+<td>history mutation audit</td>
+<td>明确警告</td>
+</tr>
+<tr>
+<td><code>session.plan_changed</code>,
+<code>session.todos_changed</code></td>
+<td>PlanUpdated/TaskSetUpdated</td>
+<td>plan/todo panel</td>
+</tr>
+<tr>
+<td><code>session.workspace_file_changed</code></td>
+<td>WorkspaceChanged</td>
+<td>diff/files badge</td>
+</tr>
+<tr>
+<td><code>session.handoff</code></td>
+<td>AgentHandoff</td>
+<td>handoff card</td>
+</tr>
+<tr>
+<td><code>session.remote_steerable_changed</code></td>
+<td>capability state</td>
+<td>steer enable/disable</td>
+</tr>
+<tr>
+<td><code>session.autopilot_objective_changed</code></td>
+<td>plan/orchestration objective</td>
+<td>autopilot header</td>
+</tr>
+<tr>
+<td><code>session.schedule_created</code>,
+<code>session.schedule_cancelled</code>,
+<code>session.schedule_rearmed</code></td>
+<td>generated-only audit</td>
+<td>app scheduler 不依赖；UI 无</td>
+</tr>
+<tr>
+<td><code>pending_messages.modified</code></td>
+<td>SDK queue observation</td>
+<td>诊断；业务 FIFO 以 app DB 为准</td>
+</tr>
+<tr>
+<td><code>user.message</code></td>
+<td>provenance/timeline</td>
+<td>不重复渲染用户消息</td>
+</tr>
+<tr>
+<td><code>assistant.turn_start</code>,
+<code>assistant.turn_end</code></td>
+<td>TurnStarted/Ended；按 pending continuation lease 判定 kind</td>
+<td>status/turn counter</td>
+</tr>
+<tr>
+<td><code>assistant.turn_retry</code></td>
+<td>TurnRetrying</td>
+<td>节流重试状态</td>
+</tr>
+<tr>
+<td><code>assistant.intent</code></td>
+<td>TurnIntentUpdated</td>
+<td>rolling status</td>
+</tr>
+<tr>
+<td><code>assistant.reasoning_delta</code></td>
+<td>ReasoningStatus</td>
+<td>默认只显示 thinking，不流出 raw CoT</td>
+</tr>
+<tr>
+<td><code>assistant.reasoning</code></td>
+<td>ReasoningCompleted</td>
+<td>仅 configured concise summary</td>
+</tr>
+<tr>
+<td><code>assistant.message_start</code>,
+<code>assistant.message_delta</code>,
+<code>assistant.message</code></td>
+<td>text start/delta/final；可触发 ContinuationStarted</td>
+<td>block-aware stream；final 校正</td>
+</tr>
+<tr>
+<td><code>assistant.streaming_delta</code></td>
+<td>transport metric</td>
+<td>UI 无；stall 诊断</td>
+</tr>
+<tr>
+<td><code>assistant.tool_call_delta</code></td>
+<td>argument buffer</td>
+<td>UI 无；等完整 start</td>
+</tr>
+<tr>
+<td><code>assistant.server_tool_progress</code></td>
+<td>ToolProgress</td>
+<td>rolling tool panel</td>
+</tr>
+<tr>
+<td><code>assistant.idle</code></td>
+<td>generated-only hint</td>
+<td>UI 无；session.idle 权威</td>
+</tr>
+<tr>
+<td><code>assistant.usage</code></td>
+<td>UsageSampled</td>
+<td>tokens/credits footer，无 USD</td>
+</tr>
+<tr>
+<td><code>model.call_start</code>, <code>model.call_failure</code></td>
+<td>metrics/error precursor</td>
+<td>start 无；孤立 failure 可见</td>
+</tr>
+<tr>
+<td><code>abort</code></td>
+<td>TurnAborted</td>
+<td>已中止，清 controls</td>
+</tr>
+<tr>
+<td><code>tool.user_requested</code></td>
+<td>ToolRequested</td>
+<td>标注 user-requested</td>
+</tr>
+<tr>
+<td><code>tool.execution_start</code></td>
+<td>ToolStarted</td>
+<td>rolling row；args redacted</td>
+</tr>
+<tr>
+<td><code>tool.execution_partial_result</code></td>
+<td>ToolOutput</td>
+<td>detail buffer，不逐 chunk 发消息</td>
+</tr>
+<tr>
+<td><code>tool.execution_progress</code></td>
+<td>ToolProgress</td>
+<td>rolling row</td>
+</tr>
+<tr>
+<td><code>tool.execution_complete</code></td>
+<td>ToolCompleted</td>
+<td>success/failure、diff/detail</td>
+</tr>
+<tr>
+<td><code>tool_search.activated</code></td>
+<td>capability/telemetry</td>
+<td>verbose 可选</td>
+</tr>
+<tr>
+<td><code>skill.invoked</code></td>
+<td>SkillInvoked</td>
+<td>显示名称，不显示完整 content</td>
+</tr>
+<tr>
+<td><code>subagent.selected</code>,
+<code>subagent.deselected</code></td>
+<td>AgentSelected/Deselected</td>
+<td>agent badge</td>
+</tr>
+<tr>
+<td><code>subagent.started</code>, <code>subagent.completed</code>,
+<code>subagent.failed</code></td>
+<td>subagent lifecycle</td>
+<td>tasks/fleet panel 与统计</td>
+</tr>
+<tr>
+<td><code>hook.start</code>, <code>hook.progress</code>,
+<code>hook.end</code></td>
+<td>audit/debug</td>
+<td>normal 无；verbose 摘要</td>
+</tr>
+<tr>
+<td><code>system.message</code></td>
+<td>prompt provenance</td>
+<td>UI 无，只存 hash/source</td>
+</tr>
+<tr>
+<td><code>system.notification</code></td>
+<td>解析 task terminal/background completion；打开 continuation
+lease</td>
+<td>task panel + continuation 状态；未知进 diagnostics</td>
+</tr>
+<tr>
+<td><code>session.binary_asset</code></td>
+<td>ArtifactAvailable（experimental）</td>
+<td>MIME/size 校验后附件</td>
+</tr>
+<tr>
+<td><code>permission.requested</code>,
+<code>permission.completed</code></td>
+<td>立即 auto approve + latency telemetry</td>
+<td>UI 无；managed deny 才显示错误</td>
+</tr>
+<tr>
+<td><code>user_input.requested</code>,
+<code>user_input.completed</code></td>
+<td>UserInput request/resolved</td>
+<td>buttons/select/modal</td>
+</tr>
+<tr>
+<td><code>elicitation.requested</code>,
+<code>elicitation.completed</code></td>
+<td>Elicitation request/resolved</td>
+<td>支持的 JSON Schema 表单</td>
+</tr>
+<tr>
+<td><code>exit_plan_mode.requested</code>,
+<code>exit_plan_mode.completed</code></td>
+<td>PlanApproval request/resolved</td>
+<td>摘要、附件、actions</td>
+</tr>
+<tr>
+<td><code>session_limits_exhausted.requested</code>,
+<code>session_limits_exhausted.completed</code></td>
+<td>自动响应 Cancel；归类 account/runtime limitation</td>
+<td>只显示不可继续错误，无设置按钮</td>
+</tr>
+<tr>
+<td><code>sampling.requested</code>,
+<code>sampling.completed</code></td>
+<td>MCP sampling lifecycle</td>
+<td>usage/audit；normal 无</td>
+</tr>
+<tr>
+<td><code>mcp.oauth_required</code>,
+<code>mcp.oauth_completed</code></td>
+<td>McpAuth request/resolved</td>
+<td>OAuth 交互</td>
+</tr>
+<tr>
+<td><code>mcp.headers_refresh_required</code>,
+<code>mcp.headers_refresh_completed</code></td>
+<td>header provider refresh</td>
+<td>成功无；失败 warning</td>
+</tr>
+<tr>
+<td><code>external_tool.requested</code>,
+<code>external_tool.completed</code></td>
+<td>external tool lifecycle</td>
+<td>普通 tool panel；超时失败</td>
+</tr>
+<tr>
+<td><code>command.queued</code>, <code>command.execute</code>,
+<code>command.completed</code></td>
+<td>runtime command lifecycle</td>
+<td>只显示 registered runtime command</td>
+</tr>
+<tr>
+<td><code>auto_mode_switch.requested</code>,
+<code>auto_mode_switch.completed</code>,
+<code>session.auto_mode_resolved</code></td>
+<td>model/mode fallback interaction</td>
+<td>Gated confirm card</td>
+</tr>
+<tr>
+<td><code>session.managed_settings_resolved</code>,
+<code>session.managed_settings_enforced</code></td>
+<td>platform limitation state</td>
+<td>warning；说明 <code>--yolo</code> 不能覆盖组织策略</td>
+</tr>
+<tr>
+<td><code>commands.changed</code>,
+<code>capabilities.changed</code></td>
+<td>CapabilitiesUpdated</td>
+<td>刷新 autocomplete/availability</td>
+</tr>
+<tr>
+<td><code>session.tools_updated</code>,
+<code>session.skills_loaded</code>,
+<code>session.custom_agents_updated</code></td>
+<td>ExtensionsUpdated</td>
+<td>tools/skill/agent 状态</td>
+</tr>
+<tr>
+<td><code>session.mcp_servers_loaded</code>,
+<code>session.mcp_server_status_changed</code></td>
+<td>MCP state</td>
+<td>health/failure warning</td>
+</tr>
+<tr>
+<td><code>mcp.tools.list_changed</code>,
+<code>mcp.resources.list_changed</code>,
+<code>mcp.prompts.list_changed</code></td>
+<td>MCP capability state</td>
+<td>inspect；normal 无</td>
+</tr>
+<tr>
+<td><code>session.background_tasks_changed</code></td>
+<td>task reducer + liveness lease acquire/release + TaskSetUpdated</td>
+<td>tasks panel；terminal 强制 trailing flush</td>
+</tr>
+<tr>
+<td><code>factory.run_updated</code></td>
+<td>experimental raw diagnostics only；不驱动 liveness/state</td>
+<td>UI 无</td>
+</tr>
+<tr>
+<td><code>session.extensions_loaded</code>,
+<code>session.extensions.attachments_pushed</code></td>
+<td>extension state/artifacts</td>
+<td>summary 或附件</td>
+</tr>
+<tr>
+<td><code>session.custom_notification</code></td>
+<td>subtype reducer；terminal subtype 可驱动 liveness</td>
+<td>已知 subtype 渲染；未知进 diagnostics</td>
+</tr>
+<tr>
+<td><code>session.canvas.opened</code>,
+<code>session.canvas.registry_changed</code>,
+<code>session.canvas.closed</code>,
+<code>session.canvas.unavailable</code>,
+<code>session.canvas.recorded</code>,
+<code>session.canvas.removed</code></td>
+<td>experimental telemetry</td>
+<td>Discord v1 不支持；只审计</td>
+</tr>
+<tr>
+<td><code>mcp_app.tool_call_complete</code></td>
+<td>MCP app completion</td>
+<td>关联 tool panel，否则审计</td>
+</tr>
+<tr>
+<td><code>unknown</code> 或未来 type</td>
+<td>UnknownSdkEvent</td>
+<td>不打断；计数/hash/diagnostics</td>
+</tr>
+</tbody>
+</table>
+<h4 id="hooks-与事件边界">Hooks 与事件边界</h4>
+<table>
+<colgroup>
+<col style="width: 50%" />
+<col style="width: 50%" />
+</colgroup>
+<thead>
+<tr>
+<th>Hook</th>
+<th>copilotD 用途</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>onPreToolUse</code></td>
+<td>固定 approve；记录 tool id/turn/task 关联，不修改参数</td>
+</tr>
+<tr>
+<td><code>onPostToolUse</code></td>
+<td>提取 diff/artifact metadata；不篡改业务结果</td>
+</tr>
+<tr>
+<td><code>onPostToolUseFailure</code></td>
+<td>失败分类/retry guidance；非幂等操作不自动重试</td>
+</tr>
+<tr>
+<td><code>onUserPromptSubmitted</code></td>
+<td>Discord provenance、mention 清理；不改变用户意图</td>
+</tr>
+<tr>
+<td><code>onUserPromptTransformed</code></td>
+<td>记录 turn 关联</td>
+</tr>
+<tr>
+<td><code>onSessionStart</code></td>
+<td>注入 typed project/session context</td>
+</tr>
+<tr>
+<td><code>onSessionEnd</code></td>
+<td>仅 explicit shutdown 后 usage/outbox flush；不能因 AgentStop 释放
+runtime</td>
+</tr>
+<tr>
+<td><code>onErrorOccurred</code></td>
+<td>统一错误分类和 correlation ID</td>
+</tr>
+<tr>
+<td><code>onAgentStop</code></td>
+<td>更新 foreground 状态；不 cancel EventPump，不假定后台工作结束</td>
+</tr>
+</tbody>
+</table>
+<p>所有 app-level <code>asyncio.create_task()</code> 必须经
+<code>TaskRegistry.spawn()</code> 创建。Registry 保存 强引用、task
+name/source/session/generation，done callback 记录异常并释放引用；任何
+heartbeat loop 异常都进入 Supervisor，不能静默停止。</p>
+<h3 id="discord-renderer">Discord Renderer</h3>
+<p>Discord 不原生渲染 GFM 表格，且 2000 字符限制、message edit rate
+limit、附件上限会破坏 普通 Markdown 流。因此 Renderer 必须先生成逻辑
+block，再决定 Discord 载体。</p>
+<h4 id="render-pipeline">Render pipeline</h4>
+<pre class="text"><code>InternalEvent
+  -&gt; SessionReducer
+  -&gt; RenderIntent(logical_seq, lane, coalesce_key)
+  -&gt; MarkdownAssembler(block state machine)
+  -&gt; RenderPlan[text segments | table assets | files | task panel]
+  -&gt; durable RenderOutbox
+  -&gt; Discord API
+  -&gt; render_messages checkpoint</code></pre>
+<ul>
+<li><code>assistant.message_delta</code> 只追加到 block assembler；最终
+<code>assistant.message</code> 是 canonical 内容并按 hash 修正 delta
+结果。</li>
+<li>每条文本目标 1850 字符，预留 fence、continuation marker 和 footer
+空间。</li>
+<li>splitter 按 Markdown block AST
+切分：paragraph、list、blockquote、fenced code、table、 thematic
+break。不得在 code fence、blockquote 或 table 内跨消息。</li>
+<li>单个 block 超过限制时不截断：code/text 输出
+<code>.md</code>/<code>.txt</code> 附件，正文只放摘要和文件名。</li>
+<li>text lane 最快 1 秒一次 edit；task panel lane 最快 4 秒一次
+edit。计时从 Discord edit 完成时开始，而不是 request 发起时。</li>
+<li>task/subagent/background continuation 使用一张 rolling
+panel；不为每个 ToolUse 单独发 消息。主回答只接收
+<code>main/continuation</code> target，agent-scoped 原始文本进入 worker
+detail。</li>
+<li>turn terminal、task terminal、continuation terminal、EventPump stop
+前都执行 trailing/ final flush，绕过普通 throttle 但仍服从 Discord
+retry-after。</li>
+<li>Discord 429 使用准确 <code>retry_after</code>；5xx 最多 3
+次。最终失败保留在 RenderOutbox， 后续重渲染，绝不重跑 Agent。</li>
+</ul>
+<h4 id="表格显示协议">表格显示协议</h4>
+<p>表格是独立 block 类型，不能沿用文本 splitter。</p>
+<ol type="1">
+<li><code>MarkdownAssembler</code> 看到“header 行 + delimiter 行”后进入
+<code>TABLE_CANDIDATE</code>。</li>
+<li>候选期间所有 table 行只进入 buffer，不发送 typewriter
+delta。遇到空行、其他 block 开始或 canonical final
+时封闭；解析失败则按原 Markdown 文本释放。</li>
+<li>parser 保留 header、alignment、原始 cell 文本和 source
+range。正文、表格、后续正文 使用同一 <code>logical_seq</code> 排序，保证
+<code>text -&gt; table -&gt; text</code> 不错位、不重复。</li>
+<li>选择显示载体：</li>
+</ol>
+<table>
+<colgroup>
+<col style="width: 33%" />
+<col style="width: 33%" />
+<col style="width: 33%" />
+</colgroup>
+<thead>
+<tr>
+<th>条件</th>
+<th>Discord 输出</th>
+<th>可复制原文</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>&lt;= 4 列、&lt;= 12 行、等宽估算 &lt;= 88 字符</td>
+<td>对齐后的 fenced code block</td>
+<td>消息本身</td>
+</tr>
+<tr>
+<td>&lt;= 8 列、&lt;= 50 行、预估图片 &lt;= 4096x4096</td>
+<td>2x PNG 预览</td>
+<td>同发 <code>.md</code></td>
+</tr>
+<tr>
+<td>&gt; 8 列、&gt; 50 行、超宽 cell 或多页</td>
+<td>首 20 行 PNG 预览</td>
+<td>完整 <code>.md</code>；纯标量表另附 <code>.csv</code></td>
+</tr>
+<tr>
+<td>PNG 生成失败/字体缺失/附件超限</td>
+<td>fenced code；仍超限则 <code>.md</code></td>
+<td><code>.md</code></td>
+</tr>
+</tbody>
+</table>
+<ol start="5" type="1">
+<li>PNG 完全本地生成，不调用远程网页。首版使用 Pillow + font
+resolver；必须覆盖 CJK、ASCII、emoji fallback、inline code、换行和
+column alignment。固定浅色高对比 主题、2x scale、重复表头、zebra
+rows、最小 12px cell padding。</li>
+<li>高度超限时按行分页并重复 header；最多发送 10 个附件。超过 10
+页只发送首页预览 + 完整 <code>.md/.csv</code>，避免刷屏。</li>
+<li>图片是预览，不是唯一数据源；完整表格始终可复制。生成
+PNG、读字体和编码都放到 <code>asyncio.to_thread()</code>，不得阻塞
+gateway/EventPump。</li>
+<li>table asset 以 source hash 缓存；canonical final 与 streamed
+candidate hash 相同则复用， 防止 final 阶段重复发图。</li>
+</ol>
+<h4 id="其他内容">其他内容</h4>
+<ul>
+<li>reasoning 只显示 intent/concise summary；opaque/encrypted reasoning
+不显示。</li>
+<li>partial tool output 每 tool 内存上限 64
+KiB，溢出写文件；默认展示摘要。</li>
+<li>diff 优先使用 SDK structured result，否则本地
+<code>git diff</code>；超长 patch 附件化。</li>
+<li>interaction 卡记录 request ID/expiry；完成/超时后禁用组件。</li>
+<li>foreground <code>session.idle</code> 后发送 model、tokens、AI
+Credits、context 和 duration；若仍有 background/continuation
+lease，footer 标记“后台任务仍在运行”，而不是“会话已完成”。</li>
+</ul>
+<h3 id="clauded-issues-避雷矩阵">claudeD issues 避雷矩阵</h3>
+<p>以下是截至 2026-08-05 对 <code>HXYerror/claudeD</code> 公开 issues/PR
+的核查。Claude SDK 细节不能 直接当作 Copilot SDK 事实；表中的
+Discord、async stream、liveness 和渲染失败模式作为 copilotD
+设计输入，具体 Copilot event 必须由 spike/fixture 验证。</p>
+<table>
+<colgroup>
+<col style="width: 25%" />
+<col style="width: 25%" />
+<col style="width: 25%" />
+<col style="width: 25%" />
+</colgroup>
+<thead>
+<tr>
+<th>来源</th>
+<th>claudeD 已验证现象</th>
+<th>copilotD 设计约束</th>
+<th>回归测试</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><a href="https://github.com/HXYerror/claudeD/issues/324">#324</a>
+open + <a href="https://github.com/HXYerror/claudeD/pull/325">#325</a>
+merged</td>
+<td>turn Result 后数分钟仍会收到 background completion 和自动
+continuation；turn reader 停止会丢事件</td>
+<td>永久单一 EventPump；foreground 结束不取消 reader</td>
+<td>idle 后延迟注入 terminal notification +
+continuation，必须完整显示</td>
+</tr>
+<tr>
+<td><a href="https://github.com/HXYerror/claudeD/pull/352">#352</a>
+merged</td>
+<td>最后 task 清除后 continuation 刚开始，quiet gap 导致 reader
+被杀</td>
+<td>task list empty 不释放 continuation lease</td>
+<td>task set 变空与 assistant continuation 交叉到达</td>
+</tr>
+<tr>
+<td><a href="https://github.com/HXYerror/claudeD/pull/353">#353</a>
+merged</td>
+<td>固定 3600 秒 max-life 杀死 81 分钟 workflow，后续结果卡在 transport
+backpressure</td>
+<td>禁止绝对生命周期；只做 progress/inactivity watchdog</td>
+<td>模拟 90 分钟 activity，EventPump 不退出</td>
+</tr>
+<tr>
+<td><a href="https://github.com/HXYerror/claudeD/issues/323">#323</a>
+closed + <a href="https://github.com/HXYerror/claudeD/pull/339">#339</a>
+merged</td>
+<td>idle reaper/watchdog 未把后台流量算 activity，误杀工作</td>
+<td>无 idle reaper；gateway 重连不重启 runtime；每帧刷新 heartbeat</td>
+<td>background active 时触发 reaper/restart 请求必须拒绝</td>
+</tr>
+<tr>
+<td><a href="https://github.com/HXYerror/claudeD/issues/139">#139</a>
+closed</td>
+<td>单靠 <code>KeepAlive</code> 只能发现进程退出，发现不了 Discord
+gateway/event loop 活着但 wedged</td>
+<td>bot 30 秒写结构化 heartbeat；独立 5 分钟 watchdog；stale、recent
+wake、restart storm 分开处理</td>
+<td>冻结 event loop 但保留 PID，watchdog 能诊断；active lease 下遵循
+sidecar/replay gate</td>
+</tr>
+<tr>
+<td><a href="https://github.com/HXYerror/claudeD/issues/168">#168</a></td>
+<td>healthcheck plist 磁盘上有 <code>StartInterval=300</code>，但
+launchd 内存仍是旧定义，watchdog 从未运行</td>
+<td>service update 必须 bootout + bootstrap；同时验证磁盘 plist 与
+<code>launchctl print</code> 的 <code>run interval</code></td>
+<td>从无 interval 的已加载 plist 升级，确认 watchdog 45 秒内首跑且后续
+300 秒执行</td>
+</tr>
+<tr>
+<td><a href="https://github.com/HXYerror/claudeD/issues/232">#232</a></td>
+<td><code>ProcessType=Background</code> 使 launchd 每 15–25 分钟以
+<code>because inefficient</code> 回收长连接 bot，thread 上下文中断</td>
+<td>主 LaunchAgent 省略 <code>ProcessType</code>，保持
+Standard；<code>LowPriorityBackgroundIO=false</code></td>
+<td>macOS 60 分钟 service soak + 跨 25 分钟 turn，launchd log 零
+<code>because inefficient</code></td>
+</tr>
+<tr>
+<td><a href="https://github.com/HXYerror/claudeD/issues/289">#289</a> +
+<a href="https://github.com/HXYerror/claudeD/pull/290">#290</a>
+merged</td>
+<td>Windows 兼容 PR 只完成 subtasks 1–5；Task Scheduler/PowerShell
+自启动仍未实现，字体和路径也有平台差异</td>
+<td>copilotD 交付原生 Scheduled Task
+installer/uninstaller/status/watchdog、<code>%LOCALAPPDATA%</code>
+路径和 Windows CJK 字体</td>
+<td>Windows fresh-user setup 后 AtLogOn 自动启动；5 分钟
+watchdog、restart、中文 PNG 和 tzdata smoke 全通过</td>
+</tr>
+<tr>
+<td><a href="https://github.com/HXYerror/claudeD/pull/327">#327</a>
+merged</td>
+<td><code>/compact</code>、turn、stop 并发消费/断开同一
+stream，文本交错或崩溃</td>
+<td>CommandMailbox 串行写；EventPump 唯一读；stop 按阶段执行</td>
+<td>send/compact/stop race，断言 single consumer 和 final flush</td>
+</tr>
+<tr>
+<td><a href="https://github.com/HXYerror/claudeD/pull/328">#328</a>
+merged</td>
+<td>无强引用 fire-and-forget task 被回收；heartbeat
+异常后静默停止；缺终态 task 永久 running</td>
+<td>TaskRegistry 强引用/done callback；loop 异常上报；task GC/unknown
+终态</td>
+<td>强制 GC、heartbeat throw、缺 terminal event</td>
+</tr>
+<tr>
+<td><a href="https://github.com/HXYerror/claudeD/pull/333">#333</a>
+merged</td>
+<td>慢 slash command 错过 3 秒 ACK，报 Discord 10062</td>
+<td>command 第一行 defer；10062 不取消 SDK task</td>
+<td>注入 4 秒磁盘/SDK 延迟仍先 ACK</td>
+</tr>
+<tr>
+<td><a href="https://github.com/HXYerror/claudeD/pull/337">#337</a>
+merged</td>
+<td>无 parent ToolUseBlock 的 background subagent 文本泄到主频道</td>
+<td>main/task/subagent/continuation 明确 render target；未知 agent 只进
+panel</td>
+<td>orphan agent event 不进入 main text</td>
+</tr>
+<tr>
+<td><a href="https://github.com/HXYerror/claudeD/pull/340">#340</a> + <a href="https://github.com/HXYerror/claudeD/pull/341">#341</a> merged</td>
+<td>1.2 秒 task-card edit 产生 29 个 429；被 throttle
+的最后状态未落屏</td>
+<td>4 秒 panel cadence、从 edit 完成计时、trailing/final flush</td>
+<td>burst 100 updates + 429，最终状态必须一致</td>
+</tr>
+<tr>
+<td><a href="https://github.com/HXYerror/claudeD/pull/346">#346</a> + <a href="https://github.com/HXYerror/claudeD/pull/350">#350</a> merged</td>
+<td>continuation 每 ToolUse 发一条消息导致刷屏，最终回退为 text +
+footer</td>
+<td>工具进度聚合到单 panel，阶段变化/最终结果才发消息</td>
+<td>100 个 tool events 消息数保持有界</td>
+</tr>
+<tr>
+<td><a href="https://github.com/HXYerror/claudeD/issues/274">#274</a>
+closed</td>
+<td>2000 字符 smart split 破坏 code
+fence、blockquote、table；超长单块仍有 xfail</td>
+<td>block-aware splitter；单块超限附件化</td>
+<td>边界前后 fence/quote/table snapshot</td>
+</tr>
+<tr>
+<td><a href="https://github.com/HXYerror/claudeD/pull/314">#314</a>
+merged</td>
+<td>typewriter 先流出 table，final PNG 阶段重复或无法渲染</td>
+<td>table candidate 全程 hold，final 单次提交</td>
+<td>streamed table + canonical final 只产生一个 asset</td>
+</tr>
+<tr>
+<td><a href="https://github.com/HXYerror/claudeD/issues/222">#222</a>
+closed</td>
+<td>本地 Markdown image path 不会自动在 Discord 显示；附件每消息最多 10
+个</td>
+<td>抽取本地 image、与文本按序发送、10 个分批、失败保留路径文本</td>
+<td>12 张图、缺失图和混合 text-image-text</td>
+</tr>
+<tr>
+<td><a href="https://github.com/HXYerror/claudeD/issues/331">#331</a>
+closed + <a href="https://github.com/HXYerror/claudeD/pull/332">#332</a>
+merged</td>
+<td>1.23 MB NDJSON 超 SDK 默认 1 MB buffer，bridge teardown</td>
+<td>probe/configure frame limit；超限事件失败不销毁 session</td>
+<td>1/5/10 MB tool/image frame 压测</td>
+</tr>
+<tr>
+<td><a href="https://github.com/HXYerror/claudeD/pull/318">#318</a>
+merged</td>
+<td>resume 失败时 SDK 静默创建新 session</td>
+<td>requested/actual ID 必须比对，失配不覆盖 mapping</td>
+<td>fake resume 返回新 ID，断言 CD-RESUME-001</td>
+</tr>
+<tr>
+<td><a href="https://github.com/HXYerror/claudeD/pull/342">#342</a>
+merged</td>
+<td>启动/resume 失败只显示占位 ProcessError，真实 stderr 未捕获</td>
+<td>runtime 启动即注册有界 stderr tail</td>
+<td>失败卡包含 exit code、tail、generation</td>
+</tr>
+<tr>
+<td><a href="https://github.com/HXYerror/claudeD/issues/320">#320</a>
+closed + <a href="https://github.com/HXYerror/claudeD/pull/343">#343</a>
+merged</td>
+<td>Windows 缺 IANA tzdata，scheduler 把依赖问题报成 invalid
+timezone</td>
+<td>启动 smoke check 时区数据库和 scheduler</td>
+<td>无 tzdata 环境返回 dependency error</td>
+</tr>
+<tr>
+<td><a href="https://github.com/HXYerror/claudeD/issues/316">#316</a>
+closed</td>
+<td>workflow 第一个 result 为空，但真实文本仍在 trailing
+transcript/continuation</td>
+<td>空 result 不等于无回复；继续由永久 EventPump 收尾</td>
+<td>empty result 后注入 trailing text，必须显示</td>
+</tr>
+</tbody>
+</table>
+<h3 id="关键事件流程">关键事件流程</h3>
+<h4 id="启动">启动</h4>
+<pre class="mermaid"><code>sequenceDiagram
+    participant OS
+    participant Bot
+    participant DB
+    participant Runtime
+    participant SDK
+    participant Discord
+    OS-&gt;&gt;Bot: default auto-start/restart
+    Bot-&gt;&gt;DB: migrate + integrity check
+    Bot-&gt;&gt;DB: resolve and persist startup account HOME
+    Bot-&gt;&gt;Runtime: connect/start pinned --yolo sidecar
+    Runtime--&gt;&gt;Bot: version/protocol + stderr stream
+    Bot-&gt;&gt;SDK: models + capability/background/replay/frame probes
+    loop every binding not explicitly STOPPED
+      Bot-&gt;&gt;SDK: resume_session(requested_id, checkpoint?)
+      SDK--&gt;&gt;Bot: actual_id
+      Bot-&gt;&gt;Bot: verify id; start exactly one EventPump
+      Bot-&gt;&gt;DB: CONNECTED + generation + pump checkpoint
+    end
+    Bot-&gt;&gt;Discord: connect + sync commands
+    Bot-&gt;&gt;Discord: flush durable RenderOutbox
+    Bot--&gt;&gt;Discord: ready/degraded + resume mismatch/stalled notices</code></pre>
+<p><code>copilotd setup</code> 安装并启动 service
+后才进入上述流程；watchdog 独立于 bot。EventPump 必须在 Discord gateway
+之前启动：sidecar 仍在运行时，后台事件先进入 event journal/render
+outbox，等 Discord ready 再发送。关键 migration 失败时不启动 command
+handling。sidecar、replay、frame-size 或 Gated RPC probe
+失败时降级对应保证， 不能把 prior live session 无条件改成 STOPPED。</p>
+<h4 id="新-threadsession-与普通-turn">新 thread/session 与普通 turn</h4>
+<pre class="mermaid"><code>sequenceDiagram
+    participant U as User
+    participant D as Discord
+    participant B as Bot
+    participant PR as ProjectRegistry
+    participant DB
+    participant SR as SessionRuntime
+    participant P as EventPump
+    participant S as SDK
+    U-&gt;&gt;D: @copilotD prompt + attachments
+    D-&gt;&gt;B: MESSAGE_CREATE
+    B-&gt;&gt;PR: resolve(channel_id)
+    alt explicit binding exists
+      PR--&gt;&gt;B: source=explicit, cwd=bound resolved path
+    else no binding
+      PR--&gt;&gt;B: source=implicit-home, cwd=resolved HOME
+    end
+    B-&gt;&gt;B: idempotency(message_id)
+    B-&gt;&gt;D: create thread
+    B-&gt;&gt;DB: reserve binding + project_source + cwd_snapshot
+    B-&gt;&gt;SR: create SessionRuntime(config snapshot)
+    SR-&gt;&gt;S: create_session(--yolo handlers)
+    S--&gt;&gt;SR: actual session id
+    SR-&gt;&gt;P: start permanent stream consumer
+    P--&gt;&gt;SR: EventPumpStarted
+    SR-&gt;&gt;DB: persist binding/generation
+    SR-&gt;&gt;S: send(prompt, attachments)
+    S--&gt;&gt;P: all foreground/background events
+    P--&gt;&gt;D: reducer -&gt; outbox -&gt; rendered response</code></pre>
+<p>重复 gateway dispatch 用 source message ID + DB unique key
+去重。thread 创建成功但 SDK 失败时保留 thread 并显示 Retry，不重复建
+thread。任何 prompt 都必须在 EventPumpStarted 持久化之后发送，避免最早的
+session/assistant event 丢失。<code>/project bind|unbind</code> 只改变
+未来 session 的 resolve；已有 thread 永远继续使用自己的
+<code>cwd_snapshot</code>，除非显式新建 session。</p>
+<pre class="mermaid"><code>sequenceDiagram
+    participant U as User
+    participant B as Bot
+    participant M as CommandMailbox
+    participant P as EventPump
+    participant DB
+    participant S as SDK
+    U-&gt;&gt;B: normal message
+    alt activity QUIET
+      M-&gt;&gt;DB: reserve submitted turn
+      M-&gt;&gt;S: send(message)
+    else foreground/background/continuation active
+      M-&gt;&gt;DB: enqueue durable FIFO
+      M--&gt;&gt;U: queued #N + activity/tasks
+    end
+    U-&gt;&gt;B: /steer correction
+    B-&gt;&gt;M: priority steer
+    M-&gt;&gt;S: send(correction, immediate)
+    S--&gt;&gt;P: session.idle
+    P-&gt;&gt;DB: finalize foreground only
+    alt no background or continuation lease
+      M-&gt;&gt;DB: dequeue first
+      M-&gt;&gt;S: send(next)
+    else still active
+      M--&gt;&gt;U: keep queued; update task panel
+    end</code></pre>
+<p>normal turn、background task 和 continuation 的 event 都由同一
+EventPump 读取； CommandMailbox 从不调用 <code>receive_response()</code>
+或创建临时 reader。</p>
+<h4 id="yolo-与-sdk-raw-工具确认事件"><code>--yolo</code> 与 SDK raw
+工具确认事件</h4>
+<pre class="mermaid"><code>sequenceDiagram
+    participant S as SDK
+    participant Y as YoloAutoApproveHandler
+    participant P as EventPump
+    S-&gt;&gt;Y: permission.requested(tool, args)
+    Y--&gt;&gt;S: approve immediately
+    S--&gt;&gt;P: permission.completed
+    alt runtime/managed policy still denies
+      S--&gt;&gt;P: session.error / managed_settings_enforced
+      P--&gt;&gt;P: platform limitation, no retry loop
+    end</code></pre>
+<p>该流程没有 Discord 按钮、timeout 或本地 deny。<code>--yolo</code>
+不等于能绕过 GitHub 组织托管 策略；平台拒绝时只显示真实原因。</p>
+<h4 id="后台-taskcompletion-与-continuation">后台 task、completion 与
+continuation</h4>
+<pre class="mermaid"><code>sequenceDiagram
+    participant U as User
+    participant M as CommandMailbox
+    participant S as SDK/runtime
+    participant P as EventPump
+    participant L as LivenessController
+    participant R as Renderer
+    U-&gt;&gt;M: prompt starts background work
+    M-&gt;&gt;S: send(prompt)
+    S--&gt;&gt;P: background task discovered/running
+    P-&gt;&gt;L: acquire background(task_id)
+    S--&gt;&gt;P: session.idle (foreground)
+    P-&gt;&gt;R: finalize foreground; footer &quot;background running&quot;
+    Note over P,S: EventPump remains blocked on same stream for minutes/hours
+    S--&gt;&gt;P: task progress / task set changed
+    P-&gt;&gt;L: refresh heartbeat/task lease
+    S--&gt;&gt;P: terminal task notification
+    P-&gt;&gt;L: terminal + acquire continuation_expected
+    P-&gt;&gt;R: trailing task-panel flush
+    S--&gt;&gt;P: assistant.turn_start/message (continuation)
+    P-&gt;&gt;L: continuation_started; task may already be absent
+    S--&gt;&gt;P: assistant.message + turn_end + session.idle
+    P-&gt;&gt;L: continuation_finished; release leases
+    P-&gt;&gt;R: canonical result + final flush
+    R--&gt;&gt;U: completion visible without new user message</code></pre>
+<p>细则：</p>
+<ul>
+<li>terminal task event 到 continuation start 之间允许任意 quiet
+gap；不设置 reader timeout。</li>
+<li>task list 在 continuation start 前变空不影响 continuation
+lease。</li>
+<li>terminal notification、assistant output 或 task-state transition
+均可打开 continuation window；只有 continuation 自己的 terminal +
+idle、明确 cancellation 或 explicit close 关闭。</li>
+<li>第一个空 result 只记录，不结束 task/continuation。后续 trailing text
+仍由 EventPump 接收。</li>
+<li>后台状态卡最多 4 秒更新一次；terminal/continuation final 强制 final
+flush。</li>
+</ul>
+<h4 id="ask-userelicitation-与-plan">Ask-user、elicitation 与 plan</h4>
+<ul>
+<li><code>user_input.requested</code>：choices &lt;= 5 用 buttons，&lt;=
+25 用 select；freeform 用 modal； 超出 Discord 限制时分页或只保留
+freeform。</li>
+<li><code>elicitation.requested</code>：只支持 JSON Schema object 下
+string/number/boolean/enum 和有限 array；未知或深层嵌套 schema 返回
+decline，不能猜字段。</li>
+<li><code>exit_plan_mode.requested</code>：摘要进 embed，完整 plan
+附件化；actions 只用 SDK 提供值； <code>autopilot_fleet</code> 仅 fleet
+probe 成功时可选。</li>
+<li><code>session_limits_exhausted.requested</code>：固定响应
+Cancel，并显示 account/runtime limitation； 不生成额度设置组件。</li>
+<li>completed event 使 UI
+失效；晚到点击返回已完成/过期，不能二次响应。</li>
+<li>每个 request 持有独立 interaction liveness lease；等待输入时
+EventPump 继续消费其他 subagent/task event，不能用全局 future 阻塞
+reader。</li>
+</ul>
+<h4 id="附件">附件</h4>
+<pre class="mermaid"><code>sequenceDiagram
+    participant D as Discord CDN
+    participant A as AttachmentService
+    participant W as Worker thread
+    participant F as Session files
+    participant S as SDK
+    A-&gt;&gt;D: async download
+    A-&gt;&gt;W: read/hash/base64/resize via asyncio.to_thread
+    W-&gt;&gt;F: atomic write under attachments/
+    alt supported image
+      A-&gt;&gt;S: blob/file image attachment within probed frame limit
+    else ordinary file
+      A-&gt;&gt;S: file attachment
+    end</code></pre>
+<p>默认输入每文件 25 MiB、每消息 100 MiB；最终上限取 Discord、SDK probed
+frame/buffer 和 runtime 配置的最小值。图片在超过 frame threshold
+时先本地压缩/降采样；不能安全缩减的 大文件改为落盘路径提示，不把超大
+base64 塞进 JSON-RPC。所有同步读盘、hash、图片和 base64 工作移出 event
+loop。</p>
+<p>Agent 输出中的本地 Markdown image path 由 Renderer
+抽取、从正文移除一次并作为 Discord attachment 发送；最多 10
+个/消息，超过分批。缺失文件保留可读路径和 warning，不让整个 turn
+失败。</p>
+<h4 id="abortcloseresumedelete">Abort、close、resume、delete</h4>
+<ul>
+<li>abort：CommandMailbox priority -&gt; 可清 app FIFO -&gt;
+<code>session.abort()</code> -&gt; 等 abort/idle； EventPump
+始终继续。若 runtime 仍报告 background task，状态回到
+BACKGROUND_PENDING， 不假装全部取消。</li>
+<li>close：标记 STOPPING，拒绝新 send -&gt; abort current -&gt; 等
+terminal/drain（默认 15 秒）-&gt; final flush -&gt; 停 EventPump -&gt;
+<code>session.disconnect()</code> -&gt; STOPPED（UI 显示 closed）。已有
+active lease 时普通 close 拒绝；<code>force=true</code> 才可跳过
+drain，并把 in-flight 标 <code>outcome_unknown</code>。</li>
+<li>resume：从 STOPPED/FAILED 调用
+<code>resume_session(requested_id)</code>，核验 actual ID，启动唯一新
+EventPump；不重发 submitted-unknown prompt。</li>
+<li>delete：close 后 SDK delete，再删 app attachment/worktree metadata；
+文件删除失败标 cleanup pending。</li>
+<li>bot graceful shutdown：若 sidecar 可独立存活，只 checkpoint 并断开
+client，不 abort task；若 bundled stdio 会随进程退出，则等待
+configurable drain，未结束 task 标 unknown。</li>
+</ul>
+<h4 id="model-与-session-config-generation">Model 与 session config
+generation</h4>
+<pre class="mermaid"><code>sequenceDiagram
+    participant U
+    participant M as CommandMailbox
+    participant P as EventPump
+    participant DB
+    participant S as SDK
+    U-&gt;&gt;M: typed config change while QUIET
+    M-&gt;&gt;DB: pending config version
+    alt set_model sufficient
+      M-&gt;&gt;S: set_model(model)
+    else recreate required
+      M-&gt;&gt;P: quiesce old generation after checkpoint
+      M-&gt;&gt;S: disconnect + resume_session(requested_id, new config)
+      S--&gt;&gt;M: actual_id
+      M-&gt;&gt;M: verify actual_id
+      M-&gt;&gt;P: start exactly one new-generation pump
+    end
+    S--&gt;&gt;P: model/config events
+    alt confirmed
+      M-&gt;&gt;DB: commit active version/generation
+      M--&gt;&gt;U: success
+    else failed
+      M-&gt;&gt;DB: rollback
+      M-&gt;&gt;S: resume old config if needed
+      M--&gt;&gt;U: explicit failure
+    end</code></pre>
+<p>有 foreground/background/continuation/interaction lease 时拒绝
+reload，不做“边跑边重建”。 old/new generation 在任意时刻只能有一个
+active reader；若 SDK 支持原地配置则优先原地更新。</p>
+<h4 id="compactforkworktree">Compact、fork、worktree</h4>
+<ul>
+<li>compact 仅 QUIET 且无 lease；先 snapshot context，再调用
+RPC；complete event/RPC result； 失败保持原 session。</li>
+<li>fork 仅 QUIET；成功调用真正的 sessions.fork 后创建/绑定新 thread
+和新 EventPump。 若 Discord thread 创建失败，fork 保留为 orphan
+metadata，可 attach 或删除。</li>
+<li>worktree 先验证 repo/branch/目标唯一，参数化 Git 创建。默认新建无
+history session； <code>history=fork</code> 仅在 fork probe
+成功时可选。按 saga 补偿新建资源，不删除用户已有 branch。</li>
+</ul>
+<h4 id="subagentfleet-与-scheduler">Subagent/fleet 与 scheduler</h4>
+<pre class="mermaid"><code>sequenceDiagram
+    participant U
+    participant M as CommandMailbox
+    participant S as SDK
+    participant P as permanent EventPump
+    participant T as TaskRegistry
+    participant R as RenderScheduler
+    U-&gt;&gt;M: /fleet prompt
+    M-&gt;&gt;S: fleet.start(prompt)
+    S--&gt;&gt;P: subagent.started (N)
+    P-&gt;&gt;T: acquire/update agent tasks
+    loop workers
+      S--&gt;&gt;P: agent-scoped events
+      P--&gt;&gt;R: worker detail + consolidated panel
+      S--&gt;&gt;P: subagent.completed/failed
+    end
+    S--&gt;&gt;P: session.task_complete? / task terminal
+    S--&gt;&gt;P: continuation output + session.idle
+    R--&gt;&gt;U: consolidated result + stats</code></pre>
+<p>事件按 envelope <code>agent_id</code> 分流；父文本只消费
+<code>agent_id is None</code>，subagent 文本进入 worker detail。没有
+parent mapping 的 agent event 不进入 main text，只更新 orphan worker
+行。</p>
+<p>Scheduler fire 先获取 DB lease/idempotency key。message kind 验证
+thread/session 后 向常驻 session FIFO 入队；STOPPED 才先
+resume。new-session 创建独立 thread/session。 schedule run
+只有在它对应的 turn terminal、continuation 关闭且 final render 已入
+outbox 后 记 succeeded，不能看到任意 <code>session.idle</code>
+就成功。Catch-up 最多一次；SDK 已接受 prompt 而结果未知时不重发。</p>
+<h4 id="runtime-crash">Runtime crash</h4>
+<pre class="mermaid"><code>sequenceDiagram
+    participant R as Runtime
+    participant S as Supervisor
+    participant SR as SessionRuntimes
+    participant DB
+    participant D as Discord
+    alt Discord gateway disconnect only
+      D--xS: gateway lost
+      S-&gt;&gt;D: reconnect in place
+      Note over R,SR: runtime/EventPumps remain untouched
+    else SDK transport lost but runtime alive
+      R--xSR: stream EOF
+      SR-&gt;&gt;DB: checkpoint last receive_seq
+      S-&gt;&gt;R: reconnect same sidecar/session
+      R--&gt;&gt;SR: replay/checkpoint events if supported
+    else runtime process exited
+      R--xS: exit
+      S-&gt;&gt;SR: RECONNECTING; in-flight -&gt; outcome_unknown
+      SR-&gt;&gt;DB: persist tasks/turns/outbox/stderr tail
+      S-&gt;&gt;R: restart with backoff
+      R--&gt;&gt;S: healthy + capabilities
+      S-&gt;&gt;SR: eager resume requested IDs; start new pumps
+      SR-&gt;&gt;D: explicit incomplete/recovered/mismatch status
+    end</code></pre>
+<p>不自动重发可能已被 SDK 接受的 prompt。Retry
+是新的明确用户操作。resume 返回的 actual ID 不等于 requested ID 时保留旧
+mapping，创建 incident 和新的可选 thread，不能静默 把新 transcript 当旧
+transcript。Runtime stderr 从进程启动时就保存有界 tail。</p>
+<h3 id="超时重试与错误分类">超时、重试与错误分类</h3>
+<table>
+<colgroup>
+<col style="width: 50%" />
+<col style="width: 50%" />
+</colgroup>
+<thead>
+<tr>
+<th>场景</th>
+<th>策略</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Session/EventPump 生命周期</td>
+<td>无 idle timeout、无绝对 max-life；只由 explicit close 或 confirmed
+failure 结束</td>
+</tr>
+<tr>
+<td>Background task</td>
+<td>无运行时长上限；任何 event/task-set 变化刷新 progress</td>
+</tr>
+<tr>
+<td>Active session silence</td>
+<td>10 分钟进入 SUSPECT 并做 non-destructive transport ping；不
+abort/disconnect</td>
+</tr>
+<tr>
+<td>Missing terminal task</td>
+<td>24 小时且 runtime snapshot 已无该 task 时标 UNKNOWN；不标
+success、不停 session</td>
+</tr>
+<tr>
+<td>Continuation expected</td>
+<td>不用 quiet-gap timeout 关闭；等待 continuation
+terminal/cancel/explicit close</td>
+</tr>
+<tr>
+<td>Discord interaction ack</td>
+<td>callback 第一行 defer，目标 500ms、硬上限 2.5 秒</td>
+</tr>
+<tr>
+<td>Input/plan</td>
+<td>默认 15 分钟；超时 cancel；EventPump 继续</td>
+</tr>
+<tr>
+<td>Runtime start</td>
+<td>单次 30 秒；Supervisor 有界退避</td>
+</tr>
+<tr>
+<td>Model API rate limit</td>
+<td>遵循 retry-after；不切换 app fallback model；选择 <code>Auto</code>
+时由 Copilot 自己路由</td>
+</tr>
+<tr>
+<td>Tool failure</td>
+<td>交回 Agent；不重试非幂等 tool</td>
+</tr>
+<tr>
+<td>MCP disconnect</td>
+<td>结果未知不重试；下次 call 前 reconnect</td>
+</tr>
+<tr>
+<td>Discord 429</td>
+<td>retry-after + renderer coalescing</td>
+</tr>
+<tr>
+<td>Discord 5xx</td>
+<td>最多 3 次；失败持久化 render，不重跑 turn</td>
+</tr>
+<tr>
+<td>DB busy</td>
+<td>busy timeout + 短事务；事务内不等待 Discord/SDK</td>
+</tr>
+<tr>
+<td>Compact/fork/fleet</td>
+<td>不通用自动重试；先做 version/capability 判断</td>
+</tr>
+<tr>
+<td>Quota exhausted</td>
+<td>显示真实 account quota/rate error；不提供本地 limits 设置</td>
+</tr>
+<tr>
+<td>Explicit close drain</td>
+<td>默认 15 秒；超时需 force 或保持 STOPPING，不静默 teardown</td>
+</tr>
+<tr>
+<td>Graceful process shutdown</td>
+<td>默认 30 秒 checkpoint/outbox flush；sidecar 可存活时不 abort
+task</td>
+</tr>
+</tbody>
+</table>
+<p>错误至少分类为 managed-policy/content-policy、rate limit、account
+quota、 provider unavailable、invalid model、runtime transport、resume
+mismatch、event-pump stall、
+frame-too-large、MCP、tool、Discord、storage 和 internal bug。rate limit
+只按 retry-after 重试；provider unavailable/invalid model
+直接显示可行动错误，不自动切换模型。</p>
+<h3 id="会话存活保证与边界">会话存活保证与边界</h3>
+<p><strong>copilotD 必须保证：</strong></p>
+<ul>
+<li>正常进程存活期间，mapped session 不因
+<code>session.idle</code>、AgentStop、task list empty、 Discord quiet
+gap 或运行时长而 disconnect。</li>
+<li>每个连接代只有一个 EventPump；所有前台/后台/continuation 事件按
+receive sequence 进入同一 journal/reducer/outbox。</li>
+<li>Discord gateway 重连不影响 runtime；RenderOutbox 可在 Discord
+恢复后补发。</li>
+<li>app 不主动重启持有 liveness lease 的 runtime；升级/配置 reload
+必须等 QUIET 或显式 force。</li>
+<li>explicit close 前完成 staged drain 和 final flush；resume 必须核验
+actual ID。</li>
+</ul>
+<p><strong>无法伪造的边界：</strong></p>
+<ul>
+<li>主机断电、OS kill、runtime crash 或外部 tool 进程消失时，SDK
+transcript 可恢复不代表 in-flight execution 可继续。</li>
+<li>没有 runtime event replay 时，断线窗口内的事件可能不可恢复；只能标
+<code>outcome_unknown</code>， 不能从 transcript 猜测
+exactly-once。</li>
+<li>已产生外部副作用但未收到 terminal event 的 tool 不自动重试。</li>
+<li><code>--yolo</code> 明确让 Agent 拥有当前 OS
+用户的宿主能力；本设计不包含任何多用户或安全保护。</li>
+</ul>
+<h3 id="版本兼容">版本兼容</h3>
+<ul>
+<li>同时 pin <code>github-copilot-sdk</code> 和 runtime，记录
+SDK/runtime/protocol/schema hash。</li>
+<li>Public
+API：create/resume/send/abort/disconnect/set_model/list_models。</li>
+<li>Gated RPC：history.compact、sessions.fork、usage.get_metrics、
+metadata.contextInfo、account.getQuota、fleet.start、tasks
+list/message/cancel。</li>
+<li>Gated runtime capability：<code>--yolo</code> 参数映射、独立
+headless sidecar、client detach 后 task 继续、event
+checkpoint/replay、frame/buffer size 配置、background task
+snapshot。</li>
+<li>每个 Gated capability 都有
+probe、fixture、契约测试；失败则不注册对应 Discord command； stale
+interaction 才返回 <code>CD-CAP-001</code>。</li>
+<li>依赖升级时 diff 完整 generated event enum；每个新增事件必须明确
+render/state/liveness/ignore。</li>
+<li>不直接解析 runtime 私有磁盘 JSONL 实现稳定功能。</li>
+<li>runtime/SDK 升级只在全部 SessionRuntime QUIET 时执行；流程为 lock
+update -&gt; event inventory diff -&gt; fixtures -&gt; 90-minute
+liveness soak -&gt; temp-repo e2e -&gt; capability matrix diff -&gt;
+发布。活动 session 不做强制滚动升级。</li>
+</ul>
+<h3 id="测试契约">测试契约</h3>
+<p>单元/属性测试覆盖：</p>
+<ul>
+<li>EventPump single-consumer invariant、generation/receive
+sequence、duplicate/unknown event、 disconnect/reconnect 和
+checkpoint。</li>
+<li>Liveness lease 的 acquire/refresh/release，task-list-empty 与
+continuation start 交叉顺序， 空 result、缺 terminal
+event、stalled/unknown 状态。</li>
+<li>CommandMailbox FIFO/steer/abort/close/reconfigure、submitted-unknown
+不重发、actual session ID mismatch。</li>
+<li>TaskRegistry 对 app task 的强引用、done callback、异常上报和
+heartbeat loop 自恢复。</li>
+<li>ProjectRegistry 的 explicit &gt; implicit-home 解析、resolved
+HOME、session cwd snapshot， 以及 bind/unbind 与已存在 session
+的隔离。</li>
+<li>RenderOutbox 幂等、Discord message hash、429
+retry-after、trailing/final flush。</li>
+<li>Markdown block assembler 的 paragraph/list/fence/blockquote/table
+边界；TableRenderer 的 CJK/emoji/wrap/alignment/pagination/PNG
+fallback/MD/CSV snapshot。</li>
+<li>Interaction request ID、timeout/double-click；Scheduler
+DST/lease/idempotency。</li>
+<li>macOS plist/Windows Task XML snapshot、installer 幂等、磁盘定义与 OS
+manager effective definition 比对、heartbeat
+stale/recent-wake/restart-storm 决策。</li>
+</ul>
+<p>SDK fixtures 至少包括 plain text、multi-turn tool
+loop、reasoning、write diff、tool failure、 <code>--yolo</code> tool
+confirmation auto-approve、ask-user、elicitation、plan
+exit、image/file、abort、resume、 model switch、compact、unexpected
+session-limit auto-cancel、quota error、subagent
+success/failure、background task delayed completion、continuation after
+task removal、empty result + trailing text、MCP OAuth、 runtime
+crash、large frame 和 unknown event。每个 fixture 断言 internal
+events、generation/ sequence、状态迁移、liveness lease、outbox 和
+Discord render snapshot。</p>
+<p>claudeD issue 回归门禁：</p>
+<ol type="1">
+<li><strong>#324/#325</strong>：foreground idle 后等待至少 5 分钟再发
+task completion + continuation，
+不发送新用户消息也必须得到最终结果。</li>
+<li><strong>#352</strong>：task list 先变空，continuation
+后开始；EventPump 和 continuation lease 不结束。</li>
+<li><strong>#353</strong>：90 分钟持续 activity soak；没有 max-life
+cancellation。</li>
+<li><strong>#323/#339</strong>：background active 时 gateway
+watchdog/restart 请求不杀 runtime。</li>
+<li><strong>#327</strong>：send/compact/close/reconfigure
+并发压力下始终一个 reader、一个 writer mailbox。</li>
+<li><strong>#328</strong>：强制 GC 不回收 registered task；heartbeat
+抛异常可观测；缺终态不伪装完成。</li>
+<li><strong>#333</strong>：command body 阻塞 4 秒仍先
+defer，不产生不可见副作用。</li>
+<li><strong>#340/#341</strong>：100 个 task updates + 模拟 429，最终
+panel 状态必须落屏。</li>
+<li><strong>#274/#314</strong>：表格跨 2000 字符边界、streamed + final
+只出现一次，fence/quote 不损坏。</li>
+<li><strong>#331/#332</strong>：1/5/10 MiB event frame
+行为可预测；超限不 teardown 其他 session。</li>
+<li><strong>#318/#342</strong>：resume ID
+失配不覆盖映射；失败诊断包含真实 stderr tail。</li>
+<li><strong>#316</strong>：空 result 后 trailing continuation text
+可见。</li>
+<li><strong>#139</strong>：保留 bot PID 但冻结 heartbeat；watchdog 诊断
+stale，且 active lease 下不会 在无 replay capability 时强杀。</li>
+<li><strong>#168</strong>：从旧 loaded definition 更新 plist；installer
+必须 bootout/bootstrap，并断言 effective
+<code>run interval = 300</code>，不能只检查磁盘文件。</li>
+<li><strong>#232</strong>：macOS service 连续 60 分钟 + 跨 25 分钟
+turn，launchd log 不出现 <code>because inefficient</code>。</li>
+<li><strong>#289/#290</strong>：Windows clean account 执行 setup
+后，AtLogOn bot/runtime 与 5 分钟 watchdog
+都注册、立即启动、失败可重启；中文表格 PNG 无 tofu。</li>
+</ol>
+<p>端到端验收：</p>
+<ol type="1">
+<li>全新未绑定 channel 发送消息，直接以启动账号 resolved
+<code>$HOME</code> 创建 thread/session 和 永久
+EventPump；<code>/project info</code> 显示
+<code>source=implicit-home</code>。</li>
+<li>bind temp repo 后新 session 使用 explicit cwd；unbind 后未来新
+session 回落 <code>$HOME</code>， 两个旧 session 的
+<code>cwd_snapshot</code> 和 EventPump 都不变。</li>
+<li>foreground <code>session.idle</code> 后 30 分钟 EventPump 仍
+CONNECTED，可直接继续对话。</li>
+<li>background task 延迟完成和 continuation
+在无新消息情况下完整显示。</li>
+<li>macOS fresh account 的 <code>copilotd setup</code> 安装
+runtime/bot/watchdog LaunchAgent 并立即启动； 重启、登录、sleep/wake
+后均恢复，effective interval 与磁盘 plist 一致。</li>
+<li>Windows fresh account 的 <code>copilotd setup</code> 注册三个
+Scheduled Task 并立即启动；重新登录、 进程 crash、sleep/resume
+后均恢复，exported XML 与预期一致。</li>
+<li>sidecar 模式下 bot/gateway 重启不杀 task；不支持 sidecar 时 active
+lease 阻止 watchdog 自动强杀，并明确告警。</li>
+<li>thread 内 <code>/session resume</code> 无参数时恢复该 thread 原
+session；requested/actual ID 一致； 失配时旧 mapping 不变。</li>
+<li>busy 消息排队，steer 生效，FIFO 不乱、不重发
+submitted-unknown。</li>
+<li>shell/write/MCP 不出现审批卡并自动执行；GitHub
+平台强制拒绝时如实显示。</li>
+<li>small table 为 code block，medium table 为 PNG + MD，large table 为
+preview + MD/CSV； text-table-text 顺序正确。</li>
+<li>code fence/blockquote/超长 block 分片不损坏；超限附件化。</li>
+<li>图片/文件异步处理，12 个 output image 正确分批，大 frame 不杀
+session。</li>
+<li>abort/close/resume/delete 四种语义准确；close 前 final flush，close
+不删除 history。</li>
+<li>model/effort/context-tier 更新成功、失败回滚且不产生双
+EventPump。</li>
+<li>runtime crash 不自动双执行，stderr/recovery/mismatch 状态可见。</li>
+<li>usage 无美元、account quota 只读准确，且没有 limits 配置入口。</li>
+<li>Gated capability 缺失时对应 Discord command 不注册；capability
+manifest 说明原因。</li>
+<li>schedule 单次/cron、catch-up、lease 和 continuation-aware success
+准确。</li>
+<li>事件突发与 Discord 429 下不刷屏，不丢 final/error/interaction。</li>
+<li><code>/workflow</code>、<code>/max-turns</code>、fallback
+model、<code>/mode</code>、<code>/goal</code>、<code>/bare</code>、<code>/tools</code>、
+<code>/cost</code>、<code>/budget</code>、<code>/limits</code>、<code>/pr</code>、<code>/delegate</code>
+均不在 Discord command manifest。</li>
+<li>没有 registered command 以 <code>/copilot</code> 开头；Core
+<code>/session</code>、<code>/model</code>、<code>/plan</code>、
+<code>/steer</code>、<code>/queue</code>、<code>/context</code>、<code>/usage</code>
+始终可用；Fleet/Tasks/Research/Init 等 Native-Gated 命令只在匹配的
+pinned runtime fixture 下出现。</li>
+<li><code>factory.run_updated</code> 不创建 panel、不获取 liveness
+lease、不改变 task set。</li>
+</ol>
+<h3 id="已固定的关键默认">已固定的关键默认</h3>
+<ul>
+<li>单用户私有部署，runtime 固定 <code>--yolo</code>；没有审批
+UI、执行模式或相关配置。</li>
+<li>不实现角色、ownership、allowlist、沙箱或多租户。</li>
+<li>channel 未绑定时固定使用启动账号 resolved
+<code>$HOME</code>；没有开关。</li>
+<li><code>project_source</code> 和 <code>cwd_snapshot</code> 在 session
+创建时持久化；bind/unbind 不改变旧 session。</li>
+<li><code>copilotd setup</code> 默认安装并立即启动 macOS LaunchAgent 或
+Windows Scheduled Tasks； <code>--foreground</code>
+是显式开发模式。</li>
+<li>每个 mapped session 常驻，没有 idle reaper、没有绝对 max-life。</li>
+<li>一个 SessionRuntime 一个永久 EventPump；foreground/background 不切
+reader。</li>
+<li>启动时 eager resume 所有非 STOPPED session 并核验 actual ID。</li>
+<li>busy 普通消息走 copilotD 持久 FIFO；只有显式 <code>/steer</code>
+使用 SDK immediate。</li>
+<li><code>/session resume</code> 在 thread 内默认使用该 thread
+持久化的原 session ID，不显示 picker。</li>
+<li>fork/worktree 创建新 Discord thread。</li>
+<li>project cwd/variables 使用 versioned immutable
+snapshot；修改只影响未来 session。</li>
+<li>表格流式阶段 hold；small -&gt; code block，medium -&gt; PNG +
+MD，large -&gt; preview + MD/CSV。</li>
+<li>task panel 4 秒 cadence，所有 terminal 点执行 final flush。</li>
+<li>scheduler 首版只接收 RFC3339/cron + timezone。</li>
+<li>raw reasoning 默认不流式展示。</li>
+<li>Native-Gated RPC/runtime command 缺失时不注册对应 Discord
+command。</li>
+<li>没有通用 <code>/workflow</code>；分别使用 plan、fleet 和
+tasks。</li>
+<li>没有 <code>/copilot</code> 命令前缀。</li>
+<li><code>/max-turns</code>、fallback
+model、<code>/mode</code>、<code>/goal</code>、<code>/bare</code>、<code>/tools</code>、<code>/cost</code>、<code>/budget</code>、
+<code>/limits</code>、<code>/pr</code>、<code>/delegate</code>
+不进入命令面；<code>/unbound-fallback</code> 不存在，因为
+<code>$HOME</code> 行为固定启用。</li>
+</ul>
+<h3 id="html-交付要求">HTML 交付要求</h3>
+<ul>
+<li>以本文件“目标、调研结论、详细设计、实施阶段、风险和官方依据”为唯一内容源。</li>
+<li>输出 UTF-8、standalone HTML，内嵌响应式
+CSS、目录、打印样式和代码/表格样式。</li>
+<li>不依赖远程字体、CSS、JavaScript 或图片；Mermaid 源码在无本地
+renderer 时以可读 流程块保留，避免把设计内容发送给第三方。</li>
+<li>页面头部标记“设计 v2.3、待审批、single-user –yolo”，突出
+Copilot-native commands、 <code>$HOME</code> 默认 cwd、macOS/Windows
+always-on、session liveness、table rendering、 claudeD issue lessons 和
+capability gate。</li>
+<li>文档 body 最大宽度至少 90rem；表格使用独立横向滚动容器、sticky
+header、长单元格 wrap 和打印分页，确保 issue/command/event
+大表可读。</li>
+<li>生成后校验 HTML 可解析、目录锚点有效、Copilot command manifest 与
+raw event 表完整、
+删除项不误注册、无未完成占位标记或多租户设计残留。</li>
+<li>Markdown 和 HTML 固定提交到仓库 <code>docs/</code>；仍不开始 SDK
+原型或项目编码。</li>
+</ul>
+<h2 id="实施阶段">实施阶段</h2>
+<h3 id="sdk-技术原型">1. SDK 技术原型</h3>
+<ul>
+<li>创建最小 Python 程序，验证安装、runtime 下载、GitHub 登录/BYOK
+和模型枚举。</li>
+<li>验证 <code>--yolo</code> 参数/raw tool-confirmation callback
+全自动批准，无 Discord approval。</li>
+<li>验证一个 subscription 是否可跨 foreground idle 持续接收 background
+completion 和 continuation；录制 task/notification/empty-result
+fixtures。</li>
+<li>验证 headless sidecar：client detach、bot restart、event
+checkpoint/replay、task 是否继续。</li>
+<li>验证 resume requested/actual ID、stderr callback、1/5/10 MiB frame
+和 buffer 配置。</li>
+<li>在临时 Git 仓库验证 stream、tool
+events、ask-user、image、abort、resume、set-model。</li>
+<li>单独验证低层 fork、compact、fleet、tasks、usage/context RPC，以及
+runtime review/security-review/research/init/chronicle command
+manifest，并记录所需版本。</li>
+<li>产出 capability matrix 和 Discord command
+manifest；sidecar/replay/background 行为未 验证前不得开始 Discord
+MVP。</li>
+</ul>
+<h3 id="discord-核心-mvp">2. Discord 核心 MVP</h3>
+<ul>
+<li>建立 Python 包、配置加载和 Discord bot 启动入口。</li>
+<li>实现 explicit project &gt; implicit <code>$HOME</code> 解析、cwd
+snapshot、mention 自动建 thread 和 thread 内连续对话。</li>
+<li>实现 <code>RuntimeSupervisor</code>、每线程
+<code>SessionRuntime</code>、CommandMailbox、永久 EventPump、
+TaskRegistry、LivenessController、持久 FIFO 和 eager resume。</li>
+<li>实现 event journal、RenderOutbox、纯文本流式渲染、错误卡和 staged
+close/abort/resume。</li>
+<li>注册 Core
+<code>/session</code>、<code>/model</code>、<code>/plan</code>、<code>/steer</code>、<code>/queue</code>、<code>/context</code>、<code>/usage</code>；
+不创建删除列表中的命令。</li>
+</ul>
+<h3 id="事件后台生命周期与富渲染">3. 事件、后台生命周期与富渲染</h3>
+<ul>
+<li>建立内部事件模型和 Copilot event adapter。</li>
+<li>实现 foreground/background/continuation reducer 和 liveness
+leases。</li>
+<li>渲染 reasoning、tool、diff、subagent、task panel、compaction 和
+usage。</li>
+<li>实现 block-aware splitter、表格 hold/code/PNG/MD/CSV、rate limit 和
+final flush。</li>
+<li>把 user-input/plan 映射为 Discord buttons/select/modal；SDK
+工具确认事件直接批准。</li>
+<li>支持异步图片/file、本地 Markdown image 抽取、10 附件分批和
+frame-size fallback。</li>
+</ul>
+<h3 id="copilot-原生能力与-copilotd-扩展">4. Copilot 原生能力与 copilotD
+扩展</h3>
+<ul>
+<li>Native-Gated：Fleet、Tasks、custom
+agents、compact/fork、review/security-review、
+research、rubber-duck、init、chronicle、instructions/env、MCP/skills/plugins。</li>
+<li>每个 Native-Gated command 由 pinned runtime manifest
+决定注册，不做空壳 fallback。</li>
+<li>Extensions：project binding/variables、durable
+scheduler/worktree、ops diagnostics。</li>
+</ul>
+<h3 id="稳定性与交付">5. 稳定性与交付</h3>
+<ul>
+<li>运行 claudeD issue 回归矩阵、90-minute liveness soak、event
+burst/429 和 large-frame 压测。</li>
+<li>覆盖 single-reader race、sidecar/bundled restart、resume
+mismatch、abort/close、 Discord rate limit、runtime crash、附件清理和
+event forward compatibility。</li>
+<li>增加结构化日志、stderr tail、EventPump/lease/outbox
+health、diagnostics 和 graceful shutdown。</li>
+<li>实现并实机验证 macOS 三 LaunchAgent、Windows 三 Scheduled
+Task、PowerShell/shell
+install/uninstall/status、heartbeat/watchdog、sleep/wake 和
+restart-storm alert。</li>
+<li>编写自托管安装、Copilot 鉴权、数据目录和 <code>--yolo</code>
+运行前提。</li>
+</ul>
+<h2 id="待办">待办</h2>
+<ol type="1">
+<li>审批本文件的详细设计和默认选择。</li>
+<li>验证 Copilot SDK 的 yolo、永久 stream、background
+continuation、sidecar/replay 和 frame。</li>
+<li>实现 implicit <code>$HOME</code>、explicit binding、cwd snapshot 和
+bind/unbind 不影响旧 session。</li>
+<li>搭建 SessionRuntime、CommandMailbox、EventPump、TaskRegistry 和
+RenderOutbox。</li>
+<li>实现稳定事件适配、liveness reducer 和 Discord 富渲染。</li>
+<li>实现表格 code/PNG/MD/CSV、附件异步处理和 final flush。</li>
+<li>按 capability manifest 补齐 Copilot
+Fleet、Tasks、agents、review、research、init、
+MCP/skills/plugins；不恢复删除的 claudeD-shaped commands。</li>
+<li>实现 macOS/Windows 默认自启动、heartbeat、watchdog
+和平台安装验证。</li>
+<li>完成 claudeD issue 回归、90 分钟
+soak、恢复、故障、兼容性测试和部署文档。</li>
+</ol>
+<h2 id="主要风险">主要风险</h2>
+<ul>
+<li>SDK GA 不代表所有生成 RPC
+都稳定；fork、compact、fleet、tasks、usage/context 必须通过原型后再
+纳入稳定命令。</li>
+<li>Copilot SDK 是否支持独立 runtime 在 client detach 后继续
+task、是否有 event replay， 是“bot
+重启不丢后台任务”保证的阻塞能力；不支持时只能保证进程内常驻。</li>
+<li>Copilot background task/continuation 的实际 event 组合可能不同于
+claudeD；必须以 Copilot fixtures 修正 reducer，不能复制 Claude message
+假设。</li>
+<li>永久 EventPump 消除了 reader 交接，但会增加长期连接、内存和
+fd；必须做 session 数量、 backpressure 和 90 分钟以上 soak。</li>
+<li>Discord 不原生显示 GFM table；PNG 生成的 CJK/emoji
+字体、图片尺寸和附件限制需要真实 Discord snapshot 测试。</li>
+<li>Copilot 计费单位与 Claude USD 成本不同；只读呈现 usage、AI Credits
+和 account quota。</li>
+<li>不同模型的 reasoning、vision、context tier 和 tool
+能力不同，命令应根据 <code>list_models()</code> 返回的 capability
+动态启用。</li>
+<li>Copilot CLI command surface 演进很快，Chronicle、worktree/scheduling
+等文档存在版本 漂移；以 pinned runtime capability manifest
+为注册依据。</li>
+<li>Discord 交互、图片编码和表格 PNG 不能阻塞
+EventPump/gateway；必须使用独立 worker 和 durable outbox。</li>
+<li>OS service definition 存在“磁盘已更新、manager
+仍运行旧配置”的风险；安装成功必须以
+<code>launchctl print</code>/exported Scheduled Task XML 和真实
+heartbeat 为准。</li>
+<li>Windows Task Scheduler 交付没有可直接复用的 claudeD 实现，必须在真实
+Windows 用户 登录、睡眠恢复、电池供电和 crash 场景测试，不能只在 macOS
+生成 XML。</li>
+<li><code>--yolo</code> 使 Agent 拥有当前 OS
+用户可用的宿主能力，这是接受的单用户产品前提。</li>
+</ul>
+<h2 id="官方依据">官方依据</h2>
+<ul>
+<li>https://github.com/github/copilot-sdk</li>
+<li>https://docs.github.com/en/copilot/how-tos/copilot-sdk</li>
+<li>https://github.blog/changelog/2026-06-02-copilot-sdk-is-now-generally-available/</li>
+<li>https://pypi.org/project/github-copilot-sdk/</li>
+<li>https://github.com/github/copilot-sdk/blob/main/docs/features/streaming-events.md</li>
+<li>https://github.com/github/copilot-sdk/blob/main/docs/features/session-persistence.md</li>
+<li>https://github.com/github/copilot-sdk/blob/main/docs/features/steering-and-queueing.md</li>
+<li>https://github.com/github/copilot-sdk/blob/main/docs/features/usage-and-billing.md</li>
+<li>https://github.com/github/copilot-sdk/blob/main/docs/features/fleet-mode.md</li>
+<li>https://github.com/github/copilot-sdk/blob/main/docs/features/remote-sessions.md</li>
+<li>https://github.com/github/copilot-sdk/blob/main/docs/features/skills.md</li>
+<li>https://github.com/github/copilot-sdk/blob/main/docs/hooks/hooks-overview.md</li>
+<li>https://docs.github.com/en/copilot/reference/copilot-cli-reference/cli-command-reference</li>
+<li>https://docs.github.com/en/copilot/concepts/agents/copilot-cli/fleet</li>
+<li>https://docs.github.com/en/copilot/how-tos/copilot-cli/use-copilot-cli/agentic-code-review</li>
+<li>https://docs.github.com/en/copilot/how-tos/copilot-cli/use-copilot-cli/chronicle</li>
+<li>https://github.blog/changelog/2026-06-02-copilot-cli-improved-ui-rubber-duck-prompt-scheduling-and-voice-input/</li>
+<li>https://github.com/HXYerror/claudeD</li>
+<li>https://github.com/HXYerror/claudeD/issues/139</li>
+<li>https://github.com/HXYerror/claudeD/issues/168</li>
+<li>https://github.com/HXYerror/claudeD/issues/232</li>
+<li>https://github.com/HXYerror/claudeD/issues/289</li>
+<li>https://github.com/HXYerror/claudeD/pull/290</li>
+<li>https://github.com/HXYerror/claudeD/issues/324</li>
+<li>https://github.com/HXYerror/claudeD/pull/352</li>
+<li>https://github.com/HXYerror/claudeD/pull/353</li>
+<li>https://github.com/HXYerror/claudeD/issues/323</li>
+<li>https://github.com/HXYerror/claudeD/pull/327</li>
+<li>https://github.com/HXYerror/claudeD/pull/328</li>
+<li>https://github.com/HXYerror/claudeD/pull/333</li>
+<li>https://github.com/HXYerror/claudeD/pull/337</li>
+<li>https://github.com/HXYerror/claudeD/pull/340</li>
+<li>https://github.com/HXYerror/claudeD/pull/341</li>
+<li>https://github.com/HXYerror/claudeD/issues/274</li>
+<li>https://github.com/HXYerror/claudeD/pull/314</li>
+<li>https://github.com/HXYerror/claudeD/issues/331</li>
+<li>https://github.com/HXYerror/claudeD/pull/318</li>
+</ul>
+</body>
+</html>
