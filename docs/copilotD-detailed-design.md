@@ -1,6 +1,6 @@
 # copilotD 详细设计与实施计划
 
-> 当前阶段：详细设计 v2.3，待审批。审批前不执行 SDK 原型、不创建项目代码。
+> 当前阶段：详细设计 v2.4，待审批。审批前不执行 SDK 原型、不创建项目代码。
 >
 > 本版固定前提：单用户、私有部署、Copilot runtime 全程 `--yolo`，不设计多用户共享、
 > 工具确认流程、安全沙箱或租户隔离。
@@ -60,7 +60,7 @@ GitHub 已提供官方 Python SDK：
 | Context 展示 | `session.usage_info` / context-info RPC | 直接支持 |
 | 用量 | `/usage`、AI Credits、premium request multiplier、account quota | 只读展示 Copilot 原生语义，不提供 limits 配置 |
 | worktree | 应用层调用 Git 创建并绑定新工作目录 | copilotD durable extension |
-| Plan/Fleet/Tasks | `agent_mode="plan"`、Fleet RPC、task RPC | Copilot 专属能力；Fleet/tasks 需 capability gate |
+| Autopilot/Plan/Fleet/Tasks | `agent_mode="autopilot"` / `"plan"`、Fleet RPC、task RPC | Autopilot/Plan 为稳定 SDK 面；Fleet/tasks 需 capability gate |
 | Code/security review | 官方 Copilot CLI `/review`、`/security-review` | Copilot 原生命令；runtime command capability gate |
 | Scheduler | 保留应用层 scheduler，并注册 custom tool/MCP | 可复用产品思路 |
 
@@ -280,7 +280,7 @@ watchdog 通过 PowerShell 查询最近的
 - 完整 SDK event -> copilotD internal event -> Discord UI 映射；
 - connection、foreground turn、background task、continuation、interaction 和 scheduler
   状态机；
-- 启动/eager resume、普通 turn、后台 completion/continuation、queue/steer、ask-user、
+- 启动/eager resume、普通 turn、Autopilot 多轮续跑、后台 completion/continuation、queue/steer、ask-user、
   attachment、abort、model switch、compact、fork、subagent、scheduler 和 runtime
   crash 时序；
 - session 常驻、single-reader、timeout、retry、Discord rate limit、表格显示、quota、
@@ -318,14 +318,16 @@ watchdog 通过 PowerShell 查询最近的
 12. 表格不能直接按普通 Markdown delta 输出；必须完整缓冲后一次性渲染。
 13. raw reasoning 默认只展示 intent/concise summary，不展示 opaque/encrypted payload。
 14. 只注册 Core 和 probe 成功的 Native-Gated commands；不为 claudeD 命令制造近似替代。
+15. Autopilot 是首版 Core：thread 级 sticky mode，普通消息按 mode snapshot 发送；显式
+    `/autopilot stop` 才退出，不用 `/plan` 按钮作为唯一入口。
 
 ### 产品范围与非目标
 
 首版包括可选项目绑定、未绑定 `$HOME` 默认 cwd、thread 会话、文本/图片/文件、
 create/eager-resume/send/abort/set-model/disconnect、常驻 EventPump、后台 task/
 continuation 状态、工具/diff/usage/subagent 渲染、表格 PNG/附件、ask-user/elicitation/
-plan 交互、SQLite 状态、render outbox、macOS/Windows 默认 service/watchdog。
-命令面优先交付 Copilot Core session/model/plan/steer/queue/context/usage，再按 probe 加入
+autopilot/plan 交互、SQLite 状态、render outbox、macOS/Windows 默认 service/watchdog。
+命令面优先交付 Copilot Core session/model/autopilot/plan/steer/queue/context/usage，再按 probe 加入
 Fleet、Tasks、agents、review/security-review、research、init、instructions、MCP/skills/plugins；
 scheduler/worktree/ops 明确是 copilotD extension。
 
@@ -334,7 +336,8 @@ scheduler/worktree/ops 明确是 copilotD extension。
 - 不复刻 Claude Code CLI 命令或 Claude message block。
 - 不执行用户提交的任意 session settings JSON。
 - 不保证所有模型都有 reasoning、vision、long context 或相同工具。
-- 不做多用户共享、资源 ownership、审批、沙箱或可切换执行模式。
+- 不做多用户共享、资源 ownership、审批、沙箱或可切换权限 profile；Agent 行为只使用
+  Copilot 原生 interactive/plan/autopilot mode。
 - 不承诺主机重启后 in-flight task 可继续；只有 SDK/runtime 能提供 detached runtime +
   replay 时才升级为该保证。
 - 不把 `session.task_complete`、task 列表变空或第一个空 result 单独当作会话可停止信号。
@@ -363,6 +366,7 @@ scheduler/worktree/ops 明确是 copilotD extension。
 | `SessionRegistry` | thread binding、metadata、eager resume 和常驻 runtime 集合 |
 | `SessionRuntime` | 聚合一个 SDK session、CommandMailbox、EventPump、liveness/task/render 状态 |
 | `CommandMailbox` | 唯一 SDK 写入者；串行 send/steer/abort/reconfigure/close 与持久 FIFO |
+| `AutopilotController` | thread sticky mode、start/status/stop、plan-exit action、mode snapshot 与 autopilot turn lease |
 | `EventPump` | 从 create/resume 到 explicit close 持续消费唯一 SDK event stream |
 | `LivenessController` | foreground/background/continuation/interaction lease 与 stall watchdog |
 | `TaskRegistry` | SDK task reducer；强引用所有 app `asyncio.Task`，done callback 回收/报错 |
@@ -393,7 +397,7 @@ checkpoint replay。若不支持，首版回落为 bundled stdio，但禁止主�
 
 | 表 | 关键字段 |
 |---|---|
-| `global_config` | key, value；包含 resolved_home、default mode/mention、global extension config |
+| `global_config` | key, value；包含 resolved_home、default mention、global extension config |
 | `channel_settings` | channel_id, layout, mention_required, config_version；不等同 project binding |
 | `projects` | id, channel_id, root_path, cwd, layout, mention_required, config_version, state(active/retired)；只存显式 binding，旧 session 引用的 retired snapshot 不删除 |
 | `project_prompts` | project_id, prompt, version |
@@ -401,10 +405,10 @@ checkpoint replay。若不支持，首版回落为 bundled stdio，但禁止主�
 | `mcp_servers` | project_id, name, transport, config_json, enabled, version |
 | `skill_dirs` / `plugin_dirs` | project_id, path, enabled |
 | `custom_agents` | project_id, name, description, prompt, tools_json, enabled |
-| `session_bindings` | thread_id, project_id?, project_source(explicit/home), cwd_snapshot, requested_session_id, actual_session_id, connection_state, activity_state, runtime_generation, last_event_seq, last_event_at, config_version, model, effort |
+| `session_bindings` | thread_id, project_id?, project_source(explicit/home), cwd_snapshot, requested_session_id, actual_session_id, connection_state, activity_state, agent_mode(interactive/plan/autopilot), runtime_generation, last_event_seq, last_event_at, config_version, model, effort |
 | `turns` | turn_id, session_id, discord_message_id, kind(foreground/continuation/scheduled), state, started_at, idle_at |
 | `session_tags` | copilot_session_id, tag |
-| `message_queue` | id, thread_id, discord_message_id, prompt, position, state |
+| `message_queue` | id, thread_id, discord_message_id, prompt, agent_mode_snapshot, position, state |
 | `background_tasks` | session_id, runtime_generation, task_id, parent_turn_id, state, last_progress_at, terminal_event_id |
 | `liveness_leases` | session_id, lease_id, kind, source_id, acquired_at, refreshed_at, released_at |
 | `event_journal` | session_id, generation, receive_seq, event_id, raw_type, reducer_hash, received_at |
@@ -440,7 +444,7 @@ export 由 session manifest 跟踪；成功发送后按 retention 清理，失�
 
 ### Session、turn 与 schedule 状态
 
-三个正交状态机，禁止压成一个 `RUNNING/IDLE` 布尔值。
+四个正交状态机，禁止压成一个 `RUNNING/IDLE` 布尔值。
 
 **Connection**
 
@@ -461,6 +465,16 @@ QUIET -> FOREGROUND -> WAITING_INPUT -> FOREGROUND
 any active state -> ABORTING -> QUIET/BACKGROUND_PENDING
 ```
 
+**Agent mode**
+
+```text
+INTERACTIVE <-> PLAN
+INTERACTIVE/PLAN -> AUTOPILOT -> INTERACTIVE
+```
+
+Agent mode 与 activity 正交：Autopilot task 完成后 activity 可回到 QUIET，但 mode 默认保持
+AUTOPILOT；只有 `/autopilot stop` 或明确的 plan-exit action 才切回 INTERACTIVE。
+
 **Background task**
 
 ```text
@@ -475,18 +489,21 @@ UNKNOWN -> RUNNING/FAILED/CLOSED
 2. `session.idle` 关闭当前 foreground/continuation turn，但不停止 EventPump。
 3. task 集合变空不代表 QUIET；若刚收到 terminal task notification 或 assistant output，
    `continuation_expected` lease 仍保持，直到 continuation 自己的 terminal + idle。
-4. liveness lease 来源至少包括 foreground turn、非终态 background task、
+4. active autopilot chain 从首个 send 到 terminal + `session.idle` 持有 `autopilot_turn` lease；
+   mode sticky 不等于 active lease。
+5. liveness lease 来源至少包括 foreground/autopilot turn、非终态 background task、
    continuation window、pending interaction、正在提交的 queued message。
-5. 没有 idle reaper。lease 只用于状态、graceful shutdown、watchdog 和“是否允许主动升级/
+6. 没有 idle reaper。lease 只用于状态、graceful shutdown、watchdog 和“是否允许主动升级/
    重启”判断，不用于普通空闲回收。
-6. 所有 raw event、task-set hash 变化和成功 stream read 都刷新 heartbeat。watchdog 只诊断
+7. 所有 raw event、task-set hash 变化和成功 stream read 都刷新 heartbeat。watchdog 只诊断
    inactivity，不按 session 年龄终止。
 
 一个 CommandMailbox 同时最多提交一个 foreground turn。QUIET 收到消息立即发送；
 FOREGROUND/WAITING/BACKGROUND/CONTINUATION 收到普通消息写入 FIFO；只有观察到 foreground
 terminal + `session.idle` 且没有 continuation 抢占时才发送下一项。`/steer` 走
 SDK immediate。重启后保留 queued 项；eager resume 成功后继续 FIFO，但绝不重发 state
-为 `submitted_unknown` 的项。
+为 `submitted_unknown` 的项。每个 queued message 在入队时保存 `agent_mode_snapshot`；
+之后 `/autopilot start/stop` 不会篡改已排队消息的执行语义。
 
 Schedule 状态为：
 
@@ -534,7 +551,7 @@ thread follow-up；不能让 ACK 失败中止已经运行的 SDK task。
 
 命令直接使用顶层 `/session`、`/model`、`/plan` 等名称，不增加 `/copilot` 前缀。
 `/project`、`/schedule`、`/worktree`、`/ops` 是明确的 copilotD 扩展。Copilot-native
-surface 共 23 个 top-level command，加 4 个 extension groups 后仍低于 Discord application
+surface 共 24 个 top-level command，加 4 个 extension groups 后仍低于 Discord application
 command 上限。标记含义：
 
 | 标记 | 注册规则 |
@@ -562,7 +579,10 @@ command 上限。标记含义：
 | `/session delete session-id?` | closed/quiet | thread 内省略 ID 使用原 session；`delete_session()` 后永久删除；命令本身即明确删除意图 |
 | `/model list` | 任意 | `list_models()`；显示 model capabilities、multiplier、reasoning/context support |
 | `/model set model effort? context-tier? reasoning-summary?` | thread QUIET | `set_model()`；其他字段按 stable session config/generation 更新，失败回滚 |
-| `/plan prompt` | thread QUIET | `send(..., agent_mode="plan")`；plan-exit 用 Discord buttons 返回 interactive/autopilot/fleet |
+| `/autopilot start prompt?` | thread QUIET | 持久化 sticky mode；有 prompt 时原子调用 `send(..., agent_mode="autopilot")` 并获取 `autopilot_turn` lease |
+| `/autopilot status` | thread | 显示 sticky mode、active turn、objective、tasks、continuation、queue 与最后进度 |
+| `/autopilot stop abort=false` | thread | 未来消息切回 interactive；`abort=true` 同时 `session.abort()` 当前 autopilot turn |
+| `/plan prompt` | thread QUIET | `send(..., agent_mode="plan")`；plan-exit 的 autopilot action 复用 `AutopilotController` |
 | `/steer text` | active turn | `send(text, mode="immediate")`；用于修正当前执行 |
 | `/queue add text` | thread | `send(text, mode="enqueue")`；同时写 app idempotency/FIFO checkpoint |
 | `/queue list` | thread | 显示 queued/submitted-unknown 项；不依赖 TUI |
@@ -577,6 +597,20 @@ SDK history。`abort`、`close`、`delete` 三者不再使用含糊的 `stop/cle
 当前 thread 持久化的原 session ID 和 cwd snapshot。若 thread 已 CONNECTED 则幂等返回当前
 状态；thread 内显式 ID 与原 ID 不同时返回 `CD-CONFLICT-001`，不能重绑到另一 session。
 resume 失败或 actual ID 失配时保留原 mapping，不静默创建新 session。
+
+`/autopilot` 是 Core，不是 Native-Gated。官方 CLI 通过 `Shift+Tab`、`--autopilot` 或 plan
+接受动作进入该 mode；Discord 没有终端 mode switch，因此直接提供同名 command group。
+Python SDK 的稳定 `session.send(..., agent_mode="autopilot")` 是执行映射：
+
+- `/autopilot start` 无 prompt 时只把当前 thread 的后续普通消息设为 Autopilot；有 prompt
+  时 mode 持久化与 message 入队/发送在一个 mailbox operation 中完成。
+- Autopilot 默认 sticky；task terminal + `session.idle` 只结束当前 turn 并释放
+  `autopilot_turn` lease，不退出 mode、不停止 EventPump。
+- `/autopilot stop abort=false` 只影响未来消息，当前 turn 继续；`abort=true` 才同时中止当前
+  turn。普通 `/session abort` 中止 turn 但保留 sticky Autopilot mode。
+- 固定 `--yolo` 已授予工具权限，不显示 permission picker。copilotD 不暴露
+  `max-autopilot-continues` 或本地 Autopilot limit，runtime 使用 unset/unlimited；用户用
+  `/autopilot stop abort=true` 或 `/session abort` 显式停止，account quota 错误仍如实显示。
 
 #### Native-Gated：有用的 Copilot 专属能力
 
@@ -666,7 +700,7 @@ Catch-up 最多执行最近一次遗漏。SDK 已接受 prompt 而结果未知�
 | `/workflow` | Copilot 无此原生命令。并行执行用 `/fleet`，运行中工作用 `/tasks`，规划用 `/plan`；不存在通用替代别名 |
 | `/max-turns` | 直接删除。Copilot 拥有 agent loop，不提供近似替代 |
 | fallback model 命令 | 直接删除。使用 model `Auto` 或显式 `/model set`；generated routing event 不构成公共配置 |
-| `/mode`、`/bare` | 直接删除。plan/fleet 是具体行为；transport `agent_mode` 不暴露成通用模式开关 |
+| `/mode`、`/bare` | 直接删除。`/autopilot`、`/plan`、`/fleet` 是具体行为；不暴露通用 mode 字符串开关 |
 | `/goal` | 直接删除。使用普通 prompt、`/plan`、tasks 或 `/init` |
 | `/tools` 的 `allow`、`deny`、`reset` | 直接删除。runtime 固定 `--yolo`，不再做另一套工具配置命令 |
 | `/cost`、`/budget`、`/limits` | 直接删除。只保留只读 `/usage`，不显示 USD，也不设置额度 |
@@ -734,7 +768,7 @@ InternalEvent {
 |---|---|---|
 | `session.start`, `session.resume` | SessionStarted/Resumed；绑定 runtime generation | 恢复状态行 |
 | `session.error` | SessionFailed；分类和 correlation | 可行动错误卡；stack 隐藏 |
-| `session.idle` | SessionReady；只完成当前 foreground/continuation；不停止 pump；仅在无 continuation lease 时 drain FIFO | finalize 文本/工具/usage |
+| `session.idle` | SessionReady；只完成当前 foreground/autopilot/continuation；释放 turn lease 但保留 sticky autopilot mode；不停止 pump；仅在无 continuation lease 时 drain FIFO | finalize 文本/工具/usage |
 | `session.shutdown` | explicit close 或 unexpected failure；停止 pump 并 flush outbox | routine close 静默；unexpected 显示恢复卡 |
 | `session.title_changed` | title state | 仅 auto-name thread 自动改名 |
 | `session.context_changed` | SessionContextUpdated | branch/cwd 状态 |
@@ -743,13 +777,13 @@ InternalEvent {
 | `session.compaction_start`, `session.compaction_complete` | compaction lifecycle | rolling compact card |
 | `session.task_complete` | best-effort task semantic completion；不释放全部 liveness | task 摘要；不驱动 disconnect |
 | `session.info`, `session.warning` | state/warning reducer | warning 可见；info 合并 |
-| `session.model_change`, `session.mode_changed`, `session.permissions_changed` | SessionConfigUpdated | footer/info，不刷屏 |
+| `session.model_change`, `session.mode_changed`, `session.permissions_changed` | SessionConfigUpdated；mode_changed 持久化 interactive/plan/autopilot | footer/info，不刷屏 |
 | `session.context_cleared`, `session.truncation`, `session.snapshot_rewind` | history mutation audit | 明确警告 |
 | `session.plan_changed`, `session.todos_changed` | PlanUpdated/TaskSetUpdated | plan/todo panel |
 | `session.workspace_file_changed` | WorkspaceChanged | diff/files badge |
 | `session.handoff` | AgentHandoff | handoff card |
 | `session.remote_steerable_changed` | capability state | steer enable/disable |
-| `session.autopilot_objective_changed` | plan/orchestration objective | autopilot header |
+| `session.autopilot_objective_changed` | Autopilot objective reducer；刷新 active turn progress/lease | autopilot header |
 | `session.schedule_created`, `session.schedule_cancelled`, `session.schedule_rearmed` | generated-only audit | app scheduler 不依赖；UI 无 |
 | `pending_messages.modified` | SDK queue observation | 诊断；业务 FIFO 以 app DB 为准 |
 | `user.message` | provenance/timeline | 不重复渲染用户消息 |
@@ -1094,12 +1128,43 @@ sequenceDiagram
 - `elicitation.requested`：只支持 JSON Schema object 下 string/number/boolean/enum 和有限
   array；未知或深层嵌套 schema 返回 decline，不能猜字段。
 - `exit_plan_mode.requested`：摘要进 embed，完整 plan 附件化；actions 只用 SDK 提供值；
-  `autopilot_fleet` 仅 fleet probe 成功时可选。
+  `autopilot` 走与 `/autopilot start` 相同的持久化/mailbox 路径，`autopilot_fleet` 仅 fleet
+  probe 成功时可选。
 - `session_limits_exhausted.requested`：固定响应 Cancel，并显示 account/runtime limitation；
   不生成额度设置组件。
 - completed event 使 UI 失效；晚到点击返回已完成/过期，不能二次响应。
 - 每个 request 持有独立 interaction liveness lease；等待输入时 EventPump 继续消费其他
   subagent/task event，不能用全局 future 阻塞 reader。
+
+#### Autopilot
+
+```mermaid
+sequenceDiagram
+    participant U as Discord user
+    participant M as CommandMailbox
+    participant A as AutopilotController
+    participant DB
+    participant S as Copilot session
+    participant P as EventPump
+    participant L as LivenessController
+    U->>M: /autopilot start prompt
+    M->>A: enable sticky mode + submit
+    A->>DB: agent_mode=autopilot + mode-snapshotted message
+    A->>L: acquire autopilot_turn lease
+    A->>S: send(prompt, agent_mode="autopilot")
+    loop runtime autonomous continuations
+      S-->>P: turn/tool/task/objective events
+      P->>L: refresh progress
+    end
+    S-->>P: terminal + session.idle
+    P->>L: release autopilot_turn lease
+    P->>DB: activity=QUIET; agent_mode remains autopilot
+```
+
+`AutopilotController` 不创建第二个 reader/writer。所有 start/stop、plan-exit action 和普通
+sticky-mode message 都进入同一个 CommandMailbox；SDK 自主 continuation 仍由永久 EventPump
+消费。bot/runtime 重启时恢复持久化 mode，但绝不重发 `submitted_unknown` prompt。若 runtime
+仍保有 active chain，resume 后继续收事件；否则明确显示 outcome unknown。
 
 #### 附件
 
@@ -1133,7 +1198,7 @@ turn 失败。
 
 - abort：CommandMailbox priority -> 可清 app FIFO -> `session.abort()` -> 等 abort/idle；
   EventPump 始终继续。若 runtime 仍报告 background task，状态回到 BACKGROUND_PENDING，
-  不假装全部取消。
+  不假装全部取消；普通 abort 不修改 sticky Autopilot mode。
 - close：标记 STOPPING，拒绝新 send -> abort current -> 等 terminal/drain（默认 15 秒）->
   final flush -> 停 EventPump -> `session.disconnect()` -> STOPPED（UI 显示 closed）。已有 active lease 时普通
   close 拒绝；`force=true` 才可跳过 drain，并把 in-flight 标 `outcome_unknown`。
@@ -1251,7 +1316,9 @@ sequenceDiagram
 
 不自动重发可能已被 SDK 接受的 prompt。Retry 是新的明确用户操作。resume 返回的 actual
 ID 不等于 requested ID 时保留旧 mapping，创建 incident 和新的可选 thread，不能静默
-把新 transcript 当旧 transcript。Runtime stderr 从进程启动时就保存有界 tail。
+把新 transcript 当旧 transcript。Runtime stderr 从进程启动时就保存有界 tail。恢复后的
+普通消息继续使用持久化 `agent_mode`；崩溃时 active autopilot prompt 标 outcome unknown，
+不能因 mode=autopilot 自动重跑。
 
 ### 超时、重试与错误分类
 
@@ -1259,6 +1326,7 @@ ID 不等于 requested ID 时保留旧 mapping，创建 incident 和新的可选
 |---|---|
 | Session/EventPump 生命周期 | 无 idle timeout、无绝对 max-life；只由 explicit close 或 confirmed failure 结束 |
 | Background task | 无运行时长上限；任何 event/task-set 变化刷新 progress |
+| Autopilot turn | 无 app duration/continuation cap；terminal、problem、explicit abort/stop 或 account quota 结束当前 chain |
 | Active session silence | 10 分钟进入 SUSPECT 并做 non-destructive transport ping；不 abort/disconnect |
 | Missing terminal task | 24 小时且 runtime snapshot 已无该 task 时标 UNKNOWN；不标 success、不停 session |
 | Continuation expected | 不用 quiet-gap timeout 关闭；等待 continuation terminal/cancel/explicit close |
@@ -1292,6 +1360,8 @@ frame-too-large、MCP、tool、Discord、storage 和 internal bug。rate limit �
 - Discord gateway 重连不影响 runtime；RenderOutbox 可在 Discord 恢复后补发。
 - app 不主动重启持有 liveness lease 的 runtime；升级/配置 reload 必须等 QUIET 或显式 force。
 - explicit close 前完成 staged drain 和 final flush；resume 必须核验 actual ID。
+- active Autopilot chain 持有独立 turn lease；terminal 后 mode 可 sticky，但不会伪造 active
+  lease，也不会触发 idle reaper。
 
 **无法伪造的边界：**
 
@@ -1305,7 +1375,8 @@ frame-too-large、MCP、tool、Discord、storage 和 internal bug。rate limit �
 ### 版本兼容
 
 - 同时 pin `github-copilot-sdk` 和 runtime，记录 SDK/runtime/protocol/schema hash。
-- Public API：create/resume/send/abort/disconnect/set_model/list_models。
+- Public API：create/resume/send（含 `agent_mode="autopilot"` / `"plan"`）/abort/disconnect/
+  set_model/list_models。
 - Gated RPC：history.compact、sessions.fork、usage.get_metrics、
   metadata.contextInfo、account.getQuota、fleet.start、tasks list/message/cancel。
 - Gated runtime capability：`--yolo` 参数映射、独立 headless sidecar、client detach 后 task
@@ -1329,6 +1400,8 @@ frame-too-large、MCP、tool、Discord、storage 和 internal bug。rate limit �
   空 result、缺 terminal event、stalled/unknown 状态。
 - CommandMailbox FIFO/steer/abort/close/reconfigure、submitted-unknown 不重发、actual session ID
   mismatch。
+- AutopilotController 的 sticky start/status/stop、plan-exit 共用路径、mode snapshot、
+  abort-preserves-mode 与 stop+abort 原子语义。
 - TaskRegistry 对 app task 的强引用、done callback、异常上报和 heartbeat loop 自恢复。
 - ProjectRegistry 的 explicit > implicit-home 解析、resolved HOME、session cwd snapshot，
   以及 bind/unbind 与已存在 session 的隔离。
@@ -1340,7 +1413,8 @@ frame-too-large、MCP、tool、Discord、storage 和 internal bug。rate limit �
   definition 比对、heartbeat stale/recent-wake/restart-storm 决策。
 
 SDK fixtures 至少包括 plain text、multi-turn tool loop、reasoning、write diff、tool failure、
-`--yolo` tool confirmation auto-approve、ask-user、elicitation、plan exit、image/file、abort、resume、
+`--yolo` tool confirmation auto-approve、ask-user、elicitation、autopilot multi-continuation、
+plan -> autopilot exit、image/file、abort、resume、
 model switch、compact、unexpected session-limit auto-cancel、quota error、subagent success/failure、background task
 delayed completion、continuation after task removal、empty result + trailing text、MCP OAuth、
 runtime crash、large frame 和 unknown event。每个 fixture 断言 internal events、generation/
@@ -1402,13 +1476,17 @@ claudeD issue 回归门禁：
 21. `/workflow`、`/max-turns`、fallback model、`/mode`、`/goal`、`/bare`、`/tools`、
     `/cost`、`/budget`、`/limits`、`/pr`、`/delegate` 均不在 Discord command manifest。
 22. 没有 registered command 以 `/copilot` 开头；Core `/session`、`/model`、`/plan`、
-    `/steer`、`/queue`、`/context`、`/usage` 始终可用；Fleet/Tasks/Research/Init 等
+    `/autopilot`、`/steer`、`/queue`、`/context`、`/usage` 始终可用；Fleet/Tasks/Research/Init 等
     Native-Gated 命令只在匹配的 pinned runtime fixture 下出现。
 23. `factory.run_updated` 不创建 panel、不获取 liveness lease、不改变 task set。
+24. `/autopilot start` 和 plan accept 都以 `agent_mode="autopilot"` 进入同一持久化路径；
+    多轮 continuation 无新用户输入也持续，terminal 后 mode sticky、turn lease 释放；
+    `/autopilot stop abort=true` 同时退出 mode 并中止当前 turn，重启不重发 unknown prompt。
 
 ### 已固定的关键默认
 
-- 单用户私有部署，runtime 固定 `--yolo`；没有审批 UI、执行模式或相关配置。
+- 单用户私有部署，runtime 固定 `--yolo`；没有审批 UI 或权限 profile。Agent mode 只保留
+  Copilot 原生 interactive/plan/autopilot 语义。
 - 不实现角色、ownership、allowlist、沙箱或多租户。
 - channel 未绑定时固定使用启动账号 resolved `$HOME`；没有开关。
 - `project_source` 和 `cwd_snapshot` 在 session 创建时持久化；bind/unbind 不改变旧 session。
@@ -1418,6 +1496,8 @@ claudeD issue 回归门禁：
 - 一个 SessionRuntime 一个永久 EventPump；foreground/background 不切 reader。
 - 启动时 eager resume 所有非 STOPPED session 并核验 actual ID。
 - busy 普通消息走 copilotD 持久 FIFO；只有显式 `/steer` 使用 SDK immediate。
+- 新 session 默认 interactive；`/autopilot start` 后 thread mode 默认 sticky，直到
+  `/autopilot stop`。不提供 max-autopilot-continues/本地 Autopilot limit。
 - `/session resume` 在 thread 内默认使用该 thread 持久化的原 session ID，不显示 picker。
 - fork/worktree 创建新 Discord thread。
 - project cwd/variables 使用 versioned immutable snapshot；修改只影响未来 session。
@@ -1438,7 +1518,7 @@ claudeD issue 回归门禁：
 - 输出 UTF-8、standalone HTML，内嵌响应式 CSS、目录、打印样式和代码/表格样式。
 - 不依赖远程字体、CSS、JavaScript 或图片；Mermaid 源码在无本地 renderer 时以可读
   流程块保留，避免把设计内容发送给第三方。
-- 页面头部标记“设计 v2.3、待审批、single-user --yolo”，突出 Copilot-native commands、
+- 页面头部标记“设计 v2.4、待审批、single-user --yolo”，突出 Copilot-native commands、
   `$HOME` 默认 cwd、macOS/Windows always-on、session liveness、table rendering、
   claudeD issue lessons 和 capability gate。
 - 文档 body 最大宽度至少 90rem；表格使用独立横向滚动容器、sticky header、长单元格
@@ -1453,6 +1533,8 @@ claudeD issue 回归门禁：
 
 - 创建最小 Python 程序，验证安装、runtime 下载、GitHub 登录/BYOK 和模型枚举。
 - 验证 `--yolo` 参数/raw tool-confirmation callback 全自动批准，无 Discord approval。
+- 验证 `send(..., agent_mode="autopilot")` 的多轮 continuation、mode_changed/objective/idle
+  事件、sticky mode、abort 和 resume 行为。
 - 验证一个 subscription 是否可跨 foreground idle 持续接收 background completion 和
   continuation；录制 task/notification/empty-result fixtures。
 - 验证 headless sidecar：client detach、bot restart、event checkpoint/replay、task 是否继续。
@@ -1471,7 +1553,7 @@ claudeD issue 回归门禁：
 - 实现 `RuntimeSupervisor`、每线程 `SessionRuntime`、CommandMailbox、永久 EventPump、
   TaskRegistry、LivenessController、持久 FIFO 和 eager resume。
 - 实现 event journal、RenderOutbox、纯文本流式渲染、错误卡和 staged close/abort/resume。
-- 注册 Core `/session`、`/model`、`/plan`、`/steer`、`/queue`、`/context`、`/usage`；
+- 注册 Core `/session`、`/model`、`/autopilot`、`/plan`、`/steer`、`/queue`、`/context`、`/usage`；
   不创建删除列表中的命令。
 
 ### 3. 事件、后台生命周期与富渲染
@@ -1508,7 +1590,8 @@ claudeD issue 回归门禁：
 4. 搭建 SessionRuntime、CommandMailbox、EventPump、TaskRegistry 和 RenderOutbox。
 5. 实现稳定事件适配、liveness reducer 和 Discord 富渲染。
 6. 实现表格 code/PNG/MD/CSV、附件异步处理和 final flush。
-7. 按 capability manifest 补齐 Copilot Fleet、Tasks、agents、review、research、init、
+7. 实现 Core Autopilot sticky mode、plan accept 共用路径、turn lease、stop/abort 和恢复语义；
+   再按 capability manifest 补齐 Copilot Fleet、Tasks、agents、review、research、init、
    MCP/skills/plugins；不恢复删除的 claudeD-shaped commands。
 8. 实现 macOS/Windows 默认自启动、heartbeat、watchdog 和平台安装验证。
 9. 完成 claudeD issue 回归、90 分钟 soak、恢复、故障、兼容性测试和部署文档。
@@ -1526,6 +1609,9 @@ claudeD issue 回归门禁：
 - Discord 不原生显示 GFM table；PNG 生成的 CJK/emoji 字体、图片尺寸和附件限制需要真实
   Discord snapshot 测试。
 - Copilot 计费单位与 Claude USD 成本不同；只读呈现 usage、AI Credits 和 account quota。
+- Autopilot 默认无限 continuation 且 runtime 固定 `--yolo`，可能持续消耗 AI Credits 并修改
+  宿主文件；这是用户明确接受的 single-user 行为，必须始终提供可达的
+  `/autopilot stop abort=true` 和 `/session abort`，但不新增本地 limit 配置。
 - 不同模型的 reasoning、vision、context tier 和 tool 能力不同，命令应根据
   `list_models()` 返回的 capability 动态启用。
 - Copilot CLI command surface 演进很快，Chronicle、worktree/scheduling 等文档存在版本
@@ -1553,6 +1639,7 @@ claudeD issue 回归门禁：
 - https://github.com/github/copilot-sdk/blob/main/docs/features/skills.md
 - https://github.com/github/copilot-sdk/blob/main/docs/hooks/hooks-overview.md
 - https://docs.github.com/en/copilot/reference/copilot-cli-reference/cli-command-reference
+- https://docs.github.com/en/copilot/concepts/agents/copilot-cli/autopilot
 - https://docs.github.com/en/copilot/concepts/agents/copilot-cli/fleet
 - https://docs.github.com/en/copilot/how-tos/copilot-cli/use-copilot-cli/agentic-code-review
 - https://docs.github.com/en/copilot/how-tos/copilot-cli/use-copilot-cli/chronicle
