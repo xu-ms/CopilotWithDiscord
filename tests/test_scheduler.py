@@ -56,6 +56,15 @@ async def _insert_binding(
         """,
         (thread_id, project_id, session_id),
     )
+    await database.execute(
+        """
+        INSERT INTO session_owner_leases(
+            sdk_session_id, owner_id, fence_token,
+            acquired_at, renewed_at, expires_at
+        ) VALUES (?, 'test-owner', 1, 0, 0, 100000)
+        """,
+        (session_id,),
+    )
 
 
 def _target(thread_id: str = "thread-1", session_id: str = "session-1") -> dict:
@@ -605,6 +614,115 @@ async def test_forced_restart_terminalizes_local_queue_with_schedule_run(
 
 
 @pytest.mark.asyncio
+async def test_forced_restart_uses_observed_user_event_as_dispatch_evidence(
+    tmp_path: Path,
+) -> None:
+    async with Database(tmp_path / "restart-observed.sqlite3") as database:
+        repository = SchedulerRepository(database)
+        await repository.recover(now=0)
+        definition = await repository.create(
+            kind=ScheduleKind.NEW_SESSION,
+            expression="cron:0 9 * * *",
+            timezone="UTC",
+            payload={"text": "observed"},
+            target_snapshot={},
+            now=0,
+        )
+        run = await repository.run_now(definition.id, now=1, manual_id="observed")
+        await database.execute(
+            """
+            INSERT INTO submissions(
+                submission_id, sdk_session_id, origin, schedule_run_id,
+                state, observed_user_event_id, created_at
+            ) VALUES ('observed-restart', 'session-1', 'app_schedule', ?,
+                      'observed_active', 'user-event-1', 1)
+            """,
+            (run.run_id,),
+        )
+        await database.execute(
+            """
+            UPDATE schedule_runs
+            SET status = 'submitting', result_submission_id = 'observed-restart'
+            WHERE run_id = ?
+            """,
+            (run.run_id,),
+        )
+
+        await repository.prepare_restart(
+            requested_by="operator",
+            force=True,
+            now=2,
+        )
+        terminal = await repository.get_run(run.run_id)
+        submission = await database.fetchone(
+            """
+            SELECT state FROM submissions
+            WHERE submission_id = 'observed-restart'
+            """
+        )
+
+    assert terminal.status == ScheduleRunState.OUTCOME_UNKNOWN
+    assert submission["state"] == "outcome_unknown"
+
+
+@pytest.mark.asyncio
+async def test_forced_restart_rechecks_acceptance_inside_finalization_transaction(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async with Database(tmp_path / "restart-evidence-race.sqlite3") as database:
+        repository = SchedulerRepository(database)
+        await repository.recover(now=0)
+        definition = await repository.create(
+            kind=ScheduleKind.NEW_SESSION,
+            expression="cron:0 9 * * *",
+            timezone="UTC",
+            payload={"text": "race"},
+            target_snapshot={},
+            now=0,
+        )
+        run = await repository.run_now(definition.id, now=1, manual_id="race")
+        await database.execute(
+            """
+            INSERT INTO submissions(
+                submission_id, sdk_session_id, origin, schedule_run_id,
+                state, created_at
+            ) VALUES ('race-submission', 'session-1', 'app_schedule', ?,
+                      'submitting', 1)
+            """,
+            (run.run_id,),
+        )
+        await database.execute(
+            """
+            UPDATE schedule_runs
+            SET status = 'submitting', result_submission_id = 'race-submission'
+            WHERE run_id = ?
+            """,
+            (run.run_id,),
+        )
+        original_finalize = repository.finalize
+
+        async def finalize_after_observation(*args: object, **kwargs: object) -> object:
+            await database.execute(
+                """
+                UPDATE submissions SET observed_user_event_id = 'user-event-race'
+                WHERE submission_id = 'race-submission'
+                """
+            )
+            return await original_finalize(*args, **kwargs)
+
+        monkeypatch.setattr(repository, "finalize", finalize_after_observation)
+        await repository.prepare_restart(
+            requested_by="operator",
+            force=True,
+            now=2,
+        )
+        terminal = await repository.get_run(run.run_id)
+
+    assert terminal.status == ScheduleRunState.OUTCOME_UNKNOWN
+
+
+@pytest.mark.asyncio
 async def test_stale_tick_cannot_reopen_draining_scheduler(tmp_path: Path) -> None:
     async with Database(tmp_path / "draining-monotonic.sqlite3") as database:
         repository = SchedulerRepository(database)
@@ -624,6 +742,61 @@ async def test_stale_tick_cannot_reopen_draining_scheduler(tmp_path: Path) -> No
         "worker_state": "draining",
         "owner_id": "worker",
     }
+
+
+@pytest.mark.asyncio
+async def test_nonterminal_creation_intent_blocks_restart(tmp_path: Path) -> None:
+    async with Database(tmp_path / "creation-restart-blocker.sqlite3") as database:
+        repository = SchedulerRepository(database)
+        await repository.recover(now=0)
+        await database.execute(
+            """
+            INSERT INTO session_creation_intents(
+                creation_token, source_kind, source_id, project_source,
+                cwd_snapshot, sdk_session_id, state, created_at, updated_at
+            ) VALUES ('creation-1', 'schedule', 'run-1', 'implicit-home',
+                      '/tmp', 'session-1', 'reserved', 1, 1)
+            """
+        )
+
+        blockers = await repository.restart_blockers()
+        with pytest.raises(ScheduleConflict, match="creation_intent"):
+            await repository.prepare_restart(
+                requested_by="operator",
+                force=False,
+                now=2,
+            )
+
+    assert "creation_intent:creation-1:reserved" in blockers
+
+
+@pytest.mark.asyncio
+async def test_claim_next_checks_draining_inside_claim_transaction(
+    tmp_path: Path,
+) -> None:
+    async with Database(tmp_path / "claim-draining.sqlite3") as database:
+        repository = SchedulerRepository(database)
+        await repository.recover(now=0)
+        definition = await repository.create(
+            kind=ScheduleKind.NEW_SESSION,
+            expression="cron:0 9 * * *",
+            timezone="UTC",
+            payload={"text": "pending"},
+            target_snapshot={},
+            now=0,
+        )
+        run = await repository.run_now(definition.id, now=1, manual_id="pending")
+        await repository.prepare_restart(
+            requested_by="operator",
+            force=False,
+            now=2,
+        )
+
+        claimed = await repository.claim_next("stale-worker", now=3)
+        unchanged = await repository.get_run(run.run_id)
+
+    assert claimed is None
+    assert unchanged.status == ScheduleRunState.PENDING
 
 
 @pytest.mark.asyncio
@@ -738,6 +911,11 @@ async def test_recovery_classifies_every_dispatch_boundary_without_reenqueue(
             now=3.5,
             manual_id="known-target",
         )
+        intent_target = await repository.run_now(
+            definition.id,
+            now=3.75,
+            manual_id="intent-target",
+        )
         stale = await repository.run_now(definition.id, now=4, manual_id="stale")
         await database.execute(
             """
@@ -807,6 +985,28 @@ async def test_recovery_classifies_every_dispatch_boundary_without_reenqueue(
             """,
             (known_target.run_id,),
         )
+        await database.execute(
+            """
+            UPDATE schedule_runs
+            SET status = 'submitting', session_create_started_at = 6,
+                result_session_id = 'intent-session',
+                lease_owner = 'dead', lease_expires_at = 5,
+                fence_token = 1, attempt = 1
+            WHERE run_id = ?
+            """,
+            (intent_target.run_id,),
+        )
+        await database.execute(
+            """
+            INSERT INTO session_creation_intents(
+                creation_token, source_kind, source_id, project_source,
+                cwd_snapshot, sdk_session_id, thread_id, state,
+                created_at, updated_at
+            ) VALUES ('intent-token', 'schedule', ?, 'implicit-home',
+                      '/tmp', 'intent-session', 'intent-thread', 'attached', 6, 6)
+            """,
+            (intent_target.run_id,),
+        )
 
         counts = await repository.recover(now=10)
         states = {
@@ -826,10 +1026,15 @@ async def test_recovery_classifies_every_dispatch_boundary_without_reenqueue(
             """,
             (targeting.run_id,),
         )
+        reconciled = await database.fetchone(
+            "SELECT result_thread_id FROM schedule_runs WHERE run_id = ?",
+            (intent_target.run_id,),
+        )
 
     assert counts == {
         "queued": 1,
         "dispatch_unknown": 1,
+        "reconciled_target": 1,
         "target_unknown": 1,
         "known_target_retry": 1,
         "retry_wait": 1,
@@ -839,9 +1044,11 @@ async def test_recovery_classifies_every_dispatch_boundary_without_reenqueue(
     assert states[dispatching.run_id] == ScheduleRunState.DISPATCH_UNKNOWN
     assert states[targeting.run_id] == ScheduleRunState.TARGET_UNKNOWN
     assert states[known_target.run_id] == ScheduleRunState.RETRY_WAIT
+    assert states[intent_target.run_id] == ScheduleRunState.RETRY_WAIT
     assert states[stale.run_id] == ScheduleRunState.RETRY_WAIT
     assert queue_count[0] == 1
     assert target_render["session_id"] == "thread:thread-1"
+    assert reconciled["result_thread_id"] == "intent-thread"
 
 
 @pytest.mark.asyncio
@@ -989,3 +1196,69 @@ async def test_temporary_detach_failure_does_not_block_other_candidates(
     assert released[runs[0].run_id] is None
     assert released[runs[1].run_id] is not None
     assert incident[0] == 1
+
+
+@pytest.mark.asyncio
+async def test_close_race_before_enqueue_retries_without_stranding_queue(
+    tmp_path: Path,
+) -> None:
+    async with Database(tmp_path / "enqueue-close-race.sqlite3") as database:
+        await _insert_binding(database)
+        repository = SchedulerRepository(database)
+        await repository.recover(now=0)
+        definition = await repository.create(
+            kind=ScheduleKind.MESSAGE,
+            expression="at:1970-01-01T00:01:00Z",
+            timezone="UTC",
+            payload={"text": "scheduled"},
+            target_snapshot=_target(),
+            thread_id="thread-1",
+            now=0,
+        )
+        await repository.plan_due("planner", now=60)
+        claimed = await repository.claim_next("worker", now=60)
+        assert claimed is not None
+        started = await repository.mark_target_started(
+            claimed,
+            "worker",
+            new_session=False,
+            now=60,
+        )
+        target = ScheduledTarget(None, "thread-1", "session-1")
+        started = await repository.record_target(
+            started,
+            "worker",
+            target,
+            now=60,
+        )
+        await database.execute(
+            """
+            UPDATE session_bindings SET attachment_state = 'absent'
+            WHERE thread_id = 'thread-1'
+            """
+        )
+        await database.execute(
+            "DELETE FROM session_owner_leases WHERE sdk_session_id = 'session-1'"
+        )
+
+        with pytest.raises(SchedulerDispatchError) as failure:
+            await repository.enqueue(
+                definition,
+                started,
+                "worker",
+                target,
+                now=61,
+            )
+        state = await repository.retry_or_fail(
+            started,
+            "worker",
+            failure.value,
+            now=61,
+        )
+        queued = await database.fetchone(
+            "SELECT COUNT(*) FROM message_queue WHERE schedule_run_id = ?",
+            (started.run_id,),
+        )
+
+    assert state == ScheduleRunState.RETRY_WAIT
+    assert queued[0] == 0

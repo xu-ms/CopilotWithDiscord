@@ -614,6 +614,13 @@ class SchedulerRepository:
         lease_seconds: float = SCHEDULE_LEASE_SECONDS,
     ) -> ScheduleRun | None:
         async with self._database.transaction() as connection:
+            scheduler = await _fetchone(
+                connection,
+                "SELECT worker_state FROM scheduler_state WHERE singleton = 1",
+                (),
+            )
+            if scheduler is not None and scheduler["worker_state"] == "draining":
+                return None
             row = await _fetchone(
                 connection,
                 """
@@ -877,18 +884,32 @@ class SchedulerRepository:
             binding = await _fetchone(
                 connection,
                 """
-                SELECT runtime_generation, owner_fence_token
-                FROM session_bindings
-                WHERE thread_id = ? AND sdk_session_id = ?
+                SELECT b.runtime_generation, b.owner_fence_token,
+                       b.binding_intent, b.attachment_state,
+                       b.permission_posture,
+                       EXISTS (
+                           SELECT 1 FROM session_owner_leases l
+                           WHERE l.sdk_session_id = b.sdk_session_id
+                             AND l.fence_token = b.owner_fence_token
+                             AND l.expires_at > ?
+                       ) AS owner_current
+                FROM session_bindings b
+                WHERE b.thread_id = ? AND b.sdk_session_id = ?
                 """,
-                (target.thread_id, target.sdk_session_id),
+                (now, target.thread_id, target.sdk_session_id),
             )
-            if binding is None:
+            if (
+                binding is None
+                or binding["binding_intent"] not in {"active", "closed"}
+                or binding["attachment_state"] != "attached"
+                or binding["permission_posture"] != "verified_allow_all"
+                or not bool(binding["owner_current"])
+            ):
                 raise SchedulerDispatchError(
-                    "scheduled target session binding is missing",
+                    "scheduled target lost attached runtime ownership before enqueue",
                     category=SchedulerErrorCategory.TARGET,
-                    code="target_binding_missing",
-                    target_unknown=True,
+                    code="target_not_ready_at_enqueue",
+                    retryable=True,
                 )
             position_row = await _fetchone(
                 connection,
@@ -1126,7 +1147,15 @@ class SchedulerRepository:
                    EXISTS (
                        SELECT 1 FROM session_bindings b
                        WHERE b.sdk_session_id = r.result_session_id
-                   ) AS result_session_bound
+                   ) AS result_session_bound,
+                   EXISTS (
+                       SELECT 1 FROM submissions sub
+                       WHERE sub.submission_id = r.result_submission_id
+                         AND (
+                             sub.accepted_message_id IS NOT NULL
+                             OR sub.observed_user_event_id IS NOT NULL
+                         )
+                   ) AS dispatch_observed
             FROM schedule_runs AS r
             JOIN schedules AS s ON s.id = r.schedule_id
             WHERE r.run_id = ?
@@ -1135,6 +1164,15 @@ class SchedulerRepository:
         )
         if row is None:
             raise ScheduleNotFound(f"schedule run does not exist: {run_id}")
+        if (
+            error_code == "forced_restart"
+            and status == ScheduleRunState.DISPATCH_UNKNOWN
+            and (
+                bool(row["dispatch_observed"])
+                or row["accepted_message_id"] is not None
+            )
+        ):
+            status = ScheduleRunState.OUTCOME_UNKNOWN
         current = ScheduleRunState(str(row["status"]))
         if current.terminal and row["render_intent_id"] is not None:
             return
@@ -1232,11 +1270,13 @@ class SchedulerRepository:
                 "outcome_unknown"
                 if row["send_started_at"] is not None
                 or row["accepted_message_id"] is not None
+                or bool(row["dispatch_observed"])
                 else "cancelled"
             )
             queue_state = (
                 "submitted_unknown"
                 if row["send_started_at"] is not None
+                or bool(row["dispatch_observed"])
                 else "cancelled"
             )
             await connection.execute(
@@ -1503,10 +1543,56 @@ class SchedulerRepository:
                   AND NOT EXISTS (
                       SELECT 1 FROM submissions
                       WHERE schedule_run_id = schedule_runs.run_id
-                        AND accepted_message_id IS NOT NULL
+                        AND (
+                            accepted_message_id IS NOT NULL
+                            OR observed_user_event_id IS NOT NULL
+                        )
                   )
                 """,
                 (now, now),
+            )
+            counts["reconciled_target"] = await _update_count(
+                connection,
+                """
+                UPDATE schedule_runs
+                SET status = 'retry_wait', retry_at = ?,
+                    result_thread_id = (
+                        SELECT i.thread_id FROM session_creation_intents i
+                        WHERE i.source_kind = 'schedule'
+                          AND i.source_id = schedule_runs.run_id
+                    ),
+                    result_project_id = COALESCE(
+                        result_project_id,
+                        (
+                            SELECT i.project_id FROM session_creation_intents i
+                            WHERE i.source_kind = 'schedule'
+                              AND i.source_id = schedule_runs.run_id
+                        )
+                    ),
+                    lease_owner = NULL, lease_expires_at = NULL,
+                    error_category = NULL, error_code = 'resume_creation_intent',
+                    error_detail = NULL, updated_at = ?, last_progress_at = ?
+                WHERE status IN ('claimed', 'submitting', 'target_unknown')
+                  AND session_create_started_at IS NOT NULL
+                  AND result_thread_id IS NULL
+                  AND send_started_at IS NULL
+                  AND render_intent_id IS NULL
+                  AND EXISTS (
+                      SELECT 1 FROM session_creation_intents i
+                      WHERE i.source_kind = 'schedule'
+                        AND i.source_id = schedule_runs.run_id
+                        AND i.thread_id IS NOT NULL
+                        AND i.sdk_session_id = schedule_runs.result_session_id
+                        AND i.state IN (
+                            'thread_created', 'creating', 'attached', 'unknown'
+                        )
+                  )
+                  AND NOT EXISTS (
+                      SELECT 1 FROM message_queue
+                      WHERE schedule_run_id = schedule_runs.run_id
+                  )
+                """,
+                (now, now, now),
             )
             counts["target_unknown"] = await _update_count(
                 connection,
@@ -1736,6 +1822,17 @@ class SchedulerRepository:
             f"interaction:{row['sdk_session_id']}:{row['interaction_id']}"
             for row in interactions
         )
+        creations = await self._database.fetchall(
+            """
+            SELECT creation_token, state FROM session_creation_intents
+            WHERE state NOT IN ('attached', 'failed')
+            ORDER BY created_at, creation_token
+            """
+        )
+        blockers.extend(
+            f"creation_intent:{row['creation_token']}:{row['state']}"
+            for row in creations
+        )
         return blockers
 
     async def prepare_restart(
@@ -1789,17 +1886,27 @@ class SchedulerRepository:
         if force:
             rows = await self._database.fetchall(
                 """
-                SELECT run_id, status FROM schedule_runs
-                WHERE status IN ('claimed', 'submitting', 'accepted', 'waiting')
+                SELECT r.run_id, r.status,
+                       EXISTS (
+                           SELECT 1 FROM submissions s
+                           WHERE s.submission_id = r.result_submission_id
+                             AND (
+                                 s.accepted_message_id IS NOT NULL
+                                 OR s.observed_user_event_id IS NOT NULL
+                             )
+                       ) AS dispatch_observed
+                FROM schedule_runs r
+                WHERE r.status IN ('claimed', 'submitting', 'accepted', 'waiting')
                 """
             )
             for row in rows:
                 run_id = str(row["run_id"])
                 current = str(row["status"])
                 target = (
-                    ScheduleRunState.DISPATCH_UNKNOWN
-                    if current in {"claimed", "submitting"}
-                    else ScheduleRunState.OUTCOME_UNKNOWN
+                    ScheduleRunState.OUTCOME_UNKNOWN
+                    if current in {"accepted", "waiting"}
+                    or bool(row["dispatch_observed"])
+                    else ScheduleRunState.DISPATCH_UNKNOWN
                 )
                 await self.finalize(
                     run_id,

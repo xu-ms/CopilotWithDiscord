@@ -173,6 +173,16 @@ class StartupRecoveryInventory:
                       SELECT 1 FROM message_queue
                       WHERE schedule_run_id = schedule_runs.run_id
                   )
+                  AND NOT EXISTS (
+                      SELECT 1 FROM session_creation_intents i
+                      WHERE i.source_kind = 'schedule'
+                        AND i.source_id = schedule_runs.run_id
+                        AND i.thread_id IS NOT NULL
+                        AND i.sdk_session_id = schedule_runs.result_session_id
+                        AND i.state IN (
+                            'thread_created', 'creating', 'attached', 'unknown'
+                        )
+                  )
                 """,
                 (timestamp,),
             )
@@ -184,6 +194,14 @@ class StartupRecoveryInventory:
                 WHERE status IN ('dispatching', 'submitting')
                   AND send_started_at IS NOT NULL
                   AND accepted_message_id IS NULL
+                  AND NOT EXISTS (
+                      SELECT 1 FROM submissions
+                      WHERE schedule_run_id = schedule_runs.run_id
+                        AND (
+                            accepted_message_id IS NOT NULL
+                            OR observed_user_event_id IS NOT NULL
+                        )
+                  )
                 """,
                 (timestamp,),
             )

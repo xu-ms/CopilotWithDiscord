@@ -18,9 +18,11 @@ from copilotd.core.worktrees import (
     WorktreeConflict,
     WorktreeHistoryMode,
     WorktreeInputError,
+    WorktreeIntent,
     WorktreeIntentState,
     WorktreeManager,
     WorktreeOperationError,
+    WorktreeTarget,
 )
 from copilotd.storage.database import Database
 from copilotd.storage.leases import OwnerLeaseStore
@@ -113,6 +115,79 @@ async def test_real_git_worktree_handles_cjk_spaces_and_preserves_branch_on_clos
     assert closed.state == "closed"
     assert not created.path.exists()
     assert branch.returncode == 0
+
+
+@pytest.mark.asyncio
+async def test_ready_fast_path_fences_externally_removed_worktree(
+    tmp_path: Path,
+) -> None:
+    async with Database(tmp_path / "ready-fast-path.sqlite3") as database:
+        manager, project_id = await _manager(
+            database,
+            tmp_path,
+            DeterministicWorktreeAdapter(),
+        )
+        created = await manager.create(
+            parent_project_id=project_id,
+            name="ready removed",
+        )
+        row = await database.fetchone(
+            "SELECT repo_root FROM project_worktrees WHERE intent_id = ?",
+            (created.intent_id,),
+        )
+        _git(Path(row["repo_root"]), "worktree", "remove", "--", str(created.path))
+
+        with pytest.raises(WorktreeOperationError):
+            await manager.create(
+                parent_project_id=project_id,
+                name="ready removed",
+            )
+        projection = await database.fetchone(
+            "SELECT state FROM project_worktrees WHERE intent_id = ?",
+            (created.intent_id,),
+        )
+        project = await database.fetchone(
+            "SELECT state FROM projects WHERE id = ?",
+            (created.project_id,),
+        )
+
+    assert projection["state"] == "intervention"
+    assert project["state"] == "closing"
+
+
+@pytest.mark.asyncio
+async def test_stale_intervention_cannot_overwrite_completed_close(
+    tmp_path: Path,
+) -> None:
+    async with Database(tmp_path / "stale-intervention.sqlite3") as database:
+        manager, project_id = await _manager(
+            database,
+            tmp_path,
+            DeterministicWorktreeAdapter(),
+        )
+        created = await manager.create(
+            parent_project_id=project_id,
+            name="stale intervention",
+        )
+        stale = await manager._intent(created.intent_id)
+        await manager.close(created.name, parent_project_id=project_id)
+
+        await manager._record_recovery_intervention(
+            stale,
+            WorktreeConflict("stale recovery"),
+            now=time.time(),
+        )
+        projection = await database.fetchone(
+            "SELECT state FROM project_worktrees WHERE intent_id = ?",
+            (created.intent_id,),
+        )
+        project = await database.fetchone(
+            "SELECT state FROM projects WHERE id = ?",
+            (created.project_id,),
+        )
+
+    assert projection["state"] == "closed"
+    assert project["state"] == "retired"
 
 
 @pytest.mark.asyncio
@@ -421,8 +496,13 @@ async def test_ready_intent_repairs_projection_atomically_on_recovery(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "intent_state",
+    ["git_creating", "git_created", "target_unknown", "ready"],
+)
 async def test_recovery_never_adopts_foreign_branch_at_reserved_path(
     tmp_path: Path,
+    intent_state: str,
 ) -> None:
     async with Database(tmp_path / "foreign-worktree.sqlite3") as database:
         manager, project_id = await _manager(
@@ -444,9 +524,9 @@ async def test_recovery_never_adopts_foreign_branch_at_reserved_path(
                 intent_id, parent_project_id, name, branch_name, base_ref,
                 history_mode, target_path, state, created_at, updated_at
             ) VALUES ('foreign-intent', ?, 'foreign', 'copilotd/expected',
-                      'HEAD', 'none', ?, 'git_creating', 1, 1)
+                      'HEAD', 'none', ?, ?, 1, 1)
             """,
-            (project_id, str(target)),
+            (project_id, str(target), intent_state),
         )
 
         report = await manager.recover()
@@ -455,7 +535,7 @@ async def test_recovery_never_adopts_foreign_branch_at_reserved_path(
         )
 
     assert report.orphaned_intents == 1
-    assert intent["state"] == "git_creating"
+    assert intent["state"] == intent_state
     assert target.exists()
 
 
@@ -611,6 +691,7 @@ async def test_recovered_history_fork_reconciles_without_second_fork(
 @pytest.mark.asyncio
 async def test_registration_race_compensation_finishes_without_project_id(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     async with Database(tmp_path / "registration-race-recovery.sqlite3") as database:
         manager, project_id = await _manager(
@@ -631,11 +712,30 @@ async def test_registration_race_compensation_finishes_without_project_id(
             (project_id, str(target)),
         )
 
+        original_metadata = manager._worktree_metadata
+
+        async def inaccessible(_repo: Path, _target: Path) -> object:
+            raise OSError("repository temporarily inaccessible")
+
+        monkeypatch.setattr(manager, "_worktree_metadata", inaccessible)
+        first_report = await manager.recover()
+        intervened = await database.fetchone(
+            """
+            SELECT state, error_code FROM worktree_intents
+            WHERE intent_id = 'registration-race'
+            """
+        )
+        monkeypatch.setattr(manager, "_worktree_metadata", original_metadata)
         report = await manager.recover()
         intent = await database.fetchone(
             "SELECT state FROM worktree_intents WHERE intent_id = 'registration-race'"
         )
 
+    assert first_report.orphaned_intents == 1
+    assert dict(intervened) == {
+        "state": "close_unknown",
+        "error_code": "compensation_remove_unknown",
+    }
     assert report.recovered_intents == 1
     assert intent["state"] == "compensated"
 
@@ -681,3 +781,134 @@ async def test_concurrent_history_fork_has_one_exclusive_creation_claim(
     assert projection.state == "ready"
     assert len(adapter.create_calls) == 1
     assert sum(not isinstance(result, Exception) for result in results) >= 1
+
+
+@pytest.mark.asyncio
+async def test_missing_repository_marks_intervention_and_recovery_continues(
+    tmp_path: Path,
+) -> None:
+    async with Database(tmp_path / "recovery-isolation.sqlite3") as database:
+        manager, project_id = await _manager(
+            database,
+            tmp_path,
+            DeterministicWorktreeAdapter(),
+        )
+        valid = await manager.create(
+            parent_project_id=project_id,
+            name="valid recovery",
+        )
+        await database.execute(
+            """
+            UPDATE project_worktrees SET state = 'project_registered'
+            WHERE intent_id = ?
+            """,
+            (valid.intent_id,),
+        )
+        missing_project = "missing-project"
+        missing_path = tmp_path / "repository-was-removed"
+        await database.execute(
+            """
+            INSERT INTO projects(
+                id, channel_id, root_path, cwd, config_version, state,
+                project_kind, timezone, created_at, updated_at
+            ) VALUES (?, 'missing-channel', ?, ?, 1, 'active',
+                      'binding', 'UTC', 0, 0)
+            """,
+            (missing_project, str(missing_path), str(missing_path)),
+        )
+        await database.execute(
+            """
+            INSERT INTO worktree_intents(
+                intent_id, parent_project_id, name, branch_name, base_ref,
+                history_mode, target_path, state, created_at, updated_at
+            ) VALUES ('missing-repo-intent', ?, 'missing', 'copilotd/missing',
+                      'HEAD', 'none', ?, 'git_creating', 0, 0)
+            """,
+            (missing_project, str(tmp_path / "missing-worktree")),
+        )
+        await database.execute(
+            """
+            INSERT INTO worktree_intents(
+                intent_id, parent_project_id, name, branch_name, base_ref,
+                history_mode, target_path, state, created_at, updated_at
+            ) VALUES ('invalid-base-intent', ?, 'invalid-base',
+                      'copilotd/invalid-base', 'missing-ref', 'none', ?,
+                      'reserved', 0.5, 0.5)
+            """,
+            (
+                project_id,
+                str(tmp_path / "managed worktrees" / project_id / "invalid-base"),
+            ),
+        )
+
+        report = await manager.recover()
+        missing = await database.fetchone(
+            """
+            SELECT error_code FROM worktree_intents
+            WHERE intent_id = 'missing-repo-intent'
+            """
+        )
+        repaired = await database.fetchone(
+            "SELECT state FROM project_worktrees WHERE intent_id = ?",
+            (valid.intent_id,),
+        )
+        invalid_base = await database.fetchone(
+            """
+            SELECT state FROM worktree_intents
+            WHERE intent_id = 'invalid-base-intent'
+            """
+        )
+
+    assert report.examined_intents == 3
+    assert report.orphaned_intents == 1
+    assert report.recovered_intents == 2
+    assert missing["error_code"] == "recovery_intervention"
+    assert repaired["state"] == "ready"
+    assert invalid_base["state"] == "failed"
+
+
+@pytest.mark.asyncio
+async def test_target_reconcile_exception_is_isolated_per_intent(tmp_path: Path) -> None:
+    class FailingReconcileAdapter(DeterministicWorktreeAdapter):
+        async def reconcile_target(
+            self,
+            intent: WorktreeIntent,
+        ) -> WorktreeTarget | None:
+            if intent.name == "failing reconcile":
+                raise RuntimeError("adapter unavailable")
+            return await super().reconcile_target(intent)
+
+    adapter = FailingReconcileAdapter()
+    async with Database(tmp_path / "reconcile-isolation.sqlite3") as database:
+        manager, project_id = await _manager(database, tmp_path, adapter)
+        failing = await manager.create(
+            parent_project_id=project_id,
+            name="failing reconcile",
+        )
+        healthy = await manager.create(
+            parent_project_id=project_id,
+            name="healthy reconcile",
+        )
+        await database.execute(
+            "UPDATE worktree_intents SET state = 'target_unknown' WHERE intent_id = ?",
+            (failing.intent_id,),
+        )
+        await database.execute(
+            "UPDATE project_worktrees SET state = 'target_unknown' WHERE intent_id = ?",
+            (failing.intent_id,),
+        )
+
+        report = await manager.recover()
+        failed_projection = await database.fetchone(
+            "SELECT state FROM project_worktrees WHERE intent_id = ?",
+            (failing.intent_id,),
+        )
+        healthy_projection = await database.fetchone(
+            "SELECT state FROM project_worktrees WHERE intent_id = ?",
+            (healthy.intent_id,),
+        )
+
+    assert report.orphaned_intents == 1
+    assert report.recovered_intents >= 1
+    assert failed_projection["state"] == "intervention"
+    assert healthy_projection["state"] == "ready"

@@ -191,6 +191,29 @@ class CreationIntentRepository:
             )
             return intent, True
 
+    async def assert_side_effect_admitted(self, intent: CreationIntent) -> None:
+        async with self._database.transaction() as connection:
+            draining = await connection.execute(
+                "SELECT value FROM global_config WHERE key = 'restart_draining'"
+            )
+            draining_row = await draining.fetchone()
+            await draining.close()
+            if draining_row is not None and draining_row["value"] == "1":
+                raise RuntimeError("copilotD is draining for restart")
+            if intent.project_id is None:
+                return
+            project = await connection.execute(
+                "SELECT state, project_kind FROM projects WHERE id = ?",
+                (intent.project_id,),
+            )
+            project_row = await project.fetchone()
+            await project.close()
+            if project_row is None or project_row["state"] == "closing" or (
+                project_row["project_kind"] == "worktree"
+                and project_row["state"] == "retired"
+            ):
+                raise RuntimeError("session project is closing or retired")
+
     async def set_thread(
         self,
         intent: CreationIntent,
@@ -396,6 +419,7 @@ class SessionCreationService:
             frozen_config = ProjectConfigSnapshot.from_dict(
                 json.loads(intent.session_config_snapshot_json)
             )
+        await self._intents.assert_side_effect_admitted(intent)
         try:
             SessionLaunchOptions.from_json(intent.session_config_snapshot_json)
         except SessionConfigSnapshotError:

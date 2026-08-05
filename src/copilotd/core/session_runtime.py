@@ -163,6 +163,10 @@ class SessionNotReady(RuntimeError):
     pass
 
 
+class SubmissionClaimDeferred(OperationRejected):
+    pass
+
+
 class DetachBlocked(RuntimeError):
     def __init__(self, blockers: list[str]) -> None:
         self.blockers = blockers
@@ -333,15 +337,35 @@ class SessionRuntime:
             self._volatile_attachments[submission_id] = attachments
 
         if mode == "immediate":
+            attempt_row = await self._database.fetchone(
+                "SELECT dispatch_attempt FROM message_queue WHERE id = ?",
+                (submission_id,),
+            )
+            dispatch_attempt = (
+                0 if attempt_row is None else int(attempt_row["dispatch_attempt"])
+            )
+            operation_key = (
+                idempotency_key
+                if dispatch_attempt == 0
+                else f"{idempotency_key}:{dispatch_attempt}"
+            )
             return await self._dispatch_submission(
                 submission_id=submission_id,
-                idempotency_key=idempotency_key,
+                idempotency_key=operation_key,
                 prompt=prompt,
                 prompt_hash=prompt_hash,
                 attachment_manifest_id=attachment_manifest_id,
                 attachments=attachments,
                 mode=mode,
                 agent_mode=effective_agent_mode,
+                dispatch_attempt=dispatch_attempt,
+                requested_model_config=json.loads(
+                    str(model_row["desired_model_config"])
+                ),
+                requested_agent=str(model_row["desired_agent"]),
+                requested_session_config_version=int(
+                    model_row["desired_session_config_version"]
+                ),
             )
         dispatched = await self._dispatch_next_queued()
         if dispatched is not None and dispatched[0] == submission_id:
@@ -493,7 +517,9 @@ class SessionRuntime:
                 raise SessionNotReady("attachments require a durable manifest")
             message_id = await self._dispatch_submission(
                 submission_id=str(row["id"]),
-                idempotency_key=f"queue:{row['id']}",
+                idempotency_key=(
+                    f"queue:{row['id']}:{int(row['dispatch_attempt'])}"
+                ),
                 prompt=str(row["prompt"]),
                 prompt_hash=str(row["prompt_hash"]),
                 attachment_manifest_id=(
@@ -502,6 +528,12 @@ class SessionRuntime:
                 attachments=attachments,
                 mode=cast(DeliveryMode, str(row["requested_delivery"])),
                 agent_mode=cast(AgentMode, str(row["requested_mode_snapshot"])),
+                dispatch_attempt=int(row["dispatch_attempt"]),
+                requested_model_config=requested_model,
+                requested_agent=str(row["requested_agent_snapshot"]),
+                requested_session_config_version=int(
+                    row["requested_session_config_version"]
+                ),
             )
             return str(row["id"]), message_id
 
@@ -516,6 +548,10 @@ class SessionRuntime:
         attachments: list[Any] | None,
         mode: DeliveryMode,
         agent_mode: AgentMode,
+        dispatch_attempt: int,
+        requested_model_config: dict[str, Any],
+        requested_agent: str,
+        requested_session_config_version: int,
     ) -> str:
         inbox = self._require_inbox()
         if attachment_manifest_id is not None:
@@ -528,15 +564,46 @@ class SessionRuntime:
             raise SessionNotReady("attachments require a durable manifest")
 
         async def dispatch() -> str:
-            claimed = await self._claim_submission(
+            claim = await self._claim_submission(
                 submission_id,
                 operation_idempotency_key=f"send:{idempotency_key}",
+                dispatch_attempt=dispatch_attempt,
             )
-            if not claimed:
+            if claim == "deferred":
+                raise SubmissionClaimDeferred(
+                    f"submission {submission_id} was deferred by restart draining"
+                )
+            if claim != "claimed":
                 raise OperationRejected(
                     f"submission {submission_id} was cancelled before dispatch"
                 )
-            await self._assert_dispatchable()
+            try:
+                await self._assert_claimed_dispatchable(
+                    requested_mode=agent_mode,
+                    requested_model_config=requested_model_config,
+                    requested_agent=requested_agent,
+                    requested_session_config_version=(
+                        requested_session_config_version
+                    ),
+                )
+            except Exception as error:
+                await inbox.commit_internal(
+                    {
+                        "type": "copilotd.submission.pre_send_deferred",
+                        "data": {
+                            "submission_id": submission_id,
+                            "dispatch_attempt": dispatch_attempt,
+                            "error_type": type(error).__name__,
+                        },
+                    },
+                    internal_event_id=(
+                        f"submission:{submission_id}:pre-send-deferred:"
+                        f"{dispatch_attempt}"
+                    ),
+                )
+                raise SubmissionClaimDeferred(
+                    f"submission {submission_id} lost readiness before SDK send"
+                ) from error
             return await self._sdk_call(
                 self._require_handle().send(
                     prompt,
@@ -558,6 +625,8 @@ class SessionRuntime:
                 },
                 operation=dispatch,
             )
+        except SubmissionClaimDeferred:
+            raise
         except OperationRejected:
             await inbox.commit_internal(
                 {
@@ -595,7 +664,8 @@ class SessionRuntime:
         submission_id: str,
         *,
         operation_idempotency_key: str,
-    ) -> bool:
+        dispatch_attempt: int,
+    ) -> Literal["claimed", "deferred", "cancelled"]:
         operation = await self._database.fetchone(
             """
             SELECT operation_id FROM session_operations
@@ -612,6 +682,7 @@ class SessionRuntime:
                 "data": {
                     "submission_id": submission_id,
                     "operation_id": operation_id,
+                    "dispatch_attempt": dispatch_attempt,
                 },
             },
             internal_event_id=f"submission:{submission_id}:submitting:{operation_id}",
@@ -619,19 +690,28 @@ class SessionRuntime:
         claimed = await self._database.fetchone(
             """
             SELECT s.state AS submission_state, s.source_operation_id,
-                   q.state AS queue_state
+                   q.state AS queue_state, q.dispatch_attempt
             FROM submissions AS s
             JOIN message_queue AS q ON q.id = s.submission_id
             WHERE s.submission_id = ? AND s.sdk_session_id = ?
             """,
             (submission_id, self.binding.sdk_session_id),
         )
-        return bool(
+        if (
             claimed is not None
             and claimed["submission_state"] == "submitting"
             and claimed["queue_state"] == "submitting"
             and claimed["source_operation_id"] == operation_id
-        )
+        ):
+            return "claimed"
+        if (
+            claimed is not None
+            and claimed["submission_state"] == "local_queued"
+            and claimed["queue_state"] == "local_queued"
+            and int(claimed["dispatch_attempt"]) > dispatch_attempt
+        ):
+            return "deferred"
+        return "cancelled"
 
     async def _block_queue_item(self, submission_id: str, state: str) -> None:
         await self._require_inbox().commit_internal(
@@ -2800,6 +2880,67 @@ class SessionRuntime:
         blockers = await self._readiness_blockers(require_quiet=False)
         if blockers:
             raise SessionNotReady("session readiness is blocked: " + ", ".join(blockers))
+
+    async def _assert_claimed_dispatchable(
+        self,
+        *,
+        requested_mode: AgentMode,
+        requested_model_config: dict[str, Any],
+        requested_agent: str,
+        requested_session_config_version: int,
+    ) -> None:
+        await self._assert_dispatchable()
+        readiness = await self._refresh_readiness()
+        if (
+            readiness["processing"]
+            or readiness["hasActiveWork"]
+            or readiness["pendingItems"]
+            or readiness["steeringMessages"]
+        ):
+            raise SessionNotReady("runtime became active after queue claim")
+        row = await self._database.fetchone(
+            """
+            SELECT runtime_mode, runtime_model_config, runtime_agent,
+                   runtime_session_config_version
+            FROM session_bindings WHERE thread_id = ?
+            """,
+            (self.binding.thread_id,),
+        )
+        if row is None:
+            raise SessionNotReady("claimed session configuration disappeared")
+        if str(row["runtime_mode"]) != requested_mode:
+            raise SessionNotReady("claimed queue mode snapshot drifted")
+        runtime_model = (
+            None
+            if row["runtime_model_config"] is None
+            else json.loads(str(row["runtime_model_config"]))
+        )
+        if requested_model_config:
+            if runtime_model is None or not _model_config_matches(
+                requested_model_config,
+                runtime_model,
+            ):
+                raise SessionNotReady("claimed queue model snapshot drifted")
+        runtime_agent = str(row["runtime_agent"])
+        agent_evidenced = (
+            self._capabilities is not None
+            and self._capabilities.supports("selected_agent")
+        )
+        if (
+            requested_agent != runtime_agent
+            and (
+                agent_evidenced
+                or runtime_agent != "unknown"
+                or requested_agent != "default"
+            )
+        ):
+            raise SessionNotReady("claimed queue agent snapshot drifted")
+        if (
+            row["runtime_session_config_version"] is not None
+            and int(row["runtime_session_config_version"])
+            != requested_session_config_version
+        ):
+            raise SessionNotReady("claimed queue session-config snapshot drifted")
 
     async def _assert_owned_handle(
         self,

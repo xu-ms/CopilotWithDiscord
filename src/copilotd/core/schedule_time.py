@@ -8,7 +8,7 @@ from enum import StrEnum
 from typing import Literal
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from croniter import croniter
+from croniter import CroniterBadDateError, croniter
 
 GapPolicy = Literal["skip", "shift_forward", "reject"]
 FoldPolicy = Literal["both", "first", "second", "reject"]
@@ -24,6 +24,7 @@ _ISO_INTERVAL = re.compile(
     r")?$",
     re.IGNORECASE,
 )
+_CRON_SEARCH_YEARS = 400
 
 
 class ScheduleExpressionKind(StrEnum):
@@ -263,24 +264,71 @@ def _cron_next(
     gap_policy: GapPolicy,
     fold_policy: FoldPolicy,
 ) -> float:
-    instant = math.floor(after_utc / 60) * 60.0 + 60
-    for _ in range(5 * 366 * 24 * 60):
-        local = datetime.fromtimestamp(instant, zone).replace(
-            tzinfo=None,
-            second=0,
-            microsecond=0,
-        )
-        if croniter.match(expression, local):
-            candidates = _resolve_wall_time(
-                local,
+    local_after = datetime.fromtimestamp(after_utc, zone).replace(
+        tzinfo=None,
+        second=0,
+        microsecond=0,
+    )
+    window = _transition_window(zone, after_utc)
+    cursor = local_after - window
+    best: float | None = None
+    horizon_year = min(datetime.max.year, local_after.year + _CRON_SEARCH_YEARS)
+    while cursor.year <= horizon_year:
+        try:
+            wall = croniter(expression, cursor).get_next(datetime)
+        except (CroniterBadDateError, OverflowError, ValueError) as error:
+            raise ScheduleTimeError(
+                "cron expression has no resolvable future occurrence"
+            ) from error
+        if wall.year > horizon_year:
+            break
+        try:
+            resolved = _resolve_wall_time(
+                wall,
                 zone,
                 gap_policy=gap_policy,
                 fold_policy=fold_policy,
             )
-            if instant in candidates:
-                return instant
-        instant += 60
-    raise ScheduleTimeError("cron expression did not produce a future occurrence")
+        except NonexistentLocalTime:
+            if wall < local_after:
+                cursor = wall
+                continue
+            raise
+        except AmbiguousLocalTime:
+            possible = _resolve_wall_time(
+                wall,
+                zone,
+                gap_policy=gap_policy,
+                fold_policy="both",
+            )
+            if any(candidate > after_utc for candidate in possible):
+                raise
+            cursor = wall
+            continue
+        future = [
+            candidate
+            for candidate in resolved
+            if candidate > after_utc
+        ]
+        if future:
+            candidate = min(future)
+            best = candidate if best is None else min(best, candidate)
+            if fold_policy != "both":
+                return best
+            all_folds = _resolve_wall_time(
+                wall,
+                zone,
+                gap_policy=gap_policy,
+                fold_policy="both",
+            )
+            if candidate == min(all_folds):
+                return best
+        if best is not None and wall > local_after + window:
+            return best
+        cursor = wall
+    if best is not None:
+        return best
+    raise ScheduleTimeError("cron expression has no resolvable future occurrence")
 
 
 def _cron_previous_or_at(
@@ -291,24 +339,69 @@ def _cron_previous_or_at(
     gap_policy: GapPolicy,
     fold_policy: FoldPolicy,
 ) -> float | None:
-    instant = math.floor(through_utc / 60) * 60.0
-    for _ in range(5 * 366 * 24 * 60):
-        local = datetime.fromtimestamp(instant, zone).replace(
-            tzinfo=None,
-            second=0,
-            microsecond=0,
-        )
-        if croniter.match(expression, local):
-            candidates = _resolve_wall_time(
-                local,
+    local_through = datetime.fromtimestamp(through_utc, zone).replace(
+        tzinfo=None,
+        second=0,
+        microsecond=0,
+    )
+    window = _transition_window(zone, through_utc)
+    cursor = local_through + window
+    best: float | None = None
+    horizon_year = max(datetime.min.year, local_through.year - _CRON_SEARCH_YEARS)
+    while cursor.year >= horizon_year:
+        try:
+            wall = croniter(expression, cursor).get_prev(datetime)
+        except (CroniterBadDateError, OverflowError, ValueError) as error:
+            raise ScheduleTimeError(
+                "cron expression has no resolvable previous occurrence"
+            ) from error
+        if wall.year < horizon_year:
+            break
+        try:
+            resolved = _resolve_wall_time(
+                wall,
                 zone,
                 gap_policy=gap_policy,
                 fold_policy=fold_policy,
             )
-            if instant in candidates:
-                return instant
-        instant -= 60
-    return None
+        except NonexistentLocalTime:
+            if wall > local_through:
+                cursor = wall
+                continue
+            raise
+        except AmbiguousLocalTime:
+            possible = _resolve_wall_time(
+                wall,
+                zone,
+                gap_policy=gap_policy,
+                fold_policy="both",
+            )
+            if any(candidate <= through_utc for candidate in possible):
+                raise
+            cursor = wall
+            continue
+        previous = [
+            candidate
+            for candidate in resolved
+            if candidate <= through_utc
+        ]
+        if previous:
+            candidate = max(previous)
+            best = candidate if best is None else max(best, candidate)
+            if fold_policy != "both":
+                return best
+            all_folds = _resolve_wall_time(
+                wall,
+                zone,
+                gap_policy=gap_policy,
+                fold_policy="both",
+            )
+            if candidate == max(all_folds):
+                return best
+        if best is not None and wall < local_through - window:
+            return best
+        cursor = wall
+    return best
 
 
 def _resolve_wall_time(
@@ -340,16 +433,24 @@ def _resolve_wall_time(
         if fold_policy == "second":
             return candidates[1:]
         if fold_policy == "reject":
-            return candidates
+            raise AmbiguousLocalTime(
+                f"{wall!s} occurs twice in timezone {zone.key}"
+            )
         raise ScheduleTimeError(f"unsupported DST fold policy: {fold_policy}")
     if gap_policy == "skip":
         return []
     if gap_policy == "reject":
-        return []
+        raise NonexistentLocalTime(
+            f"{wall!s} does not exist in timezone {zone.key}"
+        )
     if gap_policy != "shift_forward":
         raise ScheduleTimeError(f"unsupported DST gap policy: {gap_policy}")
     probe = wall
-    for _ in range(180):
+    approximate = wall.replace(tzinfo=zone, fold=0).astimezone(UTC).timestamp()
+    search_minutes = int(
+        _transition_window(zone, approximate).total_seconds() // 60
+    ) + 60
+    for _ in range(search_minutes):
         probe += timedelta(minutes=1)
         shifted = _resolve_wall_time(
             probe,
@@ -360,6 +461,19 @@ def _resolve_wall_time(
         if shifted:
             return shifted
     raise NonexistentLocalTime(f"could not shift nonexistent local time {wall!s} forward")
+
+
+def _transition_window(zone: ZoneInfo, around_utc: float) -> timedelta:
+    offsets: list[float] = []
+    for hours in range(-48, 49, 6):
+        observed = datetime.fromtimestamp(
+            around_utc + hours * 3_600,
+            zone,
+        ).utcoffset()
+        if observed is not None:
+            offsets.append(observed.total_seconds())
+    spread = 0 if not offsets else max(offsets) - min(offsets)
+    return timedelta(seconds=max(3 * 3_600, spread + 2 * 3_600))
 
 
 def _rfc3339(timestamp: float) -> str:

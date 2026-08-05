@@ -7,6 +7,7 @@ import pytest
 from copilotd.core.bindings import SessionBindingRepository
 from copilotd.core.lifecycle_commands import (
     DiscordParentType,
+    LifecycleCommandError,
     ProjectLifecycleService,
     SchedulerCommandService,
 )
@@ -136,6 +137,14 @@ async def test_project_lifecycle_validates_parent_layout_timezone_and_typed_mcp(
                 command="forbidden",
                 url="https://example.invalid/mcp",
             )
+        with pytest.raises(ProjectConfigError, match="do not exist"):
+            await service.mcp_add(
+                project.project_id,
+                name="missing-env",
+                transport="stdio",
+                command="server",
+                env_refs=("MISSING",),
+            )
         await service.variable_set(project.project_id, "TOKEN", "value")
         await service.mcp_add(
             project.project_id,
@@ -189,3 +198,61 @@ async def test_new_session_schedule_keeps_project_snapshot_after_future_changes(
     frozen = definition.target_snapshot["project_config"]
     assert frozen["variables"] == [{"name": "VALUE", "value": "before"}]
     assert current.variables == (("VALUE", "after"),)
+
+
+@pytest.mark.asyncio
+async def test_legacy_message_schedule_requires_real_channel_timezone_and_valid_intent(
+    tmp_path: Path,
+) -> None:
+    home = tmp_path / "home"
+    await asyncio.to_thread(home.mkdir)
+    async with Database(tmp_path / "legacy-schedule.sqlite3") as database:
+        projects = ProjectRegistry(database, resolved_home=home)
+        await projects.initialize()
+        await projects.set_channel_timezone("channel-1", "Asia/Shanghai")
+        bindings = SessionBindingRepository(database)
+        await bindings.create(
+            thread_id="legacy-thread",
+            sdk_session_id="legacy-session",
+            cwd_snapshot=home,
+            project_source="implicit-home",
+        )
+        commands = SchedulerCommandService(
+            database,
+            projects,
+            SchedulerRepository(database),
+        )
+
+        with pytest.raises(LifecycleCommandError, match="timezone or channel_id"):
+            await commands.create_message(
+                thread_id="legacy-thread",
+                expression="cron:0 9 * * *",
+                text="scheduled",
+                timezone=None,
+                created_by="user",
+            )
+        definition = await commands.create_message(
+            thread_id="legacy-thread",
+            expression="cron:0 9 * * *",
+            text="scheduled",
+            timezone=None,
+            created_by="user",
+            channel_id="channel-1",
+        )
+        await database.execute(
+            """
+            UPDATE session_bindings SET binding_intent = 'deleting'
+            WHERE thread_id = 'legacy-thread'
+            """
+        )
+        with pytest.raises(LifecycleCommandError, match="existing session thread"):
+            await commands.create_message(
+                thread_id="legacy-thread",
+                expression="cron:0 10 * * *",
+                text="scheduled",
+                timezone="UTC",
+                created_by="user",
+                channel_id="channel-1",
+            )
+
+    assert definition.timezone == "Asia/Shanghai"

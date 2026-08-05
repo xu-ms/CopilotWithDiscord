@@ -17,6 +17,7 @@ from aiosqlite import Connection, Row
 from copilotd.core.projects import (
     ProjectConfigError,
     ProjectConfigSnapshot,
+    ProjectPathError,
     ProjectRegistry,
     ProjectSnapshot,
 )
@@ -474,6 +475,15 @@ class WorktreeManager:
             now=timestamp,
         )
         if intent.state == WorktreeIntentState.READY:
+            try:
+                await self._validate_registered_intent(intent, repo_root)
+            except (OSError, WorktreeConflict, WorktreeOperationError) as error:
+                await self._record_recovery_intervention(
+                    intent,
+                    error,
+                    now=timestamp,
+                )
+                raise
             if (
                 intent.project_id is None
                 or intent.thread_id is None
@@ -572,17 +582,6 @@ class WorktreeManager:
             """
             SELECT * FROM worktree_intents
             WHERE state NOT IN ('closed', 'failed', 'compensated')
-              AND (
-                  state != 'ready'
-                  OR NOT EXISTS (
-                      SELECT 1 FROM project_worktrees w
-                      WHERE w.intent_id = worktree_intents.intent_id
-                        AND w.state = 'ready'
-                        AND w.project_id = worktree_intents.project_id
-                        AND w.thread_id = worktree_intents.thread_id
-                        AND w.sdk_session_id = worktree_intents.sdk_session_id
-                  )
-              )
             ORDER BY created_at, intent_id
             """
         )
@@ -590,9 +589,9 @@ class WorktreeManager:
         orphaned = 0
         for row in rows:
             intent = _row_to_intent(row)
-            parent = await self._projects.project_by_id(intent.parent_project_id)
-            repo_root = await self._repo_root(parent.root_path)
             try:
+                parent = await self._projects.project_by_id(intent.parent_project_id)
+                repo_root = await self._repo_root(parent.root_path)
                 if (
                     intent.state == WorktreeIntentState.CLOSE_UNKNOWN
                     and intent.error_code == "compensation_remove_unknown"
@@ -644,7 +643,8 @@ class WorktreeManager:
                     )
                     recovered += 1
                 elif intent.state == WorktreeIntentState.TARGET_UNKNOWN:
-                    target = await self._adapter.reconcile_target(intent)
+                    await self._validate_registered_intent(intent, repo_root)
+                    target = await self._reconcile_target(intent)
                     if target is None or intent.project_id is None:
                         orphaned += 1
                         continue
@@ -652,6 +652,7 @@ class WorktreeManager:
                     await self._mark_ready(intent, target=target, now=timestamp)
                     recovered += 1
                 elif intent.state == WorktreeIntentState.READY:
+                    await self._validate_registered_intent(intent, repo_root)
                     if (
                         intent.project_id is None
                         or intent.thread_id is None
@@ -697,10 +698,45 @@ class WorktreeManager:
                     recovered += 1
             except WorktreeOperationError as error:
                 if error.outcome_unknown:
+                    await self._record_recovery_intervention(
+                        intent,
+                        error,
+                        now=timestamp,
+                    )
                     orphaned += 1
                 else:
-                    raise
-            except WorktreeConflict:
+                    latest = await self._intent(intent.intent_id)
+                    if latest.state in {
+                        WorktreeIntentState.FAILED,
+                        WorktreeIntentState.COMPENSATED,
+                        WorktreeIntentState.CLOSED,
+                    }:
+                        recovered += 1
+                    else:
+                        await self._record_recovery_intervention(
+                            intent,
+                            error,
+                            now=timestamp,
+                        )
+                        orphaned += 1
+            except (
+                OSError,
+                ProjectConfigError,
+                ProjectPathError,
+                WorktreeInputError,
+            ) as error:
+                await self._record_recovery_intervention(
+                    intent,
+                    error,
+                    now=timestamp,
+                )
+                orphaned += 1
+            except WorktreeConflict as error:
+                await self._record_recovery_intervention(
+                    intent,
+                    error,
+                    now=timestamp,
+                )
                 orphaned += 1
         await self._database.execute(
             """
@@ -739,6 +775,20 @@ class WorktreeManager:
         repo_root: Path,
         now: float,
     ) -> WorktreeProjection:
+        if intent.state not in {
+            WorktreeIntentState.RESERVED,
+            WorktreeIntentState.GIT_CREATING,
+        }:
+            registration = await self._worktree_metadata(
+                repo_root,
+                intent.target_path,
+            )
+            if registration is None:
+                raise WorktreeOperationError(
+                    "durable worktree path is no longer registered in its repository",
+                    outcome_unknown=True,
+                )
+            _require_owned_worktree(registration, intent.branch_name)
         if intent.state in {
             WorktreeIntentState.RESERVED,
             WorktreeIntentState.GIT_CREATING,
@@ -788,7 +838,7 @@ class WorktreeManager:
                 recovered_target_creation
                 and intent.history_mode == WorktreeHistoryMode.FORK
             ):
-                target = await self._adapter.reconcile_target(intent)
+                target = await self._reconcile_target(intent)
                 if target is None:
                     await self._mark_intent(
                         intent.intent_id,
@@ -807,6 +857,7 @@ class WorktreeManager:
                     )
                 await self._mark_ready(intent, target=target, now=now)
                 return await self._projection_for_intent(intent.intent_id)
+
             try:
                 intent = await self._mark_intent(
                     intent.intent_id,
@@ -818,7 +869,7 @@ class WorktreeManager:
                 if latest.state == WorktreeIntentState.READY:
                     return await self._projection_for_intent(latest.intent_id)
                 if latest.state == WorktreeIntentState.TARGET_CREATING:
-                    target = await self._adapter.reconcile_target(latest)
+                    target = await self._reconcile_target(latest)
                     if target is not None:
                         await self._mark_ready(latest, target=target, now=now)
                         return await self._projection_for_intent(latest.intent_id)
@@ -882,6 +933,35 @@ class WorktreeManager:
                 raise WorktreeOperationError(str(error), outcome_unknown=True) from error
             intent = await self._mark_ready(intent, target=target, now=now)
         return await self._projection_for_intent(intent.intent_id)
+
+    async def _validate_registered_intent(
+        self,
+        intent: WorktreeIntent,
+        repo_root: Path,
+    ) -> GitWorktreeMetadata:
+        registration = await self._worktree_metadata(
+            repo_root,
+            intent.target_path,
+        )
+        if registration is None:
+            raise WorktreeOperationError(
+                "durable worktree path is no longer registered in its repository",
+                outcome_unknown=True,
+            )
+        _require_owned_worktree(registration, intent.branch_name)
+        return registration
+
+    async def _reconcile_target(
+        self,
+        intent: WorktreeIntent,
+    ) -> WorktreeTarget | None:
+        try:
+            return await self._adapter.reconcile_target(intent)
+        except Exception as error:
+            raise WorktreeOperationError(
+                "worktree target reconciliation failed",
+                outcome_unknown=True,
+            ) from error
 
     async def _create_git_worktree(
         self,
@@ -1135,6 +1215,74 @@ class WorktreeManager:
                 ),
             )
         return await self._intent(intent_id)
+
+    async def _record_recovery_intervention(
+        self,
+        intent: WorktreeIntent,
+        error: Exception,
+        *,
+        now: float,
+    ) -> None:
+        async with self._database.transaction() as connection:
+            updated = await connection.execute(
+                """
+                UPDATE worktree_intents
+                SET error_code = COALESCE(error_code, 'recovery_intervention'),
+                    error_detail = ?, updated_at = ?
+                WHERE intent_id = ? AND state = ?
+                """,
+                (
+                    f"{type(error).__name__}: {error}"[:1_000],
+                    now,
+                    intent.intent_id,
+                    intent.state.value,
+                ),
+            )
+            changed = updated.rowcount == 1
+            await updated.close()
+            if not changed:
+                return
+            if intent.state in {
+                WorktreeIntentState.PROJECT_REGISTERED,
+                WorktreeIntentState.TARGET_CREATING,
+                WorktreeIntentState.READY,
+                WorktreeIntentState.TARGET_UNKNOWN,
+            }:
+                await connection.execute(
+                    """
+                    UPDATE project_worktrees
+                    SET state = 'intervention', updated_at = ?
+                    WHERE intent_id = ? AND state NOT IN ('closed', 'compensated')
+                    """,
+                    (now, intent.intent_id),
+                )
+                if intent.project_id is not None:
+                    await connection.execute(
+                        """
+                        UPDATE projects SET state = 'closing', updated_at = ?
+                        WHERE id = ? AND state = 'worktree'
+                        """,
+                        (now, intent.project_id),
+                    )
+            await connection.execute(
+                """
+                INSERT INTO worktree_events(
+                    event_id, intent_id, state, detail, created_at
+                ) VALUES (?, ?, ?, ?, ?)
+                """,
+                (
+                    str(uuid.uuid4()),
+                    intent.intent_id,
+                    intent.state.value,
+                    _canonical_json(
+                        {
+                            "event": "recovery_intervention",
+                            "error_type": type(error).__name__,
+                        }
+                    ),
+                    now,
+                ),
+            )
 
     async def _ensure_worktree_row(
         self,

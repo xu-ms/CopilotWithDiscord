@@ -695,6 +695,23 @@ class ProjectRegistry:
         }
 
         async def mutate(connection: Connection) -> None:
+            if env_refs:
+                placeholders = ", ".join("?" for _ in env_refs)
+                rows = await _fetchall(
+                    connection,
+                    f"""
+                    SELECT name FROM project_env
+                    WHERE project_id = ? AND name IN ({placeholders})
+                    """,
+                    (project_id, *env_refs),
+                )
+                existing = {str(row["name"]) for row in rows}
+                missing = sorted(set(env_refs) - existing)
+                if missing:
+                    raise ProjectConfigError(
+                        "MCP project-env references do not exist: "
+                        + ", ".join(missing)
+                    )
             await connection.execute(
                 """
                 INSERT INTO mcp_servers(

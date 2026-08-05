@@ -35,6 +35,7 @@ from copilotd.core.session_runtime import (
     SessionNotReady,
     SessionOwnerConflict,
     SessionRuntime,
+    SubmissionClaimDeferred,
 )
 from copilotd.sdk.bridge import EventLogBatch, PermissionPostureError
 from copilotd.sdk.capabilities import CapabilityRegistry
@@ -331,6 +332,250 @@ async def test_runtime_preregisters_ingress_stays_alive_after_idle_and_closes_cl
     assert closed.attachment_state == AttachmentState.ABSENT
     assert owner is not None
     assert owner.expires_at <= datetime.now(UTC).timestamp()
+
+
+@pytest.mark.asyncio
+async def test_restart_drain_losing_queue_claim_stays_durable_and_retries(
+    tmp_path: Path,
+) -> None:
+    session_id = str(uuid4())
+    async with Database(tmp_path / "drain-claim.sqlite3") as database:
+        bindings = SessionBindingRepository(database)
+        binding = await bindings.create(
+            thread_id="thread-1",
+            sdk_session_id=session_id,
+            cwd_snapshot=tmp_path,
+            project_source="implicit-home",
+        )
+        bridge = FakeBridge(session_id)
+        bridge.processing = True
+        runtime = SessionRuntime(
+            database=database,
+            bridge=bridge,
+            bindings=bindings,
+            owner_leases=OwnerLeaseStore(database),
+            owner_id="process-1",
+            binding=binding,
+            queue_poll_seconds=3_600,
+        )
+        await runtime.attach_create()
+        submission_id = await runtime.send(
+            "queued across drain",
+            idempotency_key="drain-message",
+        )
+        await database.execute(
+            """
+            INSERT INTO global_config(key, value, updated_at)
+            VALUES ('restart_draining', '1', 1)
+            """
+        )
+        bridge.processing = False
+
+        with pytest.raises(SubmissionClaimDeferred):
+            await runtime.dispatch_queued_once()
+        deferred = await database.fetchone(
+            """
+            SELECT q.state AS queue_state, q.dispatch_attempt,
+                   s.state AS submission_state
+            FROM message_queue q JOIN submissions s ON s.submission_id = q.id
+            WHERE q.id = ?
+            """,
+            (submission_id,),
+        )
+        unknown = await database.fetchone(
+            """
+            SELECT COUNT(*) FROM event_journal
+            WHERE raw_type = 'copilotd.submission.acceptance_unknown'
+            """
+        )
+        await database.execute(
+            """
+            UPDATE global_config SET value = '0', updated_at = 2
+            WHERE key = 'restart_draining'
+            """
+        )
+        dispatched = await runtime.dispatch_queued_once()
+
+        assert dispatched is not None and dispatched[0] == submission_id
+        assert dict(deferred) == {
+            "queue_state": "local_queued",
+            "dispatch_attempt": 1,
+            "submission_state": "local_queued",
+        }
+        assert unknown[0] == 0
+        assert len(bridge.handle.sent) == 1
+        await runtime.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_deferred_immediate_send_retries_with_new_dispatch_operation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    session_id = str(uuid4())
+    async with Database(tmp_path / "immediate-retry.sqlite3") as database:
+        bindings = SessionBindingRepository(database)
+        binding = await bindings.create(
+            thread_id="thread-1",
+            sdk_session_id=session_id,
+            cwd_snapshot=tmp_path,
+            project_source="implicit-home",
+        )
+        bridge = FakeBridge(session_id)
+        runtime = SessionRuntime(
+            database=database,
+            bridge=bridge,
+            bindings=bindings,
+            owner_leases=OwnerLeaseStore(database),
+            owner_id="process-1",
+            binding=binding,
+            queue_poll_seconds=3_600,
+        )
+        await runtime.attach_create()
+        original_claim = runtime._claim_submission
+        claim_started = asyncio.Event()
+        allow_claim = asyncio.Event()
+
+        async def delayed_claim(
+            submission_id: str,
+            *,
+            operation_idempotency_key: str,
+            dispatch_attempt: int,
+        ) -> str:
+            claim_started.set()
+            await allow_claim.wait()
+            return await original_claim(
+                submission_id,
+                operation_idempotency_key=operation_idempotency_key,
+                dispatch_attempt=dispatch_attempt,
+            )
+
+        monkeypatch.setattr(runtime, "_claim_submission", delayed_claim)
+        first = asyncio.create_task(
+            runtime.send(
+                "immediate retry",
+                idempotency_key="immediate-retry",
+                mode="immediate",
+            )
+        )
+        await claim_started.wait()
+        await database.execute(
+            """
+            INSERT INTO global_config(key, value, updated_at)
+            VALUES ('restart_draining', '1', 1)
+            """
+        )
+        allow_claim.set()
+        with pytest.raises(SubmissionClaimDeferred):
+            await first
+        await database.execute(
+            """
+            UPDATE global_config SET value = '0', updated_at = 2
+            WHERE key = 'restart_draining'
+            """
+        )
+
+        message_id = await runtime.send(
+            "immediate retry",
+            idempotency_key="immediate-retry",
+            mode="immediate",
+        )
+        operations = await database.fetchall(
+            """
+            SELECT idempotency_key, state FROM session_operations
+            WHERE idempotency_key LIKE 'send:immediate-retry%'
+            ORDER BY idempotency_key
+            """
+        )
+
+        assert message_id == bridge.handle.message_id
+        assert [dict(row) for row in operations] == [
+            {"idempotency_key": "send:immediate-retry", "state": "rejected"},
+            {"idempotency_key": "send:immediate-retry:1", "state": "confirmed"},
+        ]
+        assert len(bridge.handle.sent) == 1
+        await runtime.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_post_claim_configuration_drift_defers_before_sdk_send(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    session_id = str(uuid4())
+    async with Database(tmp_path / "post-claim-drift.sqlite3") as database:
+        bindings = SessionBindingRepository(database)
+        binding = await bindings.create(
+            thread_id="thread-1",
+            sdk_session_id=session_id,
+            cwd_snapshot=tmp_path,
+            project_source="implicit-home",
+        )
+        bridge = FakeBridge(session_id)
+        runtime = SessionRuntime(
+            database=database,
+            bridge=bridge,
+            bindings=bindings,
+            owner_leases=OwnerLeaseStore(database),
+            owner_id="process-1",
+            binding=binding,
+            queue_poll_seconds=3_600,
+        )
+        await runtime.attach_create()
+        original_check = runtime._assert_claimed_dispatchable
+        claimed = asyncio.Event()
+        continue_check = asyncio.Event()
+
+        async def delayed_check(**kwargs: Any) -> None:
+            claimed.set()
+            await continue_check.wait()
+            await original_check(**kwargs)
+
+        monkeypatch.setattr(runtime, "_assert_claimed_dispatchable", delayed_check)
+        first = asyncio.create_task(
+            runtime.send(
+                "post-claim drift",
+                idempotency_key="post-claim-drift",
+                mode="immediate",
+            )
+        )
+        await claimed.wait()
+        await database.execute(
+            """
+            UPDATE session_bindings
+            SET desired_mode = 'plan', runtime_mode = 'plan'
+            WHERE thread_id = 'thread-1'
+            """
+        )
+        continue_check.set()
+        with pytest.raises(SubmissionClaimDeferred):
+            await first
+        queued = await database.fetchone(
+            """
+            SELECT state, dispatch_attempt FROM message_queue
+            WHERE thread_id = 'thread-1'
+            """
+        )
+        await database.execute(
+            """
+            UPDATE session_bindings
+            SET desired_mode = 'interactive', runtime_mode = 'interactive'
+            WHERE thread_id = 'thread-1'
+            """
+        )
+        message_id = await runtime.send(
+            "post-claim drift",
+            idempotency_key="post-claim-drift",
+            mode="immediate",
+        )
+
+        assert dict(queued) == {
+            "state": "local_queued",
+            "dispatch_attempt": 1,
+        }
+        assert message_id == bridge.handle.message_id
+        assert len(bridge.handle.sent) == 1
+        await runtime.shutdown()
 
 
 @pytest.mark.asyncio
@@ -1251,12 +1496,14 @@ async def test_forced_close_cancels_submission_before_atomic_dispatch_claim(
             submission_id: str,
             *,
             operation_idempotency_key: str,
-        ) -> bool:
+            dispatch_attempt: int,
+        ) -> str:
             claim_started.set()
             await allow_claim.wait()
             return await original_claim(
                 submission_id,
                 operation_idempotency_key=operation_idempotency_key,
+                dispatch_attempt=dispatch_attempt,
             )
 
         monkeypatch.setattr(runtime, "_claim_submission", delayed_claim)

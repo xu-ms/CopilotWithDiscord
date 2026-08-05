@@ -2,6 +2,7 @@ import asyncio
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import discord
 import pytest
@@ -89,6 +90,19 @@ def test_administrative_commands_require_explicit_operator_allowlist(
         Settings(data_dir=tmp_path, discord_operator_ids="41,42")
     )
     allowed._require_operator(interaction)
+
+
+@pytest.mark.asyncio
+async def test_bot_teardown_is_idempotent(tmp_path: Path) -> None:
+    bot = CopilotDiscordBot(Settings(data_dir=tmp_path))
+    bot.bridge.stop = AsyncMock()
+    bot.database.close = AsyncMock()
+
+    await bot.close()
+    await bot.close()
+
+    bot.bridge.stop.assert_awaited_once()
+    bot.database.close.assert_awaited_once()
 
 
 def test_streaming_table_is_held_before_discord_edit() -> None:

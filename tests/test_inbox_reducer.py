@@ -89,8 +89,19 @@ async def _insert_projection_binding(database: Database, session_id: str) -> Non
         """
         INSERT INTO session_bindings(
             thread_id, project_source, cwd_snapshot, sdk_session_id,
+            attachment_state, permission_posture,
             runtime_generation, owner_fence_token, created_at, updated_at
-        ) VALUES ('thread-projection', 'home', '/tmp', ?, 1, 7, 1, 1)
+        ) VALUES ('thread-projection', 'home', '/tmp', ?,
+                  'attached', 'verified_allow_all', 1, 7, 1, 1)
+        """,
+        (session_id,),
+    )
+    await database.execute(
+        """
+        INSERT INTO session_owner_leases(
+            sdk_session_id, owner_id, fence_token,
+            acquired_at, renewed_at, expires_at
+        ) VALUES (?, 'test-owner', 7, 1, 1, 9999999999)
         """,
         (session_id,),
     )

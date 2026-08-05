@@ -104,6 +104,8 @@ class CopilotDiscordBot(commands.Bot):
         self._fatal_worker_error: BaseException | None = None
         self._restart_task: asyncio.Task[None] | None = None
         self.restart_requested = False
+        self._close_lock = asyncio.Lock()
+        self._closed_once = False
 
     async def setup_hook(self) -> None:
         await self.database.open()
@@ -223,34 +225,38 @@ class CopilotDiscordBot(commands.Bot):
             await self.tree.sync()
 
     async def close(self) -> None:
-        self.heartbeat.set_gateway("down")
-        self.heartbeat.runtime_state = "down"
-        errors: list[Exception] = []
-        if self.scheduler_worker is not None:
+        async with self._close_lock:
+            if self._closed_once:
+                return
+            self._closed_once = True
+            self.heartbeat.set_gateway("down")
+            self.heartbeat.runtime_state = "down"
+            errors: list[Exception] = []
+            if self.scheduler_worker is not None:
+                try:
+                    await self.scheduler_worker.stop()
+                except Exception as error:
+                    errors.append(error)
+            if self.sessions is not None:
+                try:
+                    await self.sessions.shutdown()
+                except Exception as error:
+                    errors.append(error)
             try:
-                await self.scheduler_worker.stop()
+                await self._tasks.cancel_all()
             except Exception as error:
                 errors.append(error)
-        if self.sessions is not None:
             try:
-                await self.sessions.shutdown()
+                await self.bridge.stop()
             except Exception as error:
                 errors.append(error)
-        try:
-            await self._tasks.cancel_all()
-        except Exception as error:
-            errors.append(error)
-        try:
-            await self.bridge.stop()
-        except Exception as error:
-            errors.append(error)
-        try:
-            await self.database.close()
-        except Exception as error:
-            errors.append(error)
-        await super().close()
-        if errors:
-            raise ExceptionGroup("copilotD shutdown failed", errors)
+            try:
+                await self.database.close()
+            except Exception as error:
+                errors.append(error)
+            await super().close()
+            if errors:
+                raise ExceptionGroup("copilotD shutdown failed", errors)
 
     async def _task_failure_loop(self) -> None:
         while True:
@@ -1603,6 +1609,7 @@ class CopilotDiscordBot(commands.Bot):
                 text=text,
                 timezone=timezone,
                 created_by=str(interaction.user.id),
+                channel_id=_parent_channel_id(interaction),
             )
             await interaction.followup.send(
                 f"Schedule `{definition.id}` enabled; next UTC run "
@@ -2285,5 +2292,6 @@ async def run_discord_bot(settings: Settings) -> bool:
         if bot._fatal_worker_error is not None:
             raise RuntimeError("critical copilotD worker failed") from bot._fatal_worker_error
     finally:
-        await bot.close()
+        if not bot.is_closed():
+            await bot.close()
     return bot.restart_requested

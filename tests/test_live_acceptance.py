@@ -7,9 +7,11 @@ import pytest
 
 from copilotd.acceptance.live_scheduler_worktree import (
     DisposableThreadGateway,
+    LiveAcceptanceError,
     LiveAuthenticationError,
     LiveSchedulerWorktreeHarness,
     ResultArchive,
+    _run_crash_child,
     run_from_args,
 )
 
@@ -54,6 +56,31 @@ async def test_live_mode_is_explicitly_required(tmp_path: Path) -> None:
     )
     with pytest.raises(ValueError, match="--live is required"):
         await run_from_args(args)
+
+
+@pytest.mark.asyncio
+async def test_live_mode_requires_non_auth_feature(tmp_path: Path) -> None:
+    args = argparse.Namespace(
+        live=True,
+        output=tmp_path,
+        timeout=1,
+        features="",
+        namespace="empty-live",
+    )
+    with pytest.raises(ValueError, match="at least one"):
+        await run_from_args(args)
+
+
+@pytest.mark.asyncio
+async def test_crash_child_requires_matching_parent_nonce(tmp_path: Path) -> None:
+    config = tmp_path / "crash-config.json"
+    config.write_text(
+        json.dumps({"parent_nonce": "expected"}),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(LiveAcceptanceError, match="nonce"):
+        await _run_crash_child(config, parent_nonce="wrong")
 
 
 @pytest.mark.asyncio

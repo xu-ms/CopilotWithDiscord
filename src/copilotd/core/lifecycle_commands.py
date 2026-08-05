@@ -75,6 +75,7 @@ class SchedulerCommandService:
         text: str,
         timezone: str | None,
         created_by: str,
+        channel_id: str | None = None,
         name: str | None = None,
         misfire_policy: MisfirePolicy = MisfirePolicy.LATEST,
         now: float | None = None,
@@ -82,7 +83,7 @@ class SchedulerCommandService:
         row = await self._database.fetchone(
             """
             SELECT * FROM session_bindings
-            WHERE thread_id = ? AND binding_intent != 'deleted'
+            WHERE thread_id = ? AND binding_intent IN ('active', 'closed')
             """,
             (thread_id,),
         )
@@ -94,11 +95,17 @@ class SchedulerCommandService:
         project_timezone = timezone
         if project_timezone is None:
             if row["project_id"] is None:
-                project_timezone = await self._projects.channel_timezone(
+                snapshot_channel = (
                     str(json.loads(row["project_snapshot_json"])["channel_id"])
                     if row["project_snapshot_json"]
-                    else ""
+                    else channel_id
                 )
+                if snapshot_channel is None:
+                    raise LifecycleCommandError(
+                        "legacy implicit-home sessions require timezone or channel_id",
+                        code="CD-SCHEDULE-TZ-002",
+                    )
+                project_timezone = await self._projects.channel_timezone(snapshot_channel)
             else:
                 project_timezone = (
                     await self._projects.project_by_id(str(row["project_id"]))
@@ -135,7 +142,7 @@ class SchedulerCommandService:
             project_id=row["project_id"],
             thread_id=thread_id,
             channel_id=(
-                None
+                channel_id
                 if target["project_snapshot"] is None
                 else str(target["project_snapshot"]["channel_id"])
             ),

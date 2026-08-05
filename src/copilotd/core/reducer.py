@@ -995,6 +995,52 @@ class JournalReducer:
                 ),
             )
         elif event.raw_type == "copilotd.submission.submitting":
+            draining = await _fetchone_row(
+                connection,
+                "SELECT value FROM global_config WHERE key = 'restart_draining'",
+                (),
+            )
+            ready = await _fetchone_row(
+                connection,
+                """
+                SELECT 1
+                FROM session_bindings b
+                JOIN session_owner_leases l
+                  ON l.sdk_session_id = b.sdk_session_id
+                 AND l.fence_token = b.owner_fence_token
+                WHERE b.sdk_session_id = ?
+                  AND b.runtime_generation = ?
+                  AND b.owner_fence_token = ?
+                  AND b.binding_intent IN ('active', 'closed')
+                  AND b.attachment_state = 'attached'
+                  AND b.permission_posture = 'verified_allow_all'
+                  AND l.expires_at > ?
+                """,
+                (
+                    event.sdk_session_id,
+                    event.generation,
+                    event.fence_token,
+                    now,
+                ),
+            )
+            if (
+                draining is not None
+                and draining["value"] == "1"
+            ) or ready is None:
+                await connection.execute(
+                    """
+                    UPDATE message_queue
+                    SET dispatch_attempt = dispatch_attempt + 1, updated_at = ?
+                    WHERE id = ? AND state = 'local_queued'
+                      AND dispatch_attempt = ?
+                    """,
+                    (
+                        now,
+                        str(data["submission_id"]),
+                        int(data.get("dispatch_attempt", 0)),
+                    ),
+                )
+                return
             cursor = await connection.execute(
                 """
                 UPDATE submissions
@@ -1094,6 +1140,45 @@ class JournalReducer:
                     error_code=None,
                     now=now,
                 )
+        elif event.raw_type == "copilotd.submission.pre_send_deferred":
+            submission_id = str(data["submission_id"])
+            cursor = await connection.execute(
+                """
+                UPDATE submissions
+                SET state = 'local_queued', source_operation_id = NULL,
+                    send_started_at = NULL, terminal_at = NULL
+                WHERE submission_id = ? AND state = 'submitting'
+                  AND accepted_message_id IS NULL
+                  AND observed_user_event_id IS NULL
+                RETURNING submission_id
+                """,
+                (submission_id,),
+            )
+            deferred = await cursor.fetchone()
+            await cursor.close()
+            if deferred is None:
+                return
+            await connection.execute(
+                """
+                UPDATE message_queue
+                SET state = 'local_queued',
+                    dispatch_attempt = dispatch_attempt + 1,
+                    updated_at = ?
+                WHERE id = ? AND state = 'submitting'
+                """,
+                (now, submission_id),
+            )
+            await connection.execute(
+                """
+                UPDATE schedule_runs
+                SET status = 'submitting', send_started_at = NULL,
+                    last_progress_at = ?, updated_at = ?
+                WHERE result_submission_id = ?
+                  AND status = 'submitting'
+                  AND accepted_message_id IS NULL
+                """,
+                (now, now, submission_id),
+            )
         elif event.raw_type == "copilotd.queue.replaced":
             old_id = str(data["old_submission_id"])
             new_id = str(data["new_submission_id"])
@@ -1122,11 +1207,19 @@ class JournalReducer:
                     return
                 raise RuntimeError(f"queue item cannot be replaced: {old_id}")
             await connection.execute(
-                "UPDATE message_queue SET state = 'cancelled', updated_at = ? WHERE id = ?",
+                """
+                UPDATE message_queue
+                SET state = 'cancelled', schedule_run_id = NULL, updated_at = ?
+                WHERE id = ?
+                """,
                 (now, old_id),
             )
             await connection.execute(
-                "UPDATE submissions SET state = 'cancelled' WHERE submission_id = ?",
+                """
+                UPDATE submissions
+                SET state = 'cancelled', schedule_run_id = NULL
+                WHERE submission_id = ?
+                """,
                 (old_id,),
             )
             await connection.execute(
@@ -1152,11 +1245,11 @@ class JournalReducer:
                 """
                 INSERT INTO submissions(
                     submission_id, sdk_session_id, origin, parent_submission_id,
-                    attachment_manifest_id, prompt_hash, requested_mode,
+                    schedule_run_id, attachment_manifest_id, prompt_hash, requested_mode,
                     requested_model_config, requested_agent,
                     requested_session_config_version, requested_delivery,
                     correlation_id, attachment_count, state, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
                           'local_queued', ?)
                 ON CONFLICT(submission_id) DO NOTHING
                 """,
@@ -1165,6 +1258,7 @@ class JournalReducer:
                     old["sdk_session_id"],
                     old["origin"],
                     old_id,
+                    schedule_run_id,
                     old["attachment_manifest_id"],
                     str(data["prompt_hash"]),
                     str(data["requested_mode"]),
@@ -1239,7 +1333,7 @@ class JournalReducer:
                 )
         elif event.raw_type == "copilotd.submission.active_unknown":
             observed_at = float(data.get("observed_at", now))
-            await connection.execute(
+            transitioned_cursor = await connection.execute(
                 """
                 UPDATE submissions
                 SET state = 'outcome_unknown'
@@ -1248,9 +1342,15 @@ class JournalReducer:
                     'submitting', 'submitted', 'submitted_unknown',
                     'observed_active', 'loop_idle', 'continuation_expected'
                   )
+                RETURNING submission_id
                 """,
                 (event.sdk_session_id,),
             )
+            transitioned_rows = await transitioned_cursor.fetchall()
+            await transitioned_cursor.close()
+            transitioned_ids = [
+                str(row["submission_id"]) for row in transitioned_rows
+            ]
             await connection.execute(
                 """
                 UPDATE liveness_leases
@@ -1266,16 +1366,18 @@ class JournalReducer:
                     event.fence_token,
                 ),
             )
-            run_rows = await _fetchall_rows(
-                connection,
-                """
-                SELECT r.run_id FROM schedule_runs r
-                JOIN submissions s ON s.submission_id = r.result_submission_id
-                WHERE s.sdk_session_id = ?
-                  AND r.status IN ('submitting', 'accepted', 'waiting')
-                """,
-                (event.sdk_session_id,),
-            )
+            run_rows: list[Row] = []
+            if transitioned_ids:
+                placeholders = ", ".join("?" for _ in transitioned_ids)
+                run_rows = await _fetchall_rows(
+                    connection,
+                    f"""
+                    SELECT r.run_id FROM schedule_runs r
+                    WHERE r.result_submission_id IN ({placeholders})
+                      AND r.status IN ('submitting', 'accepted', 'waiting')
+                    """,
+                    tuple(transitioned_ids),
+                )
             for run_row in run_rows:
                 await _finalize_schedule_run_from_reducer(
                     connection,
@@ -1501,9 +1603,13 @@ class JournalReducer:
                 run_row = await _fetchone_row(
                     connection,
                     """
-                    SELECT run_id FROM schedule_runs
-                    WHERE result_submission_id = ?
-                      AND accepted_message_id IS NULL
+                    SELECT r.run_id
+                    FROM schedule_runs r
+                    JOIN submissions s ON s.submission_id = r.result_submission_id
+                    WHERE r.result_submission_id = ?
+                      AND r.accepted_message_id IS NULL
+                      AND s.accepted_message_id IS NULL
+                      AND s.observed_user_event_id IS NULL
                     """,
                     (submission_id,),
                 )
@@ -1515,6 +1621,26 @@ class JournalReducer:
                         completion_basis=None,
                         error_code="send_acceptance_unknown",
                         now=now,
+                    )
+                else:
+                    await connection.execute(
+                        """
+                        UPDATE schedule_runs
+                        SET status = 'waiting',
+                            waiting_at = COALESCE(waiting_at, ?),
+                            last_progress_at = ?, updated_at = ?
+                        WHERE result_submission_id = ?
+                          AND status IN ('submitting', 'accepted', 'waiting')
+                          AND EXISTS (
+                              SELECT 1 FROM submissions
+                              WHERE submission_id = ?
+                                AND (
+                                    accepted_message_id IS NOT NULL
+                                    OR observed_user_event_id IS NOT NULL
+                                )
+                          )
+                        """,
+                        (now, now, now, submission_id, submission_id),
                     )
             else:
                 cursor = await connection.execute(

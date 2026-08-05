@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import hashlib
+import hmac
 import json
 import os
 import re
@@ -191,6 +192,8 @@ class LiveSchedulerWorktreeHarness:
         unknown = sorted(set(features) - set(_FEATURES))
         if unknown:
             raise ValueError("unknown live acceptance features: " + ", ".join(unknown))
+        if not features:
+            raise ValueError("at least one non-auth live acceptance feature is required")
         self.features = features
         self._schedule_ids: list[str] = []
 
@@ -432,12 +435,14 @@ class LiveSchedulerWorktreeHarness:
         await asyncio.to_thread(crash_root.mkdir)
         marker = crash_root / "accepted.json"
         config_path = crash_root / "config.json"
+        parent_nonce = uuid.uuid4().hex
         _atomic_json_write(
             config_path,
             {
                 "root": str(crash_root),
                 "marker": str(marker),
                 "namespace": f"{self.namespace}-crash",
+                "parent_nonce": parent_nonce,
                 "timeout": self.timeout_seconds,
             },
         )
@@ -445,8 +450,11 @@ class LiveSchedulerWorktreeHarness:
             sys.executable,
             "-m",
             "copilotd.acceptance.live_scheduler_worktree",
+            "--live",
             "--crash-child-config",
             str(config_path),
+            "--parent-nonce",
+            parent_nonce,
             stdout=asyncio.subprocess.DEVNULL,
             stderr=asyncio.subprocess.DEVNULL,
         )
@@ -819,8 +827,11 @@ class LiveSchedulerWorktreeHarness:
                 pass
 
 
-async def _run_crash_child(config_path: Path) -> None:
+async def _run_crash_child(config_path: Path, *, parent_nonce: str) -> None:
     config = json.loads(await asyncio.to_thread(config_path.read_text, encoding="utf-8"))
+    expected_nonce = str(config.get("parent_nonce", ""))
+    if not parent_nonce or not hmac.compare_digest(parent_nonce, expected_nonce):
+        raise LiveAcceptanceError("crash child parent nonce is missing or invalid")
     root = Path(str(config["root"]))
     marker = Path(str(config["marker"]))
     namespace = str(config["namespace"])
@@ -1025,6 +1036,7 @@ def build_parser() -> argparse.ArgumentParser:
         type=Path,
         help=argparse.SUPPRESS,
     )
+    parser.add_argument("--parent-nonce", help=argparse.SUPPRESS)
     return parser
 
 
@@ -1046,7 +1058,16 @@ async def run_from_args(args: argparse.Namespace) -> dict[str, Any]:
 def main() -> None:
     args = build_parser().parse_args()
     if args.crash_child_config is not None:
-        asyncio.run(_run_crash_child(args.crash_child_config))
+        if not args.live:
+            raise SystemExit("--live is required for crash child mode")
+        if args.parent_nonce is None:
+            raise SystemExit("--parent-nonce is required for crash child mode")
+        asyncio.run(
+            _run_crash_child(
+                args.crash_child_config,
+                parent_nonce=args.parent_nonce,
+            )
+        )
         return
     try:
         summary = asyncio.run(run_from_args(args))

@@ -92,7 +92,7 @@ async def test_migrations_are_idempotent(tmp_path: Path) -> None:
     async with Database(database_path) as database:
         rows = await database.fetchall("SELECT version FROM schema_migrations")
 
-    assert [row["version"] for row in rows] == [*range(1, 10), 20, 21, 22]
+    assert [row["version"] for row in rows] == [*range(1, 10), 20, 21, 22, 23]
 
 
 @pytest.mark.asyncio
@@ -133,7 +133,7 @@ async def test_foundation_migration_upgrades_existing_v7_database(tmp_path: Path
             "SELECT name FROM sqlite_master WHERE type = 'table'"
         )
 
-    assert [row["version"] for row in versions] == [*range(1, 10), 20, 21, 22]
+    assert [row["version"] for row in versions] == [*range(1, 10), 20, 21, 22, 23]
     assert "protocol_version" in {row["name"] for row in capability_columns}
     assert {
         "schema_version",
