@@ -100,6 +100,10 @@ Runtime paths are fixed by platform:
 | macOS | `~/Library/Application Support/copilotd/` | `~/Library/Caches/copilotd/heartbeat.json` | `~/Library/Logs/copilotd/` |
 | Windows | `%LOCALAPPDATA%\copilotd\state\` | `%LOCALAPPDATA%\copilotd\cache\heartbeat.json` | `%LOCALAPPDATA%\copilotd\logs\` |
 
+On first Windows upgrade, a legacy `%LOCALAPPDATA%\copilotD\` state tree is adopted
+through a lock-protected two-rename migration before any new directories are created, so
+the existing database and session state remain visible.
+
 `copilotd.log` is rotating JSON (10 MiB with seven backups); `boot.log`,
 `watchdog.log`, and `alerts.log` have distinct destinations. Override paths with
 `COPILOTD_DATA_DIR`, `COPILOTD_CACHE_DIR`, and `COPILOTD_LOG_DIR`. A guild-scoped
@@ -108,5 +112,7 @@ development command sync can be selected with `COPILOTD_DISCORD_GUILD_ID`.
 The opt-in hardware/credential lanes are `scripts/acceptance-macos.sh` and
 `scripts/acceptance-windows.ps1`. They intentionally exit with failure when selected on
 the wrong OS or without required credentials/system facilities; they never silently
-skip. `scripts/package-smoke.sh` builds and installs both the wheel and sdist in isolated
-environments.
+skip. The workflow uses dedicated interactive self-hosted runners whose user profile is
+already authenticated to Copilot, runs a live SDK preflight, and requires permission to
+schedule a wake and put the machine to sleep. `scripts/package-smoke.sh` builds and
+installs both the wheel and sdist in isolated environments.

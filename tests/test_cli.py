@@ -1,6 +1,7 @@
 import argparse
 import asyncio
 import json
+import sqlite3
 from pathlib import Path
 
 import pytest
@@ -8,6 +9,7 @@ import pytest
 from copilotd.cli import CLI_SCHEMA_VERSION, build_parser, main, run_command
 from copilotd.config import Settings
 from copilotd.ops.service import ServiceManager
+from copilotd.storage.database import Database
 
 
 def _settings(tmp_path: Path) -> Settings:
@@ -71,3 +73,115 @@ def test_service_status_output_uses_versioned_json_envelope(
     assert payload["command"] == "service.status"
     assert payload["result"]["schema_version"] == 1
     assert payload["result"]["effective_state"] == "not-installed"
+
+
+@pytest.mark.asyncio
+async def test_schema_dependent_service_command_upgrades_schema_seven(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    settings = _settings(tmp_path)
+    async with Database(settings.database_path) as database:
+        await database.execute("DROP TABLE service_admission_fences")
+        await database.execute("DROP TABLE service_restart_intents")
+        await database.execute(
+            "DELETE FROM schema_migrations WHERE version IN (8, 9)"
+        )
+    manager = ServiceManager(settings, platform="unsupported")
+    args = argparse.Namespace(command="service", service_command="status")
+
+    assert await run_command(args, settings=settings, manager=manager) == 0
+    capsys.readouterr()
+
+    async with Database(settings.database_path) as database:
+        versions = await database.fetchall(
+            "SELECT version FROM schema_migrations ORDER BY version"
+        )
+        tables = await database.fetchall(
+            """
+            SELECT name FROM sqlite_master
+            WHERE type = 'table'
+              AND name IN ('service_restart_intents', 'service_admission_fences')
+            ORDER BY name
+            """
+        )
+    assert [row["version"] for row in versions] == list(range(1, 10))
+    assert [row["name"] for row in tables] == [
+        "service_admission_fences",
+        "service_restart_intents",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_force_restart_applies_operations_migrations_before_coordination(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    settings = _settings(tmp_path)
+    async with Database(settings.database_path) as database:
+        await database.execute("DROP TABLE service_admission_fences")
+        await database.execute("DROP TABLE service_restart_intents")
+        await database.execute(
+            "DELETE FROM schema_migrations WHERE version IN (8, 9)"
+        )
+    manager = ServiceManager(settings, platform="unsupported")
+    observed = False
+
+    class CoordinationReached(Exception):
+        pass
+
+    def restart(*, force: bool) -> None:
+        nonlocal observed
+        assert force is True
+        connection = sqlite3.connect(settings.database_path)
+        try:
+            names = {
+                row[0]
+                for row in connection.execute(
+                    """
+                    SELECT name FROM sqlite_master
+                    WHERE type = 'table'
+                    """
+                )
+            }
+        finally:
+            connection.close()
+        observed = {
+            "service_restart_intents",
+            "service_admission_fences",
+        } <= names
+        raise CoordinationReached
+
+    monkeypatch.setattr(manager, "restart", restart)
+    args = argparse.Namespace(
+        command="service",
+        service_command="restart",
+        force=True,
+    )
+
+    with pytest.raises(CoordinationReached):
+        await run_command(args, settings=settings, manager=manager)
+    assert observed is True
+
+
+@pytest.mark.asyncio
+async def test_managed_service_logging_disables_stderr_duplication(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    settings = _settings(tmp_path)
+    manager = ServiceManager(settings, platform="unsupported")
+    calls: list[tuple[str, Path | None, bool]] = []
+    monkeypatch.setenv("COPILOTD_MANAGED_SERVICE", "1")
+    monkeypatch.setattr(
+        "copilotd.cli.configure_logging",
+        lambda level, log_dir, *, stderr: calls.append(
+            (level, log_dir, stderr)
+        ),
+    )
+    args = argparse.Namespace(command="service", service_command="status")
+
+    assert await run_command(args, settings=settings, manager=manager) == 0
+    capsys.readouterr()
+    assert calls == [(settings.log_level, settings.log_dir, False)]

@@ -4,6 +4,7 @@ import json
 import os
 import stat
 import sys
+import time
 import uuid
 from collections.abc import Mapping
 from pathlib import Path
@@ -94,6 +95,7 @@ class Settings(BaseSettings):
     resume_suppression_seconds: float = 60
     setup_verify_timeout_seconds: float = 45
     restart_drain_timeout_seconds: float = 15
+    service_startup_grace_seconds: float = 120
 
     @field_validator("data_dir", "cache_dir", "log_dir", "resolved_home", mode="before")
     @classmethod
@@ -128,6 +130,7 @@ class Settings(BaseSettings):
         "resume_suppression_seconds",
         "setup_verify_timeout_seconds",
         "restart_drain_timeout_seconds",
+        "service_startup_grace_seconds",
     )
     @classmethod
     def validate_positive_seconds(cls, value: float) -> float:
@@ -158,6 +161,7 @@ class Settings(BaseSettings):
         return self.data_dir / "cache" / "event-fixtures" / "capabilities.json"
 
     def ensure_directories(self) -> None:
+        self.adopt_legacy_windows_layout()
         directories = [
             self.data_dir,
             self.cache_dir,
@@ -177,6 +181,76 @@ class Settings(BaseSettings):
             directory.mkdir(parents=True, exist_ok=True, mode=0o700)
             if os.name == "posix":
                 directory.chmod(0o700)
+
+    def adopt_legacy_windows_layout(
+        self,
+        *,
+        platform_name: str | None = None,
+        environ: Mapping[str, str] | None = None,
+        home: Path | None = None,
+    ) -> bool:
+        effective_platform = sys.platform if platform_name is None else platform_name
+        if effective_platform != "win32":
+            return False
+        effective_environ = os.environ if environ is None else environ
+        effective_home = self.resolved_home if home is None else home
+        expected_data, _, _ = platform_default_paths(
+            "win32",
+            environ=effective_environ,
+            home=effective_home,
+        )
+        if self.data_dir != expected_data.expanduser().resolve():
+            return False
+        local_app_data = expected_data.parent.parent
+        legacy_root = local_app_data / "copilotD"
+        target_root = expected_data.parent
+        staging = local_app_data / ".copilotd-legacy-state-migration"
+        journal = local_app_data / ".copilotd-layout-migration.json"
+        lock = local_app_data / ".copilotd-layout-migration.lock"
+        local_app_data.mkdir(parents=True, exist_ok=True)
+        descriptor = _acquire_private_lock(lock)
+        try:
+            if expected_data.exists():
+                if staging.exists():
+                    raise RuntimeError(
+                        "legacy Windows layout migration has both staged and target state"
+                    )
+                journal.unlink(missing_ok=True)
+                return False
+            if staging.exists():
+                target_root.mkdir(parents=True, exist_ok=True)
+                os.replace(staging, expected_data)
+                journal.unlink(missing_ok=True)
+                return True
+            if not _looks_like_legacy_state(legacy_root):
+                journal.unlink(missing_ok=True)
+                return False
+            _atomic_private_json(
+                journal,
+                {
+                    "schema_version": 1,
+                    "phase": "prepared",
+                    "legacy": str(legacy_root),
+                    "target": str(expected_data),
+                },
+            )
+            os.replace(legacy_root, staging)
+            _atomic_private_json(
+                journal,
+                {
+                    "schema_version": 1,
+                    "phase": "staged",
+                    "staging": str(staging),
+                    "target": str(expected_data),
+                },
+            )
+            target_root.mkdir(parents=True, exist_ok=True)
+            os.replace(staging, expected_data)
+            journal.unlink(missing_ok=True)
+            return True
+        finally:
+            os.close(descriptor)
+            lock.unlink(missing_ok=True)
 
     def validate_directory_security(self) -> list[str]:
         errors: list[str] = []
@@ -259,6 +333,7 @@ def load_settings() -> Settings:
     """Load environment settings plus the private service-only secret file."""
 
     settings = Settings()
+    settings.adopt_legacy_windows_layout()
     settings = _apply_persisted_service_settings(settings)
     secret_path_text = os.environ.get("COPILOTD_SERVICE_SECRETS")
     if secret_path_text is None and not settings.service_secrets_path.exists():
@@ -323,3 +398,33 @@ def _atomic_private_json(path: Path, payload: dict[str, object]) -> None:
             path.chmod(0o600)
     finally:
         temporary.unlink(missing_ok=True)
+
+
+def _looks_like_legacy_state(path: Path) -> bool:
+    return path.is_dir() and any(
+        (path / relative).exists()
+        for relative in (
+            "copilotd.sqlite3",
+            "runtime",
+            "sessions",
+            "worktrees",
+        )
+    )
+
+
+def _acquire_private_lock(path: Path) -> int:
+    deadline = time.monotonic() + 5
+    while True:
+        try:
+            return os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        except FileExistsError:
+            try:
+                stale = time.time() - path.stat().st_mtime > 60
+            except FileNotFoundError:
+                continue
+            if stale:
+                path.unlink(missing_ok=True)
+                continue
+            if time.monotonic() >= deadline:
+                raise RuntimeError("Windows layout migration lock is busy") from None
+            time.sleep(0.02)

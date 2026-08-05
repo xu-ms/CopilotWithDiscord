@@ -43,12 +43,12 @@ _WINDOWS_BOT_TASK = "copilotD Bot"
 _WINDOWS_WATCHDOG_TASK = "copilotD Watchdog"
 _TASK_NAMESPACE = "http://schemas.microsoft.com/windows/2004/02/mit/task"
 
-_TERMINAL_SUBMISSION_STATES = {
-    "rejected",
-    "semantic_complete",
-    "semantic_blocked",
-    "observed_aborted",
-    "outcome_unknown",
+_INFLIGHT_SUBMISSION_STATES = {
+    "submitting",
+    "submitted",
+    "submitted_unknown",
+    "observed_active",
+    "continuation_expected",
 }
 _TERMINAL_SCHEDULE_RUN_STATES = {
     "cancelled",
@@ -201,6 +201,17 @@ class InstallReceipt:
 
 
 @dataclass(frozen=True, slots=True)
+class QuiesceFence:
+    fence_id: str
+    expected_pid: int
+    expected_generation: str
+    requested_at: float
+    acknowledged_at: float | None = None
+    ingress_depth: int | None = None
+    violation_count: int = 0
+
+
+@dataclass(frozen=True, slots=True)
 class RestartSafetySnapshot:
     captured_at: float
     active_leases: LeaseMetrics
@@ -210,6 +221,7 @@ class RestartSafetySnapshot:
     native_schedules: int
     native_trigger_windows: int
     blockers: tuple[str, ...]
+    ingress_depth: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -234,9 +246,44 @@ class RestartReceipt:
     previous_generation: str
     safety_snapshot: RestartSafetySnapshot
     force_outcome: ForceRestartOutcome | None
+    admission_fence_id: str
 
 
 class RestartCoordinator(Protocol):
+    def request_quiesce(
+        self,
+        *,
+        expected_pid: int,
+        expected_generation: str,
+        now: float,
+    ) -> QuiesceFence: ...
+
+    def wait_for_quiesce(
+        self,
+        fence: QuiesceFence,
+        *,
+        timeout_seconds: float,
+    ) -> QuiesceFence: ...
+
+    def snapshot_under_fence(
+        self,
+        fence: QuiesceFence,
+        *,
+        now: float,
+    ) -> RestartSafetySnapshot: ...
+
+    def assert_quiesced(self, fence: QuiesceFence) -> None: ...
+
+    def commit_quiesce(self, fence: QuiesceFence, *, now: float) -> None: ...
+
+    def release_quiesce(
+        self,
+        fence: QuiesceFence,
+        *,
+        now: float,
+        reason: str,
+    ) -> None: ...
+
     def snapshot(self, *, now: float) -> RestartSafetySnapshot: ...
 
     def prepare_force(
@@ -260,105 +307,234 @@ class SqliteRestartCoordinator:
     def __init__(self, database_path: Path) -> None:
         self._database_path = database_path
 
+    def request_quiesce(
+        self,
+        *,
+        expected_pid: int,
+        expected_generation: str,
+        now: float,
+    ) -> QuiesceFence:
+        fence = QuiesceFence(
+            fence_id=str(uuid.uuid4()),
+            expected_pid=expected_pid,
+            expected_generation=expected_generation,
+            requested_at=now,
+        )
+        connection = self._connect()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            active = connection.execute(
+                """
+                SELECT fence_id, expected_pid, expected_generation, requested_at
+                FROM service_admission_fences
+                WHERE state IN ('requested', 'acknowledged', 'violated', 'committed')
+                LIMIT 1
+                """
+            ).fetchone()
+            if active is not None:
+                stale = (
+                    int(active["expected_pid"]) != expected_pid
+                    or str(active["expected_generation"]) != expected_generation
+                    or now - float(active["requested_at"]) > 60
+                )
+                if not stale:
+                    raise ServiceError(
+                        f"restart admission fence is already active: {active['fence_id']}"
+                    )
+                connection.execute(
+                    """
+                    UPDATE service_admission_fences
+                    SET state = 'released', released_at = ?, detail = ?
+                    WHERE fence_id = ?
+                    """,
+                    (
+                        now,
+                        json.dumps(
+                            {"reason": "superseded_stale_fence"},
+                            sort_keys=True,
+                            separators=(",", ":"),
+                        ),
+                        active["fence_id"],
+                    ),
+                )
+            connection.execute(
+                """
+                INSERT INTO service_admission_fences(
+                    fence_id, expected_pid, expected_generation,
+                    state, requested_at, detail
+                ) VALUES (?, ?, ?, 'requested', ?, ?)
+                """,
+                (
+                    fence.fence_id,
+                    fence.expected_pid,
+                    fence.expected_generation,
+                    fence.requested_at,
+                    json.dumps(
+                        {"reason": "service_restart"},
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    ),
+                ),
+            )
+            connection.commit()
+        except sqlite3.Error as error:
+            connection.rollback()
+            raise ServiceError(f"could not request restart quiesce: {error}") from error
+        finally:
+            connection.close()
+        return fence
+
+    def acknowledge_quiesce(
+        self,
+        fence: QuiesceFence,
+        *,
+        ingress_depth: int = 0,
+        violation_count: int = 0,
+        now: float | None = None,
+    ) -> None:
+        timestamp = time.time() if now is None else now
+        connection = self._connect()
+        try:
+            cursor = connection.execute(
+                """
+                UPDATE service_admission_fences
+                SET state = 'acknowledged', acknowledged_at = ?,
+                    ingress_depth = ?, violation_count = ?
+                WHERE fence_id = ? AND state = 'requested'
+                  AND expected_pid = ? AND expected_generation = ?
+                """,
+                (
+                    timestamp,
+                    ingress_depth,
+                    violation_count,
+                    fence.fence_id,
+                    fence.expected_pid,
+                    fence.expected_generation,
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise ServiceError("restart admission fence could not be acknowledged")
+            connection.commit()
+        finally:
+            connection.close()
+
+    def wait_for_quiesce(
+        self,
+        fence: QuiesceFence,
+        *,
+        timeout_seconds: float,
+    ) -> QuiesceFence:
+        deadline = time.monotonic() + timeout_seconds
+        while True:
+            row = self._fence_row(fence.fence_id)
+            if row is None:
+                raise ServiceError("restart admission fence disappeared")
+            state = str(row["state"])
+            if state == "acknowledged":
+                return QuiesceFence(
+                    fence_id=fence.fence_id,
+                    expected_pid=fence.expected_pid,
+                    expected_generation=fence.expected_generation,
+                    requested_at=fence.requested_at,
+                    acknowledged_at=float(row["acknowledged_at"]),
+                    ingress_depth=int(row["ingress_depth"]),
+                    violation_count=int(row["violation_count"]),
+                )
+            if state in {"violated", "released"}:
+                raise RestartBlocked([f"admission_fence_{state}"])
+            if time.monotonic() >= deadline:
+                raise RestartBlocked(["admission_quiesce_timeout"])
+            time.sleep(0.02)
+
+    def snapshot_under_fence(
+        self,
+        fence: QuiesceFence,
+        *,
+        now: float,
+    ) -> RestartSafetySnapshot:
+        connection = self._connect()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            row = self._require_acknowledged_fence(connection, fence)
+            snapshot = self._snapshot_connection(
+                connection,
+                now=now,
+                ingress_depth=int(row["ingress_depth"]),
+            )
+            self._require_acknowledged_fence(connection, fence)
+            connection.commit()
+            return snapshot
+        except sqlite3.Error as error:
+            connection.rollback()
+            raise ServiceError(
+                f"could not capture fenced restart snapshot: {error}"
+            ) from error
+        finally:
+            connection.close()
+
+    def assert_quiesced(self, fence: QuiesceFence) -> None:
+        connection = self._connect()
+        try:
+            self._require_acknowledged_fence(connection, fence)
+        finally:
+            connection.close()
+
+    def commit_quiesce(self, fence: QuiesceFence, *, now: float) -> None:
+        self._transition_fence(
+            fence,
+            expected_state="acknowledged",
+            state="committed",
+            timestamp_column="committed_at",
+            now=now,
+            reason="restart_committed",
+        )
+
+    def release_quiesce(
+        self,
+        fence: QuiesceFence,
+        *,
+        now: float,
+        reason: str,
+    ) -> None:
+        connection = self._connect()
+        try:
+            connection.execute(
+                """
+                UPDATE service_admission_fences
+                SET state = 'released', released_at = ?, detail = ?
+                WHERE fence_id = ?
+                  AND state IN ('requested', 'acknowledged', 'violated', 'committed')
+                """,
+                (
+                    now,
+                    json.dumps(
+                        {"reason": reason},
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    ),
+                    fence.fence_id,
+                ),
+            )
+            connection.commit()
+        finally:
+            connection.close()
+
     def snapshot(self, *, now: float) -> RestartSafetySnapshot:
         connection = self._connect()
         try:
             connection.execute("BEGIN")
-            lease_rows = connection.execute(
-                """
-                SELECT l.kind, COUNT(*) AS count
-                FROM liveness_leases AS l
-                JOIN session_bindings AS b USING (sdk_session_id)
-                WHERE l.state = 'active'
-                  AND l.runtime_generation = b.runtime_generation
-                  AND l.owner_fence_token = b.owner_fence_token
-                GROUP BY l.kind
-                """
-            ).fetchall()
-            lease_counts = {str(row["kind"]): int(row["count"]) for row in lease_rows}
-            submissions = lease_counts.get("submission", 0)
-            background = lease_counts.get("observed_background", 0)
-            interactions = lease_counts.get("interaction", 0)
-            leases = LeaseMetrics(
-                active_submissions=submissions,
-                observed_background_tasks=background,
-                pending_interactions=interactions,
-                total=sum(lease_counts.values()),
-            )
-            local_pending = self._count(
+            snapshot = self._snapshot_connection(
                 connection,
-                """
-                SELECT COUNT(*) FROM message_queue
-                WHERE state NOT IN ('cancelled', 'submitted', 'failed')
-                """,
-            )
-            pending_operations = self._count(
-                connection,
-                """
-                SELECT COUNT(*)
-                FROM session_operations AS o
-                JOIN session_bindings AS b USING (sdk_session_id)
-                WHERE o.state IN ('pending', 'started')
-                  AND o.runtime_generation = b.runtime_generation
-                  AND o.owner_fence_token = b.owner_fence_token
-                """,
-            )
-            remote_sessions = self._count(
-                connection,
-                """
-                SELECT COUNT(*) FROM session_bindings
-                WHERE attachment_state = 'attached'
-                  AND (
-                    runtime_remote_mode IN ('on', 'unknown')
-                    OR pending_remote_transition_id IS NOT NULL
-                  )
-                """,
-            )
-            native_schedules = self._count(
-                connection,
-                """
-                SELECT COUNT(*) FROM runtime_schedules
-                WHERE state IN ('active', 'unknown')
-                """,
-            )
-            terminal_placeholders = ",".join("?" for _ in _TERMINAL_SCHEDULE_RUN_STATES)
-            native_trigger_windows = self._count(
-                connection,
-                f"""
-                SELECT COUNT(*) FROM schedule_runs
-                WHERE status NOT IN ({terminal_placeholders})
-                  AND (
-                    claimed_at IS NOT NULL
-                    OR session_create_started_at IS NOT NULL
-                    OR send_started_at IS NOT NULL
-                  )
-                """,
-                tuple(sorted(_TERMINAL_SCHEDULE_RUN_STATES)),
+                now=now,
+                ingress_depth=0,
             )
             connection.commit()
+            return snapshot
         except sqlite3.Error as error:
             connection.rollback()
             raise ServiceError(f"could not capture durable restart snapshot: {error}") from error
         finally:
             connection.close()
-        blockers = _restart_blockers(
-            leases=leases,
-            local_pending=local_pending,
-            pending_operations=pending_operations,
-            remote_sessions=remote_sessions,
-            native_schedules=native_schedules,
-            native_trigger_windows=native_trigger_windows,
-        )
-        return RestartSafetySnapshot(
-            captured_at=now,
-            active_leases=leases,
-            local_pending=local_pending,
-            pending_operations=pending_operations,
-            remote_sessions=remote_sessions,
-            native_schedules=native_schedules,
-            native_trigger_windows=native_trigger_windows,
-            blockers=tuple(blockers),
-        )
 
     def prepare_force(
         self,
@@ -398,14 +574,37 @@ class SqliteRestartCoordinator:
                 ],
             )
             counts["intents"] = len(intent_targets)
+            inflight_placeholders = ",".join(
+                "?" for _ in _INFLIGHT_SUBMISSION_STATES
+            )
+            connection.execute(
+                f"""
+                UPDATE message_queue
+                SET state = 'submitted', updated_at = ?
+                WHERE state = 'submitting'
+                  AND id IN (
+                    SELECT submission_id FROM submissions
+                    WHERE state IN ({inflight_placeholders})
+                  )
+                """,
+                (
+                    snapshot.captured_at,
+                    *sorted(_INFLIGHT_SUBMISSION_STATES),
+                ),
+            )
             counts["submissions"] = self._update(
                 connection,
                 f"""
                 UPDATE submissions
                 SET state = 'outcome_unknown'
-                WHERE state NOT IN ({",".join("?" for _ in _TERMINAL_SUBMISSION_STATES)})
+                WHERE state IN ({inflight_placeholders})
+                  AND NOT EXISTS (
+                    SELECT 1 FROM message_queue AS q
+                    WHERE q.id = submissions.submission_id
+                      AND q.state IN ('local_queued', 'cancelled')
+                  )
                 """,
-                tuple(sorted(_TERMINAL_SUBMISSION_STATES)),
+                tuple(sorted(_INFLIGHT_SUBMISSION_STATES)),
             )
             counts["operations"] = self._update(
                 connection,
@@ -480,6 +679,14 @@ class SqliteRestartCoordinator:
                     WHERE b.sdk_session_id = liveness_leases.sdk_session_id
                       AND b.runtime_generation = liveness_leases.runtime_generation
                       AND b.owner_fence_token = liveness_leases.owner_fence_token
+                  )
+                  AND (
+                    kind != 'submission'
+                    OR EXISTS (
+                      SELECT 1 FROM submissions AS s
+                      WHERE s.submission_id = liveness_leases.source_id
+                        AND s.state = 'outcome_unknown'
+                    )
                   )
                 """,
                 (snapshot.captured_at, snapshot.captured_at),
@@ -563,6 +770,177 @@ class SqliteRestartCoordinator:
         finally:
             connection.close()
         return time.time() <= deadline
+
+    def _snapshot_connection(
+        self,
+        connection: sqlite3.Connection,
+        *,
+        now: float,
+        ingress_depth: int,
+    ) -> RestartSafetySnapshot:
+        lease_rows = connection.execute(
+            """
+            SELECT l.kind, COUNT(*) AS count
+            FROM liveness_leases AS l
+            JOIN session_bindings AS b USING (sdk_session_id)
+            WHERE l.state = 'active'
+              AND l.runtime_generation = b.runtime_generation
+              AND l.owner_fence_token = b.owner_fence_token
+            GROUP BY l.kind
+            """
+        ).fetchall()
+        lease_counts = {str(row["kind"]): int(row["count"]) for row in lease_rows}
+        leases = LeaseMetrics(
+            active_submissions=lease_counts.get("submission", 0),
+            observed_background_tasks=lease_counts.get("observed_background", 0),
+            pending_interactions=lease_counts.get("interaction", 0),
+            total=sum(lease_counts.values()),
+        )
+        local_pending = self._count(
+            connection,
+            """
+            SELECT COUNT(*) FROM message_queue
+            WHERE state NOT IN ('cancelled', 'submitted', 'failed')
+            """,
+        )
+        pending_operations = self._count(
+            connection,
+            """
+            SELECT COUNT(*)
+            FROM session_operations AS o
+            JOIN session_bindings AS b USING (sdk_session_id)
+            WHERE o.state IN ('pending', 'started')
+              AND o.runtime_generation = b.runtime_generation
+              AND o.owner_fence_token = b.owner_fence_token
+            """,
+        )
+        remote_sessions = self._count(
+            connection,
+            """
+            SELECT COUNT(*) FROM session_bindings
+            WHERE attachment_state = 'attached'
+              AND (
+                runtime_remote_mode IN ('on', 'unknown')
+                OR pending_remote_transition_id IS NOT NULL
+              )
+            """,
+        )
+        native_schedules = self._count(
+            connection,
+            """
+            SELECT COUNT(*) FROM runtime_schedules
+            WHERE state IN ('active', 'unknown')
+            """,
+        )
+        terminal_placeholders = ",".join(
+            "?" for _ in _TERMINAL_SCHEDULE_RUN_STATES
+        )
+        native_trigger_windows = self._count(
+            connection,
+            f"""
+            SELECT COUNT(*) FROM schedule_runs
+            WHERE status NOT IN ({terminal_placeholders})
+              AND (
+                claimed_at IS NOT NULL
+                OR session_create_started_at IS NOT NULL
+                OR send_started_at IS NOT NULL
+              )
+            """,
+            tuple(sorted(_TERMINAL_SCHEDULE_RUN_STATES)),
+        )
+        blockers = _restart_blockers(
+            leases=leases,
+            local_pending=local_pending,
+            pending_operations=pending_operations,
+            remote_sessions=remote_sessions,
+            native_schedules=native_schedules,
+            native_trigger_windows=native_trigger_windows,
+            ingress_depth=ingress_depth,
+        )
+        return RestartSafetySnapshot(
+            captured_at=now,
+            active_leases=leases,
+            local_pending=local_pending,
+            pending_operations=pending_operations,
+            remote_sessions=remote_sessions,
+            native_schedules=native_schedules,
+            native_trigger_windows=native_trigger_windows,
+            blockers=tuple(blockers),
+            ingress_depth=ingress_depth,
+        )
+
+    def _fence_row(self, fence_id: str) -> sqlite3.Row | None:
+        connection = self._connect()
+        try:
+            return connection.execute(
+                "SELECT * FROM service_admission_fences WHERE fence_id = ?",
+                (fence_id,),
+            ).fetchone()
+        finally:
+            connection.close()
+
+    @staticmethod
+    def _require_acknowledged_fence(
+        connection: sqlite3.Connection,
+        fence: QuiesceFence,
+    ) -> sqlite3.Row:
+        row = connection.execute(
+            """
+            SELECT * FROM service_admission_fences
+            WHERE fence_id = ? AND expected_pid = ?
+              AND expected_generation = ?
+            """,
+            (
+                fence.fence_id,
+                fence.expected_pid,
+                fence.expected_generation,
+            ),
+        ).fetchone()
+        if row is None or row["state"] != "acknowledged":
+            state = "missing" if row is None else str(row["state"])
+            raise RestartBlocked([f"admission_fence_{state}"])
+        if int(row["ingress_depth"] or 0) != 0:
+            raise RestartBlocked([f"ingress_queue:{row['ingress_depth']}"])
+        return row
+
+    def _transition_fence(
+        self,
+        fence: QuiesceFence,
+        *,
+        expected_state: str,
+        state: str,
+        timestamp_column: str,
+        now: float,
+        reason: str,
+    ) -> None:
+        connection = self._connect()
+        try:
+            cursor = connection.execute(
+                f"""
+                UPDATE service_admission_fences
+                SET state = ?, {timestamp_column} = ?, detail = ?
+                WHERE fence_id = ? AND state = ?
+                  AND expected_pid = ? AND expected_generation = ?
+                """,
+                (
+                    state,
+                    now,
+                    json.dumps(
+                        {"reason": reason},
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    ),
+                    fence.fence_id,
+                    expected_state,
+                    fence.expected_pid,
+                    fence.expected_generation,
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise RestartBlocked(["admission_fence_transition_failed"])
+            connection.commit()
+        finally:
+            connection.close()
 
     def _connect(self) -> sqlite3.Connection:
         if not self._database_path.is_file():
@@ -709,11 +1087,13 @@ class RestartStormStore:
         *,
         window_seconds: float = RESTART_STORM_WINDOW_SECONDS,
         limit: int = RESTART_STORM_LIMIT,
+        max_gap_seconds: float = WATCHDOG_INTERVAL_SECONDS * 1.5,
     ) -> None:
         self._path = path
         self._lock_path = path.with_suffix(path.suffix + ".lock")
         self._window_seconds = window_seconds
         self._limit = limit
+        self._max_gap_seconds = max_gap_seconds
 
     def check_and_record(self, now: float) -> StormDecision:
         descriptor = self._acquire_lock()
@@ -722,11 +1102,18 @@ class RestartStormStore:
                 payload = self._read()
             except (OSError, TypeError, ValueError, json.JSONDecodeError) as error:
                 return StormDecision(True, self._limit, f"corrupt restart state: {error}")
-            restarts = [
+            recent = sorted(
                 float(value)
                 for value in payload.get("restarts", [])
                 if -5 <= now - float(value) <= self._window_seconds
-            ]
+            )
+            restarts: list[float] = []
+            for value in recent:
+                if restarts and value - restarts[-1] > self._max_gap_seconds:
+                    restarts = []
+                restarts.append(value)
+            if restarts and now - restarts[-1] > self._max_gap_seconds:
+                restarts = []
             if len(restarts) >= self._limit:
                 return StormDecision(True, len(restarts), "restart threshold reached")
             restarts.append(now)
@@ -1001,20 +1388,92 @@ class ServiceManager:
                 "$taskFiles = [ordered]@{",
                 task_map,
                 "}",
+                "$knownTaskNames = @("
+                "'copilotD Runtime','copilotD Bot','copilotD Watchdog')",
                 f"$secretPath = '{secret_path}'",
                 f"$runnerPath = '{runner_path}'",
+                "function Test-CopilotDAction("
+                "[string]$Line, [string]$ActionName) {",
+                "  $runnerIndex = $Line.IndexOf($runnerPath, "
+                "[StringComparison]::OrdinalIgnoreCase)",
+                "  if ($runnerIndex -lt 0) { return $false }",
+                "  $tail = $Line.Substring($runnerIndex + $runnerPath.Length)",
+                "  $pattern = '(?i)(?:^|\\s)' + "
+                "[regex]::Escape($ActionName) + '(?:\\s|$)'",
+                "  return [regex]::IsMatch($tail, $pattern)",
+                "}",
+                "function Get-CopilotDHostProcesses([string[]]$TaskNames) {",
+                "  $actions = @($TaskNames | ForEach-Object {",
+                "    if ($_ -eq 'copilotD Bot') { 'run' }",
+                "    elseif ($_ -eq 'copilotD Runtime') { 'runtime' }",
+                "    else { 'watchdog' }",
+                "  })",
+                "  return @(Get-CimInstance Win32_Process | Where-Object {",
+                "    $line = [string]$_.CommandLine",
+                "    $matches = $false",
+                "    foreach ($actionName in $actions) {",
+                "      if (Test-CopilotDAction $line $actionName) { "
+                "$matches = $true; break }",
+                "    }",
+                "    $matches",
+                "  })",
+                "}",
+                "function Get-CopilotDProcessTreeIds([object[]]$Roots) {",
+                "  $all = @(Get-CimInstance Win32_Process)",
+                "  $pending = [Collections.Generic.Queue[int]]::new()",
+                "  $ids = [Collections.Generic.HashSet[int]]::new()",
+                "  foreach ($root in $Roots) { "
+                "$pending.Enqueue([int]$root.ProcessId) }",
+                "  while ($pending.Count -gt 0) {",
+                "    $id = $pending.Dequeue()",
+                "    if (-not $ids.Add($id)) { continue }",
+                "    foreach ($child in $all | Where-Object { "
+                "$_.ParentProcessId -eq $id }) {",
+                "      $pending.Enqueue([int]$child.ProcessId)",
+                "    }",
+                "  }",
+                "  return @($ids)",
+                "}",
+                "function Stop-CopilotDTasks([string[]]$TaskNames) {",
+                "  foreach ($taskName in $TaskNames) {",
+                "    Stop-ScheduledTask -TaskName $taskName "
+                "-ErrorAction SilentlyContinue",
+                "  }",
+                "  $hosts = @(Get-CopilotDHostProcesses $TaskNames)",
+                "  $tracked = @(Get-CopilotDProcessTreeIds $hosts)",
+                "  foreach ($hostProcess in $hosts) {",
+                "    & taskkill.exe /PID $hostProcess.ProcessId /T /F | Out-Null",
+                "    if ($LASTEXITCODE -ne 0 -and "
+                "$null -ne (Get-Process -Id $hostProcess.ProcessId "
+                "-ErrorAction SilentlyContinue)) {",
+                "      throw \"Could not stop copilotD process tree "
+                "$($hostProcess.ProcessId)\"",
+                "    }",
+                "  }",
+                "  $deadline = [DateTime]::UtcNow.AddSeconds(15)",
+                "  do {",
+                "    $remaining = @($tracked | Where-Object { "
+                "$null -ne (Get-Process -Id $_ -ErrorAction SilentlyContinue) })",
+                "    $remainingHosts = @(Get-CopilotDHostProcesses $TaskNames)",
+                "    if ($remaining.Count -eq 0 -and "
+                "$remainingHosts.Count -eq 0) { return }",
+                "    Start-Sleep -Milliseconds 200",
+                "  } while ([DateTime]::UtcNow -lt $deadline)",
+                "  throw 'copilotD process tree did not exit before task unregister'",
+                "}",
                 "function Get-CopilotDStatus {",
                 "  $rows = @()",
                 "  foreach ($taskName in $taskFiles.Keys) {",
                 "    try {",
                 "      $task = Get-ScheduledTask -TaskName $taskName -ErrorAction Stop",
                 "      $xml = Export-ScheduledTask -TaskName $taskName -ErrorAction Stop",
-                "      $needle = if ($taskName -eq 'copilotD Bot') { ' run' } "
-                "elseif ($taskName -eq 'copilotD Runtime') { ' runtime' } else { $null }",
+                "      $actionName = if ($taskName -eq 'copilotD Bot') { 'run' } "
+                "elseif ($taskName -eq 'copilotD Runtime') { 'runtime' } else { $null }",
                 "      $pid = $null",
-                "      if ($null -ne $needle) {",
+                "      if ($null -ne $actionName) {",
                 "        $hostProcess = Get-CimInstance Win32_Process | Where-Object { "
-                '$_.CommandLine -like "*$runnerPath*" -and $_.CommandLine -like "*$needle*" '
+                "$line = [string]$_.CommandLine; "
+                "Test-CopilotDAction $line $actionName "
                 "} | Select-Object -First 1",
                 "        if ($null -ne $hostProcess) {",
                 "          $process = Get-CimInstance Win32_Process | Where-Object { "
@@ -1040,7 +1499,8 @@ class ServiceManager:
                 "  & icacls.exe $secretPath '/inheritance:r' "
                 '"/grant:r" "*$($sid):(R,W)" | Out-Null',
                 "  if ($LASTEXITCODE -ne 0) { throw 'Could not restrict service secret ACL' }",
-                "  foreach ($taskName in $taskFiles.Keys) {",
+                "  Stop-CopilotDTasks $knownTaskNames",
+                "  foreach ($taskName in $knownTaskNames) {",
                 "    Unregister-ScheduledTask -TaskName $taskName -Confirm:$false "
                 "-ErrorAction SilentlyContinue",
                 "  }",
@@ -1057,10 +1517,11 @@ class ServiceManager:
                 "} elseif ($Action -eq 'Status') {",
                 "  (Get-CopilotDStatus) | ConvertTo-Json -Depth 8 -Compress",
                 "} elseif ($Action -eq 'Restart') {",
-                "  Stop-ScheduledTask -TaskName 'copilotD Bot' -ErrorAction SilentlyContinue",
+                "  Stop-CopilotDTasks @('copilotD Bot')",
                 "  Start-ScheduledTask -TaskName 'copilotD Bot' -ErrorAction Stop",
                 "} elseif ($Action -eq 'Uninstall') {",
-                "  foreach ($taskName in $taskFiles.Keys) {",
+                "  Stop-CopilotDTasks $knownTaskNames",
+                "  foreach ($taskName in $knownTaskNames) {",
                 "    Unregister-ScheduledTask -TaskName $taskName -Confirm:$false "
                 "-ErrorAction SilentlyContinue",
                 "  }",
@@ -1090,9 +1551,17 @@ class ServiceManager:
                     "Start-ScheduledTask",
                     "Stop-ScheduledTask",
                     "Get-CimInstance Win32_Process",
+                    "taskkill.exe",
+                    "Stop-CopilotDTasks",
                     "icacls.exe",
                 ),
             ),
+        }
+
+    def validate_windows_task_xml(self) -> dict[str, tuple[str, ...]]:
+        return {
+            task: _windows_task_contract_errors(xml)
+            for task, xml in self.windows_task_xml().items()
         }
 
     def install(self) -> InstallReceipt:
@@ -1162,6 +1631,7 @@ class ServiceManager:
                     _parse_rfc3339(status.heartbeat_written_at) >= receipt.installed_at - 1
                 )
             if status.ready and fresh_process and written_after_install:
+                self._record_verified_identity(status)
                 return status
             if time.monotonic() >= deadline:
                 detail = status_dict(last_status) if last_status is not None else {}
@@ -1175,7 +1645,7 @@ class ServiceManager:
     def uninstall(self) -> None:
         if self.platform == "darwin":
             domain = self._mac_domain
-            for label in self._mac_labels:
+            for label in self._all_mac_labels:
                 self._runner.run(
                     ["launchctl", "bootout", f"{domain}/{label}"],
                     check=False,
@@ -1183,27 +1653,24 @@ class ServiceManager:
                 (self.launch_agents_dir / f"{label}.plist").unlink(missing_ok=True)
         elif self.platform == "win32":
             installer = self.settings.data_dir / "runtime" / "install-service.ps1"
-            if installer.exists():
-                self._runner.run(
-                    [
-                        "powershell.exe",
-                        "-NoProfile",
-                        "-NonInteractive",
-                        "-ExecutionPolicy",
-                        "Bypass",
-                        "-File",
-                        str(installer),
-                        "-Action",
-                        "Uninstall",
-                    ],
-                    check=True,
+            if not installer.exists():
+                raise ServiceError(
+                    "refusing unsafe Windows uninstall without install-service.ps1"
                 )
-            else:
-                for task in self._windows_task_names:
-                    self._runner.run(
-                        ["schtasks.exe", "/Delete", "/TN", task, "/F"],
-                        check=False,
-                    )
+            self._runner.run(
+                [
+                    "powershell.exe",
+                    "-NoProfile",
+                    "-NonInteractive",
+                    "-ExecutionPolicy",
+                    "Bypass",
+                    "-File",
+                    str(installer),
+                    "-Action",
+                    "Uninstall",
+                ],
+                check=True,
+            )
         else:
             raise ServiceError(f"service uninstallation is unsupported on {self.platform}")
         self._mark_uninstalled()
@@ -1321,26 +1788,74 @@ class ServiceManager:
             raise RestartBlocked(["process_generation_missing"])
         if status.process_identity_matches is not True:
             raise RestartBlocked(["os_pid_heartbeat_mismatch"])
-        snapshot = self._coordinator.snapshot(now=requested_at)
-        if requested_at - snapshot.captured_at > 2:
-            raise RestartBlocked(["durable_snapshot_stale"])
-        if snapshot.blockers and not force:
-            raise RestartBlocked(snapshot.blockers)
-        force_outcome = None
-        if force:
-            force_outcome = self._prepare_force_bounded(
-                snapshot,
-                timeout_seconds=self.settings.restart_drain_timeout_seconds,
-            )
-        self._restart_bot()
-        return RestartReceipt(
-            requested_at=requested_at,
-            force=force,
-            previous_pid=status.pid,
-            previous_generation=status.process_generation,
-            safety_snapshot=snapshot,
-            force_outcome=force_outcome,
+        deadline = time.monotonic() + self.settings.restart_drain_timeout_seconds
+        fence = self._coordinator.request_quiesce(
+            expected_pid=status.pid,
+            expected_generation=status.process_generation,
+            now=requested_at,
         )
+        committed = False
+        try:
+            fence = self._coordinator.wait_for_quiesce(
+                fence,
+                timeout_seconds=_remaining_seconds(deadline),
+            )
+            snapshot = self._coordinator.snapshot_under_fence(
+                fence,
+                now=self._now(),
+            )
+            if self._now() - snapshot.captured_at > 2:
+                raise RestartBlocked(["durable_snapshot_stale"])
+            self._revalidate_restart_identity(status, fence)
+            self._coordinator.assert_quiesced(fence)
+            if snapshot.blockers and not force:
+                raise RestartBlocked(snapshot.blockers)
+            force_outcome = None
+            if force:
+                force_outcome = self._prepare_force_bounded(
+                    snapshot,
+                    timeout_seconds=_remaining_seconds(deadline),
+                )
+            self._coordinator.assert_quiesced(fence)
+            self._revalidate_restart_identity(status, fence)
+            self._coordinator.commit_quiesce(fence, now=self._now())
+            committed = True
+            self._restart_bot()
+            return RestartReceipt(
+                requested_at=requested_at,
+                force=force,
+                previous_pid=status.pid,
+                previous_generation=status.process_generation,
+                safety_snapshot=snapshot,
+                force_outcome=force_outcome,
+                admission_fence_id=fence.fence_id,
+            )
+        except BaseException:
+            self._coordinator.release_quiesce(
+                fence,
+                now=self._now(),
+                reason=(
+                    "restart_command_failed"
+                    if committed
+                    else "restart_aborted"
+                ),
+            )
+            raise
+
+    def _revalidate_restart_identity(
+        self,
+        initial: ServiceStatus,
+        fence: QuiesceFence,
+    ) -> None:
+        current = self.status()
+        if (
+            current.pid != initial.pid
+            or current.process_generation != initial.process_generation
+            or current.process_identity_matches is not True
+            or current.pid != fence.expected_pid
+            or current.process_generation != fence.expected_generation
+        ):
+            raise RestartBlocked(["managed_process_identity_changed"])
 
     def run_runtime(self) -> None:
         if self.topology != "sidecar":
@@ -1450,16 +1965,53 @@ class ServiceManager:
         ):
             return "recent-wake"
 
+        managed_bot = self._managed_bot_unit()
+        startup_grace = self._startup_grace_active(current)
         try:
             snapshot = read_heartbeat(self.settings.heartbeat_path)
             age = heartbeat_age_seconds(snapshot, now=current)
         except (OSError, TypeError, ValueError, json.JSONDecodeError) as error:
+            if (
+                managed_bot is not None
+                and managed_bot.effective_state == "running"
+                and startup_grace
+            ):
+                return "startup-grace"
             self._write_alert(
                 "watchdog_heartbeat_invalid",
                 "watchdog failed closed because heartbeat is missing or malformed",
                 error=str(error),
             )
             return "heartbeat-invalid"
+        if (
+            managed_bot is None
+            or managed_bot.effective_state != "running"
+            or managed_bot.pid is None
+        ):
+            self._write_alert(
+                "watchdog_manager_state_invalid",
+                "watchdog failed closed because the OS manager has no running bot",
+            )
+            return "manager-not-running"
+        if managed_bot.pid != snapshot.pid:
+            self._write_alert(
+                "watchdog_replacement_starting",
+                "stale heartbeat belongs to a replaced process",
+                heartbeat_pid=snapshot.pid,
+                managed_pid=managed_bot.pid,
+                process_generation=snapshot.process_generation,
+            )
+            return "replacement-starting"
+        if not self._heartbeat_generation_matches_verified(snapshot):
+            self._write_alert(
+                "watchdog_generation_mismatch",
+                "heartbeat generation does not match the verified managed process",
+                heartbeat_pid=snapshot.pid,
+                process_generation=snapshot.process_generation,
+            )
+            return "replacement-starting"
+        if age > self.settings.heartbeat_stale_seconds and startup_grace:
+            return "startup-grace"
 
         gateway_down_for = _gateway_down_seconds(snapshot, current)
         gateway_restart = (
@@ -1468,17 +2020,25 @@ class ServiceManager:
             and gateway_down_for >= self.settings.gateway_down_restart_seconds
         )
         if self.topology == "sidecar" and snapshot.runtime_state == "down":
-            durable = self._coordinator.snapshot(now=current)
-            outcome = self._prepare_force_bounded(
-                durable,
-                timeout_seconds=self.settings.restart_drain_timeout_seconds,
-            )
+            try:
+                receipt = self.restart(force=True)
+            except (RestartBlocked, ServiceError) as error:
+                self._write_alert(
+                    "watchdog_runtime_loss_quiesce_failed",
+                    "runtime sidecar loss could not safely fence bot ingress",
+                    error=str(error),
+                )
+                return "runtime-loss-quiesce-failed"
             self._write_alert(
                 "watchdog_runtime_loss",
-                "runtime sidecar loss marked in-flight outcomes unknown",
-                force_outcome=asdict(outcome),
+                "runtime sidecar loss fenced and restarted the bot",
+                force_outcome=(
+                    None
+                    if receipt.force_outcome is None
+                    else asdict(receipt.force_outcome)
+                ),
             )
-            return "runtime-loss-marked-unknown"
+            return "runtime-loss-restarted"
         if age <= self.settings.heartbeat_stale_seconds and not gateway_restart:
             return "healthy"
         try:
@@ -1496,7 +2056,10 @@ class ServiceManager:
                     durable,
                     deadline=time.time() + FORCE_RESTART_DRAIN_SECONDS,
                 ):
-                    return self._watchdog_restart(current)
+                    return self._watchdog_restart(
+                        current,
+                        allow_replay_blockers=True,
+                    )
             event = (
                 "watchdog_gateway_down_protected" if gateway_restart else "watchdog_stale_protected"
             )
@@ -1510,25 +2073,75 @@ class ServiceManager:
             return "protected-gateway-down" if gateway_restart else "protected-no-restart"
         return self._watchdog_restart(current)
 
-    def _watchdog_restart(self, now: float) -> str:
+    def _watchdog_restart(
+        self,
+        now: float,
+        *,
+        allow_replay_blockers: bool = False,
+    ) -> str:
+        initial = self.status()
+        if (
+            initial.pid is None
+            or initial.process_generation is None
+            or initial.process_identity_matches is not True
+        ):
+            return "replacement-starting"
+        fence: QuiesceFence | None = None
+        committed = False
         try:
+            fence = self._coordinator.request_quiesce(
+                expected_pid=initial.pid,
+                expected_generation=initial.process_generation,
+                now=now,
+            )
+            fence = self._coordinator.wait_for_quiesce(
+                fence,
+                timeout_seconds=self.settings.restart_drain_timeout_seconds,
+            )
+            durable = self._coordinator.snapshot_under_fence(
+                fence,
+                now=self._now(),
+            )
+            if durable.blockers and not allow_replay_blockers:
+                self._write_alert(
+                    "watchdog_restart_blocked_after_quiesce",
+                    "durable work appeared while the watchdog quiesced ingress",
+                    durable_blockers=list(durable.blockers),
+                )
+                return "protected-no-restart"
+            self._revalidate_restart_identity(initial, fence)
+            self._coordinator.assert_quiesced(fence)
             decision = self._storm_store.check_and_record(now)
-        except ServiceError as error:
-            decision = StormDecision(True, RESTART_STORM_LIMIT, str(error))
-        if decision.suppress:
+            if decision.suppress:
+                self._write_alert(
+                    "watchdog_restart_storm",
+                    "watchdog restart suppressed after repeated attempts",
+                    restart_count=decision.count,
+                    reason=decision.reason,
+                )
+                self._notifier.notify(
+                    "copilotD restart storm",
+                    "Automatic restarts were suppressed; inspect alerts.log.",
+                )
+                return "restart-storm"
+            self._coordinator.commit_quiesce(fence, now=self._now())
+            committed = True
+            self._restart_bot()
+            return "restarted"
+        except (RestartBlocked, ServiceError) as error:
             self._write_alert(
-                "watchdog_restart_storm",
-                "watchdog restart suppressed after repeated attempts",
-                restart_count=decision.count,
-                reason=decision.reason,
+                "watchdog_quiesce_failed",
+                "watchdog restart failed closed during admission quiesce",
+                error=str(error),
             )
-            self._notifier.notify(
-                "copilotD restart storm",
-                "Automatic restarts were suppressed; inspect alerts.log.",
-            )
-            return "restart-storm"
-        self._restart_bot()
-        return "restarted"
+            return "quiesce-failed"
+        finally:
+            if not committed and fence is not None:
+                self._coordinator.release_quiesce(
+                    fence,
+                    now=self._now(),
+                    reason="watchdog_restart_aborted",
+                )
 
     def _install_macos(self) -> dict[str, str]:
         self.launch_agents_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -1557,11 +2170,15 @@ class ServiceManager:
                 f"watchdog plist interval is {interval}, expected {WATCHDOG_INTERVAL_SECONDS}"
             )
         domain = self._mac_domain
-        for label in self._mac_labels:
+        for label in self._all_mac_labels:
             self._runner.run(
                 ["launchctl", "bootout", f"{domain}/{label}"],
                 check=False,
             )
+            if label not in self._mac_labels:
+                (self.launch_agents_dir / f"{label}.plist").unlink(
+                    missing_ok=True
+                )
         for label in self._mac_labels:
             path = self.launch_agents_dir / f"{label}.plist"
             self._runner.run(
@@ -1586,7 +2203,13 @@ class ServiceManager:
         runner_script = self.windows_runner()
         installer_script = self.windows_installer()
         validation = self.validate_windows_powershell()
+        task_validation = self.validate_windows_task_xml()
         failures = [f"{name}: {', '.join(errors)}" for name, errors in validation.items() if errors]
+        failures.extend(
+            f"{name}: {', '.join(errors)}"
+            for name, errors in task_validation.items()
+            if errors
+        )
         if failures:
             raise ServiceVerificationError(
                 "generated PowerShell failed static validation: " + "; ".join(failures)
@@ -1872,6 +2495,11 @@ class ServiceManager:
         )
 
     def _restart_bot(self) -> None:
+        self._update_service_state(
+            {
+                "last_restart_requested_at": self._now(),
+            }
+        )
         if self.platform == "darwin":
             self._runner.run(
                 [
@@ -1906,6 +2534,7 @@ class ServiceManager:
             "HOME": str(self.settings.resolved_home),
             "PATH": os.environ.get("PATH", ""),
             "PYTHONUNBUFFERED": "1",
+            "COPILOTD_MANAGED_SERVICE": "1",
             "COPILOTD_DATA_DIR": str(self.settings.data_dir),
             "COPILOTD_CACHE_DIR": str(self.settings.cache_dir),
             "COPILOTD_LOG_DIR": str(self.settings.log_dir),
@@ -1975,6 +2604,69 @@ class ServiceManager:
             private=True,
         )
 
+    def _record_verified_identity(self, status: ServiceStatus) -> None:
+        if status.pid is None or status.process_generation is None:
+            raise ServiceVerificationError("ready service has no process identity")
+        self._update_service_state(
+            {
+                "last_verified_pid": status.pid,
+                "last_verified_generation": status.process_generation,
+                "last_verified_at": self._now(),
+            }
+        )
+
+    def _update_service_state(self, updates: dict[str, object]) -> None:
+        state = _read_json_optional(self.settings.service_state_path) or {
+            "schema_version": SERVICE_STATE_SCHEMA_VERSION,
+        }
+        state.update(updates)
+        _atomic_write_text(
+            self.settings.service_state_path,
+            json.dumps(
+                state,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            + "\n",
+            private=True,
+        )
+
+    def _managed_bot_unit(self) -> ServiceUnitStatus | None:
+        units = (
+            self._macos_unit_statuses()
+            if self.platform == "darwin"
+            else self._windows_unit_statuses()
+            if self.platform == "win32"
+            else ()
+        )
+        return next((unit for unit in units if unit.name == "bot"), None)
+
+    def _startup_grace_active(self, now: float) -> bool:
+        state = _read_json_optional(self.settings.service_state_path) or {}
+        candidates = [
+            float(value)
+            for key in ("installed_at", "last_restart_requested_at")
+            if (value := state.get(key)) is not None
+        ]
+        return bool(candidates) and (
+            0 <= now - max(candidates) <= self.settings.service_startup_grace_seconds
+        )
+
+    def _heartbeat_generation_matches_verified(
+        self,
+        snapshot: HeartbeatSnapshot,
+    ) -> bool:
+        state = _read_json_optional(self.settings.service_state_path) or {}
+        verified_pid = state.get("last_verified_pid")
+        verified_generation = state.get("last_verified_generation")
+        if verified_pid is None or verified_generation is None:
+            return False
+        return not (
+            int(verified_pid) == snapshot.pid
+            and str(verified_generation) != snapshot.process_generation
+        )
+
     def _mark_uninstalled(self) -> None:
         state = _read_json_optional(self.settings.service_state_path) or {}
         state.update(
@@ -2041,6 +2733,14 @@ class ServiceManager:
         return tuple(labels)
 
     @property
+    def _all_mac_labels(self) -> tuple[str, ...]:
+        return (
+            _MAC_RUNTIME_LABEL,
+            _MAC_BOT_LABEL,
+            _MAC_WATCHDOG_LABEL,
+        )
+
+    @property
     def _windows_task_names(self) -> tuple[str, ...]:
         names = [_WINDOWS_BOT_TASK, _WINDOWS_WATCHDOG_TASK]
         if self.topology == "sidecar":
@@ -2068,20 +2768,17 @@ def _windows_task_xml(
     ET.SubElement(registration, f"{{{_TASK_NAMESPACE}}}Author").text = "copilotD"
     triggers = ET.SubElement(task, f"{{{_TASK_NAMESPACE}}}Triggers")
     logon = ET.SubElement(triggers, f"{{{_TASK_NAMESPACE}}}LogonTrigger")
-    ET.SubElement(logon, f"{{{_TASK_NAMESPACE}}}Enabled").text = "true"
-    ET.SubElement(logon, f"{{{_TASK_NAMESPACE}}}UserId").text = user_id
     if watchdog:
         repetition = ET.SubElement(logon, f"{{{_TASK_NAMESPACE}}}Repetition")
         ET.SubElement(repetition, f"{{{_TASK_NAMESPACE}}}Interval").text = "PT5M"
         ET.SubElement(repetition, f"{{{_TASK_NAMESPACE}}}StopAtDurationEnd").text = "false"
+    ET.SubElement(logon, f"{{{_TASK_NAMESPACE}}}Enabled").text = "true"
+    ET.SubElement(logon, f"{{{_TASK_NAMESPACE}}}UserId").text = user_id
+    if watchdog:
         registration_trigger = ET.SubElement(
             triggers,
             f"{{{_TASK_NAMESPACE}}}RegistrationTrigger",
         )
-        ET.SubElement(
-            registration_trigger,
-            f"{{{_TASK_NAMESPACE}}}Enabled",
-        ).text = "true"
         registration_repetition = ET.SubElement(
             registration_trigger,
             f"{{{_TASK_NAMESPACE}}}Repetition",
@@ -2094,6 +2791,10 @@ def _windows_task_xml(
             registration_repetition,
             f"{{{_TASK_NAMESPACE}}}StopAtDurationEnd",
         ).text = "false"
+        ET.SubElement(
+            registration_trigger,
+            f"{{{_TASK_NAMESPACE}}}Enabled",
+        ).text = "true"
 
     principals = ET.SubElement(task, f"{{{_TASK_NAMESPACE}}}Principals")
     principal = ET.SubElement(
@@ -2120,8 +2821,8 @@ def _windows_task_xml(
     for name, value in values.items():
         ET.SubElement(settings, f"{{{_TASK_NAMESPACE}}}{name}").text = value
     restart = ET.SubElement(settings, f"{{{_TASK_NAMESPACE}}}RestartOnFailure")
-    ET.SubElement(restart, f"{{{_TASK_NAMESPACE}}}Interval").text = "PT30S"
-    ET.SubElement(restart, f"{{{_TASK_NAMESPACE}}}Count").text = "999"
+    ET.SubElement(restart, f"{{{_TASK_NAMESPACE}}}Interval").text = "PT1M"
+    ET.SubElement(restart, f"{{{_TASK_NAMESPACE}}}Count").text = "255"
 
     actions = ET.SubElement(
         task,
@@ -2136,6 +2837,99 @@ def _windows_task_xml(
         f"{{{_TASK_NAMESPACE}}}WorkingDirectory",
     ).text = working_directory
     return ET.tostring(task, encoding="unicode", xml_declaration=True)
+
+
+def _windows_task_contract_errors(xml: str) -> tuple[str, ...]:
+    errors: list[str] = []
+    try:
+        root = ET.fromstring(xml)
+    except ET.ParseError as error:
+        return (f"invalid XML: {error}",)
+    if root.tag != f"{{{_TASK_NAMESPACE}}}Task":
+        errors.append("Task Scheduler namespace is invalid")
+    namespace = {"t": _TASK_NAMESPACE}
+    logon = root.find(".//t:LogonTrigger", namespace)
+    if logon is None:
+        errors.append("LogonTrigger is missing")
+    else:
+        errors.extend(
+            _ordered_child_errors(
+                logon,
+                (
+                    "Repetition",
+                    "StartBoundary",
+                    "EndBoundary",
+                    "Enabled",
+                    "UserId",
+                    "Delay",
+                ),
+                context="LogonTrigger",
+            )
+        )
+    registration = root.find(".//t:RegistrationTrigger", namespace)
+    if registration is not None:
+        errors.extend(
+            _ordered_child_errors(
+                registration,
+                (
+                    "Repetition",
+                    "StartBoundary",
+                    "EndBoundary",
+                    "Enabled",
+                    "Delay",
+                ),
+                context="RegistrationTrigger",
+            )
+        )
+    interval = root.findtext(
+        ".//t:Settings/t:RestartOnFailure/t:Interval",
+        namespaces=namespace,
+    )
+    interval_seconds = _task_duration_seconds(interval)
+    if interval_seconds is None or interval_seconds < 60:
+        errors.append("RestartOnFailure Interval must be at least PT1M")
+    count = root.findtext(
+        ".//t:Settings/t:RestartOnFailure/t:Count",
+        namespaces=namespace,
+    )
+    try:
+        count_value = int(count or "")
+    except ValueError:
+        errors.append("RestartOnFailure Count must be an unsigned byte")
+    else:
+        if not 1 <= count_value <= 255:
+            errors.append("RestartOnFailure Count must be between 1 and 255")
+    return tuple(errors)
+
+
+def _ordered_child_errors(
+    element: ET.Element,
+    expected_order: tuple[str, ...],
+    *,
+    context: str,
+) -> list[str]:
+    ranks = {name: index for index, name in enumerate(expected_order)}
+    children = [child.tag.rsplit("}", 1)[-1] for child in element]
+    known = [name for name in children if name in ranks]
+    if known != sorted(known, key=ranks.__getitem__):
+        return [f"{context} child order is schema-invalid: {children}"]
+    return []
+
+
+def _task_duration_seconds(value: str | None) -> int | None:
+    if value is None:
+        return None
+    match = re.fullmatch(
+        r"PT(?:(?P<hours>\d+)H)?(?:(?P<minutes>\d+)M)?(?:(?P<seconds>\d+)S)?",
+        value,
+    )
+    if match is None:
+        return None
+    return (
+        int(match.group("hours") or 0) * 3600
+        + int(match.group("minutes") or 0) * 60
+        + int(match.group("seconds") or 0)
+    )
 
 
 def _windows_xml_contract(xml: str) -> dict[str, str | None]:
@@ -2204,8 +2998,11 @@ def _restart_blockers(
     remote_sessions: int,
     native_schedules: int,
     native_trigger_windows: int,
+    ingress_depth: int,
 ) -> list[str]:
     blockers: list[str] = []
+    if ingress_depth:
+        blockers.append(f"ingress_queue:{ingress_depth}")
     if leases.total:
         blockers.append(f"active_liveness:{leases.total}")
     if local_pending:
@@ -2219,6 +3016,13 @@ def _restart_blockers(
     if native_trigger_windows:
         blockers.append(f"native_trigger_windows:{native_trigger_windows}")
     return blockers
+
+
+def _remaining_seconds(deadline: float) -> float:
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise RestartBlocked(["restart_deadline_exceeded"])
+    return remaining
 
 
 def _resolve_topology(

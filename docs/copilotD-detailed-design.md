@@ -257,7 +257,7 @@ steerable/unknown session；后两者即使当前没有 turn，也要求保持 a
 | bot heartbeat stale、有 protected work、无 sidecar/replay | 不自动强杀；写 alert，保留进程、任务、remote ingress 和 native schedule，等待人工 `--force` |
 | gateway down > 600 秒、无 protected work | freeze heartbeat，由 watchdog 重启 bot |
 | gateway down > 600 秒、有 protected work | 继续 heartbeat，不自动杀 bot/runtime；写告警并等待 gateway 恢复或人工 force |
-| 5 分钟内重启 >= 3 次 | 停止主动 kick loop，写 alerts log，并发本机桌面通知 |
+| 连续 3 个 5 分钟 watchdog 周期均发生重启 | 第 4 次停止主动 kick loop，写 alerts log，并发本机桌面通知；15 分钟窗口允许覆盖真实 cadence |
 
 这比 claudeD 的固定 hard ceiling 更保守：后台工作优先，不因 watchdog 误杀 session。
 
@@ -314,14 +314,14 @@ current-user Scheduled Task：
 
 | Task | Trigger/Settings |
 |---|---|
-| `copilotD Runtime` | AtLogOn；失败每 30 秒重启；`ExecutionTimeLimit=PT0S` |
-| `copilotD Bot` | AtLogOn；失败每 30 秒重启；`MultipleInstancesPolicy=IgnoreNew` |
+| `copilotD Runtime` | AtLogOn；失败每 1 分钟重启；`ExecutionTimeLimit=PT0S` |
+| `copilotD Bot` | AtLogOn；失败每 1 分钟重启；`MultipleInstancesPolicy=IgnoreNew` |
 | `copilotD Watchdog` | AtLogOn 后每 5 分钟重复；`StartWhenAvailable=true` |
 
 `bundled-runtime` topology 同样省略独立 Runtime task，只注册 Bot + Watchdog，并由
 status/export verifier 按已探测 topology 校验 2/3 个 task；两种 topology 都默认安装和启动。
 
-runtime/bot task 统一设置 `RestartCount=999`、`DisallowStartIfOnBatteries=false`、
+runtime/bot task 统一设置 schema-valid `RestartCount=255`、`RestartInterval=PT1M`、`DisallowStartIfOnBatteries=false`、
 `StopIfGoingOnBatteries=false`、`WakeToRun=false`，使用安装时解析出的绝对 Python/entrypoint
 和 working directory。安装总是先 `Unregister-ScheduledTask` 再
 `Register-ScheduledTask -Xml`，随后 `Start-ScheduledTask` 立即启动，避免磁盘 XML 已更新
@@ -2353,7 +2353,7 @@ claudeD issue 回归门禁：
 | 已实现 | 当前边界 |
 |---|---|
 | 官方 `github-copilot-sdk==1.0.8` + bundled runtime 1.0.73，stdio `--yolo`，create/resume 后 full allow-all 对账 | sidecar client transport 断开后 session retention 实测失败，因此不声明 detached continuation；crash window 保守标 outcome unknown |
-| 8 个 SQLite migration、project `$HOME` fallback/cwd snapshot、owner fence、creation saga、bounded ingress、单 reducer、event journal、CommandMailbox、liveness leases、eager resume；共享连接事务隔离；`background_tasks_changed` 后 `tasks.refresh/list`，缺 terminal 消失转 UNKNOWN；force restart intent/outcome durable journal | eventLog durable replay reconciler 仍未接入 production supervisor；experimental task action RPC 继续 gated |
+| 9 个 SQLite migration、project `$HOME` fallback/cwd snapshot、owner fence、creation saga、bounded ingress、单 reducer、event journal、CommandMailbox、liveness leases、eager resume；共享连接事务隔离；`background_tasks_changed` 后 `tasks.refresh/list`，缺 terminal 消失转 UNKNOWN；force restart intent/outcome durable journal 与跨进程 admission fence | eventLog durable replay reconciler仍未接入 production supervisor；experimental task action RPC 继续 gated |
 | durable app FIFO；每次用 `metadata.is_processing()`、`metadata.activity()` 与 `queue.pending_items()` readiness snapshot 只派发队首；`/queue add/list/remove/clear` | native queue entry 没有稳定 host ID 时不做虚假一一镜像；transport ambiguity 不自动重放 |
 | Discord core `/session`、`/project`、`/model`、bare `/autopilot`、bare/optional-prompt `/plan`、`/steer`、`/context`、`/usage`；user-input/Plan-exit/auto-mode-switch 使用 durable exactly-once interaction + select/modal 原位结算；Plan 退出 mode 精确关联并消费 | `/session delete`、compact/fork 和 Native-Gated commands 尚未实现，因而不注册；elicitation/MCP OAuth 仍待接入 |
 | durable input attachment manifest、hash/size 复验、图片 blob 压缩；stream/final RenderOutbox；table hold 与 code/PNG/MD/CSV assets；Discord HTTP/rate-limit 错误分类，超上限 artifact 按序无损分片 | Discord archived/locked thread、attachment edit、exact 429 retry-after 仍需真实 gateway fixture |

@@ -60,6 +60,7 @@ class HeartbeatSnapshot:
                 self.active_or_unknown_native_schedules,
                 self.remote_steerable_or_unknown_sessions,
                 self.pending_interactions,
+                self.ingress_queue_depth,
             )
         )
 
@@ -100,6 +101,10 @@ class HeartbeatWriter:
         elif self.gateway_state == "ready" or self.gateway_down_since is None:
             self.gateway_down_since = time.time()
         self.gateway_state = state
+
+    @property
+    def process_generation(self) -> str:
+        return self._process_generation
 
     async def run(self) -> None:
         while True:

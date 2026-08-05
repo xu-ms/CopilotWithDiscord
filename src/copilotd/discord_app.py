@@ -24,6 +24,7 @@ from copilotd.core.sessions import (
     ThreadReference,
 )
 from copilotd.core.task_registry import TaskRegistry
+from copilotd.ops.control import ServiceControlWorker
 from copilotd.ops.heartbeat import HeartbeatWriter
 from copilotd.render.markdown import MarkdownAssembler, TableBlock, TextBlock
 from copilotd.render.outbox import (
@@ -126,6 +127,14 @@ class CopilotDiscordBot(commands.Bot):
         self.dispatcher = RenderOutboxDispatcher(self.database, self)
         self._tasks.create(self._render_loop(), name="discord-render-outbox")
         self._tasks.create(self.heartbeat.run(), name="copilotd-heartbeat")
+        self._tasks.create(
+            ServiceControlWorker(
+                self.database,
+                self._require_sessions(),
+                process_generation=self.heartbeat.process_generation,
+            ).run(),
+            name="copilotd-service-control",
+        )
         self._register_application_commands()
         if self.settings.discord_guild_id is not None:
             guild = discord.Object(id=self.settings.discord_guild_id)
@@ -275,10 +284,14 @@ class CopilotDiscordBot(commands.Bot):
             binding = await self._require_bindings().by_thread(str(message.channel.id))
             if binding is None or (not prompt and not message.attachments):
                 return
-            runtime = self._require_sessions().for_thread(str(message.channel.id))
+            sessions = self._require_sessions()
+            runtime = sessions.for_thread(str(message.channel.id))
             if runtime is None:
-                runtime = await self._require_sessions().replace(binding)
-                await runtime.attach_resume()
+                async with sessions.creation_admission():
+                    runtime = sessions.for_thread(str(message.channel.id))
+                    if runtime is None:
+                        runtime = await sessions.replace(binding)
+                        await runtime.attach_resume()
             try:
                 prepared = await self.attachment_service.prepare(
                     source_kind="discord-message",
@@ -569,15 +582,17 @@ class CopilotDiscordBot(commands.Bot):
                 binding = await self._require_bindings().by_session(session_id)
                 if binding is None:
                     raise ValueError("the requested copilotD session is unknown")
-            runtime = self._require_sessions().for_thread(binding.thread_id)
-            if runtime is None or runtime.state.value in {
-                "closed",
-                "fenced",
-                "recovery_unknown",
-            }:
-                runtime = await self._require_sessions().replace(binding)
-            if runtime.state.value == "detached":
-                await runtime.attach_resume(reactivate=True)
+            sessions = self._require_sessions()
+            async with sessions.creation_admission():
+                runtime = sessions.for_thread(binding.thread_id)
+                if runtime is None or runtime.state.value in {
+                    "closed",
+                    "fenced",
+                    "recovery_unknown",
+                }:
+                    runtime = await sessions.replace(binding)
+                if runtime.state.value == "detached":
+                    await runtime.attach_resume(reactivate=True)
             thread = await self._thread_for_session(binding.sdk_session_id)
             await interaction.followup.send(
                 f"Session resumed: {thread.mention}",
@@ -846,10 +861,14 @@ class CopilotDiscordBot(commands.Bot):
 
     async def _interaction_runtime(self, interaction: discord.Interaction) -> SessionRuntime:
         binding = await self._interaction_binding(interaction)
-        runtime = self._require_sessions().for_thread(binding.thread_id)
+        sessions = self._require_sessions()
+        runtime = sessions.for_thread(binding.thread_id)
         if runtime is None:
-            runtime = await self._require_sessions().replace(binding)
-            await runtime.attach_resume()
+            async with sessions.creation_admission():
+                runtime = sessions.for_thread(binding.thread_id)
+                if runtime is None:
+                    runtime = await sessions.replace(binding)
+                    await runtime.attach_resume()
         return runtime
 
     def _clean_prompt(self, message: discord.Message) -> str:

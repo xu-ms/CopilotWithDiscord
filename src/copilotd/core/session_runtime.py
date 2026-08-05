@@ -195,6 +195,9 @@ class SessionRuntime:
         self._lifecycle_lock = asyncio.Lock()
         self._admission_lock = asyncio.Lock()
         self._accepting_sends = False
+        self._service_quiesced = False
+        self._service_quiesce_violations = 0
+        self._service_quiesce_violation_callback: Callable[[], None] | None = None
 
     @property
     def handle(self) -> SessionHandle | None:
@@ -304,7 +307,7 @@ class SessionRuntime:
 
     async def _dispatch_next_queued(self) -> tuple[str, str] | None:
         async with self._queue_dispatch_lock:
-            if self.state != RuntimeState.READY:
+            if self.state != RuntimeState.READY or self._service_quiesced:
                 return None
             try:
                 readiness = await self._refresh_readiness()
@@ -726,6 +729,10 @@ class SessionRuntime:
             )
 
     def _on_sdk_event_accepted(self, event: Any) -> None:
+        if self._service_quiesced:
+            self._service_quiesce_violations += 1
+            if self._service_quiesce_violation_callback is not None:
+                self._service_quiesce_violation_callback()
         event_type = getattr(event, "type", None)
         raw_type = getattr(event_type, "value", event_type)
         loop = self._loop
@@ -733,6 +740,32 @@ class SessionRuntime:
             loop.call_soon_threadsafe(self._task_reconcile_requested.set)
         if raw_type == "session.permissions_changed" and loop is not None:
             loop.call_soon_threadsafe(self._permission_reconcile_requested.set)
+
+    async def begin_service_quiesce(
+        self,
+        on_violation: Callable[[], None],
+    ) -> None:
+        async with self._admission_lock:
+            self._service_quiesced = True
+            self._service_quiesce_violations = 0
+            self._service_quiesce_violation_callback = on_violation
+            self._accepting_sends = False
+        async with self._queue_dispatch_lock:
+            pass
+        if self._inbox is not None:
+            await self._inbox.join()
+
+    async def end_service_quiesce(self) -> None:
+        async with self._admission_lock:
+            self._service_quiesced = False
+            self._service_quiesce_violations = 0
+            self._service_quiesce_violation_callback = None
+            if self.state == RuntimeState.READY:
+                self._accepting_sends = True
+
+    def service_quiesce_metrics(self) -> tuple[int, int]:
+        depth = 0 if self._inbox is None else self._inbox.size
+        return depth, self._service_quiesce_violations
 
     async def set_mode(
         self,
@@ -1799,6 +1832,8 @@ class SessionRuntime:
             raise SessionNotReady("runtime model configuration drifted")
 
     async def _assert_owned_handle(self, *, allow_closing: bool = False) -> None:
+        if self._service_quiesced and not allow_closing:
+            raise SessionNotReady("session admission is quiesced for service restart")
         allowed = {RuntimeState.READY}
         if allow_closing:
             allowed.add(RuntimeState.CLOSING)
@@ -1819,12 +1854,33 @@ class SessionRuntime:
         async with self._database.transaction() as connection:
             await connection.execute(
                 """
+                UPDATE message_queue
+                SET state = 'submitted', updated_at = ?
+                WHERE state = 'submitting'
+                  AND id IN (
+                    SELECT submission_id FROM submissions
+                    WHERE sdk_session_id = ?
+                      AND state IN (
+                      'submitting', 'submitted', 'submitted_unknown',
+                      'observed_active', 'continuation_expected'
+                    )
+                  )
+                """,
+                (now, self.binding.sdk_session_id),
+            )
+            await connection.execute(
+                """
                 UPDATE submissions
                 SET state = 'outcome_unknown'
                 WHERE sdk_session_id = ?
-                  AND state NOT IN (
-                    'rejected', 'semantic_complete', 'semantic_blocked',
-                    'observed_aborted', 'outcome_unknown'
+                  AND state IN (
+                    'submitting', 'submitted', 'submitted_unknown',
+                    'observed_active', 'continuation_expected'
+                  )
+                  AND NOT EXISTS (
+                    SELECT 1 FROM message_queue AS q
+                    WHERE q.id = submissions.submission_id
+                      AND q.state IN ('local_queued', 'cancelled')
                   )
                 """,
                 (self.binding.sdk_session_id,),
@@ -1835,6 +1891,14 @@ class SessionRuntime:
                 SET state = 'orphaned', refreshed_at = ?, released_at = ?
                 WHERE sdk_session_id = ? AND state = 'active'
                   AND runtime_generation = ? AND owner_fence_token = ?
+                  AND (
+                    kind != 'submission'
+                    OR EXISTS (
+                      SELECT 1 FROM submissions AS s
+                      WHERE s.submission_id = liveness_leases.source_id
+                        AND s.state = 'outcome_unknown'
+                    )
+                  )
                 """,
                 (
                     now,

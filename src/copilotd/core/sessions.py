@@ -4,6 +4,8 @@ import asyncio
 import time
 import uuid
 from collections.abc import Callable
+from contextlib import asynccontextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
@@ -17,6 +19,10 @@ from copilotd.core.session_runtime import RuntimeState, SessionAttachUnknown, Se
 from copilotd.storage.database import Database
 
 RuntimeFactory = Callable[[SessionBinding], SessionRuntime]
+_creation_admitted: ContextVar[bool] = ContextVar(
+    "copilotd_creation_admitted",
+    default=False,
+)
 
 
 class CreationState(StrEnum):
@@ -202,11 +208,17 @@ class SessionRegistry:
         self._bindings = bindings
         self._runtime_factory = runtime_factory
         self._runtimes: dict[str, SessionRuntime] = {}
+        self._service_quiesced = False
+        self._service_quiesce_violations = 0
+        self._service_violation_callback: Callable[[], None] | None = None
+        self._active_creations = 0
+        self._admission_condition = asyncio.Condition()
 
     def for_thread(self, thread_id: str) -> SessionRuntime | None:
         return self._runtimes.get(thread_id)
 
     def register(self, runtime: SessionRuntime) -> None:
+        self._assert_registry_admission()
         thread_id = runtime.binding.thread_id
         existing = self._runtimes.get(thread_id)
         if existing is not None and existing is not runtime:
@@ -233,6 +245,7 @@ class SessionRegistry:
         return depth, max_lag_ms, last_callback_at
 
     async def replace(self, binding: SessionBinding) -> SessionRuntime:
+        self._assert_registry_admission()
         existing = self._runtimes.pop(binding.thread_id, None)
         if existing is not None:
             await existing.shutdown()
@@ -250,6 +263,74 @@ class SessionRegistry:
             except Exception as error:
                 failures[binding.thread_id] = str(error)
         return failures
+
+    async def begin_service_quiesce(
+        self,
+        on_violation: Callable[[], None],
+    ) -> None:
+        async with self._admission_condition:
+            self._service_quiesced = True
+            self._service_quiesce_violations = 0
+            self._service_violation_callback = on_violation
+            while self._active_creations:
+                await self._admission_condition.wait()
+        begun: list[SessionRuntime] = []
+        try:
+            for runtime in self._runtimes.values():
+                await runtime.begin_service_quiesce(on_violation)
+                begun.append(runtime)
+        except BaseException:
+            for runtime in reversed(begun):
+                await runtime.end_service_quiesce()
+            raise
+
+    async def end_service_quiesce(self) -> None:
+        for runtime in self._runtimes.values():
+            await runtime.end_service_quiesce()
+        async with self._admission_condition:
+            self._service_quiesced = False
+            self._service_quiesce_violations = 0
+            self._service_violation_callback = None
+            self._admission_condition.notify_all()
+
+    def service_quiesce_metrics(self) -> tuple[int, int]:
+        depth = 0
+        violations = self._service_quiesce_violations
+        for runtime in self._runtimes.values():
+            runtime_depth, runtime_violations = runtime.service_quiesce_metrics()
+            depth += runtime_depth
+            violations += runtime_violations
+        return depth, violations
+
+    @asynccontextmanager
+    async def creation_admission(self):
+        async with self._admission_condition:
+            if self._service_quiesced:
+                self._record_registry_violation()
+                raise RuntimeError(
+                    "session creation is quiesced for service restart"
+                )
+            self._active_creations += 1
+        token = _creation_admitted.set(True)
+        try:
+            yield
+        finally:
+            _creation_admitted.reset(token)
+            async with self._admission_condition:
+                self._active_creations -= 1
+                self._admission_condition.notify_all()
+
+    def _assert_registry_admission(self) -> None:
+        if self._service_quiesced and not _creation_admitted.get():
+            self._record_registry_violation()
+            raise RuntimeError(
+                "session runtime admission is quiesced for service restart"
+            )
+
+    def _record_registry_violation(self) -> None:
+        self._service_quiesce_violations += 1
+        if self._service_violation_callback is not None:
+            self._service_violation_callback()
 
     async def shutdown(self) -> None:
         runtimes = list(self._runtimes.values())
@@ -286,19 +367,20 @@ class SessionCreationService:
         thread_name: str,
         send_initial_prompt: bool = True,
     ) -> SessionRuntime:
-        source_key = (source_kind, source_id)
-        entry = await self._acquire_source_lock(source_key)
-        try:
-            return await self._create_from_source_locked(
-                channel_id=channel_id,
-                source_kind=source_kind,
-                source_id=source_id,
-                prompt=prompt,
-                thread_name=thread_name,
-                send_initial_prompt=send_initial_prompt,
-            )
-        finally:
-            await self._release_source_lock(source_key, entry)
+        async with self._sessions.creation_admission():
+            source_key = (source_kind, source_id)
+            entry = await self._acquire_source_lock(source_key)
+            try:
+                return await self._create_from_source_locked(
+                    channel_id=channel_id,
+                    source_kind=source_kind,
+                    source_id=source_id,
+                    prompt=prompt,
+                    thread_name=thread_name,
+                    send_initial_prompt=send_initial_prompt,
+                )
+            finally:
+                await self._release_source_lock(source_key, entry)
 
     async def _create_from_source_locked(
         self,

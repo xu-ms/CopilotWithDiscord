@@ -67,6 +67,87 @@ def test_platform_defaults_match_operations_contract(tmp_path: Path) -> None:
     )
 
 
+def test_windows_legacy_state_is_atomically_adopted(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    local_app_data = tmp_path / "Local"
+    legacy = local_app_data / "copilotD"
+    legacy.mkdir(parents=True)
+    (legacy / "copilotd.sqlite3").write_bytes(b"legacy-db")
+    (legacy / "sessions").mkdir()
+    (legacy / "sessions" / "session.json").write_text("durable", encoding="utf-8")
+    data_dir, cache_dir, log_dir = platform_default_paths(
+        "win32",
+        environ={"LOCALAPPDATA": str(local_app_data)},
+        home=tmp_path / "home",
+    )
+    settings = Settings(
+        _env_file=None,
+        data_dir=data_dir,
+        cache_dir=cache_dir,
+        log_dir=log_dir,
+        resolved_home=tmp_path / "home",
+    )
+    replacements: list[tuple[Path, Path]] = []
+    replace = os.replace
+
+    def recording_replace(source: str | Path, target: str | Path) -> None:
+        replacements.append((Path(source), Path(target)))
+        replace(source, target)
+
+    monkeypatch.setattr("copilotd.config.os.replace", recording_replace)
+
+    assert settings.adopt_legacy_windows_layout(
+        platform_name="win32",
+        environ={"LOCALAPPDATA": str(local_app_data)},
+        home=tmp_path / "home",
+    )
+
+    assert settings.database_path.read_bytes() == b"legacy-db"
+    assert (settings.data_dir / "sessions" / "session.json").read_text() == "durable"
+    layout_moves = [
+        pair
+        for pair in replacements
+        if pair[0] in {legacy, local_app_data / ".copilotd-legacy-state-migration"}
+    ]
+    assert layout_moves[0] == (
+        legacy,
+        local_app_data / ".copilotd-legacy-state-migration",
+    )
+    assert layout_moves[-1] == (
+        local_app_data / ".copilotd-legacy-state-migration",
+        settings.data_dir,
+    )
+    assert not (local_app_data / ".copilotd-layout-migration.json").exists()
+
+
+def test_windows_legacy_adoption_recovers_staged_tree(tmp_path: Path) -> None:
+    local_app_data = tmp_path / "Local"
+    staging = local_app_data / ".copilotd-legacy-state-migration"
+    staging.mkdir(parents=True)
+    (staging / "copilotd.sqlite3").write_bytes(b"staged-db")
+    data_dir, cache_dir, log_dir = platform_default_paths(
+        "win32",
+        environ={"LOCALAPPDATA": str(local_app_data)},
+        home=tmp_path / "home",
+    )
+    settings = Settings(
+        _env_file=None,
+        data_dir=data_dir,
+        cache_dir=cache_dir,
+        log_dir=log_dir,
+        resolved_home=tmp_path / "home",
+    )
+
+    assert settings.adopt_legacy_windows_layout(
+        platform_name="win32",
+        environ={"LOCALAPPDATA": str(local_app_data)},
+        home=tmp_path / "home",
+    )
+    assert settings.database_path.read_bytes() == b"staged-db"
+
+
 def test_service_secret_is_private_and_loadable_without_plaintext_artifacts(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import os
 import platform
 import sys
 from dataclasses import asdict
@@ -78,6 +79,10 @@ def build_parser() -> argparse.ArgumentParser:
     probe.add_argument("--timeout", type=float, default=120)
     probe.add_argument("--keep-session", action="store_true")
     probe.add_argument(
+        "--expect-response",
+        help="fail unless a live assistant message exactly matches this text",
+    )
+    probe.add_argument(
         "--probe-native-schedule",
         action="store_true",
         help="invoke /after and wait for a post-idle scheduled turn",
@@ -99,7 +104,11 @@ async def run_command(
 ) -> int:
     settings = load_settings() if settings is None else settings
     settings.ensure_directories()
-    configure_logging(settings.log_level, settings.log_dir)
+    configure_logging(
+        settings.log_level,
+        settings.log_dir,
+        stderr=os.environ.get("COPILOTD_MANAGED_SERVICE") != "1",
+    )
 
     if args.command == "db-init":
         async with Database(settings.database_path):
@@ -168,9 +177,10 @@ async def run_command(
 
     if args.command == "service":
         selected_manager = manager or ServiceManager(settings)
-        if args.service_command == "install":
+        if args.service_command in {"install", "status", "restart", "watchdog"}:
             async with Database(settings.database_path):
                 pass
+        if args.service_command == "install":
             selected_preflight = preflight or SetupPreflight(settings)
             report = await selected_preflight.run()
             report.require_success()
@@ -243,6 +253,7 @@ async def run_command(
                 keep_session=args.keep_session,
                 probe_native_schedule=args.probe_native_schedule,
                 probe_sidecar=args.probe_sidecar,
+                expected_response=args.expect_response,
             )
         else:
             result = probe.static_matrix()

@@ -42,6 +42,48 @@ def test_operations_scripts_are_wheel_package_resources() -> None:
     } <= names
 
 
+def test_selected_hardware_lanes_require_real_resume_and_recheck_health() -> None:
+    repository = Path(__file__).resolve().parents[1]
+    macos = (
+        repository
+        / "src"
+        / "copilotd"
+        / "ops"
+        / "scripts"
+        / "acceptance-macos.sh"
+    ).read_text(encoding="utf-8")
+    windows = (
+        repository
+        / "src"
+        / "copilotd"
+        / "ops"
+        / "scripts"
+        / "acceptance-windows.ps1"
+    ).read_text(encoding="utf-8")
+    workflow = (
+        repository / ".github" / "workflows" / "ops-acceptance.yml"
+    ).read_text(encoding="utf-8")
+
+    assert "COPILOTD_ACCEPTANCE_ALLOW_SLEEP" in macos
+    assert "pmset relative wake" in macos
+    assert "no new macOS wake event occurred after the test started" in macos
+    assert '!= "recent-wake"' in macos
+    assert "status-after-soak.json" in macos
+    assert "bot generation changed during soak" in macos
+    assert "if ! log show" in macos
+    assert "COPILOTD_ACCEPTANCE_ALLOW_SLEEP" in windows
+    assert "SetSuspendState" in windows
+    assert "StartTime=$testStartedAt" in windows
+    assert "'recent-wake'" in windows
+    assert "service is not ready after resume" in windows
+    assert "runs-on: [self-hosted, macOS, copilotd-acceptance]" in workflow
+    assert "runs-on: [self-hosted, Windows, copilotd-acceptance]" in workflow
+    assert "sdk-probe --live" in workflow
+    assert "--expect-response COPILOTD_ACCEPTANCE_AUTH_OK" in workflow
+    assert "macos-15" not in workflow
+    assert "windows-2025" not in workflow
+
+
 def test_design_html_generator_is_reproducible(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
