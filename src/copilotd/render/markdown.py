@@ -285,53 +285,118 @@ def plan_markdown_messages(source: str, *, max_chars: int = 1850) -> MarkdownMes
     )
 
 
+@dataclass(frozen=True, slots=True)
+class _ContainerToken:
+    kind: str
+    indent: int = 0
+    marker_id: int = 0
+
+
+@dataclass(frozen=True, slots=True)
+class _LiteralContext:
+    container_path: tuple[_ContainerToken, ...]
+    fence_char: str = ""
+    fence_len: int = 0
+
+
 def extract_local_markdown_images(
     source: str,
     *,
     allowed_roots: Sequence[Path | str],
+    trusted_paths: Sequence[Path | str] | None = None,
 ) -> MarkdownImageExtractionPlan:
     roots = tuple(Path(root).resolve() for root in allowed_roots)
+    trusted = (
+        None
+        if trusted_paths is None
+        else {
+            resolved
+            for value in trusted_paths
+            for resolved in _trusted_path_candidates(Path(value), roots)
+        }
+    )
     warnings: list[MarkdownImageWarning] = []
     attachments: list[MarkdownImageAttachmentPlan] = []
     pieces: list[str] = []
-    in_fence = False
-    fence_char = ""
-    fence_len = 0
-    in_indented_code = False
+    active_fence: _LiteralContext | None = None
+    active_indented_code: _LiteralContext | None = None
+    active_list_path: tuple[_ContainerToken, ...] = ()
     inline_code_delim: int | None = None
-    for line in source.splitlines(keepends=True):
-        text = _strip_newline(line)
-        stripped = _strip_blockquote_prefix(text)
-        if in_fence:
-            pieces.append(line)
-            if _is_fence_closer(stripped, fence_char, fence_len):
-                in_fence = False
-            continue
-        if in_indented_code:
-            if text.strip() == "" or _is_indented_code_line(stripped):
+    inline_container_path: tuple[_ContainerToken, ...] | None = None
+
+    for line_number, line in enumerate(source.splitlines(keepends=True), start=1):
+        text, line_ending = _split_line_ending(line)
+
+        if active_fence is not None:
+            literal_content = _literal_container_content(text, active_fence)
+            if literal_content is None:
+                active_fence = None
+            elif _is_fence_closer(
+                literal_content,
+                active_fence.fence_char,
+                active_fence.fence_len,
+            ):
+                pieces.append(line)
+                active_fence = None
+                continue
+            else:
                 pieces.append(line)
                 continue
-            in_indented_code = False
-        fence = _parse_fence_marker(stripped)
-        if fence is not None:
-            pieces.append(line)
-            fence_char, fence_len = fence
-            in_fence = True
-            continue
-        if _is_indented_code_line(stripped):
-            pieces.append(line)
-            in_indented_code = True
-            continue
+
+        if active_indented_code is not None:
+            literal_content = _literal_container_content(text, active_indented_code)
+            if literal_content is not None and (
+                not literal_content.strip()
+                or _indent_width(_leading_whitespace(literal_content)) >= 4
+            ):
+                pieces.append(line)
+                continue
+            active_indented_code = None
+
+        container_path, content, active_list_path = _document_container_content(
+            text,
+            active_list_path,
+            marker_id=line_number,
+        )
+        if inline_code_delim is not None and (
+            not text.strip() or container_path != inline_container_path
+        ):
+            inline_code_delim = None
+            inline_container_path = None
+        indent = _indent_width(_leading_whitespace(content))
+        if inline_code_delim is None:
+            if indent >= 4:
+                pieces.append(line)
+                active_indented_code = _LiteralContext(
+                    container_path=container_path,
+                )
+                continue
+            fence = _parse_fence_marker(content)
+            if fence is not None:
+                pieces.append(line)
+                active_fence = _LiteralContext(
+                    container_path=container_path,
+                    fence_char=fence[0],
+                    fence_len=fence[1],
+                )
+                continue
+
+        previous_inline_delim = inline_code_delim
         rendered, inline_code_delim = _extract_images_from_line(
             text,
             roots,
             warnings,
             attachments,
             inline_code_delim,
+            trusted,
         )
+        if previous_inline_delim is None and inline_code_delim is not None:
+            inline_container_path = container_path
+        elif inline_code_delim is None:
+            inline_container_path = None
         pieces.append(rendered)
-        if line.endswith("\n"):
-            pieces.append("\n")
+        pieces.append(line_ending)
+
     content = "".join(pieces)
     batches = tuple(
         tuple(attachments[index : index + 10]) for index in range(0, len(attachments), 10)
@@ -367,6 +432,7 @@ def _extract_images_from_line(
     warnings: list[MarkdownImageWarning],
     attachments: list[MarkdownImageAttachmentPlan],
     inline_code_delim: int | None,
+    trusted_paths: set[Path] | None,
 ) -> tuple[str, int | None]:
     pieces: list[str] = []
     index = 0
@@ -422,6 +488,17 @@ def _extract_images_from_line(
                             if warning == "invalid-root"
                             else "image path is missing"
                         ),
+                        source=source_text,
+                    )
+                )
+                pieces.append(source_text)
+                index = end
+                continue
+            if trusted_paths is not None and resolved not in trusted_paths:
+                warnings.append(
+                    MarkdownImageWarning(
+                        kind="untrusted-image",
+                        message="local image path lacks verified host provenance",
                         source=source_text,
                     )
                 )
@@ -539,37 +616,102 @@ def _find_matching_markdown_paren(text: str, start: int) -> int | None:
     return None
 
 
-def _strip_blockquote_prefix(text: str) -> str:
-    value = text
+def _document_container_content(
+    text: str,
+    active_list_path: tuple[_ContainerToken, ...],
+    *,
+    marker_id: int,
+) -> tuple[tuple[_ContainerToken, ...], str, tuple[_ContainerToken, ...]]:
+    container_path: tuple[_ContainerToken, ...] = ()
+    content = text
+    for end in range(len(active_list_path), -1, -1):
+        candidate_path = active_list_path[:end]
+        candidate_content = _consume_container_path(text, candidate_path)
+        if candidate_content is not None:
+            container_path = candidate_path
+            content = candidate_content
+            break
+
     while True:
-        spaces = len(value) - len(value.lstrip(" "))
-        if spaces > 3:
-            return value
-        cursor = spaces
-        if cursor >= len(value) or value[cursor] != ">":
-            return value
-        cursor += 1
-        if cursor < len(value) and value[cursor] == " ":
-            cursor += 1
-        value = value[cursor:]
+        quoted = _strip_one_blockquote(content)
+        if quoted is not None:
+            container_path = (*container_path, _ContainerToken("quote"))
+            content = quoted
+            continue
+        list_match = _LIST_ITEM_RE.match(content)
+        if list_match is None:
+            break
+        content_indent = _indent_width(content[: list_match.start("body")])
+        container_path = (
+            *container_path,
+            _ContainerToken(
+                "list",
+                indent=content_indent,
+                marker_id=marker_id,
+            ),
+        )
+        content = list_match.group("body")
+
+    return container_path, content, _active_list_prefix(container_path)
 
 
-def _is_indented_code_line(text: str) -> bool:
-    return text.startswith("	") or text.startswith("    ")
+def _literal_container_content(text: str, context: _LiteralContext) -> str | None:
+    return _consume_container_path(text, context.container_path)
 
 
-def _parse_fence_marker(text: str) -> tuple[str, int] | None:
-    match = _FENCE_RE.match(text)
-    if match is None:
+def _consume_container_path(
+    text: str,
+    path: tuple[_ContainerToken, ...],
+) -> str | None:
+    content = text
+    for token in path:
+        if not content.strip():
+            return ""
+        if token.kind == "quote":
+            content = _strip_one_blockquote(content)
+        else:
+            content = _remove_indent(content, token.indent)
+        if content is None:
+            return None
+    return content
+
+
+def _strip_one_blockquote(text: str) -> str | None:
+    spaces = len(text) - len(text.lstrip(" "))
+    if spaces > 3 or spaces >= len(text) or text[spaces] != ">":
         return None
-    fence = match.group("fence")
-    return fence[0], len(fence)
+    cursor = spaces + 1
+    if cursor < len(text) and text[cursor] in " \t":
+        cursor += 1
+    return text[cursor:]
 
 
-def _is_fence_closer(text: str, fence_char: str, fence_len: int) -> bool:
-    return (
-        re.fullmatch(rf"[ 	]*{re.escape(fence_char)}{{{fence_len},}}[ 	]*", text) is not None
-    )
+def _active_list_prefix(
+    path: tuple[_ContainerToken, ...],
+) -> tuple[_ContainerToken, ...]:
+    for index in range(len(path) - 1, -1, -1):
+        if path[index].kind == "list":
+            return path[: index + 1]
+    return ()
+
+
+def _remove_indent(text: str, width: int) -> str | None:
+    consumed = 0
+    index = 0
+    while index < len(text) and consumed < width and text[index] in " \t":
+        if text[index] == "\t":
+            consumed += 4 - (consumed % 4)
+        else:
+            consumed += 1
+        index += 1
+    if consumed < width:
+        return None
+    return text[index:]
+
+
+def _split_line_ending(line: str) -> tuple[str, str]:
+    text = line.rstrip("\r\n")
+    return text, line[len(text) :]
 
 
 def split_table_row(line: str) -> list[str]:
@@ -983,16 +1125,18 @@ def _find_matching_markdown_paren(text: str, start: int) -> int | None:
 
 def _parse_fence_marker(text: str) -> tuple[str, int] | None:
     match = _FENCE_RE.match(text)
-    if match is None:
+    if match is None or _indent_width(match.group("indent")) > 3:
         return None
     fence = match.group("fence")
     return fence[0], len(fence)
 
 
 def _is_fence_closer(text: str, fence_char: str, fence_len: int) -> bool:
-    return (
-        re.fullmatch(rf"[ 	]*{re.escape(fence_char)}{{{fence_len},}}[ 	]*", text) is not None
+    match = re.fullmatch(
+        rf"(?P<indent>[ \t]*){re.escape(fence_char)}{{{fence_len},}}[ \t]*",
+        text,
     )
+    return match is not None and _indent_width(match.group("indent")) <= 3
 
 
 def _resolve_markdown_image_path(
@@ -1009,6 +1153,17 @@ def _resolve_markdown_image_path(
         if _within_root(resolved, root):
             return resolved, None
     return None, "invalid-root"
+
+
+def _trusted_path_candidates(path: Path, roots: tuple[Path, ...]) -> tuple[Path, ...]:
+    if path.is_absolute():
+        resolved = path.resolve(strict=False)
+        return (resolved,) if any(_within_root(resolved, root) for root in roots) else ()
+    return tuple(
+        resolved
+        for root in roots
+        if _within_root(resolved := (root / path).resolve(strict=False), root)
+    )
 
 
 def _within_root(path: Path, root: Path) -> bool:

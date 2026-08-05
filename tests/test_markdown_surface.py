@@ -143,6 +143,79 @@ async def test_local_markdown_image_extraction_ignores_code_containers_and_batch
 
 
 @pytest.mark.asyncio
+async def test_local_markdown_image_extraction_ends_container_scoped_fences_at_boundary(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "allowed"
+    root.mkdir()
+    quoted_hidden = root / "quoted-hidden.png"
+    quoted_visible = root / "quoted-visible.png"
+    list_hidden = root / "list-hidden.png"
+    list_visible = root / "list-visible.png"
+    for path_item in (quoted_hidden, quoted_visible, list_hidden, list_visible):
+        _write_png(path_item)
+
+    source = (
+        f"> ````\n> ![quoted-hidden]({quoted_hidden.name})\n"
+        f"![quoted-visible]({quoted_visible.name})\n"
+        f"- item\n"
+        f"    `````\n    ![list-hidden]({list_hidden.name})\n"
+        f"![list-visible]({list_visible.name})\n"
+    )
+
+    plan = extract_local_markdown_images(source, allowed_roots=[root])
+
+    assert isinstance(plan, MarkdownImageExtractionPlan)
+    assert [attachment.filename for attachment in plan.attachments] == [
+        quoted_visible.name,
+        list_visible.name,
+    ]
+    assert len(plan.batches) == 1
+    assert "![quoted-hidden]" in plan.content
+    assert "![list-hidden]" in plan.content
+    assert "![quoted-visible]" not in plan.content
+    assert "![list-visible]" not in plan.content
+    assert plan.warnings == ()
+
+
+@pytest.mark.asyncio
+async def test_local_image_extraction_preserves_container_prefixes_and_nested_boundaries(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "allowed"
+    root.mkdir()
+    quoted = root / "quoted.png"
+    listed = root / "listed.png"
+    visible = root / "visible.png"
+    nested_hidden = root / "nested-hidden.png"
+    inline_boundary = root / "inline-boundary.png"
+    for path_item in (quoted, listed, visible, nested_hidden, inline_boundary):
+        _write_png(path_item)
+    source = (
+        f"> quoted ![quoted]({quoted.name})\r\n"
+        f"- listed ![listed]({listed.name})\n"
+        "    ```\n"
+        f"    ![hidden]({visible.name})\n"
+        f"- > ```\n  > ![nested-hidden]({nested_hidden.name})\n"
+        f"> `unclosed\n![inline-boundary]({inline_boundary.name})\n"
+        f"outside ![visible]({visible.name})\n"
+    )
+
+    plan = extract_local_markdown_images(source, allowed_roots=[root])
+
+    assert [item.filename for item in plan.attachments] == [
+        quoted.name,
+        listed.name,
+        inline_boundary.name,
+        visible.name,
+    ]
+    assert plan.content.startswith("> quoted \r\n- listed \n")
+    assert f"    ![hidden]({visible.name})" in plan.content
+    assert f"  > ![nested-hidden]({nested_hidden.name})" in plan.content
+    assert plan.content.endswith("outside \n")
+
+
+@pytest.mark.asyncio
 async def test_local_markdown_image_extraction_handles_multiline_code_spans_and_blockquote_fences(
     tmp_path: Path,
 ) -> None:

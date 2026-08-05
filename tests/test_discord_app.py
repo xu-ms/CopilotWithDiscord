@@ -6,6 +6,7 @@ from typing import Any
 
 import discord
 import pytest
+from PIL import Image
 
 from copilotd.config import Settings
 from copilotd.core.commands import UnknownInteractionError
@@ -204,6 +205,7 @@ async def test_local_image_warning_flood_stays_within_discord_limit(
             "content": content,
             "finalized": True,
             "trusted_local_images": True,
+            "trusted_local_image_paths": [f"missing-{index}.png" for index in range(80)],
         },
         allowed_roots=(tmp_path,),
     )
@@ -228,6 +230,28 @@ async def test_assistant_markdown_cannot_dereference_local_image_without_trust(
 
     assert all(not batch.assets for batch in plan.batches)
     assert "![private]" in plan.batches[0].content
+
+
+@pytest.mark.asyncio
+async def test_verified_relative_assistant_image_is_uploaded(
+    tmp_path: Path,
+) -> None:
+    local = tmp_path / "artifacts" / "chart.png"
+    local.parent.mkdir()
+    Image.new("RGB", (4, 4), "green").save(local)
+
+    plan = await _discord_render_plan(
+        {
+            "content": "Result: ![chart](artifacts/chart.png)",
+            "finalized": True,
+            "trusted_local_images": True,
+            "trusted_local_image_paths": ["artifacts/chart.png"],
+        },
+        allowed_roots=(tmp_path,),
+    )
+
+    assert [asset.filename for batch in plan.batches for asset in batch.assets] == ["chart.png"]
+    assert all("![chart]" not in batch.content for batch in plan.batches)
 
 
 def test_large_discord_assets_are_split_losslessly_below_upload_limit() -> None:

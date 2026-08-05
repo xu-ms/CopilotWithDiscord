@@ -54,6 +54,7 @@ async def test_initial_migration_creates_full_schema(tmp_path: Path) -> None:
         "pinned_message_provenance",
         "tool_output_streams",
         "tool_spill_artifacts",
+        "trusted_local_artifacts",
         "usage_samples",
     }
 
@@ -64,11 +65,15 @@ async def test_initial_migration_creates_full_schema(tmp_path: Path) -> None:
         migration = await database.fetchone(
             "SELECT version, name FROM schema_migrations WHERE version = 1"
         )
+        outbox_columns = await database.fetchall("PRAGMA table_info(render_outbox)")
+        spill_columns = await database.fetchall("PRAGMA table_info(tool_spill_artifacts)")
         foreign_keys = await database.fetchone("PRAGMA foreign_keys")
         journal_mode = await database.fetchone("PRAGMA journal_mode")
 
     assert {row["name"] for row in tables} == expected_tables
     assert dict(migration) == {"version": 1, "name": "0001_initial.sql"}
+    assert "payload_revision" in {row["name"] for row in outbox_columns}
+    assert {"retention_until", "delivery_confirmed_at"} <= {row["name"] for row in spill_columns}
     assert foreign_keys[0] == 1
     assert journal_mode[0] == "wal"
 
@@ -82,7 +87,7 @@ async def test_migrations_are_idempotent(tmp_path: Path) -> None:
     async with Database(database_path) as database:
         rows = await database.fetchall("SELECT version FROM schema_migrations")
 
-    assert [row["version"] for row in rows] == list(range(1, 14))
+    assert [row["version"] for row in rows] == list(range(1, 15))
 
 
 @pytest.mark.asyncio

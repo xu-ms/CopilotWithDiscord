@@ -326,6 +326,81 @@ async def test_reducer_materializes_nonempty_status_and_usage_payloads(
 
 
 @pytest.mark.asyncio
+async def test_sdk_workspace_event_authorizes_matching_local_image_path(
+    tmp_path: Path,
+) -> None:
+    events = [
+        AdaptedEvent(
+            sdk_session_id="session-trusted-image",
+            generation=1,
+            fence_token=1,
+            inbox_seq=1,
+            source="internal",
+            raw_type="session.workspace_file_changed",
+            raw_payload={
+                "data": {
+                    "operation": "created",
+                    "path": "artifacts/unverified.png",
+                }
+            },
+            reducer_hash="unverified-workspace-image",
+            persistence_class="internal",
+            received_at=1,
+            internal_event_id="unverified-workspace-image",
+        ),
+        AdaptedEvent(
+            sdk_session_id="session-trusted-image",
+            generation=1,
+            fence_token=1,
+            inbox_seq=2,
+            source="sdk",
+            raw_type="session.workspace_file_changed",
+            raw_payload={
+                "data": {
+                    "operation": "created",
+                    "path": "artifacts/chart.png",
+                }
+            },
+            reducer_hash="workspace-image",
+            persistence_class="durable",
+            received_at=2,
+            event_id="workspace-image",
+        ),
+        AdaptedEvent(
+            sdk_session_id="session-trusted-image",
+            generation=1,
+            fence_token=1,
+            inbox_seq=3,
+            source="sdk",
+            raw_type="assistant.message",
+            raw_payload={
+                "data": {
+                    "messageId": "trusted-image-message",
+                    "content": "![chart](artifacts/chart.png)",
+                }
+            },
+            reducer_hash="assistant-image",
+            persistence_class="durable",
+            received_at=3,
+            event_id="assistant-image",
+            message_id="trusted-image-message",
+        ),
+    ]
+    async with Database(tmp_path / "trusted-image.sqlite3") as database:
+        assert await JournalReducer(database).persist(events) == 3
+        row = await database.fetchone(
+            """
+            SELECT payload FROM render_outbox
+            WHERE lane = 'assistant_final'
+            """
+        )
+
+    payload = json.loads(row["payload"])
+    assert payload["trusted_local_images"] is True
+    assert payload["trusted_local_image_paths"] == ["artifacts/chart.png"]
+
+
+@pytest.mark.asyncio
 async def test_long_tool_results_are_preserved_as_artifacts_at_8000_boundary(
     tmp_path: Path,
 ) -> None:
@@ -711,12 +786,71 @@ async def test_stable_spill_revision_preserves_pending_retry_window(
         assert await reducer.persist([progress(2, "b")]) == 1
         row = await database.fetchone(
             """
-            SELECT next_attempt_at, attempts FROM render_outbox
+            SELECT next_attempt_at, attempts, payload_revision FROM render_outbox
             WHERE coalesce_key = 'tool-spill:spill-retry'
             """
         )
 
-    assert dict(row) == {"next_attempt_at": 9999999999, "attempts": 1}
+    assert dict(row) == {
+        "next_attempt_at": 9999999999,
+        "attempts": 1,
+        "payload_revision": 2,
+    }
+
+
+@pytest.mark.asyncio
+async def test_canonical_tool_completion_does_not_duplicate_spilled_stream(
+    tmp_path: Path,
+) -> None:
+    canonical = "canonical-" * (70 * 1024 // len("canonical-") + 1)
+    events = [
+        {
+            "type": "tool.execution_progress",
+            "data": {
+                "toolCallId": "canonical-spill",
+                "outputDelta": canonical,
+            },
+        },
+        {
+            "type": "tool.execution_complete",
+            "data": {
+                "toolCallId": "canonical-spill",
+                "success": True,
+                "result": {"detailedContent": canonical},
+            },
+        },
+    ]
+    adapted = [
+        EventAdapter().adapt(
+            InboxEnvelope(
+                sdk_session_id="session-canonical-spill",
+                generation=1,
+                fence_token=1,
+                inbox_seq=index,
+                source="internal",
+                payload=event,
+                received_at=100 + index,
+                internal_event_id=f"canonical-spill-{index}",
+            )
+        )
+        for index, event in enumerate(events, start=1)
+    ]
+
+    async with Database(tmp_path / "canonical-spill.sqlite3") as database:
+        assert await JournalReducer(database).persist(adapted) == 2
+        artifact = await database.fetchone(
+            """
+            SELECT local_path, byte_size, sha256 FROM tool_spill_artifacts
+            WHERE session_id = 'session-canonical-spill'
+              AND tool_call_id = 'canonical-spill'
+            """
+        )
+
+    artifact_path = Path(str(artifact["local_path"]))
+    content = await asyncio.to_thread(artifact_path.read_text, encoding="utf-8")
+    assert content == canonical
+    assert artifact["byte_size"] == len(canonical.encode())
+    assert artifact["sha256"] == hashlib.sha256(canonical.encode()).hexdigest()
 
 
 @pytest.mark.asyncio

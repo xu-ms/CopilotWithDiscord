@@ -8,6 +8,7 @@ import time
 from dataclasses import dataclass
 from typing import Any, Protocol
 
+from copilotd.core.spill_artifacts import confirm_and_collect_tool_spills
 from copilotd.storage.database import Database
 
 
@@ -59,6 +60,7 @@ class OutboxItem:
     coalesce_key: str | None
     idempotency_key: str
     payload: dict[str, Any]
+    payload_revision: int
     attempts: int
 
 
@@ -235,6 +237,7 @@ class RenderOutboxDispatcher:
         except asyncio.CancelledError:
             if deadline is None:
                 await task
+            raise
 
     def _restore_task_done(self, task: asyncio.Task[None]) -> None:
         self._restore_tasks.discard(task)
@@ -322,6 +325,7 @@ class RenderOutboxDispatcher:
                             coalesce_key=row["coalesce_key"],
                             idempotency_key=row["idempotency_key"],
                             payload=json.loads(row["payload"]),
+                            payload_revision=int(row["payload_revision"]),
                             attempts=row["attempts"] + 1,
                         )
                     )
@@ -336,6 +340,9 @@ class RenderOutboxDispatcher:
     ) -> tuple[bool, bool]:
         logical_key = item.coalesce_key or item.id
         payload_hash = _payload_hash(item.payload)
+        transport_idempotency_key = (
+            f"{item.idempotency_key}:payload:{item.payload_revision}:{payload_hash[:16]}"
+        )
         mapping = await self._database.fetchone(
             """
             SELECT * FROM render_messages
@@ -363,7 +370,7 @@ class RenderOutboxDispatcher:
                     session_id=item.session_id,
                     lane=item.lane,
                     payload=item.payload,
-                    idempotency_key=item.idempotency_key,
+                    idempotency_key=transport_idempotency_key,
                 )
             else:
                 message_id = mapping["discord_message_id"]
@@ -374,7 +381,7 @@ class RenderOutboxDispatcher:
                         message_id=message_id,
                         lane=item.lane,
                         payload=item.payload,
-                        idempotency_key=item.idempotency_key,
+                        idempotency_key=transport_idempotency_key,
                     )
                 else:
                     await edit(
@@ -425,39 +432,43 @@ class RenderOutboxDispatcher:
                     int(finalized),
                 ),
             )
-            payload_cursor = await connection.execute(
-                "SELECT payload FROM render_outbox WHERE id = ?",
-                (item.id,),
-            )
-            current_row = await payload_cursor.fetchone()
-            await payload_cursor.close()
-            payload_changed = (
-                current_row is not None
-                and _payload_hash(json.loads(current_row["payload"])) != payload_hash
-            )
             cursor = await connection.execute(
                 """
                 UPDATE render_outbox
-                SET state = ?,
-                    next_attempt_at = CASE
-                        WHEN ? = 'pending' THEN ?
-                        ELSE next_attempt_at
-                    END,
-                    updated_at = ?
-                WHERE id = ? AND state = 'sending'
+                SET state = 'sent', updated_at = ?
+                WHERE id = ? AND state = 'sending' AND payload_revision = ?
                 """,
-                (
-                    "pending" if payload_changed else "sent",
-                    "pending" if payload_changed else "sent",
-                    time.time(),
-                    now,
-                    item.id,
-                ),
+                (now, item.id, item.payload_revision),
             )
-            if cursor.rowcount != 1:
-                await cursor.close()
-                raise RuntimeError(f"render outbox claim was lost: {item.id}")
+            payload_changed = cursor.rowcount == 0
             await cursor.close()
+            if payload_changed:
+                cursor = await connection.execute(
+                    """
+                    UPDATE render_outbox
+                    SET state = 'pending',
+                        next_attempt_at = MIN(next_attempt_at, ?),
+                        updated_at = ?
+                    WHERE id = ? AND state = 'sending'
+                      AND payload_revision > ?
+                    """,
+                    (time.time(), now, item.id, item.payload_revision),
+                )
+                if cursor.rowcount != 1:
+                    await cursor.close()
+                    raise RuntimeError(f"render outbox claim was lost: {item.id}")
+                await cursor.close()
+        if finalized and not payload_changed:
+            spill_paths = [
+                str(attachment["path"])
+                for attachment in item.payload.get("attachments", [])
+                if isinstance(attachment, dict) and isinstance(attachment.get("path"), str)
+            ]
+            await confirm_and_collect_tool_spills(
+                self._database,
+                spill_paths,
+                session_id=item.session_id,
+            )
         return True, False
 
     async def _retry(

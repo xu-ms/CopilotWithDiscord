@@ -18,7 +18,7 @@ _AUTH_HEADER_RE = re.compile(
     r"(?:(?:basic|bearer)\s+)?[^\r\n]*"
 )
 _COOKIE_HEADER_RE = re.compile(r"(?im)(?P<prefix>\b(?:set-cookie|cookie)\b\s*[:=]\s*)[^\r\n]*")
-_TEXT_KEY = r'(?:["\'][^"\r\n]{1,128}["\']|[A-Za-z0-9][A-Za-z0-9._:/-]{0,127})'
+_TEXT_KEY = r"""(?:"[^"\r\n]{1,128}"|'[^'\r\n]{1,128}'|[A-Za-z0-9][A-Za-z0-9._:/-]{0,127})"""
 _GENERIC_DOUBLE_RE = re.compile(
     rf"(?i)(?P<key>{_TEXT_KEY})(?P<sep>\s*[:=]\s*)"
     r'"(?!\[redacted\])(?P<value>(?:\\.|[^"\\])*)"'
@@ -31,6 +31,7 @@ _GENERIC_UNQUOTED_RE = re.compile(
     rf"(?i)(?P<key>{_TEXT_KEY})(?P<sep>\s*[:=]\s*)"
     r"(?P<value>(?!\[redacted\])[^\s,;)}\]\"\']+)"
 )
+_ASSIGNMENT_PREFIX_RE = re.compile(rf"(?i)(?P<key>{_TEXT_KEY})(?P<sep>\s*[:=]\s*)")
 
 
 class LocalOpsSurface:
@@ -205,18 +206,17 @@ def _read_tail(path: Path, limit: int) -> str:
 
 
 def _redact_structure(value: Any, *, sensitive: bool = False) -> Any:
+    if sensitive:
+        return "[redacted]"
     if isinstance(value, Mapping):
         redacted: dict[Any, Any] = {}
         for key, item in value.items():
-            child_sensitive = _is_sensitive_key(key)
-            redacted[key] = _redact_structure(item, sensitive=child_sensitive)
+            redacted[key] = _redact_structure(item, sensitive=_is_sensitive_key(key))
         return redacted
     if isinstance(value, list):
         return [_redact_structure(item, sensitive=False) for item in value]
     if isinstance(value, tuple):
         return tuple(_redact_structure(item, sensitive=False) for item in value)
-    if sensitive:
-        return "[redacted]"
     if isinstance(value, str):
         return _redact_text(value)
     if isinstance(value, bytes):
@@ -289,27 +289,164 @@ def _is_sensitive_key(key: Any) -> bool:
 
 
 def _redact_text(value: str) -> str:
-    redacted = _GENERIC_DOUBLE_RE.sub(_redact_generic_double, value)
-    redacted = _GENERIC_SINGLE_RE.sub(_redact_generic_single, redacted)
-    redacted = _GENERIC_UNQUOTED_RE.sub(_redact_generic_unquoted, redacted)
+    parsed = _redact_json_fragment(value)
+    if parsed is not None:
+        return parsed
+    redacted = _redact_json_fragments(value)
     redacted = _AUTH_HEADER_RE.sub(lambda match: f"{match.group('prefix')}[redacted]", redacted)
     redacted = _COOKIE_HEADER_RE.sub(lambda match: f"{match.group('prefix')}[redacted]", redacted)
+    redacted = _redact_assignment_values(redacted)
     return redacted
 
 
-def _redact_generic_double(match: re.Match[str]) -> str:
-    if not _is_sensitive_key(match.group("key")):
-        return match.group(0)
-    return f'{match.group("key")}{match.group("sep")}"[redacted]"'
+def _redact_json_fragments(text: str) -> str:
+    redacted = text
+    spans: list[tuple[int, int, str]] = []
+    for match in re.finditer(r"[\[{]", redacted):
+        end = _consume_balanced_json(redacted, match.start())
+        if end is None:
+            continue
+        replacement = _redact_json_fragment(redacted[match.start() : end])
+        if replacement is None:
+            continue
+        spans.append((match.start(), end, replacement))
+    if not spans:
+        return redacted
+    output: list[str] = []
+    cursor = 0
+    for start, end, replacement in spans:
+        if start < cursor:
+            continue
+        output.append(redacted[cursor:start])
+        output.append(replacement)
+        cursor = end
+    output.append(redacted[cursor:])
+    return "".join(output)
 
 
-def _redact_generic_single(match: re.Match[str]) -> str:
-    if not _is_sensitive_key(match.group("key")):
-        return match.group(0)
-    return f"{match.group('key')}{match.group('sep')}'[redacted]'"
+def _redact_json_fragment(fragment: str) -> str | None:
+    try:
+        parsed = json.loads(fragment)
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return None
+    redacted = _redact_structure(parsed)
+    return json.dumps(redacted, separators=(",", ":"), ensure_ascii=False)
 
 
-def _redact_generic_unquoted(match: re.Match[str]) -> str:
-    if not _is_sensitive_key(match.group("key")):
-        return match.group(0)
-    return f"{match.group('key')}{match.group('sep')}[redacted]"
+def _redact_assignment_values(text: str) -> str:
+    output: list[str] = []
+    cursor = 0
+    while True:
+        match = _ASSIGNMENT_PREFIX_RE.search(text, cursor)
+        if match is None:
+            output.append(text[cursor:])
+            break
+        output.append(text[cursor : match.start()])
+        output.append(match.group(0))
+        value_start = match.end()
+        if value_start >= len(text):
+            cursor = value_start
+            continue
+        key = match.group("key")
+        char = text[value_start]
+        if char in "\"'":
+            value_end = _consume_quoted_value(text, value_start)
+            if value_end is None:
+                output.append(text[value_start:])
+                break
+            value = text[value_start:value_end]
+            output.append(_redact_assignment_value(key, value, quoted=True))
+            cursor = value_end
+            continue
+        if char in "[{":
+            value_end = _consume_balanced_json(text, value_start)
+            if value_end is None:
+                output.append(text[value_start:])
+                break
+            value = text[value_start:value_end]
+            output.append(_redact_assignment_value(key, value, quoted=False))
+            cursor = value_end
+            continue
+        value_end = _consume_bare_value(text, value_start)
+        value = text[value_start:value_end]
+        output.append(_redact_assignment_value(key, value, quoted=False))
+        cursor = value_end
+    return "".join(output)
+
+
+def _redact_assignment_value(key: str, value: str, *, quoted: bool) -> str:
+    if _is_sensitive_key(key):
+        if quoted:
+            return value[0] + "[redacted]" + value[0]
+        return "[redacted]"
+    stripped = value.strip()
+    if stripped and stripped[0] in "[{":
+        redacted = _redact_json_fragment(stripped)
+        if redacted is not None:
+            return redacted
+        return _redact_assignment_values(value)
+    if quoted and len(value) >= 2:
+        inner = value[1:-1].strip()
+        if inner and inner[0] in "[{":
+            redacted = _redact_json_fragment(inner)
+            if redacted is not None:
+                return value[0] + redacted + value[-1]
+            return value[0] + _redact_assignment_values(value[1:-1]) + value[-1]
+    return value
+
+
+def _consume_quoted_value(text: str, start: int) -> int | None:
+    quote = text[start]
+    escaped = False
+    for index in range(start + 1, len(text)):
+        char = text[index]
+        if escaped:
+            escaped = False
+            continue
+        if char == "\\":
+            escaped = True
+            continue
+        if char == quote:
+            return index + 1
+    return None
+
+
+def _consume_bare_value(text: str, start: int) -> int:
+    end = start
+    while end < len(text) and text[end] not in "\r\n\t ,;)}]":
+        end += 1
+    return end
+
+
+def _consume_balanced_json(text: str, start: int) -> int | None:
+    opening = text[start]
+    if opening not in "[{":
+        return None
+    stack = [opening]
+    in_string: str | None = None
+    escaped = False
+    index = start + 1
+    while index < len(text):
+        char = text[index]
+        if in_string is not None:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == in_string:
+                in_string = None
+        else:
+            if char in "\"'":
+                in_string = char
+            elif char in "[{":
+                stack.append(char)
+            elif char in "]}":
+                if not stack:
+                    return None
+                open_char = stack.pop()
+                if (open_char == "{" and char != "}") or (open_char == "[" and char != "]"):
+                    return None
+                if not stack:
+                    return index + 1
+        index += 1
+    return None

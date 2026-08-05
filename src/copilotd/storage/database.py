@@ -11,7 +11,7 @@ from typing import Any
 
 import aiosqlite
 
-_CORE_MIGRATION_VERSION = 13
+_CORE_MIGRATION_VERSION = 14
 
 
 class Database:
@@ -168,6 +168,13 @@ class Database:
                 "artifact_emitted": "INTEGER NOT NULL DEFAULT 0",
                 "finalized": "INTEGER NOT NULL DEFAULT 0",
             },
+            "tool_spill_artifacts": {
+                "retention_until": "REAL NOT NULL DEFAULT 0",
+                "delivery_confirmed_at": "REAL",
+            },
+            "render_outbox": {
+                "payload_revision": "INTEGER NOT NULL DEFAULT 1",
+            },
             "session_creation_intents": {
                 "project_config_snapshot": "TEXT NOT NULL DEFAULT '{}'",
                 "channel_config_snapshot": "TEXT NOT NULL DEFAULT '{}'",
@@ -203,6 +210,14 @@ class Database:
                         || '"mention_required":false}',
                     config_snapshot_state = 'verified'
                 WHERE config_snapshot_state = 'legacy_unverified'
+                """
+            )
+        if await self._table_exists("tool_spill_artifacts"):
+            await self.execute(
+                """
+                UPDATE tool_spill_artifacts
+                SET retention_until = updated_at + 604800
+                WHERE retention_until = 0
                 """
             )
         if await self._table_exists("session_creation_intents"):

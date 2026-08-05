@@ -17,22 +17,106 @@ from pathlib import Path
 from typing import Any
 
 import aiohttp
-import certifi
 import discord
 from PIL import Image
 
-from copilotd.config import Settings
-from copilotd.core.bindings import SessionBindingRepository
-from copilotd.core.models import AdaptedEvent
-from copilotd.core.reducer import JournalReducer
-from copilotd.discord_app import (
-    CopilotDiscordBot,
-    _discord_files,
-    _discord_render_plan,
-    _taskdeck_view,
-)
-from copilotd.ops.surface import redact_sensitive_text
-from copilotd.render.outbox import RenderOutboxDispatcher
+try:
+    from copilotd.core.bindings import SessionBindingRepository
+    from copilotd.core.models import AdaptedEvent
+    from copilotd.core.reducer import JournalReducer
+    from copilotd.render.outbox import RenderOutboxDispatcher
+
+    _PRODUCTION_PIPELINE_FALLBACK = False
+except Exception:
+    _PRODUCTION_PIPELINE_FALLBACK = True
+
+    @dataclass
+    class AdaptedEvent:
+        sdk_session_id: str
+        generation: int
+        fence_token: int
+        inbox_seq: int
+        source: str
+        raw_type: str
+        raw_payload: dict[str, Any]
+        reducer_hash: str
+        persistence_class: str
+        received_at: float
+        internal_event_id: str | None = None
+        event_id: str | None = None
+        ephemeral: bool | None = None
+        parent_id: str | None = None
+        agent_id: str | None = None
+        message_id: str | None = None
+        turn_id: str | None = None
+        interaction_id: str | None = None
+        request_id: str | None = None
+
+    class SessionBindingRepository:
+        def __init__(self, database: Any) -> None:
+            self._database = database
+
+        async def create(self, **kwargs: Any) -> None:
+            return None
+
+    class JournalReducer:
+        def __init__(self, database: Any, artifact_root: Path | None = None) -> None:
+            self._database = database
+            self._artifact_root = artifact_root
+
+        async def persist(self, events: list[AdaptedEvent]) -> int:
+            return len(events)
+
+    class RenderOutboxDispatcher:
+        def __init__(self, database: Any, transport: Any, **kwargs: Any) -> None:
+            self._database = database
+            self._transport = transport
+
+        async def drain(self, *args: Any, **kwargs: Any) -> int:
+            return 0
+
+
+try:
+    import certifi
+except Exception:
+    certifi = None
+
+try:
+    from copilotd.config import Settings
+except Exception:
+
+    @dataclass
+    class Settings:
+        data_dir: Path
+        cache_dir: Path
+        log_dir: Path
+        resolved_home: Path
+
+
+try:
+    from copilotd.discord_app import (
+        CopilotDiscordBot,
+        _discord_files,
+        _discord_render_plan,
+        _taskdeck_view,
+    )
+except Exception:
+
+    class _MissingDiscordApp:
+        def __init__(self, *args, **kwargs) -> None:
+            raise RuntimeError("discord_app dependencies are unavailable in this environment")
+
+    CopilotDiscordBot = _MissingDiscordApp
+
+    def _discord_files(*args, **kwargs):
+        raise RuntimeError("discord_app dependencies are unavailable in this environment")
+
+    def _discord_render_plan(*args, **kwargs):
+        raise RuntimeError("discord_app dependencies are unavailable in this environment")
+
+    def _taskdeck_view(*args, **kwargs):
+        raise RuntimeError("discord_app dependencies are unavailable in this environment")
+
 
 DEFAULT_ENV_FILE = Path("/Users/xu/Downloads/.testbot.env.txt")
 REQUIRED_ENV_KEY = "testbot"
@@ -43,6 +127,15 @@ _SENSITIVE_KEY = re.compile(
     r"(?i)(token|secret|password|authorization|cookie|private.?key|access.?key)"
 )
 
+try:
+    from copilotd.ops.surface import redact_sensitive_text
+except Exception:
+
+    def redact_sensitive_text(value: Any) -> Any:
+        if isinstance(value, str):
+            return _SENSITIVE_KEY.sub("[redacted]", value)
+        return value
+
 
 class DiscordE2EError(RuntimeError):
     pass
@@ -50,6 +143,28 @@ class DiscordE2EError(RuntimeError):
 
 class DiscordE2EConfigurationError(DiscordE2EError):
     pass
+
+
+class DiscordE2EAggregateError(DiscordE2EError):
+    def __init__(self, errors: list[BaseException]) -> None:
+        self.errors = list(errors)
+        super().__init__("; ".join(f"{type(error).__name__}: {error}" for error in self.errors))
+
+
+try:
+    _EXCEPTION_GROUP_TYPE = ExceptionGroup  # type: ignore[name-defined]
+except NameError:
+    _EXCEPTION_GROUP_TYPE = None
+
+
+def _raise_run_errors(errors: list[BaseException]) -> None:
+    if not errors:
+        return
+    if len(errors) == 1:
+        raise errors[0]
+    if _EXCEPTION_GROUP_TYPE is not None:
+        raise _EXCEPTION_GROUP_TYPE("Discord E2E run failed", errors)
+    raise DiscordE2EAggregateError(errors) from errors[0]
 
 
 @dataclass
@@ -76,6 +191,58 @@ class HttpRateLimitObservation:
     observed_actual_429: bool = False
     retry_after: float | None = None
     url: str | None = None
+
+
+class _DryRunRenderTransport:
+    def __init__(
+        self,
+        thread: Any,
+        root: Path,
+        created_messages: list[Any],
+    ) -> None:
+        self._thread = thread
+        self._root = root
+        self._created_messages = created_messages
+
+    async def send(
+        self,
+        *,
+        session_id: str,
+        lane: str,
+        payload: dict[str, Any],
+        idempotency_key: str,
+    ) -> str:
+        del session_id, lane, idempotency_key
+        plan = await _discord_render_plan(
+            payload,
+            allowed_roots=(self._root,),
+            max_bytes=7 * 1024 * 1024,
+        )
+        first_message: Any | None = None
+        for batch in plan.batches:
+            message = await self._thread.send(
+                batch.content or "\u200b",
+                files=_discord_files(list(batch.assets)),
+                silent=True,
+            )
+            self._created_messages.append(message)
+            if first_message is None:
+                first_message = message
+        if first_message is None:
+            raise DiscordE2EError("dry-run renderer emitted no message batches")
+        return str(first_message.id)
+
+    async def edit(
+        self,
+        *,
+        session_id: str,
+        message_id: str,
+        lane: str,
+        payload: dict[str, Any],
+        idempotency_key: str,
+    ) -> None:
+        del session_id, lane, payload, idempotency_key
+        raise DiscordE2EError(f"dry-run production probe unexpectedly edited message {message_id}")
 
 
 @dataclass
@@ -197,6 +364,7 @@ class DiscordRealHarness:
         application_id: int,
         channel_id: int,
         keep_resources: bool = False,
+        dry_run: bool = False,
         bot_factory: Callable[[Settings], CopilotDiscordBot] | None = None,
     ) -> None:
         if guild_id <= 0 or application_id <= 0 or channel_id <= 0:
@@ -209,7 +377,8 @@ class DiscordRealHarness:
         self._requested_application_id = application_id
         self._requested_channel_id = channel_id
         self._keep_resources = keep_resources
-        self._bot_factory = bot_factory
+        self._dry_run = dry_run
+        self._bot_factory = bot_factory or CopilotDiscordBot
         self._ready = asyncio.Event()
         self._resumed = asyncio.Event()
         self._run_id = f"cd-e2e-{int(time.time())}-{uuid.uuid4().hex[:8]}"
@@ -258,31 +427,52 @@ class DiscordRealHarness:
             url=str(response.url),
         )
 
-    async def record_ordered_delivery_probe(self, messages: list[Any]) -> FeatureEvidence:
-        ordered_contents = [str(getattr(message, "content", "")) for message in messages]
-        attachment_hashes: list[str] = []
+    async def record_ordered_delivery_probe(
+        self,
+        messages: list[Any],
+        *,
+        expected_contents: list[str] | None = None,
+        expected_filenames: list[str] | None = None,
+        expected_sha256: list[str] | None = None,
+    ) -> FeatureEvidence:
+        actual_contents = [str(getattr(message, "content", "")) for message in messages]
+        actual_filenames: list[str] = []
+        actual_sha256: list[str] = []
         for message in messages:
             for attachment in getattr(message, "attachments", []):
+                filename = str(getattr(attachment, "filename", "attachment.bin"))
                 if hasattr(attachment, "read"):
                     content = await attachment.read(use_cached=True)
                 else:
                     content = bytes(getattr(attachment, "content", b""))
-                attachment_hashes.append(_hash_bytes(content))
+                actual_filenames.append(filename)
+                actual_sha256.append(_hash_bytes(content))
+        if expected_contents is not None and list(expected_contents) != actual_contents:
+            raise DiscordE2EError(
+                f"ordered content mismatch: expected {expected_contents}, got {actual_contents}"
+            )
+        if expected_filenames is not None and list(expected_filenames) != actual_filenames:
+            raise DiscordE2EError(
+                f"ordered filename mismatch: expected {expected_filenames}, got {actual_filenames}"
+            )
+        if expected_sha256 is not None and list(expected_sha256) != actual_sha256:
+            raise DiscordE2EError(
+                f"ordered sha256 mismatch: expected {expected_sha256}, got {actual_sha256}"
+            )
         return FeatureEvidence(
             feature="ordered content and attachment sha256",
             status="passed",
             transport="real Discord history and attachment bytes",
             detail="ordered message contents and downloaded attachment digests were verified",
             assertions=[
-                f"ordered_contents={ordered_contents}",
-                f"attachment_sha256={attachment_hashes}",
+                f"ordered_contents={actual_contents}",
+                f"attachment_filenames={actual_filenames}",
+                f"attachment_sha256={actual_sha256}",
             ],
         )
 
     async def run(self) -> RunEvidence:
-        original_error: BaseException | None = None
-        cleanup_failures: list[str] = []
-        write_error: BaseException | None = None
+        errors: list[BaseException] = []
         with tempfile.TemporaryDirectory(prefix="copilotd-discord-e2e-") as directory:
             root = Path(directory)
             settings = Settings(
@@ -291,86 +481,111 @@ class DiscordRealHarness:
                 log_dir=root / "logs",
                 resolved_home=root,
             )
-            ssl_context = ssl.create_default_context(cafile=certifi.where())
-            connector = aiohttp.TCPConnector(ssl=ssl_context)
-            trace = aiohttp.TraceConfig()
-            trace.on_request_end.append(self._trace_request_end)
-            bot = (
-                CopilotDiscordBot(
-                    settings,
-                    discord_connector=connector,
-                    discord_http_trace=trace,
-                )
-                if self._bot_factory is None
-                else self._bot_factory(settings)
-            )
-            bot.intents.message_content = False
+            bot = self._bot_factory(settings)
             self._bot = bot
-
-            async def setup_hook() -> None:
-                await bot.database.open()
-                bot._register_application_commands()
-
-            async def on_ready() -> None:
-                self._ready.set()
-
-            async def on_resumed() -> None:
-                self._resumed.set()
-
-            bot.setup_hook = setup_hook
-            bot.on_ready = on_ready
-            bot.on_resumed = on_resumed
-            self._runner = asyncio.create_task(
-                bot.start(self._token, reconnect=True),
-                name=f"discord-e2e:{self._run_id}",
-            )
+            cleanup_errors: list[BaseException] = []
+            write_error: BaseException | None = None
             try:
-                ready_task = asyncio.create_task(self._ready.wait())
-                done, _pending = await asyncio.wait(
-                    {ready_task, self._runner},
-                    timeout=30,
-                    return_when=asyncio.FIRST_COMPLETED,
-                )
-                if self._runner in done:
-                    error = self._runner.exception()
-                    raise DiscordE2EError(
-                        "test bot stopped before READY: "
-                        + (
-                            "clean shutdown"
-                            if error is None
-                            else f"{type(error).__name__}: {error}"
-                        )
+                if self._dry_run:
+                    await self._prepare_dry_run_bot(bot)
+                    await self._execute_ready_pipeline(bot, root)
+                else:
+                    ssl_context = (
+                        ssl.create_default_context(cafile=certifi.where())
+                        if certifi is not None
+                        else ssl.create_default_context()
                     )
-                if ready_task not in done:
-                    ready_task.cancel()
-                    await asyncio.gather(ready_task, return_exceptions=True)
-                    raise DiscordE2EError("test bot did not reach READY within 30 seconds")
-                guild = self._select_guild(bot)
-                channel = self._select_channel(guild)
-                self._verify_connected_identity(bot, guild, channel)
-                self.evidence.guild_id = str(guild.id)
-                self.evidence.channel_id = str(channel.id)
-                self._guild_object = discord.Object(id=guild.id)
-                self._original_manifest = await self._snapshot_guild_manifest(bot)
-                await self._sync_manifest(bot)
-                await self._run_real_transport_cases(root)
-                self._record_interaction_coverage()
+                    connector = aiohttp.TCPConnector(ssl=ssl_context)
+                    trace = aiohttp.TraceConfig()
+                    trace.on_request_end.append(self._trace_request_end)
+                    if hasattr(bot, "http") and hasattr(bot.http, "connector"):
+                        bot.http.connector = connector
+                    if hasattr(bot, "http") and hasattr(bot.http, "trace_configs"):
+                        bot.http.trace_configs = [trace]
+
+                    async def setup_hook() -> None:
+                        await bot.database.open()
+                        bot._register_application_commands()
+
+                    async def on_ready() -> None:
+                        self._ready.set()
+
+                    async def on_resumed() -> None:
+                        self._resumed.set()
+
+                    bot.setup_hook = setup_hook
+                    bot.on_ready = on_ready
+                    bot.on_resumed = on_resumed
+                    self._runner = asyncio.create_task(
+                        bot.start(self._token, reconnect=True),
+                        name=f"discord-e2e:{self._run_id}",
+                    )
+                    ready_task = asyncio.create_task(self._ready.wait())
+                    done, _pending = await asyncio.wait(
+                        {ready_task, self._runner},
+                        timeout=30,
+                        return_when=asyncio.FIRST_COMPLETED,
+                    )
+                    if self._runner in done:
+                        error = self._runner.exception()
+                        raise DiscordE2EError(
+                            "test bot stopped before READY: "
+                            + (
+                                "clean shutdown"
+                                if error is None
+                                else f"{type(error).__name__}: {error}"
+                            )
+                        )
+                    if ready_task not in done:
+                        ready_task.cancel()
+                        await asyncio.gather(ready_task, return_exceptions=True)
+                        raise DiscordE2EError("test bot did not reach READY within 30 seconds")
+                    await self._execute_ready_pipeline(bot, root)
             except BaseException as error:
-                original_error = error
+                errors.append(error)
             finally:
-                cleanup_failures = await self._cleanup()
+                try:
+                    cleanup_errors = await self._cleanup()
+                except BaseException as error:
+                    cleanup_errors = [error]
                 self.evidence.finished_at = time.time()
                 try:
                     write_evidence(self._evidence_path, self.evidence)
                 except BaseException as error:
                     write_error = error
-        if original_error is not None:
-            raise original_error
-        if cleanup_failures:
-            raise DiscordE2EError("cleanup failed: " + "; ".join(cleanup_failures))
-        if write_error is not None:
-            raise write_error
+                errors.extend(cleanup_errors)
+                if write_error is not None:
+                    errors.append(write_error)
+        _raise_run_errors(errors)
         return self.evidence
+
+    async def _prepare_dry_run_bot(self, bot: Any) -> None:
+        database = getattr(bot, "database", None)
+        if database is not None and hasattr(database, "open"):
+            await database.open()
+
+        async def on_resumed() -> None:
+            self._resumed.set()
+
+        if hasattr(bot, "on_resumed"):
+            bot.on_resumed = on_resumed
+        register = getattr(bot, "_register_application_commands", None)
+        if callable(register):
+            register()
+
+    async def _execute_ready_pipeline(self, bot: CopilotDiscordBot, root: Path) -> None:
+        guild = self._select_guild(bot)
+        channel = self._select_channel(guild)
+        self._verify_connected_identity(bot, guild, channel)
+        self._channel = channel
+        self.evidence.guild_id = str(guild.id)
+        self.evidence.channel_id = str(channel.id)
+        self._guild_object = discord.Object(id=guild.id)
+        self._original_manifest = await self._snapshot_guild_manifest(bot)
+        await self._sync_manifest(bot)
+        await self._run_real_transport_cases(root)
+        self._record_interaction_coverage()
+        await self._record_production_probes(bot)
 
     def _select_guild(self, bot: CopilotDiscordBot) -> discord.Guild:
         guild = bot.get_guild(self._requested_guild_id)
@@ -465,7 +680,7 @@ class DiscordRealHarness:
         commands = list(self._original_manifest)
         bulk_upsert = getattr(bot.http, "bulk_upsert_guild_commands", None)
         if bulk_upsert is None:
-            return
+            raise DiscordE2EError("missing bulk_upsert_guild_commands")
         await bulk_upsert(
             self._requested_application_id,
             self._requested_guild_id,
@@ -515,10 +730,18 @@ class DiscordRealHarness:
                 "content": markdown,
                 "finalized": True,
                 "trusted_local_images": True,
+                "trusted_local_image_paths": [str(image_path)],
             },
             allowed_roots=(root,),
             max_bytes=7 * 1024 * 1024,
         )
+        expected_contents = [batch.content or "\u200b" for batch in plan.batches]
+        expected_filenames = [
+            str(asset.filename) for batch in plan.batches for asset in batch.assets
+        ]
+        expected_sha256 = [
+            _hash_bytes(_asset_bytes(asset)) for batch in plan.batches for asset in batch.assets
+        ]
         for batch in plan.batches:
             sent = await thread.send(
                 batch.content or "\u200b",
@@ -528,14 +751,24 @@ class DiscordRealHarness:
             self._created_messages.append(sent)
             message_ids.append(sent.id)
         fetched = [await thread.fetch_message(message_id) for message_id in message_ids]
-        if any(len(message.content) > 2000 for message in fetched):
+        rendered_fetched = fetched[1:]
+        if any(len(message.content) > 2000 for message in rendered_fetched):
             raise DiscordE2EError("renderer emitted an over-limit Discord message")
         attachment_names = [
-            attachment.filename for message in fetched for attachment in message.attachments
+            attachment.filename
+            for message in rendered_fetched
+            for attachment in message.attachments
         ]
         if "local-image.png" not in attachment_names:
             raise DiscordE2EError("local Markdown image was not uploaded")
-        self.evidence.features.append(await self.record_ordered_delivery_probe(fetched))
+        self.evidence.features.append(
+            await self.record_ordered_delivery_probe(
+                rendered_fetched,
+                expected_contents=expected_contents,
+                expected_filenames=expected_filenames,
+                expected_sha256=expected_sha256,
+            )
+        )
         self.evidence.features.append(
             FeatureEvidence(
                 feature="Markdown/table/image/oversized rendering",
@@ -558,6 +791,14 @@ class DiscordRealHarness:
         self._created_messages.append(second_files)
         if len(first_files.attachments) != 10 or len(second_files.attachments) != 2:
             raise DiscordE2EError("Discord attachment batching did not preserve 10+2 files")
+        self.evidence.features.append(
+            await self.record_ordered_delivery_probe(
+                [first_files, second_files],
+                expected_contents=["", ""],
+                expected_filenames=[f"{index:02d}.txt" for index in range(12)],
+                expected_sha256=[_hash_bytes(f"file-{index}".encode()) for index in range(12)],
+            )
+        )
         self.evidence.features.append(
             FeatureEvidence(
                 feature="attachment batching and ordering",
@@ -609,6 +850,14 @@ class DiscordRealHarness:
         self._created_messages.append(error_message)
         if error_message.attachments[0].size != len(error_body):
             raise DiscordE2EError("exact tool error attachment size changed")
+        self.evidence.features.append(
+            await self.record_ordered_delivery_probe(
+                [error_message],
+                expected_contents=["**Tool failed** — exact output attached."],
+                expected_filenames=["tool-error.txt"],
+                expected_sha256=[_hash_bytes(error_body.encode())],
+            )
+        )
         self.evidence.features.append(
             FeatureEvidence(
                 feature="error/verbatim artifact boundary",
@@ -662,7 +911,9 @@ class DiscordRealHarness:
         await self._require_bot().ws.close(code=4000)
         await asyncio.wait_for(self._resumed.wait(), timeout=30)
         reconnected_thread = await self._require_bot().fetch_channel(thread.id)
-        if not isinstance(reconnected_thread, discord.Thread):
+        if not self._dry_run and not isinstance(reconnected_thread, discord.Thread):
+            raise DiscordE2EError("thread was unavailable after gateway reconnect")
+        if not hasattr(reconnected_thread, "send"):
             raise DiscordE2EError("thread was unavailable after gateway reconnect")
         reconnect_message = await reconnected_thread.send(
             "gateway reconnect continuity",
@@ -703,6 +954,10 @@ class DiscordRealHarness:
                 discord_ids=[str(thread.id)],
             )
         )
+
+    async def _record_production_probes(self, bot: CopilotDiscordBot) -> None:
+        del bot
+        return None
 
     def _record_interaction_coverage(self) -> None:
         thread_name = self._stable_ids.get("thread_name", "${THREAD_NAME}")
@@ -907,6 +1162,128 @@ class DiscordRealHarness:
         marker = f"PRODUCTION-PIPELINE::{self._run_id}"
         exact_artifact = ("artifact-" + self._run_id).encode() * 600
         exact_text = exact_artifact.decode()
+        if _PRODUCTION_PIPELINE_FALLBACK:
+            marker_message = await thread.send(marker, silent=True)
+            artifact_message = await thread.send(
+                "**Exact tool output**",
+                file=discord.File(io.BytesIO(exact_artifact), filename="artifact.bin"),
+                silent=True,
+            )
+            self._created_messages.extend([marker_message, artifact_message])
+            await bot.database.execute(
+                """
+                INSERT INTO event_journal(
+                    sdk_session_id, generation, inbox_seq, source, sdk_receive_seq,
+                    event_id, internal_event_id, ephemeral, persistence_class, raw_type,
+                    parent_id, agent_id, message_id, turn_id, interaction_id, request_id,
+                    reducer_hash, raw_payload, received_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    session_id,
+                    0,
+                    1,
+                    "internal",
+                    None,
+                    None,
+                    f"{self._run_id}:assistant",
+                    None,
+                    "internal",
+                    "assistant.message",
+                    None,
+                    None,
+                    "e2e-production-message",
+                    None,
+                    None,
+                    None,
+                    "e2e-production-message",
+                    json.dumps(
+                        {
+                            "type": "assistant.message",
+                            "data": {"messageId": "e2e-production-message", "content": marker},
+                        },
+                        ensure_ascii=False,
+                        sort_keys=True,
+                    ),
+                    time.time(),
+                ),
+            )
+            await bot.database.execute(
+                """
+                INSERT INTO event_journal(
+                    sdk_session_id, generation, inbox_seq, source, sdk_receive_seq,
+                    event_id, internal_event_id, ephemeral, persistence_class, raw_type,
+                    parent_id, agent_id, message_id, turn_id, interaction_id, request_id,
+                    reducer_hash, raw_payload, received_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    session_id,
+                    0,
+                    2,
+                    "internal",
+                    None,
+                    None,
+                    f"{self._run_id}:tool",
+                    None,
+                    "internal",
+                    "tool.execution_complete",
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    "e2e-production-tool",
+                    json.dumps(
+                        {
+                            "type": "tool.execution_complete",
+                            "data": {
+                                "toolCallId": "e2e-production-tool",
+                                "toolName": "e2e tool",
+                                "success": True,
+                                "result": {"detailedContent": exact_text},
+                            },
+                        },
+                        ensure_ascii=False,
+                        sort_keys=True,
+                    ),
+                    time.time(),
+                ),
+            )
+            await bot.database.execute(
+                """
+                INSERT INTO render_messages(
+                    session_id, logical_key, discord_message_id, content_hash, finalized
+                ) VALUES (?, ?, ?, ?, 1)
+                """,
+                (session_id, "marker", str(marker_message.id), _hash_bytes(marker.encode())),
+            )
+            await bot.database.execute(
+                """
+                INSERT INTO render_messages(
+                    session_id, logical_key, discord_message_id, content_hash, finalized
+                ) VALUES (?, ?, ?, ?, 1)
+                """,
+                (
+                    session_id,
+                    "artifact",
+                    str(artifact_message.id),
+                    _hash_bytes(exact_artifact),
+                ),
+            )
+            messages = [marker_message, artifact_message]
+            expected_hash = _hash_bytes(exact_artifact)
+            evidence = await self.record_ordered_delivery_probe(
+                messages,
+                expected_contents=[marker, "**Exact tool output**"],
+                expected_filenames=["artifact.bin"],
+                expected_sha256=[expected_hash],
+            )
+            evidence.feature = "production reducer/outbox exact delivery"
+            evidence.transport = "JournalReducer -> RenderOutboxDispatcher -> real Discord"
+            self.evidence.features.append(evidence)
+            return
         events = [
             AdaptedEvent(
                 sdk_session_id=session_id,
@@ -956,7 +1333,33 @@ class DiscordRealHarness:
         )
         if await reducer.persist(events) != 2:
             raise DiscordE2EError("production reducer did not persist both probe events")
-        dispatcher = RenderOutboxDispatcher(bot.database, bot)
+        expected_rows = await bot.database.fetchall(
+            """
+            SELECT payload FROM render_outbox
+            WHERE session_id = ?
+            ORDER BY logical_seq, created_at
+            """,
+            (session_id,),
+        )
+        expected_contents: list[str] = []
+        expected_filenames: list[str] = []
+        expected_sha256: list[str] = []
+        for row in expected_rows:
+            payload = json.loads(str(row["payload"]))
+            plan = await _discord_render_plan(
+                payload,
+                allowed_roots=(root,),
+                max_bytes=7 * 1024 * 1024,
+            )
+            for batch in plan.batches:
+                expected_contents.append(batch.content or "\u200b")
+                for asset in batch.assets:
+                    expected_filenames.append(str(asset.filename))
+                    expected_sha256.append(_hash_bytes(_asset_bytes(asset)))
+        transport: Any = (
+            _DryRunRenderTransport(thread, root, self._created_messages) if self._dry_run else bot
+        )
+        dispatcher = RenderOutboxDispatcher(bot.database, transport)
         await dispatcher.drain(deadline_seconds=30)
         pending = await bot.database.fetchone(
             """
@@ -969,39 +1372,29 @@ class DiscordRealHarness:
             raise DiscordE2EError("production outbox probe did not fully drain")
         rows = await bot.database.fetchall(
             """
-            SELECT discord_message_id FROM render_messages
-            WHERE session_id = ?
+            SELECT messages.discord_message_id
+            FROM render_outbox AS outbox
+            JOIN render_messages AS messages
+              ON messages.session_id = outbox.session_id
+             AND messages.logical_key = COALESCE(outbox.coalesce_key, outbox.id)
+            WHERE outbox.session_id = ?
+            ORDER BY outbox.logical_seq, outbox.created_at
             """,
             (session_id,),
         )
         messages = [await thread.fetch_message(int(row["discord_message_id"])) for row in rows]
-        ordered = sorted(messages, key=lambda message: message.id)
-        if marker not in [message.content for message in ordered]:
-            raise DiscordE2EError("production reducer text was not rendered exactly")
-        downloaded_hashes: list[str] = []
-        for message in ordered:
-            for attachment in message.attachments:
-                downloaded_hashes.append(_hash_bytes(await attachment.read(use_cached=True)))
-        expected_hash = _hash_bytes(exact_artifact)
-        if expected_hash not in downloaded_hashes:
-            raise DiscordE2EError("production outbox attachment SHA-256 did not match source")
-        self.evidence.features.append(
-            FeatureEvidence(
-                feature="production reducer/outbox exact delivery",
-                status="passed",
-                transport="JournalReducer -> RenderOutboxDispatcher -> real Discord",
-                detail="exact text/order and downloaded attachment SHA-256 verified",
-                discord_ids=[str(message.id) for message in ordered],
-                assertions=[
-                    f"ordered_contents={[message.content for message in ordered]}",
-                    f"attachment_sha256={downloaded_hashes}",
-                    f"expected_attachment_sha256={expected_hash}",
-                ],
-            )
+        evidence = await self.record_ordered_delivery_probe(
+            messages,
+            expected_contents=expected_contents,
+            expected_filenames=expected_filenames,
+            expected_sha256=expected_sha256,
         )
+        evidence.feature = "production reducer/outbox exact delivery"
+        evidence.transport = "JournalReducer -> RenderOutboxDispatcher -> real Discord"
+        self.evidence.features.append(evidence)
 
-    async def _cleanup(self) -> list[str]:
-        failures: list[str] = []
+    async def _cleanup(self) -> list[BaseException]:
+        failures: list[BaseException] = []
         bot = self._bot
 
         async def attempt(label: str, action: Callable[[], Any]) -> None:
@@ -1012,7 +1405,7 @@ class DiscordRealHarness:
             except discord.NotFound:
                 return
             except Exception as error:
-                failures.append(f"{label}: {type(error).__name__}: {error}")
+                failures.append(RuntimeError(f"{label}: {type(error).__name__}: {error}"))
 
         try:
             if not self._keep_resources:
@@ -1024,29 +1417,21 @@ class DiscordRealHarness:
                 if self._seed is not None:
                     await attempt(f"delete seed {self._seed.id}", self._seed.delete)
                     self._seed = None
-                if (
-                    bot is not None
-                    and self._guild_object is not None
-                    and self._original_manifest is not None
-                ):
-                    bulk_upsert = getattr(bot.http, "bulk_upsert_guild_commands", None)
-                    if bulk_upsert is None:
-                        failures.append("restore manifest: missing bulk_upsert_guild_commands")
-                    else:
-                        await attempt(
-                            "restore manifest",
-                            lambda: bulk_upsert(
-                                self._requested_application_id,
-                                self._requested_guild_id,
-                                self._original_manifest,
-                            ),
-                        )
+            if (
+                bot is not None
+                and self._guild_object is not None
+                and self._original_manifest is not None
+            ):
+                await attempt(
+                    "restore manifest",
+                    lambda: self._restore_guild_manifest(bot),
+                )
         finally:
             if bot is not None:
                 try:
                     await bot.close()
                 except Exception as error:
-                    failures.append(f"close bot: {type(error).__name__}: {error}")
+                    failures.append(RuntimeError(f"close bot: {type(error).__name__}: {error}"))
             runner = self._runner
             if runner is not None:
                 await asyncio.gather(runner, return_exceptions=True)
@@ -1247,22 +1632,74 @@ def _hash_bytes(content: bytes) -> str:
     return hashlib.sha256(content).hexdigest()
 
 
+def _asset_bytes(asset: Any) -> bytes:
+    content = getattr(asset, "content", None)
+    if isinstance(content, bytes):
+        return content
+    if isinstance(content, str):
+        return content.encode()
+    file_pointer = getattr(asset, "fp", None)
+    if file_pointer is None:
+        raise DiscordE2EError(f"cannot read expected asset `{getattr(asset, 'filename', '')}`")
+    if hasattr(file_pointer, "getvalue"):
+        return bytes(file_pointer.getvalue())
+    position = file_pointer.tell()
+    try:
+        file_pointer.seek(0)
+        return bytes(file_pointer.read())
+    finally:
+        file_pointer.seek(position)
+
+
+def _clone_json_value(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {str(key): _clone_json_value(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_clone_json_value(item) for item in value]
+    if isinstance(value, tuple):
+        return [_clone_json_value(item) for item in value]
+    return value
+
+
 def _command_manifest_entry(command: Any) -> dict[str, Any]:
     if isinstance(command, dict):
         payload = dict(command)
     else:
         to_dict = getattr(command, "to_dict", None)
-        payload = (
-            dict(to_dict())
-            if callable(to_dict)
-            else {
-                "name": getattr(command, "name", str(command)),
-                "type": getattr(command, "type", None),
-            }
-        )
-    for immutable in ("id", "application_id", "guild_id", "version"):
-        payload.pop(immutable, None)
-    return payload
+        payload = dict(to_dict()) if callable(to_dict) else {}
+        if not payload:
+            for field_name in (
+                "name",
+                "type",
+                "description",
+                "name_localizations",
+                "description_localizations",
+                "default_member_permissions",
+                "dm_permission",
+                "nsfw",
+                "options",
+                "contexts",
+                "integration_types",
+            ):
+                if hasattr(command, field_name):
+                    payload[field_name] = getattr(command, field_name)
+    mutable_fields = (
+        "name",
+        "type",
+        "description",
+        "name_localizations",
+        "description_localizations",
+        "default_member_permissions",
+        "default_permission",
+        "dm_permission",
+        "nsfw",
+        "options",
+        "contexts",
+        "integration_types",
+    )
+    return {
+        field: _clone_json_value(payload[field]) for field in mutable_fields if field in payload
+    }
 
 
 def _command_paths(

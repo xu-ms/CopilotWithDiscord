@@ -1,4 +1,5 @@
 import asyncio
+import hashlib
 import json
 from pathlib import Path
 from typing import Any
@@ -17,6 +18,7 @@ class FakeTransport:
     def __init__(self) -> None:
         self.sent: list[tuple[str, str, dict[str, Any], str]] = []
         self.edited: list[tuple[str, str, dict[str, Any]]] = []
+        self.edit_idempotency_keys: list[str | None] = []
         self.failures: list[Exception] = []
 
     async def send(
@@ -35,13 +37,17 @@ class FakeTransport:
     async def edit(
         self,
         *,
+        session_id: str | None = None,
         message_id: str,
         lane: str,
         payload: dict[str, Any],
+        idempotency_key: str | None = None,
     ) -> None:
+        del session_id
         if self.failures:
             raise self.failures.pop(0)
         self.edited.append((message_id, lane, payload))
+        self.edit_idempotency_keys.append(idempotency_key)
 
 
 class HungTransport(FakeTransport):
@@ -353,6 +359,7 @@ async def test_stable_outbox_update_during_send_requeues_same_row(
             UPDATE render_outbox
             SET logical_seq = 2,
                 payload = ?,
+                payload_revision = payload_revision + 1,
                 updated_at = 2
             WHERE id = 'stable' AND state = 'sending'
             """,
@@ -365,11 +372,67 @@ async def test_stable_outbox_update_during_send_requeues_same_row(
 
         assert await dispatcher.dispatch_once() == 1
         final = await database.fetchone(
-            "SELECT state, COUNT(*) OVER () AS row_count FROM render_outbox"
+            """
+            SELECT state, payload_revision, COUNT(*) OVER () AS row_count
+            FROM render_outbox
+            """
         )
 
     assert transport.edited[-1][2] == {"content": "new", "finalized": True}
-    assert dict(final) == {"state": "sent", "row_count": 1}
+    assert transport.sent[0][3] != transport.edit_idempotency_keys[-1]
+    assert dict(final) == {"state": "sent", "payload_revision": 2, "row_count": 1}
+
+
+@pytest.mark.asyncio
+async def test_final_spill_survives_retry_then_is_collected_after_delivery(
+    tmp_path: Path,
+) -> None:
+    artifact = tmp_path / "tool-spill.txt"
+    content = b"durable retry payload"
+    artifact.write_bytes(content)
+    async with Database(tmp_path / "spill-delivery.sqlite3") as database:
+        await database.execute(
+            """
+            INSERT INTO tool_spill_artifacts(
+                session_id, tool_call_id, local_path, byte_size, sha256,
+                finalized, retention_until, updated_at
+            ) VALUES ('session-1', 'tool-1', ?, ?, ?, 1, 999, 0)
+            """,
+            (
+                str(artifact),
+                len(content),
+                hashlib.sha256(content).hexdigest(),
+            ),
+        )
+        await _insert_outbox(
+            database,
+            item_id="spill-final",
+            sequence=1,
+            lane="artifact",
+            coalesce_key="tool-spill:tool-1",
+            payload={
+                "content": "tool spill",
+                "finalized": True,
+                "attachments": [{"path": str(artifact)}],
+            },
+        )
+        transport = FakeTransport()
+        transport.failures.append(RenderTransientError("retry"))
+        dispatcher = RenderOutboxDispatcher(database, transport)
+
+        assert await dispatcher.dispatch_once(now=100) == 0
+        assert artifact.is_file()
+        assert await database.fetchone(
+            "SELECT 1 FROM tool_spill_artifacts WHERE tool_call_id = 'tool-1'"
+        )
+
+        assert await dispatcher.dispatch_once(now=101) == 1
+        row = await database.fetchone(
+            "SELECT 1 FROM tool_spill_artifacts WHERE tool_call_id = 'tool-1'"
+        )
+
+    assert not artifact.exists()
+    assert row is None
 
 
 @pytest.mark.asyncio

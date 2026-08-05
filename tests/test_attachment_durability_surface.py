@@ -229,21 +229,24 @@ async def test_runtime_serialized_frame_budget_is_cumulative_across_images_and_p
             "copilotd:attachment:discord-message:message-cumulative",
         )
     )
-    expected_path = (
-        tmp_path
-        / "sessions"
-        / "session-cumulative"
-        / "attachments"
-        / manifest_id
-        / f"002-{_safe_filename(attachments[2].filename)}"
-    )
-    frame_budget = _serialized_request_size(
-        [
-            _blob_payload(attachments[0].content, attachments[0].filename, "image/jpeg"),
-            _blob_payload(attachments[1].content, attachments[1].filename, "image/jpeg"),
-            _file_payload(str(expected_path.resolve()), attachments[2].filename),
-        ]
-    )
+    directory = tmp_path / "sessions" / "session-cumulative" / "attachments" / manifest_id
+    blobs = [
+        _blob_payload(attachment.content, attachment.filename, "image/jpeg")
+        for attachment in attachments
+    ]
+    files = [
+        _file_payload(
+            str((directory / f"{index:03d}-{_safe_filename(attachment.filename)}").resolve()),
+            attachment.filename,
+        )
+        for index, attachment in enumerate(attachments)
+    ]
+    candidate_sizes = [
+        _serialized_request_size([*blobs[:index], file, *blobs[index + 1 :]])
+        for index, file in enumerate(files)
+    ]
+    expected_file_index = min(range(len(attachments)), key=candidate_sizes.__getitem__)
+    frame_budget = candidate_sizes[expected_file_index]
 
     async with Database(tmp_path / "cumulative.sqlite3") as database:
         service = AttachmentService(
@@ -264,11 +267,12 @@ async def test_runtime_serialized_frame_budget_is_cumulative_across_images_and_p
         sdk_attachments = await service.sdk_attachments(prepared.manifest_id)
 
     assert prepared is not None
-    assert [item["type"] for item in sdk_attachments] == ["blob", "blob", "file"]
-    assert base64.b64decode(sdk_attachments[0]["data"]) == attachments[0].content
-    assert base64.b64decode(sdk_attachments[1]["data"]) == attachments[1].content
-    assert sdk_attachments[2]["displayName"] == "报告.jpg"
-    assert Path(sdk_attachments[2]["path"]) == expected_path.resolve()
+    assert [item["type"] for item in sdk_attachments].count("file") == 1
+    for index, item in enumerate(sdk_attachments):
+        if index == expected_file_index:
+            assert item == files[index]
+        else:
+            assert base64.b64decode(item["data"]) == attachments[index].content
     assert _serialized_request_size(sdk_attachments) == frame_budget
 
 
@@ -445,6 +449,62 @@ async def test_later_file_can_downgrade_an_earlier_blob_to_fit_frame(
         sdk_attachments = await service.sdk_attachments(prepared.manifest_id)
 
     assert sdk_attachments == all_files
+
+
+@pytest.mark.asyncio
+async def test_frame_fit_keeps_tiny_blob_when_file_descriptor_is_larger(
+    tmp_path: Path,
+) -> None:
+    tiny_buffer = io.BytesIO()
+    Image.new("RGB", (1, 1), "blue").save(tiny_buffer, format="PNG")
+    tiny = tiny_buffer.getvalue()
+    large = _make_noisy_jpeg_bytes(128)
+    attachments = [
+        FakeAttachment(1, "tiny.png", tiny, "image/png"),
+        FakeAttachment(2, "large.jpg", large, "image/jpeg"),
+    ]
+    manifest_id = str(
+        uuid.uuid5(
+            uuid.NAMESPACE_URL,
+            "copilotd:attachment:discord-message:positive-savings",
+        )
+    )
+    directory = tmp_path / "sessions" / "session-positive" / "attachments" / manifest_id
+    tiny_blob = _blob_payload(tiny, "tiny.png", "image/png")
+    large_blob = _blob_payload(large, "large.jpg", "image/jpeg")
+    tiny_file = _file_payload(
+        str((directory / "000-tiny.png").resolve()),
+        "tiny.png",
+    )
+    large_file = _file_payload(
+        str((directory / "001-large.jpg").resolve()),
+        "large.jpg",
+    )
+    budget = _serialized_request_size([tiny_blob, large_file])
+    assert _serialized_request_size([tiny_file, large_file]) > budget
+    assert _serialized_request_size([tiny_blob, large_blob]) > budget
+
+    async with Database(tmp_path / "positive-savings.sqlite3") as database:
+        service = AttachmentService(
+            database,
+            tmp_path,
+            capabilities=AttachmentCapabilities(
+                runtime_inline_blob_max_bytes=8 * 1024 * 1024,
+                runtime_serialized_frame_max_bytes=budget,
+            ),
+        )
+        prepared = await service.prepare(
+            source_kind="discord-message",
+            source_id="positive-savings",
+            session_id="session-positive",
+            attachments=attachments,
+        )
+        assert prepared is not None
+        sdk_attachments = await service.sdk_attachments(prepared.manifest_id)
+
+    assert [item["type"] for item in sdk_attachments] == ["blob", "file"]
+    assert base64.b64decode(sdk_attachments[0]["data"]) == tiny
+    assert sdk_attachments[1] == large_file
 
 
 @pytest.mark.asyncio
@@ -635,8 +695,10 @@ async def test_runtime_serialized_frame_budget_falls_back_for_two_large_images(
         sdk_attachments = await service.sdk_attachments(prepared.manifest_id)
 
     assert prepared is not None
-    assert [item["type"] for item in sdk_attachments] == ["blob", "file"]
-    assert sdk_attachments[1]["displayName"] == "第二张图.jpg"
+    assert [item["type"] for item in sdk_attachments].count("file") == 1
+    assert [item["displayName"] for item in sdk_attachments] == [
+        attachment.filename for attachment in attachments
+    ]
     assert _serialized_request_size(sdk_attachments) <= frame_budget
 
 

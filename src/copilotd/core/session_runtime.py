@@ -500,6 +500,7 @@ class SessionRuntime:
                 operation=dispatch,
             )
         except OperationRejected:
+            self._volatile_attachments.pop(submission_id, None)
             await inbox.commit_internal(
                 {
                     "type": "copilotd.submission.rejected",

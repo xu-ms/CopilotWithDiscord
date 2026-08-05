@@ -469,6 +469,7 @@ async def test_direct_attachments_cannot_bypass_complete_frame_limit(
             )
 
         assert bridge.handle.sent == []
+        assert runtime._volatile_attachments == {}
         submission = await database.fetchone(
             "SELECT state FROM submissions WHERE sdk_session_id = ?",
             (session_id,),

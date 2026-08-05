@@ -65,6 +65,7 @@ from copilotd.core.sessions import (
     SessionRegistry,
     ThreadReference,
 )
+from copilotd.core.spill_artifacts import garbage_collect_tool_spills
 from copilotd.core.task_registry import TaskRegistry
 from copilotd.ops.heartbeat import HeartbeatWriter
 from copilotd.ops.surface import LocalOpsSurface
@@ -150,6 +151,7 @@ class CopilotDiscordBot(commands.Bot):
 
     async def setup_hook(self) -> None:
         await self.database.open()
+        await garbage_collect_tool_spills(self.database)
         self.projects = ProjectRegistry(
             self.database,
             resolved_home=self.settings.resolved_home,
@@ -2882,11 +2884,17 @@ async def _discord_render_plan(
 
     local_image_assets: list[TableAsset] = []
     image_warnings: list[str] = []
-    if allowed_roots and payload.get("trusted_local_images") is True:
+    trusted_local_paths = payload.get("trusted_local_image_paths")
+    if (
+        allowed_roots
+        and payload.get("trusted_local_images") is True
+        and isinstance(trusted_local_paths, list)
+    ):
         extraction = await asyncio.to_thread(
             lambda: extract_local_markdown_images(
                 content,
                 allowed_roots=allowed_roots,
+                trusted_paths=[str(path) for path in trusted_local_paths if isinstance(path, str)],
             )
         )
         content = extraction.content

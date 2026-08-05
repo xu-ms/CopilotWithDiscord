@@ -19,6 +19,7 @@ from copilotd.storage.database import Database
 
 FenceValidator = Callable[[int, int], Awaitable[bool]]
 _DIFF_OUTPUT_LIMIT = 8 * 1024 * 1024
+_TOOL_SPILL_RETENTION_SECONDS = 7 * 24 * 60 * 60
 
 
 class RenderPlanner:
@@ -339,6 +340,7 @@ class JournalReducer:
                                 logical_seq = excluded.logical_seq,
                                 coalesce_key = excluded.coalesce_key,
                                 payload = excluded.payload,
+                                payload_revision = render_outbox.payload_revision + 1,
                                 state = CASE
                                     WHEN render_outbox.state = 'sending'
                                     THEN 'sending'
@@ -727,13 +729,26 @@ class JournalReducer:
         )
         stream = await cursor.fetchone()
         await cursor.close()
-        return {
+        trusted_cursor = await connection.execute(
+            """
+            SELECT path FROM trusted_local_artifacts
+            WHERE session_id = ? ORDER BY observed_at, path
+            """,
+            (event.sdk_session_id,),
+        )
+        trusted_paths = [str(row["path"]) for row in await trusted_cursor.fetchall()]
+        await trusted_cursor.close()
+        payload = {
             "type": event.raw_type,
             "content": stream["content"],
             "message_id": event.message_id,
             "agent_id": event.agent_id,
             "finalized": bool(stream["finalized"]),
         }
+        if trusted_paths:
+            payload["trusted_local_images"] = True
+            payload["trusted_local_image_paths"] = trusted_paths
+        return payload
 
     async def _accumulate_render_stream(
         self,
@@ -829,10 +844,18 @@ class JournalReducer:
             await connection.execute(
                 """
                 UPDATE tool_spill_artifacts
-                SET byte_size = ?, sha256 = NULL, updated_at = ?
+                SET byte_size = ?, sha256 = NULL,
+                    retention_until = MAX(retention_until, ?),
+                    updated_at = ?
                 WHERE session_id = ? AND tool_call_id = ? AND finalized = 0
                 """,
-                (byte_size, now, event.sdk_session_id, tool_call_id),
+                (
+                    byte_size,
+                    now + _TOOL_SPILL_RETENTION_SECONDS,
+                    now,
+                    event.sdk_session_id,
+                    tool_call_id,
+                ),
             )
             await connection.execute(
                 """
@@ -869,13 +892,17 @@ class JournalReducer:
             """
             INSERT INTO tool_spill_artifacts(
                 session_id, tool_call_id, local_path, byte_size,
-                sha256, finalized, updated_at
-            ) VALUES (?, ?, ?, ?, NULL, 0, ?)
+                sha256, finalized, retention_until, updated_at
+            ) VALUES (?, ?, ?, ?, NULL, 0, ?, ?)
             ON CONFLICT(session_id, tool_call_id) DO UPDATE SET
                 local_path = excluded.local_path,
                 byte_size = excluded.byte_size,
                 sha256 = NULL,
                 finalized = 0,
+                retention_until = MAX(
+                    tool_spill_artifacts.retention_until,
+                    excluded.retention_until
+                ),
                 updated_at = excluded.updated_at
             """,
             (
@@ -883,6 +910,7 @@ class JournalReducer:
                 tool_call_id,
                 str(path),
                 len(combined),
+                now + _TOOL_SPILL_RETENTION_SECONDS,
                 now,
             ),
         )
@@ -957,11 +985,22 @@ class JournalReducer:
                 success=bool(data.get("success")),
             )
             if completion:
-                completion_bytes = (
-                    f"\n\n--- completion payload ({completion_source}) ---\n{completion}"
-                ).encode()
                 source = f"durable-stream+{completion_source}"
                 verbatim = completion_verbatim
+                canonical_bytes = completion.encode()
+                if artifact is None:
+                    completion_matches_stream = str(row["content"]).encode() == canonical_bytes
+                else:
+                    completion_matches_stream = await asyncio.to_thread(
+                        _spill_matches_bytes,
+                        Path(str(artifact["local_path"])),
+                        int(artifact["byte_size"]),
+                        canonical_bytes,
+                    )
+                if not completion_matches_stream:
+                    completion_bytes = (
+                        f"\n\n--- completion payload ({completion_source}) ---\n{completion}"
+                    ).encode()
         if artifact is None and event.raw_type == "tool.execution_complete":
             combined = str(row["content"]).encode() + completion_bytes
             if len(combined) >= 64 * 1024:
@@ -976,8 +1015,8 @@ class JournalReducer:
                     """
                     INSERT INTO tool_spill_artifacts(
                         session_id, tool_call_id, local_path, byte_size,
-                        sha256, finalized, updated_at
-                    ) VALUES (?, ?, ?, ?, ?, 1, ?)
+                        sha256, finalized, retention_until, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, 1, ?, ?)
                     """,
                     (
                         event.sdk_session_id,
@@ -985,6 +1024,7 @@ class JournalReducer:
                         str(path),
                         len(combined),
                         digest,
+                        now + _TOOL_SPILL_RETENTION_SECONDS,
                         now,
                     ),
                 )
@@ -1030,12 +1070,15 @@ class JournalReducer:
             await connection.execute(
                 """
                 UPDATE tool_spill_artifacts
-                SET byte_size = ?, sha256 = ?, finalized = 1, updated_at = ?
+                SET byte_size = ?, sha256 = ?, finalized = 1,
+                    retention_until = MAX(retention_until, ?),
+                    updated_at = ?
                 WHERE session_id = ? AND tool_call_id = ?
                 """,
                 (
                     byte_size,
                     digest,
+                    now + _TOOL_SPILL_RETENTION_SECONDS,
                     now,
                     event.sdk_session_id,
                     tool_call_id,
@@ -1085,6 +1128,29 @@ class JournalReducer:
         data = event.raw_payload.get("data", event.raw_payload)
         if not isinstance(data, dict):
             return
+        if event.raw_type == "session.workspace_file_changed" and event.source == "sdk":
+            path = data.get("path")
+            if isinstance(path, str) and path.strip():
+                operation = str(data.get("operation", "modified")).lower()
+                if operation in {"delete", "deleted", "remove", "removed"}:
+                    await connection.execute(
+                        """
+                        DELETE FROM trusted_local_artifacts
+                        WHERE session_id = ? AND path = ?
+                        """,
+                        (event.sdk_session_id, path),
+                    )
+                else:
+                    await connection.execute(
+                        """
+                        INSERT INTO trusted_local_artifacts(
+                            session_id, path, observed_at
+                        ) VALUES (?, ?, ?)
+                        ON CONFLICT(session_id, path) DO UPDATE SET
+                            observed_at = excluded.observed_at
+                        """,
+                        (event.sdk_session_id, path, event.received_at),
+                    )
         stream_content: str | None = None
         if (
             event.raw_type in {"assistant.message_delta", "assistant.message"}
@@ -3038,3 +3104,21 @@ def _spill_sha256(path: Path) -> str:
         for chunk in iter(lambda: file.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def _spill_matches_bytes(path: Path, byte_size: int, expected: bytes) -> bool:
+    if byte_size != len(expected):
+        return False
+    expected_digest = hashlib.sha256(expected).digest()
+    actual_digest = hashlib.sha256()
+    consumed = 0
+    with path.open("rb") as file:
+        while consumed < byte_size:
+            chunk = file.read(min(1024 * 1024, byte_size - consumed))
+            if not chunk:
+                return False
+            actual_digest.update(chunk)
+            consumed += len(chunk)
+        if file.read(1):
+            return False
+    return actual_digest.digest() == expected_digest

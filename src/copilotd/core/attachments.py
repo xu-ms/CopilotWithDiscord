@@ -10,6 +10,7 @@ import re
 import time
 import uuid
 import weakref
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Protocol
@@ -164,17 +165,12 @@ class AttachmentService:
                 _serialized_request_size,
                 proposed,
             )
-            if request_size > frame_budget:
-                for candidate_index in range(len(proposed) - 1, -1, -1):
-                    if proposed[candidate_index]["type"] != "blob":
-                        continue
-                    proposed[candidate_index] = _load_file_attachment(items[candidate_index])
-                    request_size = await asyncio.to_thread(
-                        _serialized_request_size,
-                        proposed,
-                    )
-                    if request_size <= frame_budget:
-                        break
+            proposed, request_size = await _downgrade_blobs_by_savings(
+                proposed,
+                items,
+                frame_budget,
+                _serialized_request_size,
+            )
             if request_size > frame_budget:
                 raise AttachmentError(
                     "serialized SDK attachment request exceeds the runtime frame limit "
@@ -213,22 +209,23 @@ class AttachmentService:
             agent_mode=agent_mode,
             trace_context=trace_context,
         )
-        if frame_size > limits.serialized_frame_max_bytes:
-            for index in range(len(attachments) - 1, -1, -1):
-                if attachments[index]["type"] != "blob":
-                    continue
-                attachments[index] = _load_file_attachment(items[index])
-                frame_size = await asyncio.to_thread(
-                    sdk_send_frame_size,
-                    session_id=session_id,
-                    prompt=prompt,
-                    attachments=attachments,
-                    mode=mode,
-                    agent_mode=agent_mode,
-                    trace_context=trace_context,
-                )
-                if frame_size <= limits.serialized_frame_max_bytes:
-                    break
+
+        def full_frame_size(values: list[dict[str, Any]]) -> int:
+            return sdk_send_frame_size(
+                session_id=session_id,
+                prompt=prompt,
+                attachments=values,
+                mode=mode,
+                agent_mode=agent_mode,
+                trace_context=trace_context,
+            )
+
+        attachments, frame_size = await _downgrade_blobs_by_savings(
+            attachments,
+            items,
+            limits.serialized_frame_max_bytes,
+            full_frame_size,
+        )
         if frame_size > limits.serialized_frame_max_bytes:
             raise AttachmentError(
                 "complete serialized session.send frame exceeds the runtime limit"
@@ -523,6 +520,36 @@ def _min_non_none(*values: int | None) -> int:
     if not numeric:
         raise ValueError("at least one attachment limit must be provided")
     return min(numeric)
+
+
+async def _downgrade_blobs_by_savings(
+    values: list[dict[str, Any]],
+    items: list[_StoredItem],
+    budget: int,
+    size_function: Callable[[list[dict[str, Any]]], int],
+) -> tuple[list[dict[str, Any]], int]:
+    current = list(values)
+    current_size = await asyncio.to_thread(size_function, current)
+    while current_size > budget:
+        best_index: int | None = None
+        best_size = current_size
+        best_saving = 0
+        for index, value in enumerate(current):
+            if value["type"] != "blob":
+                continue
+            candidate = list(current)
+            candidate[index] = _load_file_attachment(items[index])
+            candidate_size = await asyncio.to_thread(size_function, candidate)
+            saving = current_size - candidate_size
+            if saving > best_saving:
+                best_index = index
+                best_size = candidate_size
+                best_saving = saving
+        if best_index is None:
+            break
+        current[best_index] = _load_file_attachment(items[best_index])
+        current_size = best_size
+    return current, current_size
 
 
 def _safe_filename(filename: str) -> str:
