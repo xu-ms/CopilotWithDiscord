@@ -201,6 +201,9 @@ class CopilotBridge:
     async def list_models(self) -> list[dict[str, Any]]:
         return [model.to_dict() for model in await self.client.list_models()]
 
+    async def healthcheck(self) -> None:
+        await self.client.ping("copilotd-heartbeat")
+
     async def set_model(
         self,
         session: CopilotSession,

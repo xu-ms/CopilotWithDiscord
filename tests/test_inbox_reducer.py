@@ -89,6 +89,32 @@ async def test_inbox_reports_real_oldest_outstanding_lag() -> None:
     assert inbox.lag_ms == 0
 
 
+@pytest.mark.asyncio
+async def test_quiesce_observer_covers_sdk_and_internal_producers() -> None:
+    inbox = ReducerInbox(
+        sdk_session_id="session-1",
+        generation=1,
+        fence_token=7,
+        capacity=4,
+    )
+    observed: list[str] = []
+    inbox.set_producer_observer(observed.append)
+
+    assert inbox.submit_sdk(_message_delta())
+    internal = asyncio.create_task(
+        inbox.commit_internal(
+            {"type": "copilotd.snapshot"},
+            source="snapshot",
+        )
+    )
+    for _ in range(2):
+        envelope = await inbox.get()
+        inbox.acknowledge(envelope)
+    await internal
+
+    assert observed == ["sdk", "snapshot"]
+
+
 def _submit(inbox: ReducerInbox) -> None:
     assert inbox.submit_sdk(_message_delta())
 

@@ -15,7 +15,7 @@ import time
 import uuid
 import xml.etree.ElementTree as ET
 from collections.abc import Callable, Sequence
-from dataclasses import asdict, dataclass, replace
+from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Literal, Protocol
@@ -74,6 +74,10 @@ class RestartBlocked(ServiceError):
         super().__init__("restart is not detach-safe: " + ", ".join(self.blockers))
 
 
+class ForcePreparationUncertain(ServiceError):
+    pass
+
+
 @dataclass(frozen=True, slots=True)
 class CommandResult:
     command: tuple[str, ...]
@@ -125,6 +129,7 @@ class ServiceUnitStatus:
     installed_definition: bool
     effective_state: EffectiveState
     pid: int | None
+    process_started_at: float | None
     definition_matches: bool
     expected_definition_hash: str
     effective_definition_hash: str | None
@@ -172,6 +177,8 @@ class ServiceStatus:
     runtime_loaded: bool
     pid: int | None
     process_generation: str | None
+    process_started_at: str | None
+    manager_process_started_at: float | None
     process_identity_matches: bool | None
     heartbeat_age_seconds: float | None
     heartbeat_written_at: str | None
@@ -196,6 +203,7 @@ class InstallReceipt:
     topology: Topology
     previous_pid: int | None
     previous_generation: str | None
+    previous_process_started_at: str | None
     expected_units: tuple[str, ...]
     definition_hashes: dict[str, str]
 
@@ -205,6 +213,7 @@ class QuiesceFence:
     fence_id: str
     expected_pid: int
     expected_generation: str
+    expected_process_started_at: float
     requested_at: float
     acknowledged_at: float | None = None
     ingress_depth: int | None = None
@@ -244,6 +253,7 @@ class RestartReceipt:
     force: bool
     previous_pid: int
     previous_generation: str
+    previous_process_started_at: str
     safety_snapshot: RestartSafetySnapshot
     force_outcome: ForceRestartOutcome | None
     admission_fence_id: str
@@ -255,6 +265,7 @@ class RestartCoordinator(Protocol):
         *,
         expected_pid: int,
         expected_generation: str,
+        expected_process_started_at: float,
         now: float,
     ) -> QuiesceFence: ...
 
@@ -276,6 +287,16 @@ class RestartCoordinator(Protocol):
 
     def commit_quiesce(self, fence: QuiesceFence, *, now: float) -> None: ...
 
+    def commit_irreversible_quiesce(
+        self,
+        fence: QuiesceFence,
+        *,
+        now: float,
+        reason: str,
+    ) -> None: ...
+
+    def is_irreversible(self, fence: QuiesceFence) -> bool: ...
+
     def release_quiesce(
         self,
         fence: QuiesceFence,
@@ -288,6 +309,7 @@ class RestartCoordinator(Protocol):
 
     def prepare_force(
         self,
+        fence: QuiesceFence,
         snapshot: RestartSafetySnapshot,
         *,
         deadline: float,
@@ -312,12 +334,14 @@ class SqliteRestartCoordinator:
         *,
         expected_pid: int,
         expected_generation: str,
+        expected_process_started_at: float,
         now: float,
     ) -> QuiesceFence:
         fence = QuiesceFence(
             fence_id=str(uuid.uuid4()),
             expected_pid=expected_pid,
             expected_generation=expected_generation,
+            expected_process_started_at=expected_process_started_at,
             requested_at=now,
         )
         connection = self._connect()
@@ -325,16 +349,30 @@ class SqliteRestartCoordinator:
             connection.execute("BEGIN IMMEDIATE")
             active = connection.execute(
                 """
-                SELECT fence_id, expected_pid, expected_generation, requested_at
+                SELECT fence_id, state, expected_pid, expected_generation,
+                       expected_process_started_at, requested_at
                 FROM service_admission_fences
-                WHERE state IN ('requested', 'acknowledged', 'violated', 'committed')
+                WHERE state IN (
+                  'requested', 'acknowledged', 'violated',
+                  'prepared', 'committed'
+                )
                 LIMIT 1
                 """
             ).fetchone()
             if active is not None:
+                active_state = str(active["state"])
+                if active_state in {"prepared", "committed"}:
+                    raise ServiceError(
+                        "an irreversible restart fence requires replacement "
+                        f"adoption: {active['fence_id']}"
+                    )
                 stale = (
                     int(active["expected_pid"]) != expected_pid
                     or str(active["expected_generation"]) != expected_generation
+                    or not _timestamps_match(
+                        active["expected_process_started_at"],
+                        expected_process_started_at,
+                    )
                     or now - float(active["requested_at"]) > 60
                 )
                 if not stale:
@@ -361,13 +399,20 @@ class SqliteRestartCoordinator:
                 """
                 INSERT INTO service_admission_fences(
                     fence_id, expected_pid, expected_generation,
-                    state, requested_at, detail
-                ) VALUES (?, ?, ?, 'requested', ?, ?)
+                    expected_process_started_at, state, requested_at,
+                    baseline_journal_id, detail
+                ) VALUES (
+                    ?, ?, ?, ?, 'requested', ?,
+                    (SELECT COALESCE(MAX(journal_id), 0)
+                     FROM event_journal),
+                    ?
+                )
                 """,
                 (
                     fence.fence_id,
                     fence.expected_pid,
                     fence.expected_generation,
+                    fence.expected_process_started_at,
                     fence.requested_at,
                     json.dumps(
                         {"reason": "service_restart"},
@@ -384,6 +429,313 @@ class SqliteRestartCoordinator:
             connection.close()
         return fence
 
+    def recover_for_replacement(
+        self,
+        *,
+        replacement_pid: int,
+        replacement_generation: str,
+        replacement_process_started_at: float,
+        now: float,
+    ) -> str:
+        row = self._active_fence_row()
+        if row is None:
+            return "none"
+        same_process = (
+            int(row["expected_pid"]) == replacement_pid
+            and str(row["expected_generation"]) == replacement_generation
+            and _timestamps_match(
+                row["expected_process_started_at"],
+                replacement_process_started_at,
+            )
+        )
+        if same_process:
+            raise ServiceError(
+                f"service fence still belongs to this process: {row['fence_id']}"
+            )
+        state = str(row["state"])
+        if state == "prepared":
+            fence = self._row_to_fence(row)
+            self.commit_irreversible_quiesce(
+                fence,
+                now=now,
+                reason="replacement_completed_irreversible_handoff",
+            )
+            state = "committed"
+        connection = self._connect()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            if state == "committed":
+                committed = connection.execute(
+                    """
+                    SELECT producer_count, acknowledged_producer_count,
+                           acknowledged_journal_id, violation_count,
+                           (SELECT COALESCE(MAX(journal_id), 0)
+                            FROM event_journal) AS current_journal_id
+                    FROM service_admission_fences
+                    WHERE fence_id = ? AND state = 'committed'
+                    """,
+                    (row["fence_id"],),
+                ).fetchone()
+                if committed is None:
+                    raise ServiceError(
+                        "committed service fence disappeared during adoption"
+                    )
+                acknowledged_producer_count = committed[
+                    "acknowledged_producer_count"
+                ]
+                acknowledged_journal_id = committed[
+                    "acknowledged_journal_id"
+                ]
+                if (
+                    acknowledged_producer_count is None
+                    or acknowledged_journal_id is None
+                    or int(committed["producer_count"])
+                    != int(acknowledged_producer_count)
+                    or int(committed["current_journal_id"])
+                    != int(acknowledged_journal_id)
+                    or int(committed["violation_count"]) > 0
+                ):
+                    self._mark_post_commit_producer_unknown(
+                        connection,
+                        fence_id=str(row["fence_id"]),
+                        now=now,
+                        kind="post_commit_producer_violation",
+                        reason="producer_after_owner_handoff",
+                    )
+                cursor = connection.execute(
+                    """
+                    UPDATE service_admission_fences
+                    SET state = 'released', released_at = ?, detail = ?
+                    WHERE fence_id = ? AND state = 'committed'
+                      AND owner_handoff_at IS NOT NULL
+                    """,
+                    (
+                        now,
+                        json.dumps(
+                            {
+                                "reason": "replacement_generation_adopted",
+                                "replacement_pid": replacement_pid,
+                                "replacement_generation":
+                                    replacement_generation,
+                                "replacement_process_started_at":
+                                    replacement_process_started_at,
+                            },
+                            sort_keys=True,
+                            separators=(",", ":"),
+                        ),
+                        row["fence_id"],
+                    ),
+                )
+            else:
+                self._mark_post_commit_producer_unknown(
+                    connection,
+                    fence_id=str(row["fence_id"]),
+                    now=now,
+                    kind="replacement_recovered_crash",
+                    reason="process_lost_before_restart_commit",
+                )
+                self._apply_owner_handoff_rows(
+                    connection,
+                    now=now,
+                    reason="replacement_adopted_reversible_crash",
+                )
+                cursor = connection.execute(
+                    """
+                    UPDATE service_admission_fences
+                    SET state = 'released', released_at = ?,
+                        owner_handoff_at = ?, detail = ?
+                    WHERE fence_id = ?
+                      AND state IN ('requested', 'acknowledged', 'violated')
+                    """,
+                    (
+                        now,
+                        now,
+                        json.dumps(
+                            {
+                                "reason": "replacement_aborted_reversible_fence",
+                                "replacement_pid": replacement_pid,
+                                "replacement_generation":
+                                    replacement_generation,
+                            },
+                            sort_keys=True,
+                            separators=(",", ":"),
+                        ),
+                        row["fence_id"],
+                    ),
+                )
+            if cursor.rowcount != 1:
+                raise ServiceError(
+                    "replacement could not adopt the service restart fence"
+                )
+            connection.commit()
+        finally:
+            connection.close()
+        return state
+
+    @staticmethod
+    def _apply_owner_handoff_rows(
+        connection: sqlite3.Connection,
+        *,
+        now: float,
+        reason: str,
+    ) -> None:
+        connection.execute(
+            """
+            UPDATE session_owner_leases
+            SET renewed_at = ?, expires_at = ?
+            WHERE EXISTS (
+              SELECT 1 FROM session_bindings AS b
+              WHERE b.sdk_session_id = session_owner_leases.sdk_session_id
+                AND b.owner_fence_token = session_owner_leases.fence_token
+                AND b.attachment_state IN (
+                  'creating', 'resuming', 'attached',
+                  'disconnecting', 'recovery_unknown'
+                )
+            )
+            """,
+            (now, now),
+        )
+        connection.execute(
+            """
+            UPDATE session_bindings
+            SET attachment_state = 'recovery_unknown',
+                attachment_reason = ?,
+                permission_posture = 'unknown',
+                permission_verified_at = NULL,
+                updated_at = ?,
+                row_version = row_version + 1
+            WHERE attachment_state IN (
+              'creating', 'resuming', 'attached', 'disconnecting'
+            )
+            """,
+            (reason, now),
+        )
+        connection.execute(
+            """
+            UPDATE session_operations
+            SET state = 'unknown', error_code = ?, settled_at = ?
+            WHERE state IN ('pending', 'started')
+            """,
+            (reason, now),
+        )
+
+    def _mark_post_commit_producer_unknown(
+        self,
+        connection: sqlite3.Connection,
+        *,
+        fence_id: str,
+        now: float,
+        kind: str,
+        reason: str,
+    ) -> None:
+        inflight = tuple(sorted(_INFLIGHT_SUBMISSION_STATES))
+        placeholders = ",".join("?" for _ in inflight)
+        connection.execute(
+            f"""
+            UPDATE message_queue
+            SET state = 'submitted_unknown', updated_at = ?
+            WHERE state NOT IN (
+              'cancelled', 'submitted', 'submitted_unknown', 'failed'
+            )
+              AND id IN (
+                SELECT submission_id FROM submissions
+                WHERE state IN ({placeholders})
+              )
+            """,
+            (now, *inflight),
+        )
+        connection.execute(
+            f"""
+            UPDATE submissions
+            SET state = 'outcome_unknown'
+            WHERE state IN ({placeholders})
+            """,
+            inflight,
+        )
+        connection.execute(
+            """
+            UPDATE session_operations
+            SET state = 'unknown',
+                error_code = 'post_commit_producer_violation',
+                settled_at = ?
+            WHERE state IN ('pending', 'started')
+            """,
+            (now,),
+        )
+        connection.execute(
+            """
+            UPDATE pending_interactions
+            SET state = 'expired', updated_at = ?,
+                response = COALESCE(
+                  response,
+                  'Cancelled after restart admission violation.'
+                )
+            WHERE state = 'pending'
+            """,
+            (now,),
+        )
+        connection.execute(
+            """
+            UPDATE session_bindings
+            SET runtime_remote_mode = 'unknown',
+                updated_at = ?, row_version = row_version + 1
+            WHERE runtime_remote_mode = 'on'
+               OR pending_remote_transition_id IS NOT NULL
+            """,
+            (now,),
+        )
+        connection.execute(
+            """
+            UPDATE runtime_schedules
+            SET state = 'unknown', updated_at = ?
+            WHERE state = 'active'
+            """,
+            (now,),
+        )
+        terminal = tuple(sorted(_TERMINAL_SCHEDULE_RUN_STATES))
+        terminal_placeholders = ",".join("?" for _ in terminal)
+        connection.execute(
+            f"""
+            UPDATE schedule_runs
+            SET status = 'outcome_unknown', updated_at = ?
+            WHERE status NOT IN ({terminal_placeholders})
+              AND (
+                claimed_at IS NOT NULL
+                OR session_create_started_at IS NOT NULL
+                OR send_started_at IS NOT NULL
+              )
+            """,
+            (now, *terminal),
+        )
+        connection.execute(
+            """
+            UPDATE liveness_leases
+            SET state = 'orphaned', refreshed_at = ?, released_at = ?
+            WHERE state = 'active'
+            """,
+            (now, now),
+        )
+        connection.execute(
+            """
+            INSERT INTO service_restart_intents(
+                intent_id, restart_id, kind, state, outcome,
+                detail, created_at, updated_at
+            ) VALUES (?, ?, ?, 'recorded', 'unknown', ?, ?, ?)
+            """,
+            (
+                str(uuid.uuid4()),
+                fence_id,
+                kind,
+                json.dumps(
+                    {"reason": reason},
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ),
+                now,
+                now,
+            ),
+        )
+
     def acknowledge_quiesce(
         self,
         fence: QuiesceFence,
@@ -399,9 +751,15 @@ class SqliteRestartCoordinator:
                 """
                 UPDATE service_admission_fences
                 SET state = 'acknowledged', acknowledged_at = ?,
-                    ingress_depth = ?, violation_count = ?
+                    ingress_depth = ?, violation_count = ?,
+                    acknowledged_producer_count = producer_count,
+                    acknowledged_journal_id = (
+                      SELECT COALESCE(MAX(journal_id), 0)
+                      FROM event_journal
+                    )
                 WHERE fence_id = ? AND state = 'requested'
                   AND expected_pid = ? AND expected_generation = ?
+                  AND ABS(expected_process_started_at - ?) <= 5
                 """,
                 (
                     timestamp,
@@ -410,6 +768,7 @@ class SqliteRestartCoordinator:
                     fence.fence_id,
                     fence.expected_pid,
                     fence.expected_generation,
+                    fence.expected_process_started_at,
                 ),
             )
             if cursor.rowcount != 1:
@@ -435,6 +794,7 @@ class SqliteRestartCoordinator:
                     fence_id=fence.fence_id,
                     expected_pid=fence.expected_pid,
                     expected_generation=fence.expected_generation,
+                    expected_process_started_at=fence.expected_process_started_at,
                     requested_at=fence.requested_at,
                     acknowledged_at=float(row["acknowledged_at"]),
                     ingress_depth=int(row["ingress_depth"]),
@@ -455,13 +815,21 @@ class SqliteRestartCoordinator:
         connection = self._connect()
         try:
             connection.execute("BEGIN IMMEDIATE")
-            row = self._require_acknowledged_fence(connection, fence)
+            row = self._require_fence_state(
+                connection,
+                fence,
+                allowed_states={"acknowledged"},
+            )
             snapshot = self._snapshot_connection(
                 connection,
                 now=now,
                 ingress_depth=int(row["ingress_depth"]),
             )
-            self._require_acknowledged_fence(connection, fence)
+            self._require_fence_state(
+                connection,
+                fence,
+                allowed_states={"acknowledged"},
+            )
             connection.commit()
             return snapshot
         except sqlite3.Error as error:
@@ -475,19 +843,127 @@ class SqliteRestartCoordinator:
     def assert_quiesced(self, fence: QuiesceFence) -> None:
         connection = self._connect()
         try:
-            self._require_acknowledged_fence(connection, fence)
+            self._require_fence_state(
+                connection,
+                fence,
+                allowed_states={"acknowledged", "prepared"},
+            )
         finally:
             connection.close()
 
     def commit_quiesce(self, fence: QuiesceFence, *, now: float) -> None:
-        self._transition_fence(
+        self._commit_owner_handoff(
             fence,
-            expected_state="acknowledged",
-            state="committed",
-            timestamp_column="committed_at",
             now=now,
-            reason="restart_committed",
+            allow_changed_producers=False,
+            reason="restart_owner_handoff",
         )
+
+    def commit_irreversible_quiesce(
+        self,
+        fence: QuiesceFence,
+        *,
+        now: float,
+        reason: str,
+    ) -> None:
+        self._commit_owner_handoff(
+            fence,
+            now=now,
+            allow_changed_producers=True,
+            reason=reason,
+        )
+
+    def is_irreversible(self, fence: QuiesceFence) -> bool:
+        row = self._fence_row(fence.fence_id)
+        return row is not None and str(row["state"]) in {
+            "prepared",
+            "committed",
+        }
+
+    def _commit_owner_handoff(
+        self,
+        fence: QuiesceFence,
+        *,
+        now: float,
+        allow_changed_producers: bool,
+        reason: str,
+    ) -> None:
+        connection = self._connect()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            if allow_changed_producers:
+                row = connection.execute(
+                    """
+                    SELECT * FROM service_admission_fences
+                    WHERE fence_id = ? AND state = 'prepared'
+                      AND expected_pid = ?
+                      AND expected_generation = ?
+                      AND ABS(expected_process_started_at - ?) <= 5
+                    """,
+                    (
+                        fence.fence_id,
+                        fence.expected_pid,
+                        fence.expected_generation,
+                        fence.expected_process_started_at,
+                    ),
+                ).fetchone()
+                if row is None:
+                    raise RestartBlocked(
+                        ["irreversible_admission_fence_missing"]
+                    )
+            else:
+                self._require_fence_state(
+                    connection,
+                    fence,
+                    allowed_states={"acknowledged", "prepared"},
+                )
+            producer_clause = (
+                ""
+                if allow_changed_producers
+                else """
+                  AND producer_count = acknowledged_producer_count
+                  AND acknowledged_journal_id = (
+                    SELECT COALESCE(MAX(journal_id), 0)
+                    FROM event_journal
+                  )
+                  AND violation_count = 0
+                """
+            )
+            cursor = connection.execute(
+                f"""
+                UPDATE service_admission_fences
+                SET state = 'committed', committed_at = ?,
+                    owner_handoff_at = ?, detail = ?
+                WHERE fence_id = ?
+                  AND state IN ('acknowledged', 'prepared')
+                  {producer_clause}
+                """,
+                (
+                    now,
+                    now,
+                    json.dumps(
+                        {"reason": reason},
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    ),
+                    fence.fence_id,
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise RestartBlocked(["owner_handoff_fence_changed"])
+            self._apply_owner_handoff_rows(
+                connection,
+                now=now,
+                reason=reason,
+            )
+            connection.commit()
+        except sqlite3.Error as error:
+            connection.rollback()
+            raise ServiceError(
+                f"could not commit restart owner handoff: {error}"
+            ) from error
+        finally:
+            connection.close()
 
     def release_quiesce(
         self,
@@ -503,7 +979,7 @@ class SqliteRestartCoordinator:
                 UPDATE service_admission_fences
                 SET state = 'released', released_at = ?, detail = ?
                 WHERE fence_id = ?
-                  AND state IN ('requested', 'acknowledged', 'violated', 'committed')
+                  AND state IN ('requested', 'acknowledged', 'violated')
                 """,
                 (
                     now,
@@ -538,6 +1014,7 @@ class SqliteRestartCoordinator:
 
     def prepare_force(
         self,
+        fence: QuiesceFence,
         snapshot: RestartSafetySnapshot,
         *,
         deadline: float,
@@ -547,6 +1024,11 @@ class SqliteRestartCoordinator:
         transition_id = f"service-force-restart:{uuid.uuid4()}"
         try:
             connection.execute("BEGIN IMMEDIATE")
+            self._require_fence_state(
+                connection,
+                fence,
+                allowed_states={"acknowledged"},
+            )
             intent_targets = self._restart_intent_targets(connection)
             connection.executemany(
                 """
@@ -580,8 +1062,10 @@ class SqliteRestartCoordinator:
             connection.execute(
                 f"""
                 UPDATE message_queue
-                SET state = 'submitted', updated_at = ?
-                WHERE state = 'submitting'
+                SET state = 'submitted_unknown', updated_at = ?
+                WHERE state NOT IN (
+                  'cancelled', 'submitted', 'submitted_unknown', 'failed'
+                )
                   AND id IN (
                     SELECT submission_id FROM submissions
                     WHERE state IN ({inflight_placeholders})
@@ -598,11 +1082,6 @@ class SqliteRestartCoordinator:
                 UPDATE submissions
                 SET state = 'outcome_unknown'
                 WHERE state IN ({inflight_placeholders})
-                  AND NOT EXISTS (
-                    SELECT 1 FROM message_queue AS q
-                    WHERE q.id = submissions.submission_id
-                      AND q.state IN ('local_queued', 'cancelled')
-                  )
                 """,
                 tuple(sorted(_INFLIGHT_SUBMISSION_STATES)),
             )
@@ -691,6 +1170,30 @@ class SqliteRestartCoordinator:
                 """,
                 (snapshot.captured_at, snapshot.captured_at),
             )
+            cursor = connection.execute(
+                """
+                UPDATE service_admission_fences
+                SET state = 'prepared', force_prepared_at = ?, detail = ?
+                WHERE fence_id = ? AND state = 'acknowledged'
+                  AND producer_count = acknowledged_producer_count
+                  AND acknowledged_journal_id = (
+                    SELECT COALESCE(MAX(journal_id), 0)
+                    FROM event_journal
+                  )
+                  AND violation_count = 0
+                """,
+                (
+                    snapshot.captured_at,
+                    json.dumps(
+                        {"reason": "force_outcomes_prepared"},
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    ),
+                    fence.fence_id,
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise RestartBlocked(["admission_fence_changed_during_prepare"])
             connection.commit()
         except sqlite3.Error as error:
             connection.rollback()
@@ -800,7 +1303,9 @@ class SqliteRestartCoordinator:
             connection,
             """
             SELECT COUNT(*) FROM message_queue
-            WHERE state NOT IN ('cancelled', 'submitted', 'failed')
+            WHERE state NOT IN (
+              'cancelled', 'submitted', 'submitted_unknown', 'failed'
+            )
             """,
         )
         pending_operations = self._count(
@@ -879,68 +1384,91 @@ class SqliteRestartCoordinator:
         finally:
             connection.close()
 
+    def _active_fence_row(self) -> sqlite3.Row | None:
+        connection = self._connect()
+        try:
+            return connection.execute(
+                """
+                SELECT * FROM service_admission_fences
+                WHERE state IN (
+                  'requested', 'acknowledged', 'violated',
+                  'prepared', 'committed'
+                )
+                LIMIT 1
+                """
+            ).fetchone()
+        finally:
+            connection.close()
+
     @staticmethod
-    def _require_acknowledged_fence(
+    def _row_to_fence(row: sqlite3.Row) -> QuiesceFence:
+        return QuiesceFence(
+            fence_id=str(row["fence_id"]),
+            expected_pid=int(row["expected_pid"]),
+            expected_generation=str(row["expected_generation"]),
+            expected_process_started_at=float(
+                row["expected_process_started_at"]
+            ),
+            requested_at=float(row["requested_at"]),
+            acknowledged_at=(
+                None
+                if row["acknowledged_at"] is None
+                else float(row["acknowledged_at"])
+            ),
+            ingress_depth=(
+                None
+                if row["ingress_depth"] is None
+                else int(row["ingress_depth"])
+            ),
+            violation_count=int(row["violation_count"]),
+        )
+
+    @staticmethod
+    def _require_fence_state(
         connection: sqlite3.Connection,
         fence: QuiesceFence,
+        *,
+        allowed_states: set[str],
     ) -> sqlite3.Row:
         row = connection.execute(
             """
             SELECT * FROM service_admission_fences
             WHERE fence_id = ? AND expected_pid = ?
               AND expected_generation = ?
+              AND ABS(expected_process_started_at - ?) <= 5
             """,
             (
                 fence.fence_id,
                 fence.expected_pid,
                 fence.expected_generation,
+                fence.expected_process_started_at,
             ),
         ).fetchone()
-        if row is None or row["state"] != "acknowledged":
+        if row is None or str(row["state"]) not in allowed_states:
             state = "missing" if row is None else str(row["state"])
             raise RestartBlocked([f"admission_fence_{state}"])
         if int(row["ingress_depth"] or 0) != 0:
             raise RestartBlocked([f"ingress_queue:{row['ingress_depth']}"])
-        return row
-
-    def _transition_fence(
-        self,
-        fence: QuiesceFence,
-        *,
-        expected_state: str,
-        state: str,
-        timestamp_column: str,
-        now: float,
-        reason: str,
-    ) -> None:
-        connection = self._connect()
-        try:
-            cursor = connection.execute(
-                f"""
-                UPDATE service_admission_fences
-                SET state = ?, {timestamp_column} = ?, detail = ?
-                WHERE fence_id = ? AND state = ?
-                  AND expected_pid = ? AND expected_generation = ?
-                """,
-                (
-                    state,
-                    now,
-                    json.dumps(
-                        {"reason": reason},
-                        sort_keys=True,
-                        separators=(",", ":"),
-                    ),
-                    fence.fence_id,
-                    expected_state,
-                    fence.expected_pid,
-                    fence.expected_generation,
-                ),
+        if (
+            int(row["producer_count"])
+            != (
+                -1
+                if row["acknowledged_producer_count"] is None
+                else int(row["acknowledged_producer_count"])
             )
-            if cursor.rowcount != 1:
-                raise RestartBlocked(["admission_fence_transition_failed"])
-            connection.commit()
-        finally:
-            connection.close()
+            or int(row["violation_count"]) != 0
+        ):
+            raise RestartBlocked(["admission_fence_producer_changed"])
+        journal = connection.execute(
+            "SELECT COALESCE(MAX(journal_id), 0) FROM event_journal"
+        ).fetchone()
+        if (
+            row["acknowledged_journal_id"] is None
+            or journal is None
+            or int(row["acknowledged_journal_id"]) != int(journal[0])
+        ):
+            raise RestartBlocked(["admission_fence_journal_changed"])
+        return row
 
     def _connect(self) -> sqlite3.Connection:
         if not self._database_path.is_file():
@@ -1180,6 +1708,7 @@ class ServiceManager:
         command_runner: CommandRunner | None = None,
         restart_coordinator: RestartCoordinator | None = None,
         resume_provider: ResumeTimestampProvider | None = None,
+        process_start_provider: Callable[[int], float | None] | None = None,
         notifier: Notifier | None = None,
         uid: int | None = None,
         windows_user_id: str | None = None,
@@ -1226,6 +1755,7 @@ class ServiceManager:
         self._runner = command_runner or SubprocessCommandRunner()
         self._coordinator = restart_coordinator or SqliteRestartCoordinator(settings.database_path)
         self._resume_provider = resume_provider or resume_timestamp_provider(self.platform)
+        self._process_start_provider = process_start_provider
         self._notifier = notifier or PlatformNotifier(self.platform, self._runner)
         self._uid = os.getuid() if uid is None and hasattr(os, "getuid") else (uid or 0)
         self._windows_user_id = windows_user_id or _current_windows_user()
@@ -1379,7 +1909,8 @@ class ServiceManager:
         return "\n".join(
             [
                 "param([Parameter(Mandatory=$true)]"
-                "[ValidateSet('Install','Status','Restart','Uninstall')]"
+                "[ValidateSet('Install','Status','Restart','RestartRuntime',"
+                "'StopBot','Uninstall')]"
                 "[string]$Action)",
                 "$ErrorActionPreference = 'Stop'",
                 "$identity = [Security.Principal.WindowsIdentity]::GetCurrent()",
@@ -1470,6 +2001,7 @@ class ServiceManager:
                 "      $actionName = if ($taskName -eq 'copilotD Bot') { 'run' } "
                 "elseif ($taskName -eq 'copilotD Runtime') { 'runtime' } else { $null }",
                 "      $pid = $null",
+                "      $processStartedAt = $null",
                 "      if ($null -ne $actionName) {",
                 "        $hostProcess = Get-CimInstance Win32_Process | Where-Object { "
                 "$line = [string]$_.CommandLine; "
@@ -1478,15 +2010,21 @@ class ServiceManager:
                 "        if ($null -ne $hostProcess) {",
                 "          $process = Get-CimInstance Win32_Process | Where-Object { "
                 "$_.ParentProcessId -eq $hostProcess.ProcessId } | Select-Object -First 1",
-                "          if ($null -ne $process) { $pid = [int]$process.ProcessId }",
+                "          if ($null -ne $process) {",
+                "            $pid = [int]$process.ProcessId",
+                "            $processStartedAt = "
+                "$process.CreationDate.ToUniversalTime().ToString('o')",
+                "          }",
                 "        }",
                 "      }",
                 "      $rows += [ordered]@{ "
-                "name=$taskName; state=[string]$task.State; pid=$pid; xml=$xml; "
+                "name=$taskName; state=[string]$task.State; pid=$pid; "
+                "process_started_at=$processStartedAt; xml=$xml; "
                 "current_user_sid=$identity.User.Value }",
                 "    } catch {",
                 "      $rows += [ordered]@{ "
-                "name=$taskName; state='Missing'; pid=$null; xml=$null; "
+                "name=$taskName; state='Missing'; pid=$null; "
+                "process_started_at=$null; xml=$null; "
                 "current_user_sid=$identity.User.Value }",
                 "    }",
                 "  }",
@@ -1519,6 +2057,12 @@ class ServiceManager:
                 "} elseif ($Action -eq 'Restart') {",
                 "  Stop-CopilotDTasks @('copilotD Bot')",
                 "  Start-ScheduledTask -TaskName 'copilotD Bot' -ErrorAction Stop",
+                "} elseif ($Action -eq 'RestartRuntime') {",
+                "  Stop-CopilotDTasks @('copilotD Runtime')",
+                "  Start-ScheduledTask -TaskName 'copilotD Runtime' "
+                "-ErrorAction Stop",
+                "} elseif ($Action -eq 'StopBot') {",
+                "  Stop-CopilotDTasks @('copilotD Bot')",
                 "} elseif ($Action -eq 'Uninstall') {",
                 "  Stop-CopilotDTasks $knownTaskNames",
                 "  foreach ($taskName in $knownTaskNames) {",
@@ -1596,6 +2140,9 @@ class ServiceManager:
             topology=self.topology,
             previous_pid=None if previous is None else previous.pid,
             previous_generation=(None if previous is None else previous.process_generation),
+            previous_process_started_at=(
+                None if previous is None else previous.process_started_at
+            ),
             expected_units=self.expected_unit_names,
             definition_hashes=hashes,
         )
@@ -1616,13 +2163,27 @@ class ServiceManager:
         while True:
             status = self.status()
             last_status = status
+            current_process_started_at = _optional_timestamp(
+                status.process_started_at
+            )
+            previous_process_started_at = _optional_timestamp(
+                receipt.previous_process_started_at
+            )
             fresh_process = (
                 status.pid is not None
                 and status.process_generation is not None
+                and current_process_started_at is not None
                 and (
-                    receipt.previous_pid is None
-                    or status.pid != receipt.previous_pid
-                    or status.process_generation != receipt.previous_generation
+                    receipt.previous_generation is None
+                    or (
+                        status.process_generation
+                        != receipt.previous_generation
+                        and (
+                            previous_process_started_at is None
+                            or current_process_started_at
+                            > previous_process_started_at
+                        )
+                    )
                 )
             )
             written_after_install = False
@@ -1710,10 +2271,27 @@ class ServiceManager:
             for unit in expected_units
         )
         process_identity_matches: bool | None
-        if heartbeat is None or bot is None or bot.pid is None:
+        heartbeat_process_started_at = (
+            None
+            if heartbeat is None
+            else _optional_timestamp(heartbeat.process_started_at)
+        )
+        if (
+            heartbeat is None
+            or bot is None
+            or bot.pid is None
+            or bot.process_started_at is None
+            or heartbeat_process_started_at is None
+        ):
             process_identity_matches = None
         else:
-            process_identity_matches = heartbeat.pid == bot.pid
+            process_identity_matches = (
+                heartbeat.pid == bot.pid
+                and _timestamps_match(
+                    heartbeat_process_started_at,
+                    bot.process_started_at,
+                )
+            )
         units_effective = all(
             unit is not None
             and (
@@ -1753,6 +2331,12 @@ class ServiceManager:
             ),
             pid=None if heartbeat is None else heartbeat.pid,
             process_generation=(None if heartbeat is None else heartbeat.process_generation),
+            process_started_at=(
+                None if heartbeat is None else heartbeat.process_started_at
+            ),
+            manager_process_started_at=(
+                None if bot is None else bot.process_started_at
+            ),
             process_identity_matches=process_identity_matches,
             heartbeat_age_seconds=age,
             heartbeat_written_at=(None if heartbeat is None else heartbeat.written_at),
@@ -1777,7 +2361,12 @@ class ServiceManager:
             ),
         )
 
-    def restart(self, *, force: bool = False) -> RestartReceipt:
+    def restart(
+        self,
+        *,
+        force: bool = False,
+        restart_runtime: bool = False,
+    ) -> RestartReceipt:
         requested_at = self._now()
         status = self.status()
         if status.heartbeat_error is not None or status.pid is None:
@@ -1786,15 +2375,23 @@ class ServiceManager:
             raise RestartBlocked(["heartbeat_stale"])
         if status.process_generation is None:
             raise RestartBlocked(["process_generation_missing"])
+        expected_process_started_at = _optional_timestamp(
+            status.process_started_at
+        )
+        if expected_process_started_at is None:
+            raise RestartBlocked(["process_start_identity_missing"])
         if status.process_identity_matches is not True:
             raise RestartBlocked(["os_pid_heartbeat_mismatch"])
         deadline = time.monotonic() + self.settings.restart_drain_timeout_seconds
         fence = self._coordinator.request_quiesce(
             expected_pid=status.pid,
             expected_generation=status.process_generation,
+            expected_process_started_at=expected_process_started_at,
             now=requested_at,
         )
         committed = False
+        irreversible = False
+        force_attempted = False
         try:
             fence = self._coordinator.wait_for_quiesce(
                 fence,
@@ -1812,34 +2409,61 @@ class ServiceManager:
                 raise RestartBlocked(snapshot.blockers)
             force_outcome = None
             if force:
+                force_attempted = True
                 force_outcome = self._prepare_force_bounded(
+                    fence,
                     snapshot,
                     timeout_seconds=_remaining_seconds(deadline),
                 )
+                irreversible = True
             self._coordinator.assert_quiesced(fence)
             self._revalidate_restart_identity(status, fence)
             self._coordinator.commit_quiesce(fence, now=self._now())
             committed = True
+            if restart_runtime:
+                if self.topology != "sidecar":
+                    raise ServiceError(
+                        "runtime restart requires sidecar topology"
+                    )
+                self._restart_runtime()
             self._restart_bot()
             return RestartReceipt(
                 requested_at=requested_at,
                 force=force,
                 previous_pid=status.pid,
                 previous_generation=status.process_generation,
+                previous_process_started_at=status.process_started_at,
                 safety_snapshot=snapshot,
                 force_outcome=force_outcome,
                 admission_fence_id=fence.fence_id,
             )
-        except BaseException:
-            self._coordinator.release_quiesce(
-                fence,
-                now=self._now(),
-                reason=(
-                    "restart_command_failed"
-                    if committed
-                    else "restart_aborted"
-                ),
+        except BaseException as error:
+            if force_attempted and isinstance(
+                error,
+                ForcePreparationUncertain,
+            ):
+                self._terminate_bot_fail_closed()
+                raise
+            irreversible = (
+                irreversible
+                or self._coordinator.is_irreversible(fence)
             )
+            if irreversible:
+                try:
+                    if not committed:
+                        self._coordinator.commit_irreversible_quiesce(
+                            fence,
+                            now=self._now(),
+                            reason="irreversible_restart_failure",
+                        )
+                finally:
+                    self._terminate_bot_fail_closed()
+            else:
+                self._coordinator.release_quiesce(
+                    fence,
+                    now=self._now(),
+                    reason="restart_aborted",
+                )
             raise
 
     def _revalidate_restart_identity(
@@ -1854,6 +2478,10 @@ class ServiceManager:
             or current.process_identity_matches is not True
             or current.pid != fence.expected_pid
             or current.process_generation != fence.expected_generation
+            or not _timestamps_match(
+                current.process_started_at,
+                fence.expected_process_started_at,
+            )
         ):
             raise RestartBlocked(["managed_process_identity_changed"])
 
@@ -1879,6 +2507,7 @@ class ServiceManager:
 
     def _prepare_force_bounded(
         self,
+        fence: QuiesceFence,
         snapshot: RestartSafetySnapshot,
         *,
         timeout_seconds: float,
@@ -1890,6 +2519,7 @@ class ServiceManager:
             try:
                 outcomes.put(
                     self._coordinator.prepare_force(
+                        fence,
                         snapshot,
                         deadline=deadline,
                     )
@@ -1906,31 +2536,15 @@ class ServiceManager:
         try:
             result = outcomes.get(timeout=timeout_seconds)
         except queue.Empty:
-            fallback = SqliteRestartCoordinator(self.settings.database_path).prepare_force(
-                snapshot, deadline=time.time()
-            )
-            return replace(
-                fallback,
-                bounded=False,
-                detail=("restart coordinator timed out; durable fallback marked outcomes unknown"),
-            )
+            raise ForcePreparationUncertain(
+                "force preparation timed out; process terminated fail-closed"
+            ) from None
         if isinstance(result, BaseException):
-            fallback = SqliteRestartCoordinator(self.settings.database_path).prepare_force(
-                snapshot, deadline=time.time()
-            )
-            return replace(
-                fallback,
-                bounded=False,
-                detail=(
-                    "restart coordinator failed; durable fallback marked outcomes unknown: "
-                    f"{type(result).__name__}: {result}"
-                ),
-            )
+            raise result
         if time.time() > deadline or not result.bounded:
-            return replace(
-                result,
-                bounded=False,
-                detail=f"{result.detail}; drain deadline exceeded",
+            raise ForcePreparationUncertain(
+                "force preparation exceeded its deadline; "
+                "process terminated fail-closed"
             )
         return result
 
@@ -1945,6 +2559,7 @@ class ServiceManager:
             topology=self.topology,
             previous_pid=receipt.previous_pid,
             previous_generation=receipt.previous_generation,
+            previous_process_started_at=receipt.previous_process_started_at,
             expected_units=self.expected_unit_names,
             definition_hashes={},
         )
@@ -1994,6 +2609,8 @@ class ServiceManager:
             )
             return "manager-not-running"
         if managed_bot.pid != snapshot.pid:
+            if startup_grace:
+                return "startup-grace"
             self._write_alert(
                 "watchdog_replacement_starting",
                 "stale heartbeat belongs to a replaced process",
@@ -2002,7 +2619,27 @@ class ServiceManager:
                 process_generation=snapshot.process_generation,
             )
             return "replacement-starting"
-        if not self._heartbeat_generation_matches_verified(snapshot):
+        heartbeat_process_started_at = _optional_timestamp(
+            snapshot.process_started_at
+        )
+        if (
+            heartbeat_process_started_at is None
+            or managed_bot.process_started_at is None
+            or not _timestamps_match(
+                heartbeat_process_started_at,
+                managed_bot.process_started_at,
+            )
+        ):
+            if startup_grace:
+                return "startup-grace"
+            return "replacement-starting"
+        if not self._heartbeat_generation_matches_verified(
+            snapshot,
+            managed_bot,
+            age=age,
+        ):
+            if startup_grace:
+                return "startup-grace"
             self._write_alert(
                 "watchdog_generation_mismatch",
                 "heartbeat generation does not match the verified managed process",
@@ -2021,7 +2658,7 @@ class ServiceManager:
         )
         if self.topology == "sidecar" and snapshot.runtime_state == "down":
             try:
-                receipt = self.restart(force=True)
+                receipt = self.restart(force=True, restart_runtime=True)
             except (RestartBlocked, ServiceError) as error:
                 self._write_alert(
                     "watchdog_runtime_loss_quiesce_failed",
@@ -2089,9 +2726,15 @@ class ServiceManager:
         fence: QuiesceFence | None = None
         committed = False
         try:
+            expected_process_started_at = _optional_timestamp(
+                initial.process_started_at
+            )
+            if expected_process_started_at is None:
+                return "replacement-starting"
             fence = self._coordinator.request_quiesce(
                 expected_pid=initial.pid,
                 expected_generation=initial.process_generation,
+                expected_process_started_at=expected_process_started_at,
                 now=now,
             )
             fence = self._coordinator.wait_for_quiesce(
@@ -2129,12 +2772,18 @@ class ServiceManager:
             self._restart_bot()
             return "restarted"
         except (RestartBlocked, ServiceError) as error:
+            if committed:
+                self._terminate_bot_fail_closed()
             self._write_alert(
                 "watchdog_quiesce_failed",
                 "watchdog restart failed closed during admission quiesce",
                 error=str(error),
             )
-            return "quiesce-failed"
+            return (
+                "restart-failed-closed"
+                if committed
+                else "quiesce-failed"
+            )
         finally:
             if not committed and fence is not None:
                 self._coordinator.release_quiesce(
@@ -2294,12 +2943,19 @@ class ServiceManager:
             if result.returncode != 0:
                 state: EffectiveState = "missing"
                 pid = None
+                process_started_at = None
+                process_started_at = None
                 effective_matches = False
                 effective_hash = None
                 detail = result.stderr.strip() or result.stdout.strip() or None
             else:
                 state = _parse_launchctl_state(result.stdout)
                 pid = _parse_launchctl_pid(result.stdout)
+                process_started_at = (
+                    None
+                    if pid is None
+                    else self._process_started_at(pid)
+                )
                 expected_plist = plistlib.loads(expected)
                 effective_matches = _launchctl_definition_matches(
                     result.stdout,
@@ -2315,6 +2971,7 @@ class ServiceManager:
                     installed_definition=path.is_file(),
                     effective_state=state,
                     pid=pid,
+                    process_started_at=process_started_at,
                     definition_matches=disk_matches and effective_matches,
                     expected_definition_hash=_sha256_bytes(expected),
                     effective_definition_hash=effective_hash,
@@ -2379,12 +3036,16 @@ class ServiceManager:
             if row is None or str(row.get("state", "")).lower() == "missing":
                 state: EffectiveState = "missing"
                 pid = None
+                process_started_at = None
                 effective_matches = False
                 effective_hash = None
             else:
                 state = _normalize_windows_task_state(str(row.get("state", "")))
                 pid_value = row.get("pid")
                 pid = None if pid_value is None else int(pid_value)
+                process_started_at = _optional_timestamp(
+                    row.get("process_started_at")
+                )
                 try:
                     effective_matches = isinstance(
                         exported,
@@ -2413,6 +3074,7 @@ class ServiceManager:
                     installed_definition=path.is_file(),
                     effective_state=state,
                     pid=pid,
+                    process_started_at=process_started_at,
                     definition_matches=disk_matches and effective_matches,
                     expected_definition_hash=_sha256_text(expected),
                     effective_definition_hash=effective_hash,
@@ -2451,7 +3113,9 @@ class ServiceManager:
                 connection.execute(
                     """
                     SELECT COUNT(*) FROM message_queue
-                    WHERE state NOT IN ('cancelled', 'submitted', 'failed')
+                    WHERE state NOT IN (
+                      'cancelled', 'submitted', 'submitted_unknown', 'failed'
+                    )
                     """
                 ).fetchone()[0]
             )
@@ -2529,6 +3193,68 @@ class ServiceManager:
         else:
             raise ServiceError(f"service restart is unsupported on {self.platform}")
 
+    def _restart_runtime(self) -> None:
+        if self.platform == "darwin":
+            self._runner.run(
+                [
+                    "launchctl",
+                    "kickstart",
+                    "-k",
+                    f"{self._mac_domain}/{_MAC_RUNTIME_LABEL}",
+                ],
+                check=True,
+            )
+            return
+        if self.platform == "win32":
+            installer = self.settings.data_dir / "runtime" / "install-service.ps1"
+            self._runner.run(
+                [
+                    "powershell.exe",
+                    "-NoProfile",
+                    "-NonInteractive",
+                    "-ExecutionPolicy",
+                    "Bypass",
+                    "-File",
+                    str(installer),
+                    "-Action",
+                    "RestartRuntime",
+                ],
+                check=True,
+            )
+            return
+        raise ServiceError(
+            f"runtime restart is unsupported on {self.platform}"
+        )
+
+    def _terminate_bot_fail_closed(self) -> None:
+        if self.platform == "darwin":
+            self._runner.run(
+                [
+                    "launchctl",
+                    "kill",
+                    "SIGTERM",
+                    f"{self._mac_domain}/{_MAC_BOT_LABEL}",
+                ],
+                check=False,
+            )
+            return
+        if self.platform == "win32":
+            installer = self.settings.data_dir / "runtime" / "install-service.ps1"
+            self._runner.run(
+                [
+                    "powershell.exe",
+                    "-NoProfile",
+                    "-NonInteractive",
+                    "-ExecutionPolicy",
+                    "Bypass",
+                    "-File",
+                    str(installer),
+                    "-Action",
+                    "StopBot",
+                ],
+                check=False,
+            )
+
     def _service_environment(self) -> dict[str, str]:
         environment = {
             "HOME": str(self.settings.resolved_home),
@@ -2549,6 +3275,26 @@ class ServiceManager:
         if self.settings.runtime_uri is not None:
             environment["COPILOTD_RUNTIME_URI"] = self.settings.runtime_uri
         return environment
+
+    def _process_started_at(self, pid: int) -> float | None:
+        if self._process_start_provider is not None:
+            return self._process_start_provider(pid)
+        if self.platform != "darwin":
+            return None
+        result = self._runner.run(
+            ["ps", "-p", str(pid), "-o", "lstart="],
+            check=False,
+        )
+        if result.returncode != 0 or not result.stdout.strip():
+            return None
+        try:
+            parsed = datetime.strptime(
+                " ".join(result.stdout.split()),
+                "%a %b %d %H:%M:%S %Y",
+            )
+        except ValueError:
+            return None
+        return parsed.astimezone().timestamp()
 
     def _assert_runtime_argv_has_no_secrets(self) -> None:
         serialized = "\0".join(self.runtime_argv)
@@ -2605,12 +3351,17 @@ class ServiceManager:
         )
 
     def _record_verified_identity(self, status: ServiceStatus) -> None:
-        if status.pid is None or status.process_generation is None:
+        if (
+            status.pid is None
+            or status.process_generation is None
+            or status.process_started_at is None
+        ):
             raise ServiceVerificationError("ready service has no process identity")
         self._update_service_state(
             {
                 "last_verified_pid": status.pid,
                 "last_verified_generation": status.process_generation,
+                "last_verified_process_started_at": status.process_started_at,
                 "last_verified_at": self._now(),
             }
         )
@@ -2656,16 +3407,57 @@ class ServiceManager:
     def _heartbeat_generation_matches_verified(
         self,
         snapshot: HeartbeatSnapshot,
+        managed_bot: ServiceUnitStatus,
+        *,
+        age: float,
     ) -> bool:
         state = _read_json_optional(self.settings.service_state_path) or {}
         verified_pid = state.get("last_verified_pid")
         verified_generation = state.get("last_verified_generation")
-        if verified_pid is None or verified_generation is None:
-            return False
-        return not (
-            int(verified_pid) == snapshot.pid
-            and str(verified_generation) != snapshot.process_generation
+        verified_started_at = _optional_timestamp(
+            state.get("last_verified_process_started_at")
         )
+        heartbeat_started_at = _optional_timestamp(snapshot.process_started_at)
+        exact = (
+            verified_pid is not None
+            and verified_generation is not None
+            and verified_started_at is not None
+            and int(verified_pid) == snapshot.pid
+            and str(verified_generation) == snapshot.process_generation
+            and _timestamps_match(
+                verified_started_at,
+                heartbeat_started_at,
+            )
+        )
+        if exact:
+            return True
+        replacement_is_ready = (
+            age <= self.settings.heartbeat_stale_seconds
+            and snapshot.gateway_state == "ready"
+            and snapshot.runtime_state == "ready"
+            and heartbeat_started_at is not None
+            and managed_bot.process_started_at is not None
+            and _timestamps_match(
+                heartbeat_started_at,
+                managed_bot.process_started_at,
+            )
+            and (
+                verified_started_at is None
+                or heartbeat_started_at > verified_started_at
+            )
+        )
+        if not replacement_is_ready:
+            return False
+        self._update_service_state(
+            {
+                "last_verified_pid": snapshot.pid,
+                "last_verified_generation": snapshot.process_generation,
+                "last_verified_process_started_at": snapshot.process_started_at,
+                "last_verified_at": self._now(),
+                "replacement_adopted_at": self._now(),
+            }
+        )
+        return True
 
     def _mark_uninstalled(self) -> None:
         state = _read_json_optional(self.settings.service_state_path) or {}
@@ -2768,17 +3560,21 @@ def _windows_task_xml(
     ET.SubElement(registration, f"{{{_TASK_NAMESPACE}}}Author").text = "copilotD"
     triggers = ET.SubElement(task, f"{{{_TASK_NAMESPACE}}}Triggers")
     logon = ET.SubElement(triggers, f"{{{_TASK_NAMESPACE}}}LogonTrigger")
+    ET.SubElement(logon, f"{{{_TASK_NAMESPACE}}}Enabled").text = "true"
     if watchdog:
         repetition = ET.SubElement(logon, f"{{{_TASK_NAMESPACE}}}Repetition")
         ET.SubElement(repetition, f"{{{_TASK_NAMESPACE}}}Interval").text = "PT5M"
         ET.SubElement(repetition, f"{{{_TASK_NAMESPACE}}}StopAtDurationEnd").text = "false"
-    ET.SubElement(logon, f"{{{_TASK_NAMESPACE}}}Enabled").text = "true"
     ET.SubElement(logon, f"{{{_TASK_NAMESPACE}}}UserId").text = user_id
     if watchdog:
         registration_trigger = ET.SubElement(
             triggers,
             f"{{{_TASK_NAMESPACE}}}RegistrationTrigger",
         )
+        ET.SubElement(
+            registration_trigger,
+            f"{{{_TASK_NAMESPACE}}}Enabled",
+        ).text = "true"
         registration_repetition = ET.SubElement(
             registration_trigger,
             f"{{{_TASK_NAMESPACE}}}Repetition",
@@ -2791,10 +3587,6 @@ def _windows_task_xml(
             registration_repetition,
             f"{{{_TASK_NAMESPACE}}}StopAtDurationEnd",
         ).text = "false"
-        ET.SubElement(
-            registration_trigger,
-            f"{{{_TASK_NAMESPACE}}}Enabled",
-        ).text = "true"
 
     principals = ET.SubElement(task, f"{{{_TASK_NAMESPACE}}}Principals")
     principal = ET.SubElement(
@@ -2856,10 +3648,10 @@ def _windows_task_contract_errors(xml: str) -> tuple[str, ...]:
             _ordered_child_errors(
                 logon,
                 (
+                    "Enabled",
                     "Repetition",
                     "StartBoundary",
                     "EndBoundary",
-                    "Enabled",
                     "UserId",
                     "Delay",
                 ),
@@ -2872,10 +3664,10 @@ def _windows_task_contract_errors(xml: str) -> tuple[str, ...]:
             _ordered_child_errors(
                 registration,
                 (
+                    "Enabled",
                     "Repetition",
                     "StartBoundary",
                     "EndBoundary",
-                    "Enabled",
                     "Delay",
                 ),
                 context="RegistrationTrigger",
@@ -3122,6 +3914,32 @@ def _gateway_down_seconds(
 
 def _parse_rfc3339(value: str) -> float:
     return datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp()
+
+
+def _optional_timestamp(value: object) -> float | None:
+    if value is None:
+        return None
+    if isinstance(value, int | float):
+        return float(value)
+    try:
+        return _parse_rfc3339(str(value))
+    except ValueError:
+        return None
+
+
+def _timestamps_match(
+    left: object,
+    right: object,
+    *,
+    tolerance_seconds: float = 5,
+) -> bool:
+    left_timestamp = _optional_timestamp(left)
+    right_timestamp = _optional_timestamp(right)
+    return (
+        left_timestamp is not None
+        and right_timestamp is not None
+        and abs(left_timestamp - right_timestamp) <= tolerance_seconds
+    )
 
 
 def _normalize_manager_output(output: str) -> str:

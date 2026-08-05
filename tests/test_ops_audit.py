@@ -66,14 +66,17 @@ def test_selected_hardware_lanes_require_real_resume_and_recheck_health() -> Non
 
     assert "COPILOTD_ACCEPTANCE_ALLOW_SLEEP" in macos
     assert "pmset relative wake" in macos
-    assert "no new macOS wake event occurred after the test started" in macos
+    assert 'wake_deadline="$((sleep_requested_at + 180))"' in macos
+    assert "scheduled wake interval" in macos
     assert '!= "recent-wake"' in macos
     assert "status-after-soak.json" in macos
     assert "bot generation changed during soak" in macos
     assert "if ! log show" in macos
     assert "COPILOTD_ACCEPTANCE_ALLOW_SLEEP" in windows
     assert "SetSuspendState" in windows
-    assert "StartTime=$testStartedAt" in windows
+    assert "$wakeDeadline = $sleepRequestedAt.AddMinutes(3)" in windows
+    assert "StartTime=$sleepRequestedAt" in windows
+    assert "wake marker is outside the intended wake interval" in windows
     assert "'recent-wake'" in windows
     assert "service is not ready after resume" in windows
     assert "runs-on: [self-hosted, macOS, copilotd-acceptance]" in workflow

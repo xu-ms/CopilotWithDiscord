@@ -1175,6 +1175,25 @@ outcome unknown</td>
 </tr>
 </tbody>
 </table>
+<p>restart 使用持久事务而不是“读一次 heartbeat 后 kill”：</p>
+<ol type="1">
+<li>manager 写 <code>requested</code> fence，同时记录 PID、OS process
+start、generation 和 event-journal high-water mark；</li>
+<li>bot 关闭全局 create/resume/send admission，停止并 await
+queue/task/permission/owner-renew producer，冻结并 await mailbox，再 drain
+reducer inbox；</li>
+<li><code>acknowledged</code> 通过 producer counter + journal high-water
+的同一条 CAS 提交；任何 SDK callback 或 internal producer 在
+requested/acknowledged/prepared/committed 阶段都持久计数，ACK
+后到达则令可逆阶段 violated；</li>
+<li>normal restart 只在 fenced snapshot 无 blocker 时进入 owner
+handoff；force 先原子提交 <code>prepared</code>，只把真实 in-flight 结果置
+unknown，并保持 local queued/cancelled/terminal；</li>
+<li><code>committed</code> 与 owner lease expiry、binding recovery_unknown
+同事务；此后失败只能 fail-closed terminate，不能 release/reopen。新
+PID/generation/process-start 在启动 attach 前完成 committed fence
+adoption，随后 queued claim 以新 generation/fence 重建 submission lease。</li>
+</ol>
 <h3 id="heartbeat-协议">Heartbeat 协议</h3>
 <p>bot 每 30 秒原子写入 heartbeat JSON；不是只 touch mtime：</p>
 <div class="sourceCode" id="cb3"><pre
@@ -5282,12 +5301,13 @@ model、<code>/mode</code>、<code>/goal</code>、<code>/bare</code>、<code>/to
 unknown</td>
 </tr>
 <tr>
-<td>9 个 SQLite migration、project <code>$HOME</code> fallback/cwd
+<td>10 个 SQLite migration、project <code>$HOME</code> fallback/cwd
 snapshot、owner fence、creation saga、bounded ingress、单 reducer、event
 journal、CommandMailbox、liveness leases、eager
 resume；共享连接事务隔离；<code>background_tasks_changed</code> 后
 <code>tasks.refresh/list</code>，缺 terminal 消失转 UNKNOWN；force restart
-intent/outcome durable journal 与跨进程 admission fence</td>
+intent/outcome durable journal、producer/journal dual epoch admission fence
+与 owner handoff</td>
 <td>eventLog durable replay reconciler 仍未接入 production
 supervisor；experimental task action RPC 继续 gated</td>
 </tr>

@@ -85,7 +85,7 @@ async def test_schema_dependent_service_command_upgrades_schema_seven(
         await database.execute("DROP TABLE service_admission_fences")
         await database.execute("DROP TABLE service_restart_intents")
         await database.execute(
-            "DELETE FROM schema_migrations WHERE version IN (8, 9)"
+            "DELETE FROM schema_migrations WHERE version IN (8, 9, 10)"
         )
     manager = ServiceManager(settings, platform="unsupported")
     args = argparse.Namespace(command="service", service_command="status")
@@ -105,7 +105,7 @@ async def test_schema_dependent_service_command_upgrades_schema_seven(
             ORDER BY name
             """
         )
-    assert [row["version"] for row in versions] == list(range(1, 10))
+    assert [row["version"] for row in versions] == list(range(1, 11))
     assert [row["name"] for row in tables] == [
         "service_admission_fences",
         "service_restart_intents",
@@ -122,7 +122,7 @@ async def test_force_restart_applies_operations_migrations_before_coordination(
         await database.execute("DROP TABLE service_admission_fences")
         await database.execute("DROP TABLE service_restart_intents")
         await database.execute(
-            "DELETE FROM schema_migrations WHERE version IN (8, 9)"
+            "DELETE FROM schema_migrations WHERE version IN (8, 9, 10)"
         )
     manager = ServiceManager(settings, platform="unsupported")
     observed = False

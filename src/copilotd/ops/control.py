@@ -6,7 +6,7 @@ import os
 import sqlite3
 import time
 from collections.abc import Callable
-from typing import Protocol
+from typing import Any, Protocol
 
 from copilotd.storage.database import Database
 
@@ -14,8 +14,10 @@ from copilotd.storage.database import Database
 class QuiesceSessions(Protocol):
     async def begin_service_quiesce(
         self,
-        on_violation: Callable[[], None],
+        on_producer: Callable[[str], None],
     ) -> None: ...
+
+    async def drain_service_quiesce(self) -> None: ...
 
     async def end_service_quiesce(self) -> None: ...
 
@@ -23,7 +25,7 @@ class QuiesceSessions(Protocol):
 
 
 class ServiceControlWorker:
-    """Acknowledges durable restart fences only after ingress is drained."""
+    """Runs the process half of the durable restart transaction."""
 
     def __init__(
         self,
@@ -31,15 +33,18 @@ class ServiceControlWorker:
         sessions: QuiesceSessions,
         *,
         process_generation: str,
+        process_started_at: float,
         poll_seconds: float = 0.05,
+        quiesce_timeout_seconds: float = 15,
     ) -> None:
         self._database = database
         self._sessions = sessions
         self._pid = os.getpid()
         self._process_generation = process_generation
+        self._process_started_at = process_started_at
         self._poll_seconds = poll_seconds
+        self._quiesce_timeout_seconds = quiesce_timeout_seconds
         self._active_fence_id: str | None = None
-        self._acknowledged_violations = 0
 
     async def run(self) -> None:
         try:
@@ -48,11 +53,8 @@ class ServiceControlWorker:
                 await asyncio.sleep(self._poll_seconds)
         finally:
             if self._active_fence_id is not None:
-                row = await self._database.fetchone(
-                    "SELECT state FROM service_admission_fences WHERE fence_id = ?",
-                    (self._active_fence_id,),
-                )
-                if row is None or row["state"] != "committed":
+                state = await self._fence_state(self._active_fence_id)
+                if state not in {"prepared", "committed"}:
                     await self._sessions.end_service_quiesce()
 
     async def _poll_once(self) -> None:
@@ -70,116 +72,240 @@ class ServiceControlWorker:
             if (
                 int(row["expected_pid"]) != self._pid
                 or str(row["expected_generation"]) != self._process_generation
-            ):
-                await self._database.execute(
-                    """
-                    UPDATE service_admission_fences
-                    SET state = 'released', released_at = ?,
-                        detail = ?
-                    WHERE fence_id = ? AND state = 'requested'
-                    """,
-                    (
-                        time.time(),
-                        json.dumps(
-                            {"reason": "process_identity_mismatch"},
-                            sort_keys=True,
-                            separators=(",", ":"),
-                        ),
-                        row["fence_id"],
-                    ),
+                or abs(
+                    float(row["expected_process_started_at"])
+                    - self._process_started_at
                 )
+                > 5
+            ):
+                await self._release_mismatched_fence(row)
                 return
             self._active_fence_id = str(row["fence_id"])
-            await self._sessions.begin_service_quiesce(
-                self._record_violation_sync,
-            )
-            await self._acknowledge_when_stable()
+            await self._begin_and_acknowledge(row)
             return
 
-        row = await self._database.fetchone(
-            "SELECT state FROM service_admission_fences WHERE fence_id = ?",
-            (self._active_fence_id,),
-        )
-        if row is None or row["state"] == "released":
+        state = await self._fence_state(self._active_fence_id)
+        if state is None or state == "released":
             await self._sessions.end_service_quiesce()
             self._active_fence_id = None
             return
-        if row["state"] == "acknowledged":
-            depth, violations = self._sessions.service_quiesce_metrics()
-            if depth or violations != self._acknowledged_violations:
-                await self._database.execute(
+        if state == "acknowledged":
+            depth, _ = self._sessions.service_quiesce_metrics()
+            if depth:
+                self._record_producer_sync("post_ack_depth")
+
+    async def _begin_and_acknowledge(self, row: Any) -> None:
+        fence_id = str(row["fence_id"])
+        deadline = time.monotonic() + self._quiesce_timeout_seconds
+        begin = asyncio.create_task(
+            self._sessions.begin_service_quiesce(
+                self._record_producer_sync,
+            ),
+            name=f"service-quiesce:{fence_id}",
+        )
+        if not await self._await_or_abort(begin, fence_id, deadline):
+            return
+        while True:
+            drain = asyncio.create_task(
+                self._sessions.drain_service_quiesce(),
+                name=f"service-drain:{fence_id}",
+            )
+            if not await self._await_or_abort(drain, fence_id, deadline):
+                return
+            depth, _ = self._sessions.service_quiesce_metrics()
+            if depth:
+                self._record_producer_sync("drain_depth")
+                continue
+            producer_count = await self._producer_count(fence_id)
+            journal_id = await self._journal_id()
+            async with self._database.transaction() as connection:
+                cursor = await connection.execute(
                     """
                     UPDATE service_admission_fences
-                    SET state = 'violated', ingress_depth = ?,
-                        violation_count = ?, detail = ?
-                    WHERE fence_id = ? AND state = 'acknowledged'
+                    SET state = 'acknowledged', acknowledged_at = ?,
+                        ingress_depth = 0,
+                        acknowledged_producer_count = ?,
+                        acknowledged_journal_id = ?,
+                        detail = ?
+                    WHERE fence_id = ? AND state = 'requested'
+                      AND expected_pid = ? AND expected_generation = ?
+                      AND ABS(expected_process_started_at - ?) <= 5
+                      AND producer_count = ?
+                      AND (SELECT COALESCE(MAX(journal_id), 0)
+                           FROM event_journal) = ?
                     """,
                     (
-                        depth,
-                        violations,
+                        time.time(),
+                        producer_count,
+                        journal_id,
                         json.dumps(
-                            {"reason": "post_ack_ingress"},
+                            {"drained": True},
                             sort_keys=True,
                             separators=(",", ":"),
                         ),
-                        self._active_fence_id,
+                        fence_id,
+                        self._pid,
+                        self._process_generation,
+                        self._process_started_at,
+                        producer_count,
+                        journal_id,
                     ),
                 )
+                changed = cursor.rowcount == 1
+                await cursor.close()
+            if changed:
+                return
+            state = await self._fence_state(fence_id)
+            if state != "requested":
+                await self._rollback_quiesce(fence_id)
+                return
+            if time.monotonic() >= deadline:
+                await self._mark_quiesce_failed(fence_id, "quiesce_timeout")
+                await self._rollback_quiesce(fence_id)
+                return
 
-    async def _acknowledge_when_stable(self) -> None:
-        stable_samples = 0
-        last_violations = -1
-        while stable_samples < 2:
-            depth, violations = self._sessions.service_quiesce_metrics()
-            if depth == 0 and violations == last_violations:
-                stable_samples += 1
-            else:
-                stable_samples = 0
-            last_violations = violations
-            if depth:
+    async def _await_or_abort(
+        self,
+        task: asyncio.Task[None],
+        fence_id: str,
+        deadline: float,
+    ) -> bool:
+        try:
+            while not task.done():
+                state = await self._fence_state(fence_id)
+                if state == "released":
+                    await self._cancel_bounded(task)
+                    await self._rollback_quiesce(fence_id)
+                    return False
+                if time.monotonic() >= deadline:
+                    await self._cancel_bounded(task)
+                    await self._mark_quiesce_failed(
+                        fence_id,
+                        "quiesce_timeout",
+                    )
+                    await self._rollback_quiesce(fence_id)
+                    return False
                 await asyncio.sleep(self._poll_seconds)
-                continue
-            await asyncio.sleep(self._poll_seconds)
-        self._acknowledged_violations = last_violations
+            error = task.exception()
+            if error is not None:
+                await self._mark_quiesce_failed(
+                    fence_id,
+                    f"{type(error).__name__}: {error}",
+                )
+                await self._rollback_quiesce(fence_id)
+                return False
+            return True
+        except asyncio.CancelledError:
+            await self._cancel_bounded(task)
+            await self._rollback_quiesce(fence_id)
+            raise
+
+    async def _cancel_bounded(self, task: asyncio.Task[None]) -> None:
+        task.cancel()
+        try:
+            async with asyncio.timeout(max(1.0, self._poll_seconds * 4)):
+                await asyncio.gather(task, return_exceptions=True)
+        except TimeoutError:
+            task.add_done_callback(_consume_task_result)
+
+    async def _rollback_quiesce(self, fence_id: str) -> None:
+        await self._sessions.end_service_quiesce()
+        if self._active_fence_id == fence_id:
+            self._active_fence_id = None
+
+    async def _mark_quiesce_failed(self, fence_id: str, reason: str) -> None:
         await self._database.execute(
             """
             UPDATE service_admission_fences
-            SET state = 'acknowledged', acknowledged_at = ?,
-                ingress_depth = 0, violation_count = ?, detail = ?
+            SET state = 'violated', violation_count = violation_count + 1,
+                detail = ?
             WHERE fence_id = ? AND state = 'requested'
-              AND expected_pid = ? AND expected_generation = ?
             """,
             (
-                time.time(),
-                last_violations,
                 json.dumps(
-                    {"drained": True},
+                    {"reason": reason},
                     sort_keys=True,
                     separators=(",", ":"),
                 ),
-                self._active_fence_id,
-                self._pid,
-                self._process_generation,
+                fence_id,
             ),
         )
 
-    def _record_violation_sync(self) -> None:
+    async def _release_mismatched_fence(self, row: Any) -> None:
+        await self._database.execute(
+            """
+            UPDATE service_admission_fences
+            SET state = 'released', released_at = ?, detail = ?
+            WHERE fence_id = ? AND state = 'requested'
+            """,
+            (
+                time.time(),
+                json.dumps(
+                    {"reason": "process_identity_mismatch"},
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ),
+                row["fence_id"],
+            ),
+        )
+
+    async def _fence_state(self, fence_id: str) -> str | None:
+        row = await self._database.fetchone(
+            "SELECT state FROM service_admission_fences WHERE fence_id = ?",
+            (fence_id,),
+        )
+        return None if row is None else str(row["state"])
+
+    async def _producer_count(self, fence_id: str) -> int:
+        row = await self._database.fetchone(
+            """
+            SELECT producer_count FROM service_admission_fences
+            WHERE fence_id = ?
+            """,
+            (fence_id,),
+        )
+        if row is None:
+            raise RuntimeError("service admission fence disappeared")
+        return int(row["producer_count"])
+
+    async def _journal_id(self) -> int:
+        row = await self._database.fetchone(
+            """
+            SELECT COALESCE(MAX(journal_id), 0) AS journal_id
+            FROM event_journal
+            """
+        )
+        if row is None:
+            raise RuntimeError("event journal high-water mark is unavailable")
+        return int(row["journal_id"])
+
+    def _record_producer_sync(self, source: str) -> None:
         if self._active_fence_id is None:
             return
         try:
-            connection = sqlite3.connect(str(self._database.path), timeout=0.25)
+            connection = sqlite3.connect(str(self._database.path), timeout=5)
             try:
-                connection.execute(
+                connection.row_factory = sqlite3.Row
+                cursor = connection.execute(
                     """
                     UPDATE service_admission_fences
-                    SET state = 'violated',
-                        violation_count = violation_count + 1,
+                    SET producer_count = producer_count + 1,
+                        violation_count = violation_count + CASE
+                          WHEN state IN (
+                            'acknowledged', 'violated', 'prepared', 'committed'
+                          )
+                          THEN 1 ELSE 0 END,
+                        state = CASE
+                          WHEN state = 'acknowledged' THEN 'violated'
+                          ELSE state END,
                         detail = ?
-                    WHERE fence_id = ? AND state = 'acknowledged'
+                    WHERE fence_id = ?
+                      AND state IN ('requested', 'acknowledged',
+                                    'violated', 'prepared', 'committed')
                     """,
                     (
                         json.dumps(
-                            {"reason": "post_ack_ingress"},
+                            {"producer": source},
                             sort_keys=True,
                             separators=(",", ":"),
                         ),
@@ -187,8 +313,27 @@ class ServiceControlWorker:
                     ),
                 )
                 connection.commit()
+                if cursor.rowcount != 1:
+                    row = connection.execute(
+                        """
+                        SELECT state FROM service_admission_fences
+                        WHERE fence_id = ?
+                        """,
+                        (self._active_fence_id,),
+                    ).fetchone()
+                    if row is None or row["state"] == "released":
+                        return
+                    raise RuntimeError(
+                        "active service admission fence disappeared"
+                    )
             finally:
                 connection.close()
-        except sqlite3.Error:
-            # The async poll path observes the in-memory violation count too.
-            return
+        except sqlite3.Error as error:
+            raise RuntimeError(
+                "could not durably record post-quiesce producer"
+            ) from error
+
+
+def _consume_task_result(task: asyncio.Task[Any]) -> None:
+    if not task.cancelled():
+        task.exception()

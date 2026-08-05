@@ -106,16 +106,7 @@ def test_windows_legacy_state_is_atomically_adopted(
 
     assert settings.database_path.read_bytes() == b"legacy-db"
     assert (settings.data_dir / "sessions" / "session.json").read_text() == "durable"
-    layout_moves = [
-        pair
-        for pair in replacements
-        if pair[0] in {legacy, local_app_data / ".copilotd-legacy-state-migration"}
-    ]
-    assert layout_moves[0] == (
-        legacy,
-        local_app_data / ".copilotd-legacy-state-migration",
-    )
-    assert layout_moves[-1] == (
+    assert replacements[-1] == (
         local_app_data / ".copilotd-legacy-state-migration",
         settings.data_dir,
     )
@@ -127,6 +118,16 @@ def test_windows_legacy_adoption_recovers_staged_tree(tmp_path: Path) -> None:
     staging = local_app_data / ".copilotd-legacy-state-migration"
     staging.mkdir(parents=True)
     (staging / "copilotd.sqlite3").write_bytes(b"staged-db")
+    (local_app_data / ".copilotd-layout-migration.json").write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "phase": "staged",
+                "staging": str(staging),
+            }
+        ),
+        encoding="utf-8",
+    )
     data_dir, cache_dir, log_dir = platform_default_paths(
         "win32",
         environ={"LOCALAPPDATA": str(local_app_data)},
@@ -146,6 +147,143 @@ def test_windows_legacy_adoption_recovers_staged_tree(tmp_path: Path) -> None:
         home=tmp_path / "home",
     )
     assert settings.database_path.read_bytes() == b"staged-db"
+
+
+def test_windows_split_layout_merges_legacy_and_new_state(tmp_path: Path) -> None:
+    local_app_data = tmp_path / "Local"
+    legacy = local_app_data / "copilotD"
+    legacy.mkdir(parents=True)
+    (legacy / "copilotd.sqlite3").write_bytes(b"legacy-db")
+    (legacy / "sessions").mkdir()
+    (legacy / "sessions" / "legacy.json").write_text(
+        "legacy",
+        encoding="utf-8",
+    )
+    data_dir, cache_dir, log_dir = platform_default_paths(
+        "win32",
+        environ={"LOCALAPPDATA": str(local_app_data)},
+        home=tmp_path / "home",
+    )
+    data_dir.mkdir(parents=True)
+    (data_dir / "worktrees").mkdir()
+    (data_dir / "worktrees" / "new.json").write_text(
+        "new",
+        encoding="utf-8",
+    )
+    settings = Settings(
+        _env_file=None,
+        data_dir=data_dir,
+        cache_dir=cache_dir,
+        log_dir=log_dir,
+        resolved_home=tmp_path / "home",
+    )
+
+    assert settings.adopt_legacy_windows_layout(
+        platform_name="win32",
+        environ={"LOCALAPPDATA": str(local_app_data)},
+        home=tmp_path / "home",
+    )
+
+    assert settings.database_path.read_bytes() == b"legacy-db"
+    assert (data_dir / "sessions" / "legacy.json").read_text() == "legacy"
+    assert (data_dir / "worktrees" / "new.json").read_text() == "new"
+    assert not (legacy / "copilotd.sqlite3").exists()
+    assert not (legacy / "sessions").exists()
+
+
+def test_windows_split_layout_fails_closed_on_conflicting_databases(
+    tmp_path: Path,
+) -> None:
+    local_app_data = tmp_path / "Local"
+    legacy = local_app_data / "copilotD"
+    legacy.mkdir(parents=True)
+    legacy_db = legacy / "copilotd.sqlite3"
+    legacy_db.write_bytes(b"legacy-db")
+    data_dir, cache_dir, log_dir = platform_default_paths(
+        "win32",
+        environ={"LOCALAPPDATA": str(local_app_data)},
+        home=tmp_path / "home",
+    )
+    data_dir.mkdir(parents=True)
+    target_db = data_dir / "copilotd.sqlite3"
+    target_db.write_bytes(b"different-db")
+    settings = Settings(
+        _env_file=None,
+        data_dir=data_dir,
+        cache_dir=cache_dir,
+        log_dir=log_dir,
+        resolved_home=tmp_path / "home",
+    )
+
+    with pytest.raises(RuntimeError, match="state conflict"):
+        settings.adopt_legacy_windows_layout(
+            platform_name="win32",
+            environ={"LOCALAPPDATA": str(local_app_data)},
+            home=tmp_path / "home",
+        )
+
+    assert legacy_db.read_bytes() == b"legacy-db"
+    assert target_db.read_bytes() == b"different-db"
+    assert not (
+        local_app_data / ".copilotd-legacy-state-migration"
+    ).exists()
+
+
+def test_windows_split_layout_recovers_after_staging_crash(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    local_app_data = tmp_path / "Local"
+    legacy = local_app_data / "copilotD"
+    (legacy / "sessions").mkdir(parents=True)
+    legacy_session = legacy / "sessions" / "legacy.json"
+    legacy_session.write_text("legacy", encoding="utf-8")
+    data_dir, cache_dir, log_dir = platform_default_paths(
+        "win32",
+        environ={"LOCALAPPDATA": str(local_app_data)},
+        home=tmp_path / "home",
+    )
+    data_dir.mkdir(parents=True)
+    (data_dir / "copilotd.sqlite3").write_bytes(b"target-db")
+    settings = Settings(
+        _env_file=None,
+        data_dir=data_dir,
+        cache_dir=cache_dir,
+        log_dir=log_dir,
+        resolved_home=tmp_path / "home",
+    )
+    replace = os.replace
+    crashed = False
+
+    def crash_after_staging(source: str | Path, target: str | Path) -> None:
+        nonlocal crashed
+        source_path = Path(source)
+        if source_path == legacy / "sessions" and not crashed:
+            crashed = True
+            raise OSError("simulated migration crash")
+        replace(source, target)
+
+    monkeypatch.setattr("copilotd.config.os.replace", crash_after_staging)
+    with pytest.raises(OSError, match="simulated migration crash"):
+        settings.adopt_legacy_windows_layout(
+            platform_name="win32",
+            environ={"LOCALAPPDATA": str(local_app_data)},
+            home=tmp_path / "home",
+        )
+    staging = local_app_data / ".copilotd-legacy-state-migration"
+    journal = local_app_data / ".copilotd-layout-migration.json"
+    assert staging.exists() and journal.exists()
+    assert not data_dir.exists()
+
+    monkeypatch.setattr("copilotd.config.os.replace", replace)
+    assert settings.adopt_legacy_windows_layout(
+        platform_name="win32",
+        environ={"LOCALAPPDATA": str(local_app_data)},
+        home=tmp_path / "home",
+    )
+    assert (data_dir / "copilotd.sqlite3").read_bytes() == b"target-db"
+    assert (data_dir / "sessions" / "legacy.json").read_text() == "legacy"
+    assert not staging.exists() and not journal.exists()
 
 
 def test_service_secret_is_private_and_loadable_without_plaintext_artifacts(

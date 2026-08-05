@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import asyncio
 import io
+import os
 import re
+import time
 import uuid
 from pathlib import Path
 from typing import Any
@@ -26,6 +28,7 @@ from copilotd.core.sessions import (
 from copilotd.core.task_registry import TaskRegistry
 from copilotd.ops.control import ServiceControlWorker
 from copilotd.ops.heartbeat import HeartbeatWriter
+from copilotd.ops.service import SqliteRestartCoordinator
 from copilotd.render.markdown import MarkdownAssembler, TableBlock, TextBlock
 from copilotd.render.outbox import (
     RenderDeliveryError,
@@ -82,6 +85,17 @@ class CopilotDiscordBot(commands.Bot):
 
     async def setup_hook(self) -> None:
         await self.database.open()
+        await asyncio.to_thread(
+            SqliteRestartCoordinator(
+                self.settings.database_path
+            ).recover_for_replacement,
+            replacement_pid=os.getpid(),
+            replacement_generation=self.heartbeat.process_generation,
+            replacement_process_started_at=(
+                self.heartbeat.process_started_at
+            ),
+            now=time.time(),
+        )
         self.projects = ProjectRegistry(
             self.database,
             resolved_home=self.settings.resolved_home,
@@ -126,12 +140,17 @@ class CopilotDiscordBot(commands.Bot):
             )
         self.dispatcher = RenderOutboxDispatcher(self.database, self)
         self._tasks.create(self._render_loop(), name="discord-render-outbox")
+        self._tasks.create(
+            self._runtime_health_loop(),
+            name="copilotd-runtime-health",
+        )
         self._tasks.create(self.heartbeat.run(), name="copilotd-heartbeat")
         self._tasks.create(
             ServiceControlWorker(
                 self.database,
                 self._require_sessions(),
                 process_generation=self.heartbeat.process_generation,
+                process_started_at=self.heartbeat.process_started_at,
             ).run(),
             name="copilotd-service-control",
         )
@@ -152,6 +171,24 @@ class CopilotDiscordBot(commands.Bot):
         await self.bridge.stop()
         await self.database.close()
         await super().close()
+
+    async def _runtime_health_loop(self) -> None:
+        while True:
+            try:
+                async with asyncio.timeout(10):
+                    await self.bridge.healthcheck()
+            except asyncio.CancelledError:
+                raise
+            except Exception as error:
+                self.heartbeat.runtime_state = "down"
+                await logger.aerror(
+                    "runtime_healthcheck_failed",
+                    error_type=type(error).__name__,
+                    error=str(error),
+                )
+            else:
+                self.heartbeat.runtime_state = "ready"
+            await asyncio.sleep(self.settings.heartbeat_interval_seconds)
 
     async def on_ready(self) -> None:
         self.heartbeat.set_gateway("ready")
@@ -286,11 +323,19 @@ class CopilotDiscordBot(commands.Bot):
                 return
             sessions = self._require_sessions()
             runtime = sessions.for_thread(str(message.channel.id))
-            if runtime is None:
+            if runtime is None or runtime.state.value in {
+                "detached",
+                "fenced",
+                "recovery_unknown",
+            }:
                 async with sessions.creation_admission():
                     runtime = sessions.for_thread(str(message.channel.id))
-                    if runtime is None:
+                    if runtime is None or runtime.state.value in {
+                        "fenced",
+                        "recovery_unknown",
+                    }:
                         runtime = await sessions.replace(binding)
+                    if runtime.state.value == "detached":
                         await runtime.attach_resume()
             try:
                 prepared = await self.attachment_service.prepare(
@@ -863,11 +908,19 @@ class CopilotDiscordBot(commands.Bot):
         binding = await self._interaction_binding(interaction)
         sessions = self._require_sessions()
         runtime = sessions.for_thread(binding.thread_id)
-        if runtime is None:
+        if runtime is None or runtime.state.value in {
+            "detached",
+            "fenced",
+            "recovery_unknown",
+        }:
             async with sessions.creation_admission():
                 runtime = sessions.for_thread(binding.thread_id)
-                if runtime is None:
+                if runtime is None or runtime.state.value in {
+                    "fenced",
+                    "recovery_unknown",
+                }:
                     runtime = await sessions.replace(binding)
+                if runtime.state.value == "detached":
                     await runtime.attach_resume()
         return runtime
 

@@ -25,7 +25,6 @@ foreach ($Command in @(
   }
 }
 
-$testStartedAt = [DateTime]::UtcNow
 $setup = copilotd setup | ConvertFrom-Json
 if (-not $setup.ok -or -not $setup.result.status.ready) {
   throw 'copilotD setup did not reach ready state'
@@ -59,6 +58,8 @@ foreach ($TaskName in $expected) {
 
 $wakeTask = "copilotD Acceptance Wake $([Guid]::NewGuid())"
 $wakeMarker = Join-Path $env:TEMP "$wakeTask.txt"
+$sleepRequestedAt = [DateTime]::UtcNow
+$wakeDeadline = $sleepRequestedAt.AddMinutes(3)
 $wakeAction = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument (
   "-NoProfile -NonInteractive -Command " +
   "`"Set-Content -LiteralPath '$($wakeMarker.Replace("'", "''"))' " +
@@ -80,31 +81,43 @@ try {
     $false
   )
   if (-not $suspended) { throw 'Windows refused the requested suspend transition' }
-  $deadline = [DateTime]::UtcNow.AddSeconds(30)
   do {
     $resume = Get-WinEvent -FilterHashtable @{
       LogName='Microsoft-Windows-Power-Troubleshooter/Operational'
       Id=1
-      StartTime=$testStartedAt
+      StartTime=$sleepRequestedAt
     } -MaxEvents 1 -ErrorAction SilentlyContinue
     if ($null -eq $resume) {
       $resume = Get-WinEvent -FilterHashtable @{
         LogName='System'
         ProviderName='Microsoft-Windows-Power-Troubleshooter'
         Id=1
-        StartTime=$testStartedAt
+        StartTime=$sleepRequestedAt
       } -MaxEvents 1 -ErrorAction SilentlyContinue
     }
-    if ($null -ne $resume -and $resume.TimeCreated.ToUniversalTime() -ge $testStartedAt) {
+    if (
+      $null -ne $resume -and
+      $resume.TimeCreated.ToUniversalTime() -ge $sleepRequestedAt -and
+      $resume.TimeCreated.ToUniversalTime() -le $wakeDeadline
+    ) {
       if (Test-Path -LiteralPath $wakeMarker) { break }
     }
     Start-Sleep -Seconds 1
-  } while ([DateTime]::UtcNow -lt $deadline)
+  } while ([DateTime]::UtcNow -lt $wakeDeadline)
   if ($null -eq $resume) {
     throw 'no new Windows resume event occurred after the test started'
   }
   if (-not (Test-Path -LiteralPath $wakeMarker)) {
     throw 'the WakeToRun acceptance task did not execute after resume'
+  }
+  $markerTime = [DateTime]::Parse(
+    (Get-Content -LiteralPath $wakeMarker -Raw).Trim()
+  ).ToUniversalTime()
+  if (
+    $markerTime -lt $sleepRequestedAt -or
+    $markerTime -gt $wakeDeadline
+  ) {
+    throw 'the wake marker is outside the intended wake interval'
   }
 
   $watchdog = copilotd service watchdog | ConvertFrom-Json

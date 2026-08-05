@@ -210,7 +210,7 @@ class SessionRegistry:
         self._runtimes: dict[str, SessionRuntime] = {}
         self._service_quiesced = False
         self._service_quiesce_violations = 0
-        self._service_violation_callback: Callable[[], None] | None = None
+        self._service_violation_callback: Callable[[str], None] | None = None
         self._active_creations = 0
         self._admission_condition = asyncio.Condition()
 
@@ -266,7 +266,7 @@ class SessionRegistry:
 
     async def begin_service_quiesce(
         self,
-        on_violation: Callable[[], None],
+        on_violation: Callable[[str], None],
     ) -> None:
         async with self._admission_condition:
             self._service_quiesced = True
@@ -293,6 +293,10 @@ class SessionRegistry:
             self._service_violation_callback = None
             self._admission_condition.notify_all()
 
+    async def drain_service_quiesce(self) -> None:
+        for runtime in self._runtimes.values():
+            await runtime.drain_service_quiesce()
+
     def service_quiesce_metrics(self) -> tuple[int, int]:
         depth = 0
         violations = self._service_quiesce_violations
@@ -306,7 +310,7 @@ class SessionRegistry:
     async def creation_admission(self):
         async with self._admission_condition:
             if self._service_quiesced:
-                self._record_registry_violation()
+                self._record_registry_violation("session_creation")
                 raise RuntimeError(
                     "session creation is quiesced for service restart"
                 )
@@ -322,15 +326,15 @@ class SessionRegistry:
 
     def _assert_registry_admission(self) -> None:
         if self._service_quiesced and not _creation_admitted.get():
-            self._record_registry_violation()
+            self._record_registry_violation("runtime_registration")
             raise RuntimeError(
                 "session runtime admission is quiesced for service restart"
             )
 
-    def _record_registry_violation(self) -> None:
+    def _record_registry_violation(self, source: str) -> None:
         self._service_quiesce_violations += 1
         if self._service_violation_callback is not None:
-            self._service_violation_callback()
+            self._service_violation_callback(source)
 
     async def shutdown(self) -> None:
         runtimes = list(self._runtimes.values())

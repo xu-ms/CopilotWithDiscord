@@ -46,6 +46,7 @@ class ReducerInbox:
         self._closed = False
         self._sdk_closed = False
         self._overflow: OverflowIncident | None = None
+        self._producer_observer: Callable[[str], None] | None = None
         self.overflow_event = asyncio.Event()
 
     @property
@@ -195,12 +196,22 @@ class ReducerInbox:
         with self._lock:
             self._sdk_closed = True
 
+    def set_producer_observer(
+        self,
+        observer: Callable[[str], None] | None,
+    ) -> None:
+        with self._lock:
+            self._producer_observer = observer
+
     def _reserve(
         self,
         *,
         source: str,
         record_overflow: bool = True,
     ) -> tuple[int, int | None] | None:
+        observer = self._producer_observer
+        if observer is not None:
+            observer(source)
         with self._lock:
             if self._closed:
                 return None

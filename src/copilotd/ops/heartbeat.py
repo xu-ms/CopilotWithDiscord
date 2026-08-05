@@ -106,6 +106,10 @@ class HeartbeatWriter:
     def process_generation(self) -> str:
         return self._process_generation
 
+    @property
+    def process_started_at(self) -> float:
+        return self._process_started_at
+
     async def run(self) -> None:
         while True:
             current = time.time()

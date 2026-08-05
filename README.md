@@ -73,7 +73,10 @@ Useful operations:
 `service restart` fails closed when the heartbeat is missing, malformed, stale, or does
 not match the OS PID. A normal restart also refuses active current-generation leases,
 queued work, remote exposure, native schedules, and trigger windows. `--force` first
-durably marks ambiguous outcomes unknown and records remote/schedule stop intents.
+durably quiesces all create/resume/send/callback/internal producers, atomically compares
+producer and event-journal epochs, marks only true in-flight outcomes unknown, and commits
+owner-lease handoff before replacing the process. Once force preparation is durable, a
+later failure terminates fail-closed and cannot reopen the old process.
 
 ## Development
 

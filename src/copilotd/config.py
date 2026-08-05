@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import stat
@@ -210,40 +211,81 @@ class Settings(BaseSettings):
         local_app_data.mkdir(parents=True, exist_ok=True)
         descriptor = _acquire_private_lock(lock)
         try:
-            if expected_data.exists():
-                if staging.exists():
-                    raise RuntimeError(
-                        "legacy Windows layout migration has both staged and target state"
-                    )
-                journal.unlink(missing_ok=True)
-                return False
-            if staging.exists():
-                target_root.mkdir(parents=True, exist_ok=True)
-                os.replace(staging, expected_data)
-                journal.unlink(missing_ok=True)
-                return True
-            if not _looks_like_legacy_state(legacy_root):
-                journal.unlink(missing_ok=True)
-                return False
-            _atomic_private_json(
-                journal,
-                {
-                    "schema_version": 1,
-                    "phase": "prepared",
-                    "legacy": str(legacy_root),
-                    "target": str(expected_data),
-                },
+            legacy_source = (
+                legacy_root
+                if legacy_root.exists()
+                else target_root
             )
-            os.replace(legacy_root, staging)
+            excluded = {
+                expected_data,
+                self.cache_dir,
+                self.log_dir,
+                staging,
+                journal,
+                lock,
+            }
+            legacy_entries = _legacy_state_entries(
+                legacy_source,
+                excluded=excluded,
+            )
+            migration = _read_private_json(journal)
+            if staging.exists() and expected_data.exists():
+                raise RuntimeError(
+                    "Windows state migration has both staged and target trees"
+                )
+            if staging.exists():
+                if migration is None or migration.get("phase") not in {
+                    "prepared",
+                    "staged",
+                }:
+                    raise RuntimeError(
+                        "Windows state migration staging exists without "
+                        "a recoverable journal"
+                    )
+                _assert_merge_compatible(legacy_entries, staging)
+            elif not legacy_entries:
+                journal.unlink(missing_ok=True)
+                return False
+            else:
+                if expected_data.exists():
+                    _assert_merge_compatible(legacy_entries, expected_data)
+                _atomic_private_json(
+                    journal,
+                    {
+                        "schema_version": 1,
+                        "phase": "prepared",
+                        "legacy": str(legacy_source),
+                        "target": str(expected_data),
+                        "staging": str(staging),
+                    },
+                )
+                if expected_data.exists():
+                    os.replace(expected_data, staging)
+                else:
+                    staging.mkdir(parents=True, exist_ok=False)
             _atomic_private_json(
                 journal,
                 {
                     "schema_version": 1,
                     "phase": "staged",
+                    "legacy": str(legacy_source),
                     "staging": str(staging),
                     "target": str(expected_data),
                 },
             )
+            legacy_entries = _legacy_state_entries(
+                legacy_source,
+                excluded=excluded,
+            )
+            _assert_merge_compatible(legacy_entries, staging)
+            for entry in legacy_entries:
+                _merge_state_entry(entry, staging / entry.name)
+            if (
+                legacy_source != target_root
+                and legacy_source.exists()
+                and not any(legacy_source.iterdir())
+            ):
+                legacy_source.rmdir()
             target_root.mkdir(parents=True, exist_ok=True)
             os.replace(staging, expected_data)
             journal.unlink(missing_ok=True)
@@ -400,16 +442,97 @@ def _atomic_private_json(path: Path, payload: dict[str, object]) -> None:
         temporary.unlink(missing_ok=True)
 
 
-def _looks_like_legacy_state(path: Path) -> bool:
-    return path.is_dir() and any(
-        (path / relative).exists()
-        for relative in (
-            "copilotd.sqlite3",
-            "runtime",
-            "sessions",
-            "worktrees",
-        )
+def _legacy_state_entries(
+    root: Path,
+    *,
+    excluded: set[Path],
+) -> list[Path]:
+    if not root.is_dir():
+        return []
+    excluded_keys = {
+        str(path).replace("/", "\\").casefold() for path in excluded
+    }
+    return sorted(
+        (
+            entry
+            for entry in root.iterdir()
+            if str(entry).replace("/", "\\").casefold()
+            not in excluded_keys
+            and entry.name
+            not in {
+                ".copilotd-layout-migration.json",
+                ".copilotd-layout-migration.lock",
+                ".copilotd-legacy-state-migration",
+            }
+        ),
+        key=lambda path: path.name.casefold(),
     )
+
+
+def _assert_merge_compatible(entries: list[Path], target: Path) -> None:
+    conflicts: list[str] = []
+    for source in entries:
+        _collect_merge_conflicts(source, target / source.name, conflicts)
+    if conflicts:
+        raise RuntimeError(
+            "Windows legacy and target state conflict: "
+            + ", ".join(conflicts)
+        )
+
+
+def _collect_merge_conflicts(
+    source: Path,
+    target: Path,
+    conflicts: list[str],
+) -> None:
+    if not target.exists():
+        return
+    if source.is_dir() and target.is_dir():
+        for child in source.iterdir():
+            _collect_merge_conflicts(child, target / child.name, conflicts)
+        return
+    if source.is_file() and target.is_file():
+        if _file_digest(source) != _file_digest(target):
+            conflicts.append(
+                f"{source.name} differs at {source} and {target}"
+            )
+        return
+    conflicts.append(f"type mismatch at {source} and {target}")
+
+
+def _merge_state_entry(source: Path, target: Path) -> None:
+    if not target.exists():
+        os.replace(source, target)
+        return
+    if source.is_dir() and target.is_dir():
+        for child in list(source.iterdir()):
+            _merge_state_entry(child, target / child.name)
+        source.rmdir()
+        return
+    if source.is_file() and target.is_file():
+        if _file_digest(source) != _file_digest(target):
+            raise RuntimeError(
+                f"Windows state changed during migration: {source}"
+            )
+        source.unlink()
+        return
+    raise RuntimeError(f"Windows state type changed during migration: {source}")
+
+
+def _file_digest(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        while block := stream.read(1024 * 1024):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def _read_private_json(path: Path) -> dict[str, object] | None:
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError, json.JSONDecodeError):
+        return None
+    return payload if isinstance(payload, dict) else None
 
 
 def _acquire_private_lock(path: Path) -> int:

@@ -29,7 +29,12 @@ from copilotd.core.reducer import EventReducerWorker, JournalReducer
 from copilotd.core.task_registry import TaskRegistry
 from copilotd.sdk.bridge import PermissionPostureError
 from copilotd.storage.database import Database
-from copilotd.storage.leases import FenceLost, OwnerLease, OwnerLeaseStore
+from copilotd.storage.leases import (
+    FenceLost,
+    OwnerConflict,
+    OwnerLease,
+    OwnerLeaseStore,
+)
 
 AgentMode = Literal["interactive", "plan", "autopilot", "shell"]
 DeliveryMode = Literal["enqueue", "immediate"]
@@ -197,7 +202,8 @@ class SessionRuntime:
         self._accepting_sends = False
         self._service_quiesced = False
         self._service_quiesce_violations = 0
-        self._service_quiesce_violation_callback: Callable[[], None] | None = None
+        self._service_quiesce_violation_callback: Callable[[str], None] | None = None
+        self._service_producers_stopped = False
 
     @property
     def handle(self) -> SessionHandle | None:
@@ -522,6 +528,75 @@ class SessionRuntime:
                 raise RuntimeError(
                     f"submission queue state diverged while claiming {submission_id}"
                 )
+            active_cursor = await connection.execute(
+                """
+                SELECT lease_id, runtime_generation, owner_fence_token
+                FROM liveness_leases
+                WHERE sdk_session_id = ? AND kind = 'submission'
+                  AND source_id = ? AND state = 'active'
+                """,
+                (self.binding.sdk_session_id, submission_id),
+            )
+            active_lease = await active_cursor.fetchone()
+            await active_cursor.close()
+            fence_token = self._require_fence_token()
+            if active_lease is None:
+                lease_id = str(
+                    uuid.uuid5(
+                        uuid.NAMESPACE_URL,
+                        (
+                            f"copilotd:{self.binding.sdk_session_id}:"
+                            f"submission-lease:{submission_id}:"
+                            f"{self.binding.runtime_generation}:{fence_token}"
+                        ),
+                    )
+                )
+                await connection.execute(
+                    """
+                    INSERT INTO liveness_leases(
+                        sdk_session_id, lease_id, kind, source_id,
+                        runtime_generation, owner_fence_token, state,
+                        acquired_at, refreshed_at
+                    ) VALUES (?, ?, 'submission', ?, ?, ?, 'active', ?, ?)
+                    ON CONFLICT(sdk_session_id, lease_id) DO UPDATE SET
+                        state = 'active',
+                        runtime_generation = excluded.runtime_generation,
+                        owner_fence_token = excluded.owner_fence_token,
+                        refreshed_at = excluded.refreshed_at,
+                        released_at = NULL
+                    """,
+                    (
+                        self.binding.sdk_session_id,
+                        lease_id,
+                        submission_id,
+                        self.binding.runtime_generation,
+                        fence_token,
+                        now,
+                        now,
+                    ),
+                )
+            elif (
+                int(active_lease["runtime_generation"])
+                != self.binding.runtime_generation
+                or int(active_lease["owner_fence_token"]) != fence_token
+            ):
+                raise RuntimeError(
+                    "queued submission has a stale active liveness lease"
+                )
+            else:
+                await connection.execute(
+                    """
+                    UPDATE liveness_leases
+                    SET refreshed_at = ?
+                    WHERE sdk_session_id = ? AND lease_id = ?
+                      AND state = 'active'
+                    """,
+                    (
+                        now,
+                        self.binding.sdk_session_id,
+                        active_lease["lease_id"],
+                    ),
+                )
         return True
 
     async def _block_queue_item(self, submission_id: str, state: str) -> None:
@@ -621,6 +696,13 @@ class SessionRuntime:
             if stopped in done and self._task_reconcile_stop.is_set():
                 return
             self._task_reconcile_requested.clear()
+            if self.state != RuntimeState.READY:
+                return
+            if not await self._is_current_owner():
+                self.state = RuntimeState.FENCED
+                if self._mailbox is not None:
+                    self._mailbox.freeze()
+                return
             self._task_snapshot_epoch += 1
             epoch = self._task_snapshot_epoch
             try:
@@ -628,6 +710,14 @@ class SessionRuntime:
             except asyncio.CancelledError:
                 raise
             except Exception as error:
+                if (
+                    self.state != RuntimeState.READY
+                    or not await self._is_current_owner()
+                ):
+                    self.state = RuntimeState.FENCED
+                    if self._mailbox is not None:
+                        self._mailbox.freeze()
+                    return
                 await self._require_inbox().commit_internal(
                     {
                         "type": "copilotd.tasks.snapshot_failed",
@@ -642,6 +732,11 @@ class SessionRuntime:
                     ),
                 )
                 continue
+            if self.state != RuntimeState.READY or not await self._is_current_owner():
+                self.state = RuntimeState.FENCED
+                if self._mailbox is not None:
+                    self._mailbox.freeze()
+                return
             await self._require_inbox().commit_internal(
                 {
                     "type": "copilotd.tasks.snapshot",
@@ -729,10 +824,6 @@ class SessionRuntime:
             )
 
     def _on_sdk_event_accepted(self, event: Any) -> None:
-        if self._service_quiesced:
-            self._service_quiesce_violations += 1
-            if self._service_quiesce_violation_callback is not None:
-                self._service_quiesce_violation_callback()
         event_type = getattr(event, "type", None)
         raw_type = getattr(event_type, "value", event_type)
         loop = self._loop
@@ -743,19 +834,36 @@ class SessionRuntime:
 
     async def begin_service_quiesce(
         self,
-        on_violation: Callable[[], None],
+        on_violation: Callable[[str], None],
     ) -> None:
         async with self._admission_lock:
             self._service_quiesced = True
             self._service_quiesce_violations = 0
             self._service_quiesce_violation_callback = on_violation
             self._accepting_sends = False
+            if self._inbox is not None:
+                self._inbox.set_producer_observer(
+                    self._record_service_quiesce_producer
+                )
+                overflow = self._inbox.overflow
+                if overflow is not None and overflow.lost_count:
+                    self._record_service_quiesce_producer(
+                        "pre_quiesce_inbox_overflow"
+                    )
+        if self._mailbox is not None:
+            await self._mailbox.pause_admission()
+            await self._mailbox.wait_idle()
         async with self._queue_dispatch_lock:
             pass
-        if self._inbox is not None:
-            await self._inbox.join()
+        await self._stop_service_quiesce_producers()
+        await self.drain_service_quiesce()
 
     async def end_service_quiesce(self) -> None:
+        if self._inbox is not None:
+            self._inbox.set_producer_observer(None)
+        await self._restart_service_quiesce_producers()
+        if self._mailbox is not None:
+            await self._mailbox.resume_admission()
         async with self._admission_lock:
             self._service_quiesced = False
             self._service_quiesce_violations = 0
@@ -763,9 +871,63 @@ class SessionRuntime:
             if self.state == RuntimeState.READY:
                 self._accepting_sends = True
 
+    async def drain_service_quiesce(self) -> None:
+        if self._inbox is not None:
+            await self._inbox.join()
+
     def service_quiesce_metrics(self) -> tuple[int, int]:
         depth = 0 if self._inbox is None else self._inbox.size
         return depth, self._service_quiesce_violations
+
+    def _record_service_quiesce_producer(self, source: str) -> None:
+        self._service_quiesce_violations += 1
+        callback = self._service_quiesce_violation_callback
+        if callback is not None:
+            callback(source)
+
+    async def _stop_service_quiesce_producers(self) -> None:
+        if self._service_producers_stopped:
+            return
+        self._queue_stop.set()
+        self._task_reconcile_stop.set()
+        self._task_reconcile_requested.set()
+        self._permission_reconcile_stop.set()
+        self._permission_reconcile_requested.set()
+        self._renewal_stop.set()
+        tasks = (
+            self._queue_task,
+            self._task_reconcile_task,
+            self._permission_reconcile_task,
+            self._renewal_task,
+        )
+        for task in tasks:
+            if task is None:
+                continue
+            task.cancel()
+        active = [task for task in tasks if task is not None]
+        try:
+            if active:
+                async with asyncio.timeout(self._shutdown_timeout_seconds):
+                    await asyncio.gather(*active, return_exceptions=True)
+        finally:
+            self._queue_task = None
+            self._task_reconcile_task = None
+            self._permission_reconcile_task = None
+            self._renewal_task = None
+            self._service_producers_stopped = True
+
+    async def _restart_service_quiesce_producers(self) -> None:
+        if not self._service_producers_stopped:
+            return
+        if self.state == RuntimeState.READY:
+            self._start_runtime_producers()
+        elif self.state == RuntimeState.DEGRADED and self._lease is not None:
+            self._renewal_stop.clear()
+            self._renewal_task = self._tasks.create(
+                self._renew_owner(),
+                name=f"owner-renew:{self.binding.sdk_session_id}",
+            )
+        self._service_producers_stopped = False
 
     async def set_mode(
         self,
@@ -1527,7 +1689,9 @@ class SessionRuntime:
         queued = await self._database.fetchone(
             """
             SELECT COUNT(*) FROM message_queue
-            WHERE thread_id = ? AND state NOT IN ('cancelled', 'submitted', 'failed')
+            WHERE thread_id = ? AND state NOT IN (
+              'cancelled', 'submitted', 'submitted_unknown', 'failed'
+            )
             """,
             (binding.thread_id,),
         )
@@ -1558,6 +1722,7 @@ class SessionRuntime:
         async with self._lifecycle_lock:
             if self.state == RuntimeState.CLOSED:
                 return
+            was_fenced = self.state == RuntimeState.FENCED
             async with self._admission_lock:
                 self._accepting_sends = False
             if self._mailbox is not None:
@@ -1577,7 +1742,8 @@ class SessionRuntime:
                 }
             ):
                 self.binding = await self._bindings.mark_recovery_unknown(current)
-                self.state = RuntimeState.RECOVERY_UNKNOWN
+                if not was_fenced:
+                    self.state = RuntimeState.RECOVERY_UNKNOWN
             await self._stop_components(release_owner=True)
             if self.state not in {RuntimeState.RECOVERY_UNKNOWN, RuntimeState.FENCED}:
                 self.state = RuntimeState.DETACHED
@@ -1587,16 +1753,32 @@ class SessionRuntime:
             if self.state != RuntimeState.DETACHED:
                 raise SessionNotReady(f"runtime cannot attach from state {self.state}")
             self.state = RuntimeState.ATTACHING
-            self._lease = await self._owner_leases.acquire(
-                self.binding.sdk_session_id,
-                self._owner_id,
-            )
-            self.binding = await self._bindings.begin_attachment(
-                thread_id=self.binding.thread_id,
-                lease=self._lease,
-                state=AttachmentState.CREATING if create else AttachmentState.RESUMING,
-            )
-            self._start_components()
+            try:
+                self._lease = await self._acquire_owner_for_attachment()
+            except Exception:
+                self.state = RuntimeState.DETACHED
+                raise
+            try:
+                self.binding = await self._bindings.begin_attachment(
+                    thread_id=self.binding.thread_id,
+                    lease=self._lease,
+                    state=(
+                        AttachmentState.CREATING
+                        if create
+                        else AttachmentState.RESUMING
+                    ),
+                )
+                self._start_components()
+            except Exception:
+                lease = self._lease
+                self._lease = None
+                self.state = RuntimeState.DETACHED
+                if lease is not None:
+                    try:
+                        await self._owner_leases.release(lease)
+                    except FenceLost:
+                        pass
+                raise
 
             try:
                 if create:
@@ -1627,6 +1809,7 @@ class SessionRuntime:
             except Exception as error:
                 self.binding = await self._bindings.mark_attach_unknown(self.binding)
                 self.state = RuntimeState.RECOVERY_UNKNOWN
+                await self._stop_components(release_owner=True)
                 raise SessionAttachUnknown(
                     f"session {self.binding.sdk_session_id} attachment is unknown"
                 ) from error
@@ -1715,22 +1898,23 @@ class SessionRuntime:
             self.state = RuntimeState.READY
             async with self._admission_lock:
                 self._accepting_sends = True
-            self._queue_stop.clear()
-            self._queue_task = self._tasks.create(
-                self._queue_pump(),
-                name=f"queue-pump:{self.binding.sdk_session_id}",
-            )
-            self._task_reconcile_stop.clear()
-            self._task_reconcile_requested.set()
-            self._task_reconcile_task = self._tasks.create(
-                self._task_reconcile_loop(),
-                name=f"task-reconcile:{self.binding.sdk_session_id}",
-            )
-            self._permission_reconcile_stop.clear()
-            self._permission_reconcile_task = self._tasks.create(
-                self._permission_reconcile_loop(),
-                name=f"permission-reconcile:{self.binding.sdk_session_id}",
-            )
+            self._start_runtime_producers()
+
+    async def _acquire_owner_for_attachment(self) -> OwnerLease:
+        error: OwnerConflict | None = None
+        for attempt in range(5):
+            try:
+                return await self._owner_leases.acquire(
+                    self.binding.sdk_session_id,
+                    self._owner_id,
+                )
+            except OwnerConflict as conflict:
+                error = conflict
+                if attempt == 4:
+                    break
+                await asyncio.sleep(0.1 * (attempt + 1))
+        assert error is not None
+        raise error
 
     def _start_components(self) -> None:
         self._loop = asyncio.get_running_loop()
@@ -1765,6 +1949,30 @@ class SessionRuntime:
             self._renew_owner(),
             name=f"owner-renew:{self.binding.sdk_session_id}",
         )
+
+    def _start_runtime_producers(self) -> None:
+        self._queue_stop.clear()
+        self._queue_task = self._tasks.create(
+            self._queue_pump(),
+            name=f"queue-pump:{self.binding.sdk_session_id}",
+        )
+        self._task_reconcile_stop.clear()
+        self._task_reconcile_requested.set()
+        self._task_reconcile_task = self._tasks.create(
+            self._task_reconcile_loop(),
+            name=f"task-reconcile:{self.binding.sdk_session_id}",
+        )
+        self._permission_reconcile_stop.clear()
+        self._permission_reconcile_task = self._tasks.create(
+            self._permission_reconcile_loop(),
+            name=f"permission-reconcile:{self.binding.sdk_session_id}",
+        )
+        if self._renewal_task is None:
+            self._renewal_stop.clear()
+            self._renewal_task = self._tasks.create(
+                self._renew_owner(),
+                name=f"owner-renew:{self.binding.sdk_session_id}",
+            )
 
     async def _renew_owner(self) -> None:
         while not self._renewal_stop.is_set():
@@ -1855,8 +2063,10 @@ class SessionRuntime:
             await connection.execute(
                 """
                 UPDATE message_queue
-                SET state = 'submitted', updated_at = ?
-                WHERE state = 'submitting'
+                SET state = 'submitted_unknown', updated_at = ?
+                WHERE state NOT IN (
+                  'cancelled', 'submitted', 'submitted_unknown', 'failed'
+                )
                   AND id IN (
                     SELECT submission_id FROM submissions
                     WHERE sdk_session_id = ?
@@ -1876,11 +2086,6 @@ class SessionRuntime:
                   AND state IN (
                     'submitting', 'submitted', 'submitted_unknown',
                     'observed_active', 'continuation_expected'
-                  )
-                  AND NOT EXISTS (
-                    SELECT 1 FROM message_queue AS q
-                    WHERE q.id = submissions.submission_id
-                      AND q.state IN ('local_queued', 'cancelled')
                   )
                 """,
                 (self.binding.sdk_session_id,),
@@ -1961,7 +2166,8 @@ class SessionRuntime:
                     timeout_seconds=self._shutdown_timeout_seconds
                 )
             except Exception as error:
-                errors.append(error)
+                if self.state != RuntimeState.FENCED:
+                    errors.append(error)
             self._reducer = None
         self._inbox = None
         self._ingress = None
@@ -1973,7 +2179,11 @@ class SessionRuntime:
             try:
                 await self._owner_leases.release(lease)
             except Exception as error:
-                errors.append(error)
+                if not (
+                    self.state == RuntimeState.FENCED
+                    and isinstance(error, FenceLost)
+                ):
+                    errors.append(error)
         if errors:
             raise ExceptionGroup("session component shutdown failed", errors)
 

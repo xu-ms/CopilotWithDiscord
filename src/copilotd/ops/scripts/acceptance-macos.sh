@@ -43,23 +43,27 @@ json.dump(
 )
 PY
 
+sleep_requested_at="$(date +%s)"
+wake_deadline="$((sleep_requested_at + 180))"
 sudo -n pmset relative wake 60
 sudo -n pmset sleepnow
 
-python3 - "$test_started_at" <<'PY'
+python3 - "$sleep_requested_at" "$wake_deadline" <<'PY'
 import sys
 import time
 
 from copilotd.ops.wake import macos_last_resume_timestamp
 
 started = float(sys.argv[1])
-deadline = time.monotonic() + 30
+deadline = float(sys.argv[2])
 while True:
     resumed = macos_last_resume_timestamp()
-    if resumed is not None and resumed >= started:
+    if resumed is not None and started <= resumed <= deadline:
         break
-    if time.monotonic() >= deadline:
-        raise SystemExit("no new macOS wake event occurred after the test started")
+    if time.time() >= deadline:
+        raise SystemExit(
+            "no macOS wake event occurred in the scheduled wake interval"
+        )
     time.sleep(1)
 PY
 

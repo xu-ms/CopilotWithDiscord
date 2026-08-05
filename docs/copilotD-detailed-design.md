@@ -210,6 +210,21 @@ OS service manager
 | `copilotd service uninstall` | 停止并注销 service；保留 SQLite、session state 和 logs |
 | `copilotd run --foreground` | 不注册 service 的显式开发入口 |
 
+restart 使用持久事务而不是“读一次 heartbeat 后 kill”：
+
+1. manager 写 `requested` fence，同时记录 PID、OS process start、generation 和
+   event-journal high-water mark；
+2. bot 关闭全局 create/resume/send admission，停止并 await queue/task/permission/owner-renew
+   producer，冻结并 await mailbox，再 drain reducer inbox；
+3. `acknowledged` 通过 producer counter + journal high-water 的同一条 CAS 提交；任何 SDK
+   callback 或 internal producer 在 requested/acknowledged/prepared/committed 阶段都持久计数，
+   ACK 后到达则令可逆阶段 violated；
+4. normal restart 只在 fenced snapshot 无 blocker 时进入 owner handoff；force 先原子提交
+   `prepared`，只把真实 in-flight 结果置 unknown，并保持 local queued/cancelled/terminal；
+5. `committed` 与 owner lease expiry、binding recovery_unknown 同事务；此后失败只能 fail-closed
+   terminate，不能 release/reopen。新 PID/generation/process-start 在启动 attach 前完成 committed
+   fence adoption，随后 queued claim 以新 generation/fence 重建 submission lease。
+
 ### Heartbeat 协议
 
 bot 每 30 秒原子写入 heartbeat JSON；不是只 touch mtime：
@@ -2353,7 +2368,7 @@ claudeD issue 回归门禁：
 | 已实现 | 当前边界 |
 |---|---|
 | 官方 `github-copilot-sdk==1.0.8` + bundled runtime 1.0.73，stdio `--yolo`，create/resume 后 full allow-all 对账 | sidecar client transport 断开后 session retention 实测失败，因此不声明 detached continuation；crash window 保守标 outcome unknown |
-| 9 个 SQLite migration、project `$HOME` fallback/cwd snapshot、owner fence、creation saga、bounded ingress、单 reducer、event journal、CommandMailbox、liveness leases、eager resume；共享连接事务隔离；`background_tasks_changed` 后 `tasks.refresh/list`，缺 terminal 消失转 UNKNOWN；force restart intent/outcome durable journal 与跨进程 admission fence | eventLog durable replay reconciler仍未接入 production supervisor；experimental task action RPC 继续 gated |
+| 10 个 SQLite migration、project `$HOME` fallback/cwd snapshot、owner fence、creation saga、bounded ingress、单 reducer、event journal、CommandMailbox、liveness leases、eager resume；共享连接事务隔离；`background_tasks_changed` 后 `tasks.refresh/list`，缺 terminal 消失转 UNKNOWN；force restart intent/outcome durable journal、producer/journal dual epoch admission fence 与 owner handoff | eventLog durable replay reconciler仍未接入 production supervisor；experimental task action RPC 继续 gated |
 | durable app FIFO；每次用 `metadata.is_processing()`、`metadata.activity()` 与 `queue.pending_items()` readiness snapshot 只派发队首；`/queue add/list/remove/clear` | native queue entry 没有稳定 host ID 时不做虚假一一镜像；transport ambiguity 不自动重放 |
 | Discord core `/session`、`/project`、`/model`、bare `/autopilot`、bare/optional-prompt `/plan`、`/steer`、`/context`、`/usage`；user-input/Plan-exit/auto-mode-switch 使用 durable exactly-once interaction + select/modal 原位结算；Plan 退出 mode 精确关联并消费 | `/session delete`、compact/fork 和 Native-Gated commands 尚未实现，因而不注册；elicitation/MCP OAuth 仍待接入 |
 | durable input attachment manifest、hash/size 复验、图片 blob 压缩；stream/final RenderOutbox；table hold 与 code/PNG/MD/CSV assets；Discord HTTP/rate-limit 错误分类，超上限 artifact 按序无损分片 | Discord archived/locked thread、attachment edit、exact 429 retry-after 仍需真实 gateway fixture |

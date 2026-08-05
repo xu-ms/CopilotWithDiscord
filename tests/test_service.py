@@ -1,6 +1,7 @@
 import asyncio
 import json
 import plistlib
+import sqlite3
 import sys
 import threading
 import time
@@ -18,16 +19,19 @@ from copilotd.config import Settings
 from copilotd.ops.heartbeat import HeartbeatSnapshot, HeartbeatWriter, read_heartbeat
 from copilotd.ops.service import (
     CommandResult,
+    ForcePreparationUncertain,
     ForceRestartOutcome,
     QuiesceFence,
     RestartBlocked,
     RestartSafetySnapshot,
     RestartStormStore,
+    ServiceError,
     ServiceManager,
     SqliteRestartCoordinator,
     _windows_task_contract_errors,
 )
 from copilotd.storage.database import Database
+from copilotd.storage.leases import OwnerLeaseStore
 
 
 def _settings(tmp_path: Path) -> Settings:
@@ -84,7 +88,9 @@ class FakeRunner:
         self.calls: list[tuple[str, ...]] = []
         self.manager: ServiceManager | None = None
         self.mac_pid = 4321
+        self.process_started_at = time.time() - 10
         self.missing_labels: set[str] = set()
+        self.missing_tasks: set[str] = set()
         self.launchctl_overrides: dict[str, str] = {}
 
     def run(self, command: Any, *, check: bool = False) -> CommandResult:
@@ -132,8 +138,28 @@ class FakeRunner:
             rows.append(
                 {
                     "name": task,
-                    "state": "Ready" if task.endswith("Watchdog") else "Running",
-                    "pid": None if task.endswith("Watchdog") else self.mac_pid,
+                    "state": (
+                        "Missing"
+                        if task in self.missing_tasks
+                        else "Ready"
+                        if task.endswith("Watchdog")
+                        else "Running"
+                    ),
+                    "pid": (
+                        None
+                        if task in self.missing_tasks
+                        or task.endswith("Watchdog")
+                        else self.mac_pid
+                    ),
+                    "process_started_at": (
+                        None
+                        if task in self.missing_tasks
+                        or task.endswith("Watchdog")
+                        else datetime.fromtimestamp(
+                            self.process_started_at,
+                            UTC,
+                        ).isoformat()
+                    ),
                     "xml": xml,
                 }
             )
@@ -156,20 +182,17 @@ class AutoAckRestartCoordinator(SqliteRestartCoordinator):
         *,
         expected_pid: int,
         expected_generation: str,
+        expected_process_started_at: float,
         now: float,
     ) -> QuiesceFence:
         fence = super().request_quiesce(
             expected_pid=expected_pid,
             expected_generation=expected_generation,
+            expected_process_started_at=expected_process_started_at,
             now=now,
         )
         self.acknowledge_quiesce(fence, now=now)
         return fence
-
-    def commit_quiesce(self, fence: QuiesceFence, *, now: float) -> None:
-        super().commit_quiesce(fence, now=now)
-        self.release_quiesce(fence, now=now, reason="test_process_replaced")
-
 
 class ViolatingRestartCoordinator(AutoAckRestartCoordinator):
     def snapshot_under_fence(
@@ -195,6 +218,36 @@ class ViolatingRestartCoordinator(AutoAckRestartCoordinator):
         return snapshot
 
 
+class LateProducerAfterPrepareCoordinator(AutoAckRestartCoordinator):
+    def prepare_force(
+        self,
+        fence: QuiesceFence,
+        snapshot: RestartSafetySnapshot,
+        *,
+        deadline: float,
+    ) -> ForceRestartOutcome:
+        outcome = super().prepare_force(
+            fence,
+            snapshot,
+            deadline=deadline,
+        )
+        connection = self._connect()
+        try:
+            connection.execute(
+                """
+                UPDATE service_admission_fences
+                SET producer_count = producer_count + 1,
+                    violation_count = violation_count + 1
+                WHERE fence_id = ? AND state = 'prepared'
+                """,
+                (fence.fence_id,),
+            )
+            connection.commit()
+        finally:
+            connection.close()
+        return outcome
+
+
 def _manager(
     settings: Settings,
     runner: FakeRunner,
@@ -215,6 +268,7 @@ def _manager(
         uid=501,
         windows_user_id="DOMAIN\\测试用户",
         resume_provider=lambda: None,
+        process_start_provider=lambda _: runner.process_started_at,
         sleep=lambda _: None,
     )
     runner.manager = manager
@@ -338,6 +392,7 @@ def test_reinstall_uses_current_entrypoint_instead_of_stale_persisted_path(
         platform="darwin",
         launch_agents_dir=old_manager.launch_agents_dir,
         command_runner=new_runner,
+        process_start_provider=lambda _: new_runner.process_started_at,
         uid=501,
         resume_provider=lambda: None,
         sleep=lambda _: None,
@@ -373,6 +428,39 @@ def test_effective_launchctl_definition_drift_is_reported(tmp_path: Path) -> Non
     drifted = manager.status()
     assert drifted.ready is False
     assert drifted.definition_drift == ("bot",)
+
+
+def test_post_install_accepts_new_identity_after_legacy_heartbeat(
+    tmp_path: Path,
+) -> None:
+    settings = _settings(tmp_path)
+    runner = FakeRunner()
+    manager = _manager(settings, runner)
+    old = _heartbeat(
+        time.time() - 30,
+        process_generation="legacy-generation",
+        process_started_at=None,
+    )
+    _write_heartbeat(settings, old)
+
+    receipt = manager.install()
+    replacement_started_at = time.time()
+    runner.process_started_at = replacement_started_at
+    _write_heartbeat(
+        settings,
+        _heartbeat(
+            time.time(),
+            process_generation="replacement-generation",
+            process_started_at=datetime.fromtimestamp(
+                replacement_started_at,
+                UTC,
+            ).isoformat().replace("+00:00", "Z"),
+        ),
+    )
+
+    status = manager.verify_post_install(receipt, timeout_seconds=0.1)
+    assert status.ready is True
+    assert status.process_generation == "replacement-generation"
 
 
 def test_windows_tasks_and_powershell_cover_full_current_user_contract(
@@ -413,8 +501,8 @@ def test_windows_tasks_and_powershell_cover_full_current_user_contract(
         child.tag.rsplit("}", 1)[-1]
         for child in watchdog.find(".//t:RegistrationTrigger", namespace)
     ]
-    assert logon_children == ["Repetition", "Enabled", "UserId"]
-    assert registration_children == ["Repetition", "Enabled"]
+    assert logon_children == ["Enabled", "Repetition", "UserId"]
+    assert registration_children == ["Enabled", "Repetition"]
     assert manager.validate_windows_task_xml() == {
         "copilotD Bot": (),
         "copilotD Watchdog": (),
@@ -450,6 +538,8 @@ def test_windows_tasks_and_powershell_cover_full_current_user_contract(
     assert "[regex]::Escape($ActionName)" in installer
     assert "taskkill.exe /PID $hostProcess.ProcessId /T /F" in installer
     assert "process tree did not exit before task unregister" in installer
+    assert "RestartRuntime" in installer
+    assert "Start-ScheduledTask -TaskName 'copilotD Runtime'" in installer
     assert "$knownTaskNames" in installer
     assert installer.index("Stop-CopilotDTasks $knownTaskNames") < installer.index(
         "Unregister-ScheduledTask"
@@ -497,6 +587,52 @@ def test_windows_install_is_idempotent_and_verifies_exported_xml(tmp_path: Path)
     status = manager.status()
     assert status.installed is True
     assert status.definition_drift == ()
+
+
+def test_windows_sidecar_runtime_restart_uses_runtime_task(tmp_path: Path) -> None:
+    settings = _settings(tmp_path)
+    runner = FakeRunner()
+    manager = _manager(
+        settings,
+        runner,
+        platform_name="win32",
+        topology="sidecar",
+    )
+
+    manager._restart_runtime()
+
+    assert any(
+        call[0] == "powershell.exe"
+        and "-Action" in call
+        and call[call.index("-Action") + 1] == "RestartRuntime"
+        for call in runner.calls
+    )
+
+
+def test_windows_partial_install_reports_missing_task_without_crashing(
+    tmp_path: Path,
+) -> None:
+    settings = _settings(tmp_path)
+    runner = FakeRunner()
+    manager = _manager(settings, runner, platform_name="win32")
+    settings.ensure_directories()
+    runtime_dir = settings.data_dir / "runtime"
+    (runtime_dir / "install-service.ps1").write_text(
+        manager.windows_installer(),
+        encoding="utf-8",
+    )
+    for task, xml in manager.windows_task_xml().items():
+        path = manager._windows_task_paths()[task]
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(xml, encoding="utf-8")
+    runner.missing_tasks.add("copilotD Bot")
+
+    status = manager.status()
+
+    assert status.ready is False
+    bot = next(unit for unit in status.units if unit.name == "bot")
+    assert bot.effective_state == "missing"
+    assert bot.process_started_at is None
 
 
 def test_windows_uninstall_fails_closed_without_safe_process_tree_script(
@@ -653,6 +789,9 @@ class RecordingServiceManager(ServiceManager):
         topology: str = "bundled-runtime",
     ) -> None:
         runner = FakeRunner()
+        self.runner = runner
+        self._provider_settings = settings
+        self.use_heartbeat_process_start = True
         super().__init__(
             settings,
             entrypoint=Path("/tmp/copilotd"),
@@ -662,21 +801,55 @@ class RecordingServiceManager(ServiceManager):
             restart_coordinator=AutoAckRestartCoordinator(settings.database_path),
             topology=topology,  # type: ignore[arg-type]
             resume_provider=lambda: resume_at,
+            process_start_provider=self._test_process_started_at,
             notifier=notifier,
         )
         runner.manager = self
-        self.runner = runner
         self.restarts = 0
 
     def _restart_bot(self) -> None:
         self.restarts += 1
+        connection = sqlite3.connect(self.settings.database_path)
+        try:
+            connection.execute(
+                """
+                UPDATE service_admission_fences
+                SET state = 'released', released_at = ?
+                WHERE state = 'committed'
+                """,
+                (time.time(),),
+            )
+            connection.commit()
+        finally:
+            connection.close()
 
     def _heartbeat_generation_matches_verified(
         self,
         snapshot: HeartbeatSnapshot,
+        managed_bot,
+        *,
+        age: float,
     ) -> bool:
-        del snapshot
+        del snapshot, managed_bot, age
         return True
+
+    def _test_process_started_at(self, _pid: int) -> float:
+        if (
+            self.use_heartbeat_process_start
+            and self._provider_settings.heartbeat_path.exists()
+        ):
+            try:
+                snapshot = read_heartbeat(
+                    self._provider_settings.heartbeat_path
+                )
+            except (ValueError, json.JSONDecodeError):
+                pass
+            else:
+                assert snapshot.process_started_at is not None
+                return datetime.fromisoformat(
+                    snapshot.process_started_at.replace("Z", "+00:00")
+                ).timestamp()
+        return self.runner.process_started_at
 
 
 class RecordingNotifier:
@@ -685,6 +858,11 @@ class RecordingNotifier:
 
     def notify(self, title: str, message: str) -> None:
         self.notifications.append((title, message))
+
+
+class FailingWatchdogRestartManager(RecordingServiceManager):
+    def _restart_bot(self) -> None:
+        raise ServiceError("simulated manager restart failure")
 
 
 @pytest.mark.asyncio
@@ -786,6 +964,36 @@ async def test_watchdog_uses_full_durable_restart_blocker_snapshot(
 
 
 @pytest.mark.asyncio
+async def test_watchdog_restart_failure_after_commit_terminates_fail_closed(
+    tmp_path: Path,
+) -> None:
+    settings = _settings(tmp_path)
+    async with Database(settings.database_path):
+        pass
+    settings.ensure_directories()
+    now = time.time()
+    _write_heartbeat(settings, _heartbeat(now - 180))
+    manager = FailingWatchdogRestartManager(settings)
+
+    assert manager.watchdog(now=now) == "restart-failed-closed"
+    assert any(
+        call[:3] == ("launchctl", "kill", "SIGTERM")
+        for call in manager.runner.calls
+    )
+    connection = sqlite3.connect(settings.database_path)
+    try:
+        state = connection.execute(
+            """
+            SELECT state FROM service_admission_fences
+            ORDER BY requested_at DESC LIMIT 1
+            """
+        ).fetchone()[0]
+    finally:
+        connection.close()
+    assert state == "committed"
+
+
+@pytest.mark.asyncio
 async def test_sidecar_watchdog_checkpoints_before_replay_safe_restart(
     tmp_path: Path,
 ) -> None:
@@ -867,6 +1075,8 @@ async def test_sidecar_runtime_loss_marks_inflight_outcome_unknown_without_bot_k
                 submission_id, sdk_session_id, origin, state, created_at
             ) VALUES
               ('submission-1', 'session-1', 'app_message', 'submitted', 0),
+              ('ambiguous-1', 'session-1', 'app_message',
+               'submitted_unknown', 0),
               ('queued-1', 'session-1', 'app_message', 'local_queued', 0),
               ('cancelled-1', 'session-1', 'app_message', 'cancelled', 0),
               ('complete-1', 'session-1', 'app_message', 'semantic_complete', 0)
@@ -882,7 +1092,9 @@ async def test_sidecar_runtime_loss_marks_inflight_outcome_unknown_without_bot_k
               ('submission-1', 'thread-1', 'in flight', 'interactive',
                '{}', 1, 1, 'submitting', 0, 0),
               ('queued-1', 'thread-1', 'queued', 'interactive',
-               '{}', 1, 2, 'local_queued', 0, 0)
+               '{}', 1, 2, 'local_queued', 0, 0),
+              ('ambiguous-1', 'thread-1', 'ambiguous', 'interactive',
+               '{}', 1, 3, 'local_queued', 0, 0)
             """
         )
     now = time.time()
@@ -894,6 +1106,11 @@ async def test_sidecar_runtime_loss_marks_inflight_outcome_unknown_without_bot_k
 
     assert manager.watchdog(now=now) == "runtime-loss-restarted"
     assert manager.restarts == 1
+    assert any(
+        call[:3] == ("launchctl", "kickstart", "-k")
+        and call[-1].endswith("com.github.copilotd.runtime")
+        for call in manager.runner.calls
+    )
     async with Database(settings.database_path) as database:
         submissions = await database.fetchall(
             """
@@ -905,15 +1122,28 @@ async def test_sidecar_runtime_loss_marks_inflight_outcome_unknown_without_bot_k
             "SELECT id, state FROM message_queue ORDER BY id"
         )
     assert [tuple(row) for row in submissions] == [
+        ("ambiguous-1", "outcome_unknown"),
         ("cancelled-1", "cancelled"),
         ("complete-1", "semantic_complete"),
         ("queued-1", "local_queued"),
         ("submission-1", "outcome_unknown"),
     ]
     assert [tuple(row) for row in queue_rows] == [
+        ("ambiguous-1", "submitted_unknown"),
         ("queued-1", "local_queued"),
-        ("submission-1", "submitted"),
+        ("submission-1", "submitted_unknown"),
     ]
+    async with Database(settings.database_path) as database:
+        await database.execute(
+            """
+            UPDATE message_queue SET state = 'cancelled'
+            WHERE id = 'queued-1'
+            """
+        )
+    snapshot = SqliteRestartCoordinator(settings.database_path).snapshot(
+        now=time.time()
+    )
+    assert snapshot.local_pending == 0
 
 
 def test_restart_storm_state_is_concurrency_safe(tmp_path: Path) -> None:
@@ -946,6 +1176,303 @@ def test_restart_storm_policy_spans_real_watchdog_cadence(tmp_path: Path) -> Non
 
 
 @pytest.mark.asyncio
+async def test_committed_restart_hands_off_owner_and_recovers_attachment(
+    tmp_path: Path,
+) -> None:
+    settings = _settings(tmp_path)
+    now = time.time()
+    async with Database(settings.database_path) as database:
+        await database.execute(
+            """
+            INSERT INTO session_bindings(
+                thread_id, project_source, cwd_snapshot, sdk_session_id,
+                attachment_state, runtime_generation, owner_fence_token,
+                created_at, updated_at
+            ) VALUES ('thread-1', 'home', '/tmp', 'session-1',
+                      'attached', 1, 7, ?, ?)
+            """,
+            (now, now),
+        )
+        await database.execute(
+            """
+            INSERT INTO session_owner_leases(
+                sdk_session_id, owner_id, fence_token,
+                acquired_at, renewed_at, expires_at
+            ) VALUES ('session-1', 'old-owner', 7, ?, ?, ?)
+            """,
+            (now, now, now + 60),
+        )
+        await database.execute(
+            """
+            INSERT INTO session_bindings(
+                thread_id, project_source, cwd_snapshot, sdk_session_id,
+                binding_intent, attachment_state,
+                runtime_generation, owner_fence_token,
+                created_at, updated_at
+            ) VALUES ('thread-closing', 'home', '/tmp', 'session-closing',
+                      'closed', 'disconnecting', 1, 9, ?, ?)
+            """,
+            (now, now),
+        )
+        await database.execute(
+            """
+            INSERT INTO session_owner_leases(
+                sdk_session_id, owner_id, fence_token,
+                acquired_at, renewed_at, expires_at
+            ) VALUES ('session-closing', 'closing-owner', 9, ?, ?, ?)
+            """,
+            (now, now, now + 60),
+        )
+    coordinator = SqliteRestartCoordinator(settings.database_path)
+    fence = coordinator.request_quiesce(
+        expected_pid=4321,
+        expected_generation="old-generation",
+        expected_process_started_at=now - 10,
+        now=now,
+    )
+    coordinator.acknowledge_quiesce(fence, now=now)
+    coordinator.commit_quiesce(fence, now=now + 1)
+
+    async with Database(settings.database_path) as database:
+        binding = await database.fetchone(
+            """
+            SELECT attachment_state, attachment_reason
+            FROM session_bindings WHERE sdk_session_id = 'session-1'
+            """
+        )
+        old_owner = await database.fetchone(
+            """
+            SELECT expires_at FROM session_owner_leases
+            WHERE sdk_session_id = 'session-1'
+            """
+        )
+        closing = await database.fetchone(
+            """
+            SELECT binding_intent, attachment_state, attachment_reason
+            FROM session_bindings
+            WHERE sdk_session_id = 'session-closing'
+            """
+        )
+        closing_owner = await database.fetchone(
+            """
+            SELECT expires_at FROM session_owner_leases
+            WHERE sdk_session_id = 'session-closing'
+            """
+        )
+        replacement = await OwnerLeaseStore(database).acquire(
+            "session-1",
+            "replacement-owner",
+            now=now + 2,
+        )
+    assert tuple(binding) == (
+        "recovery_unknown",
+        "restart_owner_handoff",
+    )
+    assert old_owner["expires_at"] == pytest.approx(now + 1)
+    assert tuple(closing) == (
+        "closed",
+        "recovery_unknown",
+        "restart_owner_handoff",
+    )
+    assert closing_owner["expires_at"] == pytest.approx(now + 1)
+    assert replacement.fence_token == 8
+
+    assert coordinator.recover_for_replacement(
+        replacement_pid=5000,
+        replacement_generation="new-generation",
+        replacement_process_started_at=now + 2,
+        now=now + 2,
+    ) == "committed"
+    row = coordinator._fence_row(fence.fence_id)
+    assert row is not None and row["state"] == "released"
+
+
+@pytest.mark.asyncio
+async def test_replacement_completes_crashed_irreversible_prepare(
+    tmp_path: Path,
+) -> None:
+    settings = _settings(tmp_path)
+    now = time.time()
+    async with Database(settings.database_path) as database:
+        await database.execute(
+            """
+            INSERT INTO session_bindings(
+                thread_id, project_source, cwd_snapshot, sdk_session_id,
+                attachment_state, runtime_generation, owner_fence_token,
+                created_at, updated_at
+            ) VALUES ('thread-1', 'home', '/tmp', 'session-1',
+                      'attached', 1, 2, ?, ?)
+            """,
+            (now, now),
+        )
+        await database.execute(
+            """
+            INSERT INTO session_owner_leases(
+                sdk_session_id, owner_id, fence_token,
+                acquired_at, renewed_at, expires_at
+            ) VALUES ('session-1', 'old-owner', 2, ?, ?, ?)
+            """,
+            (now, now, now + 60),
+        )
+        await database.execute(
+            """
+            INSERT INTO submissions(
+                submission_id, sdk_session_id, origin, state, created_at
+            ) VALUES ('submission-1', 'session-1', 'app_message',
+                      'submitted', ?)
+            """,
+            (now,),
+        )
+    coordinator = SqliteRestartCoordinator(settings.database_path)
+    fence = coordinator.request_quiesce(
+        expected_pid=4321,
+        expected_generation="old-generation",
+        expected_process_started_at=now - 10,
+        now=now,
+    )
+    coordinator.acknowledge_quiesce(fence, now=now)
+    snapshot = coordinator.snapshot_under_fence(fence, now=now)
+    coordinator.prepare_force(fence, snapshot, deadline=now + 10)
+    assert coordinator._fence_row(fence.fence_id)["state"] == "prepared"
+
+    assert coordinator.recover_for_replacement(
+        replacement_pid=5000,
+        replacement_generation="replacement-generation",
+        replacement_process_started_at=now + 1,
+        now=now + 1,
+    ) == "committed"
+
+    connection = coordinator._connect()
+    try:
+        row = connection.execute(
+            """
+            SELECT state, owner_handoff_at
+            FROM service_admission_fences WHERE fence_id = ?
+            """,
+            (fence.fence_id,),
+        ).fetchone()
+        owner = connection.execute(
+            """
+            SELECT expires_at FROM session_owner_leases
+            WHERE sdk_session_id = 'session-1'
+            """
+        ).fetchone()
+    finally:
+        connection.close()
+    assert row["state"] == "released"
+    assert row["owner_handoff_at"] is not None
+    assert owner["expires_at"] == pytest.approx(now + 1)
+
+
+@pytest.mark.asyncio
+async def test_replacement_adopts_reversible_crash_owner_without_ttl_wait(
+    tmp_path: Path,
+) -> None:
+    settings = _settings(tmp_path)
+    now = time.time()
+    async with Database(settings.database_path) as database:
+        await database.execute(
+            """
+            INSERT INTO session_bindings(
+                thread_id, project_source, cwd_snapshot, sdk_session_id,
+                attachment_state, runtime_generation, owner_fence_token,
+                created_at, updated_at
+            ) VALUES ('thread-1', 'home', '/tmp', 'session-1',
+                      'attached', 1, 4, ?, ?)
+            """,
+            (now, now),
+        )
+        await database.execute(
+            """
+            INSERT INTO session_owner_leases(
+                sdk_session_id, owner_id, fence_token,
+                acquired_at, renewed_at, expires_at
+            ) VALUES ('session-1', 'crashed-owner', 4, ?, ?, ?)
+            """,
+            (now, now, now + 60),
+        )
+    coordinator = SqliteRestartCoordinator(settings.database_path)
+    coordinator.request_quiesce(
+        expected_pid=4321,
+        expected_generation="crashed-generation",
+        expected_process_started_at=now - 10,
+        now=now,
+    )
+
+    assert coordinator.recover_for_replacement(
+        replacement_pid=5000,
+        replacement_generation="replacement-generation",
+        replacement_process_started_at=now + 1,
+        now=now + 1,
+    ) == "requested"
+
+    async with Database(settings.database_path) as database:
+        binding = await database.fetchone(
+            """
+            SELECT attachment_state, attachment_reason
+            FROM session_bindings WHERE sdk_session_id = 'session-1'
+            """
+        )
+        replacement = await OwnerLeaseStore(database).acquire(
+            "session-1",
+            "replacement-owner",
+            now=now + 2,
+        )
+    assert tuple(binding) == (
+        "recovery_unknown",
+        "replacement_adopted_reversible_crash",
+    )
+    assert replacement.fence_token == 5
+
+
+@pytest.mark.asyncio
+async def test_replacement_recovers_legacy_committed_fence_with_null_epochs(
+    tmp_path: Path,
+) -> None:
+    settings = _settings(tmp_path)
+    now = time.time()
+    async with Database(settings.database_path) as database:
+        await database.execute(
+            """
+            INSERT INTO service_admission_fences(
+                fence_id, expected_pid, expected_generation,
+                expected_process_started_at, state, requested_at,
+                acknowledged_at, committed_at, owner_handoff_at,
+                ingress_depth, producer_count,
+                acknowledged_producer_count,
+                acknowledged_journal_id, violation_count, detail
+            ) VALUES (
+                'legacy-fence', 4321, 'legacy-generation', NULL,
+                'committed', ?, ?, ?, ?, 0, 0, NULL, NULL, 0, '{}'
+            )
+            """,
+            (now - 10, now - 9, now - 8, now - 8),
+        )
+    coordinator = SqliteRestartCoordinator(settings.database_path)
+
+    assert coordinator.recover_for_replacement(
+        replacement_pid=5000,
+        replacement_generation="replacement-generation",
+        replacement_process_started_at=now,
+        now=now,
+    ) == "committed"
+
+    row = coordinator._fence_row("legacy-fence")
+    assert row is not None and row["state"] == "released"
+    connection = coordinator._connect()
+    try:
+        incident = connection.execute(
+            """
+            SELECT kind FROM service_restart_intents
+            WHERE restart_id = 'legacy-fence'
+            """
+        ).fetchone()
+    finally:
+        connection.close()
+    assert incident["kind"] == "post_commit_producer_violation"
+
+
+@pytest.mark.asyncio
 async def test_watchdog_never_kills_replacement_or_process_in_startup_grace(
     tmp_path: Path,
 ) -> None:
@@ -955,9 +1482,26 @@ async def test_watchdog_never_kills_replacement_or_process_in_startup_grace(
     settings.ensure_directories()
     now = time.time()
     replacement = RecordingServiceManager(settings)
+    replacement.use_heartbeat_process_start = False
     replacement.runner.mac_pid = 9001
     _write_heartbeat(settings, _heartbeat(now - 180, pid=4321))
 
+    assert replacement.watchdog(now=now) == "replacement-starting"
+    assert replacement.restarts == 0
+
+    replacement.runner.mac_pid = 4321
+    replacement.runner.process_started_at = now - 10
+    _write_heartbeat(
+        settings,
+        _heartbeat(
+            now - 180,
+            pid=4321,
+            process_started_at=datetime.fromtimestamp(
+                now - 190,
+                UTC,
+            ).isoformat().replace("+00:00", "Z"),
+        ),
+    )
     assert replacement.watchdog(now=now) == "replacement-starting"
     assert replacement.restarts == 0
 
@@ -973,6 +1517,54 @@ async def test_watchdog_never_kills_replacement_or_process_in_startup_grace(
     )
     assert replacement.watchdog(now=now) == "startup-grace"
     assert replacement.restarts == 0
+
+
+@pytest.mark.asyncio
+async def test_watchdog_explicitly_adopts_ready_replacement_generation(
+    tmp_path: Path,
+) -> None:
+    settings = _settings(tmp_path)
+    async with Database(settings.database_path):
+        pass
+    settings.ensure_directories()
+    now = time.time()
+    runner = FakeRunner()
+    runner.process_started_at = now - 10
+    manager = _manager(settings, runner)
+    settings.service_state_path.parent.mkdir(parents=True, exist_ok=True)
+    settings.service_state_path.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "last_verified_pid": 4321,
+                "last_verified_generation": "old-generation",
+                "last_verified_process_started_at": (
+                    datetime.fromtimestamp(now - 100, UTC)
+                    .isoformat()
+                    .replace("+00:00", "Z")
+                ),
+                "last_verified_at": now - 90,
+            }
+        ),
+        encoding="utf-8",
+    )
+    _write_heartbeat(
+        settings,
+        _heartbeat(
+            now,
+            process_generation="replacement-generation",
+            process_started_at=(
+                datetime.fromtimestamp(now - 10, UTC)
+                .isoformat()
+                .replace("+00:00", "Z")
+            ),
+        ),
+    )
+
+    assert manager.watchdog(now=now) == "healthy"
+    state = json.loads(settings.service_state_path.read_text(encoding="utf-8"))
+    assert state["last_verified_generation"] == "replacement-generation"
+    assert state["replacement_adopted_at"] == pytest.approx(now)
 
 
 @pytest.mark.asyncio
@@ -1113,13 +1705,30 @@ async def test_restart_fails_closed_and_force_marks_ambiguous_work_unknown(
 class SlowRestartCoordinator(AutoAckRestartCoordinator):
     def prepare_force(
         self,
+        fence: QuiesceFence,
         snapshot: RestartSafetySnapshot,
         *,
         deadline: float,
     ) -> ForceRestartOutcome:
-        del snapshot, deadline
-        time.sleep(1.5)
-        return ForceRestartOutcome(0, 0, 0, 0, 0, 0, 0, False, "slow")
+        del fence, snapshot, deadline
+        connection = self._connect()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            time.sleep(1.5)
+            connection.rollback()
+        finally:
+            connection.close()
+        return ForceRestartOutcome(
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            False,
+            "slow locked writer",
+        )
 
 
 @pytest.mark.asyncio
@@ -1138,6 +1747,7 @@ async def test_force_restart_coordinator_is_bounded_with_durable_fallback(
         command_runner=runner,
         restart_coordinator=SlowRestartCoordinator(settings.database_path),
         resume_provider=lambda: None,
+        process_start_provider=lambda _: runner.process_started_at,
         uid=501,
         sleep=lambda _: None,
     )
@@ -1146,13 +1756,15 @@ async def test_force_restart_coordinator_is_bounded_with_durable_fallback(
     _write_heartbeat(settings, _heartbeat(time.time()))
 
     started = time.monotonic()
-    receipt = manager.restart(force=True)
+    with pytest.raises(ForcePreparationUncertain):
+        manager.restart(force=True)
     elapsed = time.monotonic() - started
 
     assert elapsed < 1.2
-    assert receipt.force_outcome is not None
-    assert receipt.force_outcome.bounded is False
-    assert "timed out" in receipt.force_outcome.detail
+    assert any(
+        call[:3] == ("launchctl", "kill", "SIGTERM")
+        for call in runner.calls
+    )
 
 
 def test_restart_missing_or_malformed_heartbeat_fails_closed(tmp_path: Path) -> None:
@@ -1181,6 +1793,7 @@ async def test_restart_aborts_if_ingress_arrives_after_fenced_snapshot(
         command_runner=runner,
         restart_coordinator=ViolatingRestartCoordinator(settings.database_path),
         resume_provider=lambda: None,
+        process_start_provider=lambda _: runner.process_started_at,
         uid=501,
         sleep=lambda _: None,
     )
@@ -1198,6 +1811,115 @@ async def test_restart_aborts_if_ingress_arrives_after_fenced_snapshot(
         [call for call in runner.calls if call[:3] == ("launchctl", "kickstart", "-k")]
     )
     assert restart_calls_after == restart_calls_before
+
+
+@pytest.mark.asyncio
+async def test_force_prepare_failure_stays_irreversible_and_terminates_bot(
+    tmp_path: Path,
+) -> None:
+    settings = _settings(tmp_path)
+    now = time.time()
+    async with Database(settings.database_path) as database:
+        await database.execute(
+            """
+            INSERT INTO session_bindings(
+                thread_id, project_source, cwd_snapshot, sdk_session_id,
+                attachment_state, runtime_generation, owner_fence_token,
+                created_at, updated_at
+            ) VALUES ('thread-1', 'home', '/tmp', 'session-1',
+                      'attached', 1, 5, ?, ?)
+            """,
+            (now, now),
+        )
+        await database.execute(
+            """
+            INSERT INTO session_owner_leases(
+                sdk_session_id, owner_id, fence_token,
+                acquired_at, renewed_at, expires_at
+            ) VALUES ('session-1', 'old-owner', 5, ?, ?, ?)
+            """,
+            (now, now, now + 60),
+        )
+        await database.execute(
+            """
+            INSERT INTO submissions(
+                submission_id, sdk_session_id, origin, state, created_at
+            ) VALUES ('submission-1', 'session-1', 'app_message',
+                      'submitted', ?)
+            """,
+            (now,),
+        )
+    runner = FakeRunner()
+    coordinator = LateProducerAfterPrepareCoordinator(
+        settings.database_path
+    )
+    manager = ServiceManager(
+        settings,
+        entrypoint=settings.resolved_home / "copilotd",
+        platform="darwin",
+        launch_agents_dir=settings.resolved_home / "LaunchAgents",
+        command_runner=runner,
+        restart_coordinator=coordinator,
+        resume_provider=lambda: None,
+        process_start_provider=lambda _: runner.process_started_at,
+        uid=501,
+        sleep=lambda _: None,
+    )
+    runner.manager = manager
+    manager.install()
+    _write_heartbeat(settings, _heartbeat(now, active_submissions=1))
+
+    with pytest.raises(
+        RestartBlocked,
+        match="admission_fence_producer_changed",
+    ):
+        manager.restart(force=True)
+
+    connection = coordinator._connect()
+    try:
+        fence = connection.execute(
+            """
+            SELECT state, owner_handoff_at, violation_count
+            FROM service_admission_fences
+            ORDER BY requested_at DESC LIMIT 1
+            """
+        ).fetchone()
+        owner = connection.execute(
+            """
+            SELECT expires_at FROM session_owner_leases
+            WHERE sdk_session_id = 'session-1'
+            """
+        ).fetchone()
+    finally:
+        connection.close()
+    assert fence["state"] == "committed"
+    assert fence["owner_handoff_at"] is not None
+    assert fence["violation_count"] == 1
+    assert owner["expires_at"] <= time.time()
+    assert any(
+        call[:3] == ("launchctl", "kill", "SIGTERM")
+        for call in runner.calls
+    )
+    assert coordinator.recover_for_replacement(
+        replacement_pid=5000,
+        replacement_generation="replacement-generation",
+        replacement_process_started_at=now + 2,
+        now=now + 2,
+    ) == "committed"
+    connection = coordinator._connect()
+    try:
+        incident = connection.execute(
+            """
+            SELECT kind, outcome FROM service_restart_intents
+            WHERE kind = 'post_commit_producer_violation'
+            """
+        ).fetchone()
+    finally:
+        connection.close()
+    assert tuple(incident) == (
+        "post_commit_producer_violation",
+        "unknown",
+    )
     settings.heartbeat_path.parent.mkdir(parents=True, exist_ok=True)
     settings.heartbeat_path.write_text("not-json", encoding="utf-8")
     with pytest.raises(RestartBlocked, match="heartbeat_unavailable"):

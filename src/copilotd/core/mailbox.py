@@ -238,6 +238,19 @@ class CommandMailbox:
     def freeze(self) -> None:
         self._accepting = False
 
+    async def pause_admission(self) -> None:
+        async with self._submission_lock:
+            self._accepting = False
+
+    async def resume_admission(self) -> None:
+        async with self._submission_lock:
+            if self._worker is None:
+                raise RuntimeError("command mailbox is not running")
+            self._accepting = True
+
+    async def wait_idle(self) -> None:
+        await self._queue.join()
+
     async def stop(self, *, timeout_seconds: float = 5) -> None:
         if self._worker is None:
             return
