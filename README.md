@@ -119,3 +119,8 @@ skip. The workflow uses dedicated interactive self-hosted runners whose user pro
 already authenticated to Copilot, runs a live SDK preflight, and requires permission to
 schedule a wake and put the machine to sleep. `scripts/package-smoke.sh` builds and
 installs both the wheel and sdist in isolated environments.
+
+The macOS lane refuses to overwrite pre-existing copilotD LaunchAgents, validates a real
+restart plus post-wake soak, scans its work artifacts for the Discord token, and always
+uninstalls its test service. Set `COPILOTD_ACCEPTANCE_EVIDENCE_DIR` to retain its
+permission-restricted sanitized JSON summary.

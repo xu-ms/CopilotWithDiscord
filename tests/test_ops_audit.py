@@ -72,6 +72,11 @@ def test_selected_hardware_lanes_require_real_resume_and_recheck_health() -> Non
     assert "status-after-soak.json" in macos
     assert "bot generation changed during soak" in macos
     assert "if ! log show" in macos
+    assert "existing LaunchAgent would be replaced" in macos
+    assert "copilotd service uninstall" in macos
+    assert "COPILOTD_ACCEPTANCE_EVIDENCE_DIR" in macos
+    assert "credential leaked into acceptance artifact" in macos
+    assert '"cleanup_verified": True' in macos
     assert "COPILOTD_ACCEPTANCE_ALLOW_SLEEP" in windows
     assert "SetSuspendState" in windows
     assert "$wakeDeadline = $sleepRequestedAt.AddMinutes(3)" in windows
