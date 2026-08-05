@@ -31,14 +31,21 @@ class DiscordAttachment(Protocol):
     async def read(self, *, use_cached: bool = ...) -> bytes: ...
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True)
+class AttachmentCapabilities:
+    discord_file_max_bytes: int | None = None
+    discord_message_max_bytes: int | None = None
+    runtime_inline_blob_max_bytes: int | None = None
+
+
+@dataclass(frozen=True)
 class PreparedAttachments:
     manifest_id: str
     count: int
     total_bytes: int
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True)
 class _StoredItem:
     item_index: int
     original_name: str
@@ -47,6 +54,13 @@ class _StoredItem:
     sha256: str
     local_path: Path
     sdk_attachment_kind: str
+
+
+@dataclass(frozen=True)
+class _ResolvedLimits:
+    file_max_bytes: int
+    message_max_bytes: int
+    inline_blob_max_bytes: int
 
 
 class AttachmentService:
@@ -60,15 +74,15 @@ class AttachmentService:
         file_max_bytes: int = 25 * 1024 * 1024,
         message_max_bytes: int = 100 * 1024 * 1024,
         blob_max_bytes: int = 7 * 1024 * 1024,
+        capabilities: AttachmentCapabilities | None = None,
     ) -> None:
         self._database = database
         self._data_dir = data_dir
         self._file_max_bytes = file_max_bytes
         self._message_max_bytes = message_max_bytes
         self._blob_max_bytes = blob_max_bytes
-        self._locks: weakref.WeakValueDictionary[str, asyncio.Lock] = (
-            weakref.WeakValueDictionary()
-        )
+        self._capabilities = capabilities
+        self._locks: weakref.WeakValueDictionary[str, asyncio.Lock] = weakref.WeakValueDictionary()
 
     async def prepare(
         self,
@@ -107,7 +121,8 @@ class AttachmentService:
                 session_id=session_id,
             )
             try:
-                self._validate_declared_sizes(attachments)
+                if self._capabilities is None:
+                    self._validate_declared_sizes(attachments)
                 stored = await self._download_all(manifest_id, session_id, attachments)
                 total_bytes = sum(item.byte_size for item in stored)
                 await self._commit_items(manifest_id, stored, total_bytes)
@@ -129,11 +144,11 @@ class AttachmentService:
         result: list[dict[str, Any]] = []
         for item in items:
             if item.sdk_attachment_kind == "blob":
-                content = await asyncio.to_thread(item.local_path.read_bytes)
+                data = await asyncio.to_thread(_read_and_encode_blob, item.local_path)
                 result.append(
                     {
                         "type": "blob",
-                        "data": base64.b64encode(content).decode("ascii"),
+                        "data": data,
                         "mimeType": item.mime_type,
                         "displayName": item.original_name,
                     }
@@ -199,43 +214,56 @@ class AttachmentService:
         directory = self._data_dir / "sessions" / session_id / "attachments" / manifest_id
         await asyncio.to_thread(directory.mkdir, parents=True, exist_ok=True)
         stored: list[_StoredItem] = []
-        image_count = sum(
-            1
-            for attachment in attachments
-            if (attachment.content_type or "").startswith("image/")
-        )
-        per_image_limit = (
-            self._blob_max_bytes
-            if image_count == 0
-            else max(128 * 1024, self._blob_max_bytes // image_count)
-        )
-        downloaded_bytes = 0
+        limits = self._resolved_limits()
+        strict_legacy = self._capabilities is None
         for index, attachment in enumerate(attachments):
             content = await attachment.read(use_cached=True)
-            if len(content) > self._file_max_bytes:
-                raise AttachmentError(f"{attachment.filename} exceeded its declared size limit")
-            downloaded_bytes += len(content)
-            if downloaded_bytes > self._message_max_bytes:
-                raise AttachmentError("downloaded attachments exceeded the message limit")
             mime_type = attachment.content_type or "application/octet-stream"
-            kind = "blob" if mime_type.startswith("image/") else "file"
-            if kind == "blob" and len(content) > per_image_limit:
-                content, mime_type = await asyncio.to_thread(
-                    _compress_image,
-                    content,
-                    mime_type,
-                    per_image_limit,
+            stored_bytes = content
+            stored_mime = mime_type
+            kind = "file"
+
+            if mime_type.startswith("image/"):
+                if len(content) <= limits.inline_blob_max_bytes:
+                    kind = "blob"
+                else:
+                    try:
+                        compressed, compressed_mime = await asyncio.to_thread(
+                            _compress_image,
+                            content,
+                            mime_type,
+                            limits.inline_blob_max_bytes,
+                        )
+                    except AttachmentError:
+                        if strict_legacy:
+                            raise
+                    else:
+                        if len(compressed) <= limits.inline_blob_max_bytes:
+                            stored_bytes = compressed
+                            stored_mime = compressed_mime
+                            kind = "blob"
+                        elif strict_legacy:
+                            raise AttachmentError(
+                                "image cannot be reduced below the SDK inline attachment limit"
+                            )
+            elif strict_legacy and (
+                attachment.size > self._file_max_bytes or len(content) > self._message_max_bytes
+            ):
+                raise AttachmentError(
+                    f"{attachment.filename} exceeds the "
+                    f"{self._file_max_bytes // (1024 * 1024)} MiB file limit"
                 )
+
             filename = f"{index:03d}-{_safe_filename(attachment.filename)}"
             target = directory / filename
-            await asyncio.to_thread(_atomic_write, target, content)
+            await asyncio.to_thread(_atomic_write, target, stored_bytes)
             stored.append(
                 _StoredItem(
                     item_index=index,
                     original_name=attachment.filename,
-                    mime_type=mime_type,
-                    byte_size=len(content),
-                    sha256=hashlib.sha256(content).hexdigest(),
+                    mime_type=stored_mime,
+                    byte_size=len(stored_bytes),
+                    sha256=await asyncio.to_thread(_sha256_hex, stored_bytes),
                     local_path=target.resolve(),
                     sdk_attachment_kind=kind,
                 )
@@ -316,6 +344,35 @@ class AttachmentService:
                 raise AttachmentError(f"attachment integrity check failed: {item.original_name}")
         return items
 
+    def _resolved_limits(self) -> _ResolvedLimits:
+        if self._capabilities is None:
+            return _ResolvedLimits(
+                file_max_bytes=self._file_max_bytes,
+                message_max_bytes=self._message_max_bytes,
+                inline_blob_max_bytes=self._blob_max_bytes,
+            )
+        return _ResolvedLimits(
+            file_max_bytes=_min_non_none(
+                self._file_max_bytes,
+                self._capabilities.discord_file_max_bytes,
+            ),
+            message_max_bytes=_min_non_none(
+                self._message_max_bytes,
+                self._capabilities.discord_message_max_bytes,
+            ),
+            inline_blob_max_bytes=_min_non_none(
+                self._blob_max_bytes,
+                self._capabilities.runtime_inline_blob_max_bytes,
+            ),
+        )
+
+
+def _min_non_none(*values: int | None) -> int:
+    numeric = [value for value in values if value is not None]
+    if not numeric:
+        raise ValueError("at least one attachment limit must be provided")
+    return min(numeric)
+
 
 def _safe_filename(filename: str) -> str:
     name = Path(filename).name
@@ -332,12 +389,21 @@ def _atomic_write(path: Path, content: bytes) -> None:
         temporary.unlink(missing_ok=True)
 
 
+def _sha256_hex(content: bytes) -> str:
+    return hashlib.sha256(content).hexdigest()
+
+
+def _read_and_encode_blob(path: Path) -> str:
+    content = path.read_bytes()
+    return base64.b64encode(content).decode("ascii")
+
+
 def _matches_integrity(item: _StoredItem) -> bool:
     try:
         content = item.local_path.read_bytes()
     except OSError:
         return False
-    return len(content) == item.byte_size and hashlib.sha256(content).hexdigest() == item.sha256
+    return len(content) == item.byte_size and _sha256_hex(content) == item.sha256
 
 
 def _compress_image(content: bytes, mime_type: str, limit: int) -> tuple[bytes, str]:

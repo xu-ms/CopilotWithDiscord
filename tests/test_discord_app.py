@@ -1,12 +1,17 @@
 from pathlib import Path
+from types import SimpleNamespace
+from typing import Any
 
 import discord
 import pytest
 
 from copilotd.config import Settings
+from copilotd.core.commands import UnknownInteractionError
 from copilotd.discord_app import (
     CopilotDiscordBot,
+    DiscordInteractionResponder,
     _discord_render,
+    _discord_render_plan,
     _prepare_discord_assets,
     _render_delivery_error,
     _render_view,
@@ -36,21 +41,68 @@ def test_discord_command_manifest_has_core_modes_and_no_deleted_roots(tmp_path: 
         "plan",
         "steer",
         "queue",
+        "ops",
+        "Ask Copilot",
+        "Pin message",
     } <= roots
-    assert not {
-        "copilot",
-        "workflow",
-        "max-turns",
-        "mode",
-        "goal",
-        "bare",
-        "tools",
-        "cost",
-        "budget",
-        "limits",
-        "pr",
-        "delegate",
-    } & roots
+    assert (
+        not {
+            "copilot",
+            "workflow",
+            "max-turns",
+            "mode",
+            "goal",
+            "bare",
+            "tools",
+            "cost",
+            "budget",
+            "limits",
+            "pr",
+            "delegate",
+        }
+        & roots
+    )
+
+    project = bot.tree.get_command("project")
+    ops = bot.tree.get_command("ops")
+    assert isinstance(project, discord.app_commands.Group)
+    assert isinstance(ops, discord.app_commands.Group)
+    assert {"bind", "info", "layout", "mention", "variable", "mcp", "skill", "plugin", "agent"} <= {
+        command.name for command in project.commands
+    }
+    assert {"health", "diagnostics", "debug", "log-tail", "event-dump"} == {
+        command.name for command in ops.commands
+    }
+
+
+class _SummaryCapability:
+    def supports_reasoning_summary(self, model_id: str) -> bool:
+        return model_id == "gpt-test"
+
+    async def read_current_model(self, *, session_id: str) -> dict[str, Any]:
+        del session_id
+        return {"reasoningSummary": "concise"}
+
+
+def test_model_reasoning_summary_option_is_capability_injected(tmp_path: Path) -> None:
+    unsupported = CopilotDiscordBot(Settings(data_dir=tmp_path / "unsupported"))
+    unsupported._register_application_commands()
+    unsupported_model = unsupported.tree.get_command("model")
+    assert isinstance(unsupported_model, discord.app_commands.Group)
+    unsupported_set = unsupported_model.get_command("set")
+    assert unsupported_set is not None
+    assert "reasoning_summary" not in {parameter.name for parameter in unsupported_set.parameters}
+
+    supported = CopilotDiscordBot(
+        Settings(data_dir=tmp_path / "supported"),
+        model_summary_adapter=_SummaryCapability(),
+    )
+    supported._register_application_commands()
+    supported_model = supported.tree.get_command("model")
+    assert isinstance(supported_model, discord.app_commands.Group)
+    supported_set = supported_model.get_command("set")
+    assert supported_set is not None
+    assert "reasoning_summary" in {parameter.name for parameter in supported_set.parameters}
 
 
 def test_streaming_table_is_held_before_discord_edit() -> None:
@@ -76,9 +128,7 @@ before
 after
 """.strip()
 
-    rendered, assets = await _discord_render(
-        {"content": content, "finalized": True}
-    )
+    rendered, assets = await _discord_render({"content": content, "finalized": True})
 
     assert "before" in rendered
     assert "alpha" in rendered
@@ -106,6 +156,22 @@ async def test_discord_render_preserves_explicit_text_artifact() -> None:
     assert len(assets) == 1
     assert assets[0].filename == "tool-output.txt"
     assert assets[0].content == b"verbatim output"
+
+
+@pytest.mark.asyncio
+async def test_local_image_warning_flood_stays_within_discord_limit(
+    tmp_path: Path,
+) -> None:
+    content = "\n".join(f"![missing-{index}](missing-{index}.png)" for index in range(80))
+
+    plan = await _discord_render_plan(
+        {"content": content, "finalized": True},
+        allowed_roots=(tmp_path,),
+    )
+
+    assert len(plan.batches) > 1
+    assert all(len(batch.content) <= 1850 for batch in plan.batches)
+    assert any("image path" in batch.content for batch in plan.batches)
 
 
 def test_large_discord_assets_are_split_losslessly_below_upload_limit() -> None:
@@ -144,6 +210,55 @@ class _FakeDiscordResponse:
         self.headers = headers or {}
 
 
+class _ExpiredInteractionResponse:
+    def is_done(self) -> bool:
+        return False
+
+    async def defer(self, **_kwargs: Any) -> None:
+        raise discord.NotFound(
+            _FakeDiscordResponse(404),
+            {"code": 10062, "message": "Unknown interaction"},
+        )
+
+    async def send_modal(self, _modal: discord.ui.Modal) -> None:
+        raise discord.NotFound(
+            _FakeDiscordResponse(404),
+            {"code": 10062, "message": "Unknown interaction"},
+        )
+
+
+class _FallbackChannel:
+    def __init__(self) -> None:
+        self.messages: list[str] = []
+
+    async def send(self, content: str, **_kwargs: Any) -> None:
+        self.messages.append(content)
+
+
+@pytest.mark.asyncio
+async def test_component_and_modal_unknown_interaction_fall_back_in_thread(
+    tmp_path: Path,
+) -> None:
+    bot = CopilotDiscordBot(Settings(data_dir=tmp_path))
+    channel = _FallbackChannel()
+    interaction = SimpleNamespace(
+        response=_ExpiredInteractionResponse(),
+        followup=SimpleNamespace(),
+        channel=channel,
+    )
+    responder = DiscordInteractionResponder(bot, interaction, name="component")
+
+    with pytest.raises(UnknownInteractionError):
+        await responder.defer()
+    await responder.send_followup("durable component result")
+
+    modal_responder = DiscordInteractionResponder(bot, interaction, name="modal")
+    await modal_responder.send_modal(discord.ui.Modal(title="Test modal"))
+
+    assert "durable component result" in channel.messages[0]
+    assert "form opened" in channel.messages[1]
+
+
 def test_discord_http_errors_map_to_outbox_delivery_classes() -> None:
     rate_limit = _render_delivery_error(
         discord.HTTPException(
@@ -174,9 +289,7 @@ def test_taskdeck_view_uses_short_in_place_controls() -> None:
                 "page_count": 2,
                 "selected_card_token": "card-a",
                 "expanded": False,
-                "options": [
-                    {"label": "Worker A", "value": "card-a", "state": "running"}
-                ],
+                "options": [{"label": "Worker A", "value": "card-a", "state": "running"}],
             }
         }
     )

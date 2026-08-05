@@ -31,6 +31,9 @@ async def test_initial_migration_creates_full_schema(tmp_path: Path) -> None:
         "render_messages",
         "render_outbox",
         "render_streams",
+        "render_attachment_batches",
+        "render_attachment_checkpoints",
+        "render_parent_diagnostics",
         "runtime_incidents",
         "runtime_schedules",
         "schedule_runs",
@@ -40,10 +43,14 @@ async def test_initial_migration_creates_full_schema(tmp_path: Path) -> None:
         "session_creation_intents",
         "session_operations",
         "session_owner_leases",
+        "session_projection_snapshots",
+        "session_ui_metadata",
         "skill_dirs",
         "submissions",
         "task_card_projections",
         "taskdeck_panel_state",
+        "pinned_message_provenance",
+        "tool_output_streams",
         "usage_samples",
     }
 
@@ -72,7 +79,7 @@ async def test_migrations_are_idempotent(tmp_path: Path) -> None:
     async with Database(database_path) as database:
         rows = await database.fetchall("SELECT version FROM schema_migrations")
 
-    assert [row["version"] for row in rows] == [1, 2, 3, 4, 5, 6, 7]
+    assert [row["version"] for row in rows] == list(range(1, 11))
 
 
 @pytest.mark.asyncio

@@ -1,32 +1,171 @@
 from __future__ import annotations
 
+import hashlib
 import re
+import shlex
+from collections.abc import Sequence
 from dataclasses import dataclass
+from pathlib import Path
+
+from PIL import Image, UnidentifiedImageError
 
 _DELIMITER_CELL = re.compile(r"^:?-{3,}:?$")
+_LIST_ITEM_RE = re.compile(r"^(?P<indent>[ \t]*)(?P<marker>(?:[*+-]|\d+[.)]))[ \t]+(?P<body>.*)$")
+_FENCE_RE = re.compile(r"^(?P<indent>[ \t]*)(?P<fence>`{3,}|~{3,})(?P<info>.*)$")
+_BLOCKQUOTE_RE = re.compile(r"^[ \t]*>[ \t]?(?P<body>.*)$")
+_THEMATIC_BREAK_RE = re.compile(r"^[ \t]*(?:\*{3,}|-{3,}|_{3,})[ \t]*$")
+_IMAGE_RE = re.compile(r"!\[(?P<alt>[^\]]*)\]\((?P<target>[^)]+)\)")
+_CONTINUATION_MARKER = "… continued …\n"
+_SUPPORTED_IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".tiff"}
+
+
+@dataclass(frozen=True, slots=True)
+class MarkdownSpan:
+    start_line: int
+    end_line: int
 
 
 @dataclass(frozen=True, slots=True)
 class TextBlock:
     content: str
+    span: MarkdownSpan | None = None
 
 
 @dataclass(frozen=True, slots=True)
 class TableBlock:
     markdown: str
+    span: MarkdownSpan | None = None
+    source_hash: str | None = None
+    raw_lines: tuple[str, ...] = ()
 
 
 MarkdownBlock = TextBlock | TableBlock
 
 
+@dataclass(frozen=True, slots=True)
+class MarkdownParagraph:
+    text: str
+    raw: str
+    span: MarkdownSpan
+
+
+@dataclass(frozen=True, slots=True)
+class MarkdownListItem:
+    marker: str
+    body: str
+    raw: str
+    span: MarkdownSpan
+    continuation_lines: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class MarkdownListBlock:
+    ordered: bool
+    items: tuple[MarkdownListItem, ...]
+    raw: str
+    span: MarkdownSpan
+
+
+@dataclass(frozen=True, slots=True)
+class MarkdownBlockquote:
+    lines: tuple[str, ...]
+    raw: str
+    span: MarkdownSpan
+
+
+@dataclass(frozen=True, slots=True)
+class MarkdownFence:
+    fence: str
+    info: str
+    code: str
+    raw: str
+    span: MarkdownSpan
+
+
+@dataclass(frozen=True, slots=True)
+class MarkdownThematicBreak:
+    raw: str
+    span: MarkdownSpan
+
+
+@dataclass(frozen=True, slots=True)
+class MarkdownTableCandidate:
+    markdown: str
+    span: MarkdownSpan
+    headers: tuple[str, ...]
+    alignments: tuple[str, ...]
+    rows: tuple[tuple[str, ...], ...]
+    raw_headers: tuple[str, ...]
+    raw_rows: tuple[tuple[str, ...], ...]
+    source_hash: str
+
+
+MarkdownAstNode = (
+    MarkdownParagraph
+    | MarkdownListBlock
+    | MarkdownBlockquote
+    | MarkdownFence
+    | MarkdownTableCandidate
+    | MarkdownThematicBreak
+)
+
+
+@dataclass(frozen=True, slots=True)
+class MarkdownAttachmentPlan:
+    filename: str
+    media_type: str
+    content: str
+    block_kind: str
+    span: MarkdownSpan | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class MarkdownMessageSegment:
+    content: str
+    spans: tuple[MarkdownSpan, ...]
+    attachments: tuple[MarkdownAttachmentPlan, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class MarkdownMessagePlan:
+    segments: tuple[MarkdownMessageSegment, ...]
+    source_hash: str
+    block_count: int
+    truncated: bool
+
+
+@dataclass(frozen=True, slots=True)
+class MarkdownImageWarning:
+    kind: str
+    message: str
+    source: str
+    span: MarkdownSpan | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class MarkdownImageAttachmentPlan:
+    source: str
+    path: str
+    resolved_path: str
+    alt_text: str
+    title: str | None
+    filename: str
+    batch_index: int = 1
+    batch_size: int = 1
+
+
+@dataclass(frozen=True, slots=True)
+class MarkdownImageExtractionPlan:
+    content: str
+    attachments: tuple[MarkdownImageAttachmentPlan, ...]
+    batches: tuple[tuple[MarkdownImageAttachmentPlan, ...], ...]
+    warnings: tuple[MarkdownImageWarning, ...]
+
+
 class MarkdownAssembler:
-    """Streams text while holding a possible GFM table until it is complete."""
+    """Accumulates markdown and emits block-preserving text/table payloads."""
 
     def __init__(self) -> None:
-        self._line_buffer = ""
-        self._pending_line: str | None = None
-        self._text_lines: list[str] = []
-        self._table_lines: list[str] | None = None
         self._source = ""
         self._finalized = False
 
@@ -34,86 +173,225 @@ class MarkdownAssembler:
         if self._finalized:
             raise RuntimeError("markdown assembler is already finalized")
         self._source += delta
-        self._line_buffer += delta
-        blocks: list[MarkdownBlock] = []
-        while "\n" in self._line_buffer:
-            line, self._line_buffer = self._line_buffer.split("\n", 1)
-            blocks.extend(self._consume_line(line))
-        blocks.extend(self._flush_text())
-        return blocks
+        return []
 
     def finalize(self, canonical_content: str | None = None) -> list[MarkdownBlock]:
         if self._finalized:
             return []
-        blocks: list[MarkdownBlock] = []
         if canonical_content is not None:
             if canonical_content.startswith(self._source):
                 suffix = canonical_content[len(self._source) :]
                 if suffix:
-                    blocks.extend(self.append(suffix))
+                    self._source += suffix
             elif canonical_content != self._source:
                 raise ValueError("canonical content diverged from already streamed markdown")
-
-        if self._line_buffer:
-            blocks.extend(self._consume_line(self._line_buffer))
-            self._line_buffer = ""
-        if self._table_lines is not None:
-            blocks.append(self._close_table())
-        elif self._pending_line is not None:
-            self._text_lines.append(self._pending_line)
-            self._pending_line = None
-        blocks.extend(self._flush_text())
+        blocks: list[MarkdownBlock] = []
+        for node in parse_markdown_blocks(self._source):
+            if isinstance(node, MarkdownTableCandidate):
+                blocks.append(
+                    TableBlock(
+                        node.markdown,
+                        span=node.span,
+                        source_hash=node.source_hash,
+                        raw_lines=tuple(node.markdown.splitlines()),
+                    )
+                )
+            else:
+                raw = _node_raw(node)
+                if raw:
+                    blocks.append(TextBlock(raw, span=_node_span(node)))
         self._finalized = True
         return blocks
 
-    def _consume_line(self, line: str) -> list[MarkdownBlock]:
-        blocks: list[MarkdownBlock] = []
-        if self._table_lines is not None:
-            if _looks_like_table_row(line):
-                self._table_lines.append(line)
-                return blocks
-            blocks.append(self._close_table())
 
-        if self._pending_line is None:
-            self._pending_line = line
-            return blocks
-        if _looks_like_table_header(self._pending_line, line):
-            blocks.extend(self._flush_text())
-            self._table_lines = [self._pending_line, line]
-            self._pending_line = None
-            return blocks
-
-        self._text_lines.append(self._pending_line)
-        self._pending_line = line
-        return blocks
-
-    def _flush_text(self) -> list[MarkdownBlock]:
-        if not self._text_lines:
-            return []
-        content = "\n".join(self._text_lines) + "\n"
-        self._text_lines.clear()
-        return [TextBlock(content)]
-
-    def _close_table(self) -> TableBlock:
-        if self._table_lines is None:
-            raise RuntimeError("no table is being assembled")
-        block = TableBlock("\n".join(self._table_lines))
-        self._table_lines = None
-        return block
+def parse_markdown_blocks(source: str) -> list[MarkdownAstNode]:
+    lines = source.splitlines(keepends=True)
+    blocks: list[MarkdownAstNode] = []
+    index = 0
+    while index < len(lines):
+        if not _strip_newline(lines[index]).strip():
+            index += 1
+            continue
+        node, next_index = _consume_markdown_block(lines, index)
+        blocks.append(node)
+        index = next_index
+    return blocks
 
 
-def _looks_like_table_header(header: str, delimiter: str) -> bool:
-    header_cells = split_table_row(header)
-    delimiter_cells = split_table_row(delimiter)
-    return (
-        len(header_cells) >= 2
-        and len(header_cells) == len(delimiter_cells)
-        and all(_DELIMITER_CELL.fullmatch(cell.strip()) for cell in delimiter_cells)
+def plan_markdown_messages(source: str, *, max_chars: int = 1850) -> MarkdownMessagePlan:
+    if max_chars < 1:
+        raise ValueError("max_chars must be positive")
+    blocks = parse_markdown_blocks(source)
+    source_hash = hashlib.sha256(source.encode("utf-8")).hexdigest()
+    segments: list[MarkdownMessageSegment] = []
+    current_content = ""
+    current_spans: list[MarkdownSpan] = []
+    current_attachments: list[MarkdownAttachmentPlan] = []
+
+    def flush() -> None:
+        nonlocal current_content, current_spans, current_attachments
+        if current_content or current_attachments:
+            segments.append(
+                MarkdownMessageSegment(
+                    content=current_content.rstrip(),
+                    spans=tuple(current_spans),
+                    attachments=tuple(current_attachments),
+                )
+            )
+        current_content = ""
+        current_spans = []
+        current_attachments = []
+
+    for block_index, block in enumerate(blocks, start=1):
+        raw = _node_raw(block).rstrip("\n")
+        span = _node_span(block)
+        if len(raw) > max_chars:
+            flush()
+            filename = f"markdown-block-{block_index:03d}.md"
+            segments.append(
+                MarkdownMessageSegment(
+                    content=f"{_summarize_block(block)} [{filename}]",
+                    spans=(span,),
+                    attachments=(
+                        MarkdownAttachmentPlan(
+                            filename=filename,
+                            media_type="text/markdown",
+                            content=raw,
+                            block_kind=block.__class__.__name__,
+                            span=span,
+                        ),
+                    ),
+                )
+            )
+            continue
+        prefix = _CONTINUATION_MARKER if segments or current_content else ""
+        candidate = prefix + raw if not current_content else f"{current_content}\n{raw}"
+        if len(candidate) > max_chars:
+            flush()
+            current_content = prefix + raw
+            current_spans = [span]
+            continue
+        if not current_content and prefix:
+            current_content = prefix + raw
+        else:
+            current_content = candidate
+        current_spans.append(span)
+    flush()
+    return MarkdownMessagePlan(
+        segments=tuple(segments),
+        source_hash=source_hash,
+        block_count=len(blocks),
+        truncated=any(segment.attachments for segment in segments),
     )
 
 
-def _looks_like_table_row(line: str) -> bool:
-    return bool(line.strip()) and len(split_table_row(line)) >= 2
+def extract_local_markdown_images(
+    source: str,
+    *,
+    allowed_roots: Sequence[Path | str],
+) -> MarkdownImageExtractionPlan:
+    roots = tuple(Path(root).resolve() for root in allowed_roots)
+    warnings: list[MarkdownImageWarning] = []
+    attachments: list[MarkdownImageAttachmentPlan] = []
+
+    def replace(match: re.Match[str]) -> str:
+        alt_text = match.group("alt")
+        target = match.group("target").strip()
+        path_text, title = _parse_markdown_image_target(target)
+        if path_text is None:
+            warnings.append(
+                MarkdownImageWarning(
+                    kind="invalid-target",
+                    message="image target could not be parsed",
+                    source=match.group(0),
+                )
+            )
+            return match.group(0)
+        resolved, warning = _resolve_markdown_image_path(path_text, roots)
+        if warning is not None:
+            warnings.append(
+                MarkdownImageWarning(
+                    kind=warning,
+                    message=(
+                        "image path is outside allowed roots"
+                        if warning == "invalid-root"
+                        else "image path is missing"
+                    ),
+                    source=match.group(0),
+                )
+            )
+            return match.group(0)
+        if not resolved.is_file():
+            warnings.append(
+                MarkdownImageWarning(
+                    kind="missing-image",
+                    message="image path does not point to a file",
+                    source=match.group(0),
+                )
+            )
+            return match.group(0)
+        if not _is_supported_image(resolved):
+            warnings.append(
+                MarkdownImageWarning(
+                    kind="unsupported-image",
+                    message="local Markdown image is not a verified image file",
+                    source=match.group(0),
+                )
+            )
+            return match.group(0)
+        attachments.append(
+            MarkdownImageAttachmentPlan(
+                source=match.group(0),
+                path=path_text,
+                resolved_path=str(resolved),
+                alt_text=alt_text,
+                title=title,
+                filename=resolved.name,
+            )
+        )
+        return ""
+
+    stripped = _IMAGE_RE.sub(replace, source)
+    batches = tuple(
+        tuple(attachments[index : index + 10]) for index in range(0, len(attachments), 10)
+    )
+    rebatched: list[MarkdownImageAttachmentPlan] = []
+    for batch_index, batch in enumerate(batches, start=1):
+        for item in batch:
+            rebatched.append(
+                MarkdownImageAttachmentPlan(
+                    source=item.source,
+                    path=item.path,
+                    resolved_path=item.resolved_path,
+                    alt_text=item.alt_text,
+                    title=item.title,
+                    filename=item.filename,
+                    batch_index=batch_index,
+                    batch_size=len(batch),
+                )
+            )
+    rebatches = tuple(
+        tuple(
+            MarkdownImageAttachmentPlan(
+                source=item.source,
+                path=item.path,
+                resolved_path=item.resolved_path,
+                alt_text=item.alt_text,
+                title=item.title,
+                filename=item.filename,
+                batch_index=batch_index,
+                batch_size=len(batch),
+            )
+            for item in batch
+        )
+        for batch_index, batch in enumerate(batches, start=1)
+    )
+    return MarkdownImageExtractionPlan(
+        content=stripped,
+        attachments=tuple(rebatched),
+        batches=rebatches,
+        warnings=tuple(warnings),
+    )
 
 
 def split_table_row(line: str) -> list[str]:
@@ -154,3 +432,343 @@ def split_table_row(line: str) -> list[str]:
         index += 1
     cells.append("".join(current).strip())
     return cells
+
+
+def _consume_markdown_block(lines: list[str], index: int) -> tuple[MarkdownAstNode, int]:
+    text = _strip_newline(lines[index])
+    table = _try_consume_table(lines, index)
+    if table is not None:
+        return table
+    fence = _try_consume_fence(lines, index)
+    if fence is not None:
+        return fence
+    quote = _try_consume_blockquote(lines, index)
+    if quote is not None:
+        return quote
+    list_block = _try_consume_list(lines, index)
+    if list_block is not None:
+        return list_block
+    if _is_thematic_break(text):
+        return MarkdownThematicBreak(raw=text, span=MarkdownSpan(index + 1, index + 1)), index + 1
+    return _consume_paragraph(lines, index)
+
+
+def _consume_paragraph(lines: list[str], index: int) -> tuple[MarkdownParagraph, int]:
+    start = index
+    raw_lines = [lines[index]]
+    index += 1
+    while index < len(lines):
+        text = _strip_newline(lines[index])
+        if not text.strip() or _is_block_start(lines, index):
+            break
+        raw_lines.append(lines[index])
+        index += 1
+    raw = "".join(raw_lines)
+    span = MarkdownSpan(start + 1, index)
+    return MarkdownParagraph(text=raw.rstrip("\n"), raw=raw, span=span), index
+
+
+def _try_consume_table(lines: list[str], index: int) -> tuple[MarkdownTableCandidate, int] | None:
+    if index + 1 >= len(lines):
+        return None
+    header = _strip_newline(lines[index])
+    delimiter = _strip_newline(lines[index + 1])
+    if not _looks_like_table_header(header, delimiter):
+        return None
+    end = index + 2
+    while end < len(lines):
+        text = _strip_newline(lines[end])
+        if not text.strip() or not _looks_like_table_row(text):
+            break
+        end += 1
+    raw_lines = tuple(_strip_newline(line) for line in lines[index:end])
+    markdown = "\n".join(raw_lines)
+    headers = tuple(split_table_row(header))
+    delimiter_cells = tuple(split_table_row(delimiter))
+    rows_raw: list[tuple[str, ...]] = []
+    rows_display: list[tuple[str, ...]] = []
+    for line in raw_lines[2:]:
+        cells = split_table_row(line)
+        if len(cells) > len(headers):
+            break
+        padded = cells + ["" for _ in range(len(headers) - len(cells))]
+        rows_raw.append(tuple(cells))
+        rows_display.append(tuple(_display_cell(cell) for cell in padded))
+    candidate = MarkdownTableCandidate(
+        markdown=markdown,
+        span=MarkdownSpan(index + 1, end),
+        headers=tuple(_display_cell(cell) for cell in headers),
+        alignments=tuple(_parse_table_alignment(cell) for cell in delimiter_cells),
+        rows=tuple(rows_display),
+        raw_headers=headers,
+        raw_rows=tuple(rows_raw),
+        source_hash=hashlib.sha256(markdown.encode("utf-8")).hexdigest(),
+    )
+    return candidate, end
+
+
+def _try_consume_fence(lines: list[str], index: int) -> tuple[MarkdownFence, int] | None:
+    match = _FENCE_RE.match(_strip_newline(lines[index]))
+    if match is None:
+        return None
+    fence = match.group("fence")
+    info = match.group("info").strip()
+    fence_char = fence[0]
+    fence_len = len(fence)
+    end = index + 1
+    code_lines: list[str] = []
+    while end < len(lines):
+        text = _strip_newline(lines[end])
+        if re.fullmatch(rf"[ \t]*{re.escape(fence_char)}{{{fence_len},}}[ \t]*", text):
+            end += 1
+            break
+        code_lines.append(text)
+        end += 1
+    raw = "\n".join(_strip_newline(line) for line in lines[index:end])
+    return (
+        MarkdownFence(
+            fence=fence,
+            info=info,
+            code="\n".join(code_lines),
+            raw=raw,
+            span=MarkdownSpan(index + 1, end),
+        ),
+        end,
+    )
+
+
+def _try_consume_blockquote(lines: list[str], index: int) -> tuple[MarkdownBlockquote, int] | None:
+    if _BLOCKQUOTE_RE.match(_strip_newline(lines[index])) is None:
+        return None
+    end = index
+    quoted: list[str] = []
+    while end < len(lines):
+        text = _strip_newline(lines[end])
+        if not text.strip():
+            next_nonblank = end + 1
+            while next_nonblank < len(lines) and not _strip_newline(lines[next_nonblank]).strip():
+                next_nonblank += 1
+            if next_nonblank < len(lines) and _BLOCKQUOTE_RE.match(
+                _strip_newline(lines[next_nonblank])
+            ):
+                quoted.append(text)
+                end += 1
+                continue
+            break
+        match = _BLOCKQUOTE_RE.match(text)
+        if match is None:
+            break
+        quoted.append(match.group("body"))
+        end += 1
+    raw = "\n".join(_strip_newline(line) for line in lines[index:end])
+    return (
+        MarkdownBlockquote(
+            lines=tuple(quoted),
+            raw=raw,
+            span=MarkdownSpan(index + 1, end),
+        ),
+        end,
+    )
+
+
+def _try_consume_list(lines: list[str], index: int) -> tuple[MarkdownListBlock, int] | None:
+    first = _LIST_ITEM_RE.match(_strip_newline(lines[index]))
+    if first is None:
+        return None
+    start = index
+    end = index
+    items: list[MarkdownListItem] = []
+    first_indent = _indent_width(first.group("indent"))
+    item_start = index
+    while end < len(lines):
+        text = _strip_newline(lines[end])
+        if not text.strip():
+            end += 1
+            continue
+        match = _LIST_ITEM_RE.match(text)
+        if match is not None:
+            indent = _indent_width(match.group("indent"))
+            if indent < first_indent and items:
+                break
+            if end > item_start:
+                items.append(_make_list_item(lines[item_start:end], item_start))
+            item_start = end
+            end += 1
+            continue
+        indent = _indent_width(_leading_whitespace(text))
+        if indent <= first_indent and not text.startswith((" ", "\t")):
+            break
+        end += 1
+    if item_start < end:
+        items.append(_make_list_item(lines[item_start:end], item_start))
+    raw = "".join(lines[start:end])
+    ordered = bool(_LIST_ITEM_RE.match(_strip_newline(lines[start])).group("marker")[0].isdigit())
+    return (
+        MarkdownListBlock(
+            ordered=ordered,
+            items=tuple(items),
+            raw=raw,
+            span=MarkdownSpan(start + 1, end),
+        ),
+        end,
+    )
+
+
+def _make_list_item(lines: list[str], start_index: int) -> MarkdownListItem:
+    first = _LIST_ITEM_RE.match(_strip_newline(lines[0]))
+    if first is None:
+        raise ValueError("list item does not start with a list marker")
+    marker = first.group("marker")
+    body = first.group("body")
+    continuation = tuple(_strip_newline(line) for line in lines[1:])
+    raw = "".join(lines)
+    return MarkdownListItem(
+        marker=marker,
+        body="\n".join([body, *continuation]).rstrip(),
+        raw=raw,
+        span=MarkdownSpan(start_index + 1, start_index + len(lines)),
+        continuation_lines=continuation,
+    )
+
+
+def _looks_like_table_header(header: str, delimiter: str) -> bool:
+    header_cells = split_table_row(header)
+    delimiter_cells = split_table_row(delimiter)
+    return (
+        len(header_cells) >= 2
+        and len(header_cells) == len(delimiter_cells)
+        and all(_DELIMITER_CELL.fullmatch(cell.strip()) for cell in delimiter_cells)
+    )
+
+
+def _looks_like_table_row(line: str) -> bool:
+    return bool(line.strip()) and len(split_table_row(line)) >= 2
+
+
+def _parse_table_alignment(cell: str) -> str:
+    value = cell.strip()
+    match = _DELIMITER_CELL.fullmatch(value)
+    if match is None:
+        raise ValueError(f"invalid table delimiter cell: {cell}")
+    if value.startswith(":") and value.endswith(":"):
+        return "center"
+    if value.endswith(":"):
+        return "right"
+    return "left"
+
+
+def _display_cell(cell: str) -> str:
+    return cell.replace("\\|", "|").strip()
+
+
+def _is_thematic_break(text: str) -> bool:
+    return _THEMATIC_BREAK_RE.fullmatch(text) is not None
+
+
+def _is_block_start(lines: list[str], index: int) -> bool:
+    text = _strip_newline(lines[index])
+    if not text.strip():
+        return True
+    return (
+        _is_thematic_break(text)
+        or _try_peek_table(lines, index)
+        or _FENCE_RE.match(text) is not None
+        or _BLOCKQUOTE_RE.match(text) is not None
+        or _LIST_ITEM_RE.match(text) is not None
+    )
+
+
+def _try_peek_table(lines: list[str], index: int) -> bool:
+    if index + 1 >= len(lines):
+        return False
+    return _looks_like_table_header(_strip_newline(lines[index]), _strip_newline(lines[index + 1]))
+
+
+def _strip_newline(value: str) -> str:
+    return value[:-1] if value.endswith("\n") else value
+
+
+def _leading_whitespace(value: str) -> str:
+    return value[: len(value) - len(value.lstrip(" \t"))]
+
+
+def _indent_width(value: str) -> int:
+    return len(value.expandtabs(4))
+
+
+def _node_raw(node: MarkdownAstNode) -> str:
+    return node.raw
+
+
+def _node_span(node: MarkdownAstNode) -> MarkdownSpan:
+    return node.span
+
+
+def _summarize_block(node: MarkdownAstNode) -> str:
+    if isinstance(node, MarkdownFence):
+        return f"[{node.fence[:3]} fence block]"
+    if isinstance(node, MarkdownBlockquote):
+        return "[blockquote attached]"
+    if isinstance(node, MarkdownListBlock):
+        return "[list attached]"
+    if isinstance(node, MarkdownTableCandidate):
+        return "[table attached]"
+    if isinstance(node, MarkdownThematicBreak):
+        return "[thematic break attached]"
+    return "[markdown block attached]"
+
+
+def _parse_markdown_image_target(target: str) -> tuple[str | None, str | None]:
+    target = target.strip()
+    if not target:
+        return None, None
+    if target.startswith("<") and target.endswith(">"):
+        target = target[1:-1].strip()
+    if not target:
+        return None, None
+    try:
+        parts = shlex.split(target)
+    except ValueError:
+        return None, None
+    if not parts:
+        return None, None
+    path = parts[0]
+    title = None if len(parts) == 1 else " ".join(parts[1:])
+    if re.match(r"^[a-zA-Z][a-zA-Z0-9+.-]*:", path):
+        return None, None
+    return path, title
+
+
+def _resolve_markdown_image_path(
+    path_text: str, roots: tuple[Path, ...]
+) -> tuple[Path | None, str | None]:
+    candidate = Path(path_text)
+    if candidate.is_absolute():
+        resolved = candidate.resolve(strict=False)
+        if any(_within_root(resolved, root) for root in roots):
+            return resolved, None
+        return None, "invalid-root"
+    for root in roots:
+        resolved = (root / candidate).resolve(strict=False)
+        if _within_root(resolved, root):
+            return resolved, None
+    return None, "invalid-root"
+
+
+def _within_root(path: Path, root: Path) -> bool:
+    try:
+        path.relative_to(root)
+    except ValueError:
+        return False
+    return True
+
+
+def _is_supported_image(path: Path) -> bool:
+    if path.suffix.lower() not in _SUPPORTED_IMAGE_SUFFIXES:
+        return False
+    try:
+        with Image.open(path) as image:
+            image.verify()
+    except (OSError, SyntaxError, UnidentifiedImageError):
+        return False
+    return True

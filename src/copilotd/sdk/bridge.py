@@ -80,14 +80,10 @@ class CopilotBridge:
             return
         try:
             try:
-                async with asyncio.timeout(
-                    self._settings.sdk_shutdown_timeout_seconds
-                ):
+                async with asyncio.timeout(self._settings.sdk_shutdown_timeout_seconds):
                     await client.stop()
             except TimeoutError:
-                async with asyncio.timeout(
-                    self._settings.sdk_shutdown_timeout_seconds
-                ):
+                async with asyncio.timeout(self._settings.sdk_shutdown_timeout_seconds):
                     await client.force_stop()
         finally:
             if self._client is client:
@@ -208,10 +204,12 @@ class CopilotBridge:
         model: str,
         reasoning_effort: str | None,
         context_tier: str | None,
+        reasoning_summary: str | None = None,
     ) -> None:
         await session.set_model(
             model,
             reasoning_effort=reasoning_effort,
+            reasoning_summary=reasoning_summary,
             context_tier=cast(Any, context_tier),
         )
 

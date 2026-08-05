@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import inspect
 import json
 import time
 from dataclasses import dataclass
@@ -22,9 +23,11 @@ class RenderTransport(Protocol):
     async def edit(
         self,
         *,
+        session_id: str,
         message_id: str,
         lane: str,
         payload: dict[str, Any],
+        idempotency_key: str,
     ) -> None: ...
 
 
@@ -85,6 +88,15 @@ class RenderOutboxDispatcher:
         for item in items:
             if await self._deliver(item, now=timestamp):
                 delivered += 1
+        return delivered
+
+    async def drain(self, *, max_iterations: int = 100, limit: int = 50) -> int:
+        delivered = 0
+        for _ in range(max_iterations):
+            count = await self.dispatch_once(limit=limit)
+            delivered += count
+            if count == 0:
+                break
         return delivered
 
     async def _claim(self, *, limit: int, now: float) -> list[OutboxItem]:
@@ -185,11 +197,21 @@ class RenderOutboxDispatcher:
                 )
             else:
                 message_id = mapping["discord_message_id"]
-                await self._transport.edit(
-                    message_id=message_id,
-                    lane=item.lane,
-                    payload=item.payload,
-                )
+                edit = self._transport.edit
+                if "session_id" in inspect.signature(edit).parameters:
+                    await edit(
+                        session_id=item.session_id,
+                        message_id=message_id,
+                        lane=item.lane,
+                        payload=item.payload,
+                        idempotency_key=item.idempotency_key,
+                    )
+                else:
+                    await edit(
+                        message_id=message_id,
+                        lane=item.lane,
+                        payload=item.payload,
+                    )
         except RenderRateLimited as error:
             await self._retry(item, next_attempt_at=now + error.retry_after, now=now)
             return False

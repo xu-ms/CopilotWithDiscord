@@ -15,6 +15,7 @@ from copilot.session_events import (
     SubagentStartedData,
 )
 
+from copilotd.core.bindings import SessionBindingRepository
 from copilotd.core.event_adapter import EventAdapter
 from copilotd.core.inbox import ReducerInbox
 from copilotd.core.models import AdaptedEvent, InboxEnvelope
@@ -235,9 +236,7 @@ async def test_reducer_materializes_full_stream_content_for_each_outbox_edit(
         ]
 
         assert await JournalReducer(database).persist(adapted) == 3
-        rows = await database.fetchall(
-            "SELECT payload FROM render_outbox ORDER BY logical_seq"
-        )
+        rows = await database.fetchall("SELECT payload FROM render_outbox ORDER BY logical_seq")
         stream = await database.fetchone(
             "SELECT content, finalized FROM render_streams WHERE message_id = 'message-1'"
         )
@@ -371,6 +370,149 @@ async def test_long_tool_results_are_preserved_as_artifacts_at_8000_boundary(
     assert payloads[1]["attachments"][0]["content"] == "z" * 12000
     assert "**Tool failed**" in payloads[2]["content"]
     assert payloads[2]["attachments"][0]["content"] == "e" * 8000
+
+
+@pytest.mark.asyncio
+async def test_partial_tool_spill_and_fenced_diff_are_attached_losslessly(
+    tmp_path: Path,
+) -> None:
+    events = [
+        {
+            "type": "tool.execution_progress",
+            "data": {
+                "toolCallId": "partial-short",
+                "output": "a" * (64 * 1024 - 1),
+            },
+        },
+        {
+            "type": "tool.execution_progress",
+            "data": {
+                "toolCallId": "partial-spill",
+                "output": "b" * (64 * 1024),
+            },
+        },
+        {
+            "type": "tool.execution_complete",
+            "data": {
+                "toolCallId": "diff-fence",
+                "toolName": "git diff",
+                "success": True,
+                "result": {"patch": "+```python\n+print('safe')\n+```"},
+            },
+        },
+    ]
+    adapted = [
+        EventAdapter().adapt(
+            InboxEnvelope(
+                sdk_session_id="session-tool-spill",
+                generation=1,
+                fence_token=1,
+                inbox_seq=index,
+                source="internal",
+                payload=event,
+                received_at=100 + index,
+                internal_event_id=f"spill-{index}",
+            )
+        )
+        for index, event in enumerate(events, start=1)
+    ]
+    async with Database(tmp_path / "tool-spill.sqlite3") as database:
+        assert await JournalReducer(database).persist(adapted) == 3
+        artifact_rows = await database.fetchall(
+            "SELECT payload FROM render_outbox WHERE lane = 'artifact'"
+        )
+        diff_row = await database.fetchone("SELECT payload FROM render_outbox WHERE lane = 'diff'")
+        spill = await database.fetchone(
+            """
+            SELECT content, spilled FROM tool_output_streams
+            WHERE tool_call_id = 'partial-spill'
+            """
+        )
+
+    assert len(artifact_rows) == 1
+    artifact = json.loads(artifact_rows[0]["payload"])
+    assert artifact["attachments"][0]["content"] == "b" * (64 * 1024)
+    assert artifact["verbatim"] is True
+    assert len(spill["content"]) == 64 * 1024
+    assert spill["spilled"] == 1
+    diff = json.loads(diff_row["payload"])
+    assert diff["content"].endswith("attached as `changes-diff-fence.diff`.")
+    assert diff["attachments"][0]["content"] == "+```python\n+print('safe')\n+```"
+
+
+@pytest.mark.asyncio
+async def test_correlated_idle_emits_model_token_context_duration_footer(
+    tmp_path: Path,
+) -> None:
+    session_id = "session-footer"
+    async with Database(tmp_path / "footer.sqlite3") as database:
+        await SessionBindingRepository(database).create(
+            thread_id="thread-footer",
+            sdk_session_id=session_id,
+            cwd_snapshot=tmp_path,
+            project_source="implicit-home",
+            now=90,
+        )
+        await database.execute(
+            """
+            UPDATE session_bindings
+            SET runtime_model_config = '{"modelId":"gpt-footer"}'
+            WHERE sdk_session_id = ?
+            """,
+            (session_id,),
+        )
+        await database.execute(
+            """
+            INSERT INTO submissions(
+                submission_id, sdk_session_id, origin, requested_mode,
+                requested_delivery, state, created_at
+            ) VALUES ('submission-footer', ?, 'app_message', 'interactive',
+                      'enqueue', 'observed_active', 100)
+            """,
+            (session_id,),
+        )
+        await database.execute(
+            """
+            INSERT INTO usage_samples(
+                session_id, model, input_tokens, output_tokens,
+                premium_requests, observed_at
+            ) VALUES (?, 'gpt-footer', 12, 7, 1.5, 119)
+            """,
+            (session_id,),
+        )
+        await database.execute(
+            """
+            INSERT INTO session_projection_snapshots(
+                session_id, kind, payload, observed_at
+            ) VALUES (?, 'context', '{"totalTokens":19,"limit":100}', 119)
+            """,
+            (session_id,),
+        )
+        event = EventAdapter().adapt(
+            InboxEnvelope(
+                sdk_session_id=session_id,
+                generation=0,
+                fence_token=0,
+                inbox_seq=1,
+                source="internal",
+                payload={"type": "session.idle", "data": {}},
+                received_at=120,
+                internal_event_id="idle-footer",
+            )
+        )
+        assert await JournalReducer(database).persist([event]) == 1
+        row = await database.fetchone(
+            "SELECT lane, payload FROM render_outbox WHERE lane = 'footer'"
+        )
+
+    assert row["lane"] == "footer"
+    payload = json.loads(row["payload"])
+    assert payload["model"] == "gpt-footer"
+    assert payload["input_tokens"] == 12
+    assert payload["output_tokens"] == 7
+    assert payload["credits"] == 1.5
+    assert payload["context"] == "19/100"
+    assert payload["duration_seconds"] == 20
 
 
 @pytest.mark.asyncio
