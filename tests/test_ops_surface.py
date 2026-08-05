@@ -9,95 +9,121 @@ from copilotd.config import Settings
 from copilotd.ops.surface import LocalOpsSurface, _redact_structure, _redact_text
 from copilotd.storage.database import Database
 
+NL = chr(10)
 
-def _auth_word() -> str:
+
+def _authorization() -> str:
     return "".join(["Auth", "orization"])
 
 
-def _bearer_word() -> str:
-    return "".join(["Bea", "rer"])
+def _cookie() -> str:
+    return "".join(["Co", "okie"])
 
 
-def _auth_colon(secret: str) -> str:
-    return "".join([_auth_word(), "    :", _bearer_word(), "   ", secret])
+def _set_cookie() -> str:
+    return "".join(["Set-", "Cookie"])
 
 
-def _auth_equals(secret: str) -> str:
-    return "".join([_auth_word().lower(), " = ", _bearer_word(), " ", secret])
+def _aws_secret() -> str:
+    return "".join(["AWS_", "SECRET_", "ACCESS_", "KEY"])
 
 
-def test_redact_text_consumes_common_secret_formats() -> None:
+def test_redact_text_consumes_auth_cookie_and_composite_formats() -> None:
     text = (
         "safe keep "
-        '{"token":"json-secret-123","nested":{"password":"pw-1"}} '
-        + _auth_colon("abc123XYZ")
-        + " "
-        + _auth_equals("def456")
-        + " "
-        + "token=plain-secret "
-        + 'password = "quoted-secret" '
-        + "api-key='key-777' "
-        + 'cookie = "crumb-8"'
+        '{"token":"json-secret-123","aws_secret_access_key":"aws-secret-1"} '
+        + "Authorization    :   Basic abc def ghi"
+        + NL
+        + "authorization =   Bearer def 456"
+        + NL
+        + f"{_cookie()}   : session=abc; token=xyz; Path=/; HttpOnly"
+        + NL
+        + f"{_set_cookie()} : sid=abc; Path=/; Secure"
+        + NL
+        + f"{_aws_secret()} = very-secret"
+        + NL
+        + 'access_token="access-secret" '
+        + "client_secret='client-secret' "
+        + "private_key=private-secret "
+        + 'client_access_token = "client-access-secret" '
+        + 'client_private_token = "client-private-secret" '
+        + "nonsecret=keep-me"
     )
     redacted = _redact_text(text)
 
     for secret in (
         "json-secret-123",
-        "pw-1",
-        "abc123XYZ",
-        "def456",
-        "plain-secret",
-        "quoted-secret",
-        "key-777",
-        "crumb-8",
+        "aws-secret-1",
+        "abc def ghi",
+        "def 456",
+        "session=abc",
+        "token=xyz",
+        "sid=abc",
+        "very-secret",
+        "access-secret",
+        "client-secret",
+        "private-secret",
+        "client-access-secret",
+        "client-private-secret",
     ):
         assert secret not in redacted
+
     assert "safe keep" in redacted
     assert '"token":"[redacted]"' in redacted
-    assert '"password":"[redacted]"' in redacted
-    assert f"{_auth_word()}    :{_bearer_word()}   [redacted]" in redacted
-    assert f"{_auth_word().lower()} = {_bearer_word()} [redacted]" in redacted
-    assert "token=[redacted]" in redacted
-    assert "password = [redacted]" in redacted
-    assert "api-key=[redacted]" in redacted or "api-key = [redacted]" in redacted
-    assert "cookie = [redacted]" in redacted
+    assert '"aws_secret_access_key":"[redacted]"' in redacted
+    assert "Authorization    :   [redacted]" in redacted
+    assert "authorization =   [redacted]" in redacted
+    assert f"{_cookie()}   : [redacted]" in redacted
+    assert f"{_set_cookie()} : [redacted]" in redacted
+    assert f"{_aws_secret()} = [redacted]" in redacted
+    assert 'access_token="[redacted]"' in redacted
+    assert "client_secret='[redacted]'" in redacted
+    assert "private_key=[redacted]" in redacted
+    assert 'client_access_token = "[redacted]"' in redacted
+    assert 'client_private_token = "[redacted]"' in redacted
+    assert "nonsecret=keep-me" in redacted
 
 
 def test_redact_structure_recurses_nested_sensitive_keys() -> None:
     payload = {
         "authorization": {
             "token": "abc",
+            "aws_secret_access_key": "aws-secret-2",
             "nested": [
                 {"cookie": "crumb"},
+                {"client_access_token": "client-access"},
                 {"note": "visible"},
-                "plain text",
             ],
             "plain": "keep me",
         },
         "meta": {
-            "note": "Authorization: Bearer inner-secret",
+            "note": "Authorization: Basic structured-secret",
             "list": [
                 {"password": "pw-2"},
-                "safe",
+                {"private_key": "priv"},
+                {"client_secret": "client"},
             ],
         },
-        "apiKey": [
-            {"client_id": "id-1", "secret": "s-2"},
-        ],
+        "aws_secret_access_key": "top-secret",
+        "client_key": "client-key-secret",
+        "client_id": "id-1",
     }
 
     redacted = _redact_structure(payload)
 
     assert redacted["authorization"]["token"] == "[redacted]"
+    assert redacted["authorization"]["aws_secret_access_key"] == "[redacted]"
     assert redacted["authorization"]["nested"][0]["cookie"] == "[redacted]"
-    assert redacted["authorization"]["nested"][1]["note"] == "[redacted]"
-    assert redacted["authorization"]["nested"][2] == "[redacted]"
+    assert redacted["authorization"]["nested"][1]["client_access_token"] == "[redacted]"
+    assert redacted["authorization"]["nested"][2]["note"] == "[redacted]"
     assert redacted["authorization"]["plain"] == "[redacted]"
-    assert redacted["meta"]["note"] == f"{_auth_word()}: {_bearer_word()} [redacted]"
+    assert redacted["meta"]["note"] == "Authorization: [redacted]"
     assert redacted["meta"]["list"][0]["password"] == "[redacted]"
-    assert redacted["meta"]["list"][1] == "safe"
-    assert redacted["apiKey"][0]["client_id"] == "[redacted]"
-    assert redacted["apiKey"][0]["secret"] == "[redacted]"
+    assert redacted["meta"]["list"][1]["private_key"] == "[redacted]"
+    assert redacted["meta"]["list"][2]["client_secret"] == "[redacted]"
+    assert redacted["aws_secret_access_key"] == "[redacted]"
+    assert redacted["client_key"] == "[redacted]"
+    assert redacted["client_id"] == "id-1"
 
 
 @pytest.mark.asyncio
@@ -106,16 +132,24 @@ async def test_ops_surface_redacts_diagnostics_log_tail_and_event_dump(
 ) -> None:
     log_dir = tmp_path / "logs"
     log_dir.mkdir()
-    (log_dir / "boot.log").write_text("boot corr-1 safe text\n", encoding="utf-8")
+    (log_dir / "boot.log").write_text("boot corr-1 safe text" + NL, encoding="utf-8")
     copilotd_log = (
-        'corr-1 {"token":"json-secret-123","nested":{"password":"pw-1"}}\n'
-        + _auth_colon("abc123XYZ")
-        + "\n"
-        + _auth_equals("def456")
-        + "\n"
-        + 'corr-1 token=plain-secret password = "quoted-secret" '
-        + 'api-key=key-777 cookie = "crumb-8"\n'
-        + "corr-1 keep this text\n"
+        'corr-1 {"token":"json-secret-123","aws_secret_access_key":"aws-secret-1"}'
+        + NL
+        + "corr-1 Authorization    :   Basic abc def ghi"
+        + NL
+        + "corr-1 Cookie   = session=abc; token=xyz; Path=/; HttpOnly"
+        + NL
+        + "corr-1 Set-Cookie : sid=abc; Path=/; Secure"
+        + NL
+        + f"corr-1 {_aws_secret()} = very-secret"
+        + NL
+        + 'corr-1 client_access_token = "client-access-secret"'
+        + NL
+        + 'corr-1 private_key = "private-secret"'
+        + NL
+        + "corr-1 keep this text"
+        + NL
     )
     (log_dir / "copilotd.log").write_text(copilotd_log, encoding="utf-8")
     settings = Settings(
@@ -145,7 +179,7 @@ async def test_ops_surface_redacts_diagnostics_log_tail_and_event_dump(
                 "1.0",
                 "demo",
                 1,
-                '{"token":"cap-secret","nested":{"password":"cap-pw"}}',
+                '{"aws_secret_access_key":"cap-secret","client_private_token":"cap-private"}',
                 now,
             ),
         )
@@ -161,7 +195,7 @@ async def test_ops_surface_redacts_diagnostics_log_tail_and_event_dump(
                 3,
                 "session-1",
                 "crash",
-                _auth_colon("incident-secret"),
+                "Authorization = Digest incident-secret",
                 7,
                 9,
                 "detail",
@@ -182,12 +216,12 @@ async def test_ops_surface_redacts_diagnostics_log_tail_and_event_dump(
                 "sdk",
                 "durable",
                 "message",
-                _auth_colon("parent-secret"),
-                "token=agent-secret",
-                "cookie=message-secret",
-                "".join(["pass", "word=turn-secret"]),
+                "Authorization    : Bearer parent-secret",
+                'client_secret="agent-secret"',
+                f"{_cookie()} = message-secret",
+                f"{_aws_secret()} = turn-secret",
                 "hash",
-                '{"token":"payload-secret"}',
+                '{"client_access_token":"payload-secret"}',
                 now,
             ),
         )
@@ -198,43 +232,34 @@ async def test_ops_surface_redacts_diagnostics_log_tail_and_event_dump(
         logs = await service.log_tail(correlation_id="corr-1")
         events = await service.event_dump(session_id="session-1")
 
-    expected_incident_tail = "".join(
-        [
-            _auth_word(),
-            "    :",
-            _bearer_word(),
-            "   ",
-            "[redacted]",
-        ]
-    )
-    expected_parent_id = "".join(
-        [
-            _auth_word(),
-            "    :",
-            _bearer_word(),
-            "   ",
-            "[redacted]",
-        ]
-    )
     assert health["database"] == "ok"
     assert health["pending_outbox"] == 0
     assert diagnostics["bindings"][0]["owner_fence_token"] == "[redacted]"
     assert diagnostics["capabilities"][0]["probe_detail"] == (
-        '{"token":"[redacted]","nested":{"password":"[redacted]"}}'
+        '{"aws_secret_access_key":"[redacted]","client_private_token":"[redacted]"}'
     )
-    assert diagnostics["incidents"][0]["stderr_tail"] == expected_incident_tail
+    assert diagnostics["incidents"][0]["stderr_tail"] == "Authorization = [redacted]"
+    assert "incident-secret" not in diagnostics["incidents"][0]["stderr_tail"]
     assert "json-secret-123" not in logs["files"]["copilotd.log"]
-    assert "abc123XYZ" not in logs["files"]["copilotd.log"]
-    assert "def456" not in logs["files"]["copilotd.log"]
-    assert "plain-secret" not in logs["files"]["copilotd.log"]
-    assert "quoted-secret" not in logs["files"]["copilotd.log"]
-    assert "key-777" not in logs["files"]["copilotd.log"]
-    assert "crumb-8" not in logs["files"]["copilotd.log"]
+    assert "aws-secret-1" not in logs["files"]["copilotd.log"]
+    assert "abc def ghi" not in logs["files"]["copilotd.log"]
+    assert "session=abc" not in logs["files"]["copilotd.log"]
+    assert "token=xyz" not in logs["files"]["copilotd.log"]
+    assert "sid=abc" not in logs["files"]["copilotd.log"]
+    assert "very-secret" not in logs["files"]["copilotd.log"]
+    assert "client-access-secret" not in logs["files"]["copilotd.log"]
+    assert "private-secret" not in logs["files"]["copilotd.log"]
     assert '"token":"[redacted]"' in logs["files"]["copilotd.log"]
-    assert "token=[redacted]" in logs["files"]["copilotd.log"]
+    assert '"aws_secret_access_key":"[redacted]"' in logs["files"]["copilotd.log"]
+    assert "Authorization    :   [redacted]" in logs["files"]["copilotd.log"]
+    assert "Cookie   = [redacted]" in logs["files"]["copilotd.log"]
+    assert "Set-Cookie : [redacted]" in logs["files"]["copilotd.log"]
+    assert f"corr-1 {_aws_secret()} = [redacted]" in logs["files"]["copilotd.log"]
+    assert 'client_access_token = "[redacted]"' in logs["files"]["copilotd.log"]
+    assert 'private_key = "[redacted]"' in logs["files"]["copilotd.log"]
     assert "safe text" in logs["files"]["boot.log"]
-    assert events["events"][0]["parent_id"] == expected_parent_id
-    assert events["events"][0]["agent_id"] == "token=[redacted]"
-    assert events["events"][0]["message_id"] == "cookie=[redacted]"
-    assert events["events"][0]["turn_id"] == "".join(["pass", "word=[redacted]"])
+    assert events["events"][0]["parent_id"] == "Authorization    : [redacted]"
+    assert events["events"][0]["agent_id"] == 'client_secret="[redacted]"'
+    assert events["events"][0]["message_id"] == "Cookie = [redacted]"
+    assert events["events"][0]["turn_id"] == f"{_aws_secret()} = [redacted]"
     assert events["events"][0]["raw_type"] == "message"

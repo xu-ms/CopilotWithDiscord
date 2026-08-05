@@ -37,6 +37,7 @@ class AttachmentCapabilities:
     discord_file_max_bytes: int | None = None
     discord_message_max_bytes: int | None = None
     runtime_inline_blob_max_bytes: int | None = None
+    runtime_serialized_frame_max_bytes: int | None = None
 
 
 @dataclass(frozen=True)
@@ -62,6 +63,7 @@ class _ResolvedLimits:
     file_max_bytes: int
     message_max_bytes: int
     inline_blob_max_bytes: int
+    serialized_frame_max_bytes: int
 
 
 class AttachmentService:
@@ -122,8 +124,10 @@ class AttachmentService:
                 session_id=session_id,
             )
             try:
-                if self._capabilities is None:
-                    self._validate_declared_sizes(attachments)
+                self._validate_declared_sizes(
+                    attachments,
+                    self._resolved_limits(),
+                )
                 stored = await self._download_all(manifest_id, session_id, attachments)
                 total_bytes = sum(item.byte_size for item in stored)
                 await self._commit_items(manifest_id, stored, total_bytes)
@@ -143,26 +147,37 @@ class AttachmentService:
     async def sdk_attachments(self, manifest_id: str) -> list[dict[str, Any]]:
         items = await self._verified_items(manifest_id)
         limits = self._resolved_limits()
-        budget = max(0, limits.message_max_bytes - 2)
-        emitted_items = 0
+        frame_budget = max(0, limits.serialized_frame_max_bytes)
         result: list[dict[str, Any]] = []
         for item in items:
             if item.sdk_attachment_kind == "blob":
-                blob, cost = await asyncio.to_thread(_load_inline_blob, item)
-                request_cost = cost + (1 if emitted_items else 0)
-                if request_cost <= budget:
-                    result.append(blob)
-                    budget -= request_cost
-                    emitted_items += 1
-                    continue
-            result.append(
-                {
-                    "type": "file",
-                    "path": str(item.local_path),
-                    "displayName": item.original_name,
-                }
+                candidate = await asyncio.to_thread(_load_inline_blob, item)
+            else:
+                candidate = _load_file_attachment(item)
+
+            proposed = [*result, candidate]
+            request_size = await asyncio.to_thread(
+                _serialized_request_size,
+                proposed,
             )
-            emitted_items += 1
+            if request_size > frame_budget:
+                for candidate_index in range(len(proposed) - 1, -1, -1):
+                    if proposed[candidate_index]["type"] != "blob":
+                        continue
+                    proposed[candidate_index] = _load_file_attachment(items[candidate_index])
+                    request_size = await asyncio.to_thread(
+                        _serialized_request_size,
+                        proposed,
+                    )
+                    if request_size <= frame_budget:
+                        break
+            if request_size > frame_budget:
+                raise AttachmentError(
+                    "serialized SDK attachment request exceeds the runtime frame limit "
+                    f"at {item.original_name}"
+                )
+
+            result = proposed
         return result
 
     async def _begin_manifest(
@@ -192,19 +207,23 @@ class AttachmentService:
                 (manifest_id,),
             )
 
-    def _validate_declared_sizes(self, attachments: list[DiscordAttachment]) -> None:
+    def _validate_declared_sizes(
+        self,
+        attachments: list[DiscordAttachment],
+        limits: _ResolvedLimits,
+    ) -> None:
         total = 0
         for attachment in attachments:
-            if attachment.size > self._file_max_bytes:
+            if attachment.size > limits.file_max_bytes:
                 raise AttachmentError(
                     f"{attachment.filename} exceeds the "
-                    f"{self._file_max_bytes // (1024 * 1024)} MiB file limit"
+                    f"{limits.file_max_bytes // (1024 * 1024)} MiB file limit"
                 )
             total += attachment.size
-        if total > self._message_max_bytes:
+        if total > limits.message_max_bytes:
             raise AttachmentError(
                 f"attachments exceed the "
-                f"{self._message_max_bytes // (1024 * 1024)} MiB message limit"
+                f"{limits.message_max_bytes // (1024 * 1024)} MiB message limit"
             )
 
     async def _download_all(
@@ -218,8 +237,14 @@ class AttachmentService:
         stored: list[_StoredItem] = []
         limits = self._resolved_limits()
         strict_legacy = self._capabilities is None
+        actual_total = 0
         for index, attachment in enumerate(attachments):
             content = await attachment.read(use_cached=True)
+            if len(content) > limits.file_max_bytes:
+                raise AttachmentError(f"{attachment.filename} exceeds the actual file limit")
+            actual_total += len(content)
+            if actual_total > limits.message_max_bytes:
+                raise AttachmentError("actual attachments exceed the message limit")
             mime_type = attachment.content_type or "application/octet-stream"
             stored_bytes = content
             stored_mime = mime_type
@@ -248,14 +273,6 @@ class AttachmentService:
                             raise AttachmentError(
                                 "image cannot be reduced below the SDK inline attachment limit"
                             )
-            elif strict_legacy and (
-                attachment.size > self._file_max_bytes or len(content) > self._message_max_bytes
-            ):
-                raise AttachmentError(
-                    f"{attachment.filename} exceeds the "
-                    f"{self._file_max_bytes // (1024 * 1024)} MiB file limit"
-                )
-
             filename = f"{index:03d}-{_safe_filename(attachment.filename)}"
             target = directory / filename
             await asyncio.to_thread(_atomic_write, target, stored_bytes)
@@ -352,6 +369,7 @@ class AttachmentService:
                 file_max_bytes=self._file_max_bytes,
                 message_max_bytes=self._message_max_bytes,
                 inline_blob_max_bytes=self._blob_max_bytes,
+                serialized_frame_max_bytes=self._message_max_bytes,
             )
         return _ResolvedLimits(
             file_max_bytes=_min_non_none(
@@ -365,6 +383,11 @@ class AttachmentService:
             inline_blob_max_bytes=_min_non_none(
                 self._blob_max_bytes,
                 self._capabilities.runtime_inline_blob_max_bytes,
+            ),
+            serialized_frame_max_bytes=(
+                self._capabilities.runtime_serialized_frame_max_bytes
+                if self._capabilities.runtime_serialized_frame_max_bytes is not None
+                else self._message_max_bytes
             ),
         )
 
@@ -395,23 +418,33 @@ def _sha256_hex(content: bytes) -> str:
     return hashlib.sha256(content).hexdigest()
 
 
-def _load_inline_blob(item: _StoredItem) -> tuple[dict[str, Any], int]:
+def _load_inline_blob(item: _StoredItem) -> dict[str, Any]:
     content = item.local_path.read_bytes()
     data = base64.b64encode(content).decode("ascii")
-    payload = {
+    return {
         "type": "blob",
         "data": data,
         "mimeType": item.mime_type,
         "displayName": item.original_name,
     }
-    serialized = json.dumps(
-        payload,
+
+
+def _load_file_attachment(item: _StoredItem) -> dict[str, Any]:
+    return {
+        "type": "file",
+        "path": str(item.local_path),
+        "displayName": item.original_name,
+    }
+
+
+def _serialized_request_size(items: list[dict[str, Any]]) -> int:
+    payload = json.dumps(
+        items,
         ensure_ascii=False,
         sort_keys=True,
         separators=(",", ":"),
     )
-    cost = len(serialized.encode("utf-8"))
-    return payload, cost
+    return len(payload.encode("utf-8"))
 
 
 def _matches_integrity(item: _StoredItem) -> bool:

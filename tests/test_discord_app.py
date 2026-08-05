@@ -73,6 +73,11 @@ def test_discord_command_manifest_has_core_modes_and_no_deleted_roots(tmp_path: 
     assert {"health", "diagnostics", "debug", "log-tail", "event-dump"} == {
         command.name for command in ops.commands
     }
+    mcp = project.get_command("mcp")
+    assert isinstance(mcp, discord.app_commands.Group)
+    mcp_add = mcp.get_command("add")
+    assert mcp_add is not None
+    assert "project_env_refs" in {parameter.name for parameter in mcp_add.parameters}
 
 
 class _SummaryCapability:

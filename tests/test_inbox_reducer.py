@@ -19,7 +19,11 @@ from copilotd.core.bindings import SessionBindingRepository
 from copilotd.core.event_adapter import EventAdapter
 from copilotd.core.inbox import ReducerInbox
 from copilotd.core.models import AdaptedEvent, InboxEnvelope
-from copilotd.core.reducer import EventReducerWorker, JournalReducer
+from copilotd.core.reducer import (
+    EventReducerWorker,
+    JournalReducer,
+    _diff_render_payload,
+)
 from copilotd.storage.database import Database
 
 
@@ -440,9 +444,40 @@ async def test_partial_tool_spill_and_fenced_diff_are_attached_losslessly(
     assert diff["attachments"][0]["content"] == "+```python\n+print('safe')\n+```"
 
 
+def test_structured_diff_enforces_render_byte_cap() -> None:
+    patch = "x" * (8 * 1024 * 1024 + 1)
+    event = AdaptedEvent(
+        sdk_session_id="session-large-diff",
+        generation=1,
+        fence_token=1,
+        inbox_seq=1,
+        source="internal",
+        raw_type="tool.execution_complete",
+        raw_payload={
+            "data": {
+                "toolCallId": "large-diff",
+                "success": True,
+                "result": {"patch": patch},
+            }
+        },
+        reducer_hash="large-diff",
+        persistence_class="internal",
+        received_at=1,
+        internal_event_id="large-diff",
+    )
+
+    payload = _diff_render_payload(event)
+
+    assert payload is not None
+    assert payload["oversized"] is True
+    assert payload["byte_count"] == len(patch)
+    assert payload["attachments"] == []
+    assert len(payload["content"]) < 300
+
+
 @pytest.mark.asyncio
 async def test_tool_spill_uses_durable_cumulative_stream(tmp_path: Path) -> None:
-    chunks = ("a" * (40 * 1024), "b" * (40 * 1024))
+    chunks = ("a" * (70 * 1024), "b" * (10 * 1024))
     adapted = [
         EventAdapter().adapt(
             InboxEnvelope(
@@ -473,21 +508,46 @@ async def test_tool_spill_uses_durable_cumulative_stream(tmp_path: Path) -> None
                 inbox_seq=3,
                 source="internal",
                 payload={
+                    "type": "tool.execution_progress",
+                    "data": {
+                        "toolCallId": "cumulative-tool",
+                        "progressMessage": "human status only",
+                    },
+                },
+                received_at=103,
+                internal_event_id="cumulative-status",
+            )
+        )
+    )
+    adapted.append(
+        EventAdapter().adapt(
+            InboxEnvelope(
+                sdk_session_id="session-cumulative-tool",
+                generation=1,
+                fence_token=1,
+                inbox_seq=4,
+                source="internal",
+                payload={
                     "type": "tool.execution_complete",
                     "data": {
                         "toolCallId": "cumulative-tool",
                         "success": True,
-                        "result": {"content": "done"},
+                        "result": {"detailedContent": "FINAL-RESULT"},
                     },
                 },
-                received_at=103,
+                received_at=104,
                 internal_event_id="cumulative-complete",
             )
         )
     )
     async with Database(tmp_path / "cumulative-tool.sqlite3") as database:
-        assert await JournalReducer(database).persist(adapted) == 3
-        rows = await database.fetchall("SELECT payload FROM render_outbox WHERE lane = 'artifact'")
+        assert await JournalReducer(database).persist(adapted) == 4
+        rows = await database.fetchall(
+            """
+            SELECT coalesce_key, payload FROM render_outbox
+            WHERE lane = 'artifact' ORDER BY logical_seq
+            """
+        )
         stream = await database.fetchone(
             """
             SELECT content, spilled, artifact_emitted, finalized
@@ -497,14 +557,79 @@ async def test_tool_spill_uses_durable_cumulative_stream(tmp_path: Path) -> None
             """
         )
 
-    assert len(rows) == 1
-    payload = json.loads(rows[0]["payload"])
-    assert payload["attachments"][0]["content"] == "".join(chunks)
-    assert payload["tool_source"] == "durable-stream"
-    assert stream["content"] == "".join(chunks)
+    assert len(rows) == 3
+    payloads = [json.loads(row["payload"]) for row in rows]
+    assert {row["coalesce_key"] for row in rows} == {"tool-spill:cumulative-tool"}
+    assert payloads[0]["attachments"][0]["content"] == chunks[0]
+    assert payloads[1]["attachments"][0]["content"] == "".join(chunks)
+    final_content = payloads[2]["attachments"][0]["content"]
+    assert final_content.startswith("".join(chunks))
+    assert final_content.endswith("FINAL-RESULT")
+    assert [payload["finalized"] for payload in payloads] == [False, False, True]
+    assert payloads[0]["tool_source"] == "durable-stream"
+    assert payloads[1]["tool_source"] == "durable-stream"
+    assert payloads[2]["tool_source"] == "durable-stream+detailedContent"
+    assert stream["content"] == final_content
+    assert "human status only" not in stream["content"]
     assert stream["spilled"] == 1
     assert stream["artifact_emitted"] == 1
     assert stream["finalized"] == 1
+
+
+@pytest.mark.asyncio
+async def test_tool_spill_preserves_full_structured_completion_error(
+    tmp_path: Path,
+) -> None:
+    events = [
+        {
+            "type": "tool.execution_progress",
+            "data": {
+                "toolCallId": "error-spill",
+                "outputDelta": "x" * (70 * 1024),
+            },
+        },
+        {
+            "type": "tool.execution_complete",
+            "data": {
+                "toolCallId": "error-spill",
+                "success": False,
+                "error": {
+                    "message": "ENOENT",
+                    "path": "/tmp/missing",
+                    "errno": 2,
+                },
+            },
+        },
+    ]
+    adapted = [
+        EventAdapter().adapt(
+            InboxEnvelope(
+                sdk_session_id="session-error-spill",
+                generation=1,
+                fence_token=1,
+                inbox_seq=index,
+                source="internal",
+                payload=event,
+                received_at=100 + index,
+                internal_event_id=f"error-spill-{index}",
+            )
+        )
+        for index, event in enumerate(events, start=1)
+    ]
+    async with Database(tmp_path / "error-spill.sqlite3") as database:
+        assert await JournalReducer(database).persist(adapted) == 2
+        rows = await database.fetchall(
+            """
+            SELECT payload FROM render_outbox
+            WHERE lane = 'artifact' ORDER BY logical_seq
+            """
+        )
+
+    final_content = json.loads(rows[-1]["payload"])["attachments"][0]["content"]
+    assert final_content.startswith("x" * 100)
+    assert '"message": "ENOENT"' in final_content
+    assert '"path": "/tmp/missing"' in final_content
+    assert '"errno": 2' in final_content
 
 
 @pytest.mark.asyncio

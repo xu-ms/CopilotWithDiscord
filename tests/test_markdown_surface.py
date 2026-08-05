@@ -58,8 +58,7 @@ def test_markdown_ast_parses_structural_blocks_and_spans() -> None:
         MarkdownTableCandidate,
         MarkdownThematicBreak,
     ]
-    paragraph = blocks[0]
-    assert paragraph.span == MarkdownSpan(1, 1)
+    assert blocks[0].span == MarkdownSpan(1, 1)
     list_block = blocks[1]
     assert list_block.span == MarkdownSpan(3, 6)
     assert len(list_block.items) == 2
@@ -96,13 +95,13 @@ async def test_markdown_split_plan_adds_continuation_marker_and_attaches_oversiz
 
 
 @pytest.mark.asyncio
-async def test_local_markdown_image_extraction_skips_fenced_inline_escaped_literals_and_batches(
+async def test_local_markdown_image_extraction_ignores_code_containers_and_batches(
     tmp_path: Path,
 ) -> None:
     root = tmp_path / "allowed"
     root.mkdir()
     images = []
-    for index in range(11):
+    for index in range(13):
         image = root / f"img{index:02d}.png"
         _write_png(image)
         images.append(image)
@@ -110,36 +109,34 @@ async def test_local_markdown_image_extraction_skips_fenced_inline_escaped_liter
     outside.write_bytes(b"outside")
 
     source = (
-        f"intro ![one]({images[0].name}) and again ![one]({images[0].name})\n"
-        f"```text\n![code]({images[2].name})\n```\n"
-        f"`![inline]({images[3].name})` and \\![escaped]({images[4].name})\n"
-        f"![two]({images[1].name})\n"
-        f"![missing](missing.png)\n"
-        f"![outside]({outside})\n"
-        f"![remote](https://example.com/image.png)\n"
-        + " ".join(f"![{index}]({image.name})" for index, image in enumerate(images[2:], start=2))
+        f"> quoted ![quote]({images[0].name})\n"
+        f"![one]({images[1].name}) and ![two]({images[2].name})\n"
+        f"> ```\n> ![blocked-fence]({images[3].name})\n> ```\n"
+        f"    ![blocked-indent]({images[4].name})\n"
+        f"`![inline]({images[5].name})` and ``![nested]({images[6].name})``\n"
+        f"`code ``![mismatched]({images[5].name})`` still code`\n"
+        f"\\![escaped]({images[7].name})\n"
+        f"![three]({images[8].name}) ![four]({images[9].name})\n"
+        f"![five]({images[10].name}) ![six]({images[11].name})\n"
+        f"![seven]({images[12].name}) ![outside]({outside})\n"
     )
 
     plan = extract_local_markdown_images(source, allowed_roots=[root])
 
     assert isinstance(plan, MarkdownImageExtractionPlan)
-    assert len(plan.attachments) == 12
-    assert len(plan.batches) == 2
-    assert len(plan.batches[0]) == 10
-    assert len(plan.batches[1]) == 2
-    assert plan.attachments[0].resolved_path == str(images[0].resolve())
-    assert plan.attachments[0].batch_index == 1
-    assert plan.attachments[-1].batch_index == 2
-    assert f"![code]({images[2].name})" in plan.content
-    assert f"`![inline]({images[3].name})`" in plan.content
-    assert "\\![escaped](" in plan.content
-    assert "missing.png" in plan.content
-    assert str(outside) in plan.content
-    assert "https://example.com/image.png" in plan.content
-    assert {warning.kind for warning in plan.warnings} == {
-        "missing-image",
-        "invalid-root",
-        "invalid-target",
-    }
+    assert len(plan.attachments) == 8
+    assert len(plan.batches) == 1
+    assert [attachment.filename for attachment in plan.attachments] == [
+        f"img{index:02d}.png" for index in [0, 1, 2, 8, 9, 10, 11, 12]
+    ]
+    assert plan.attachments[0].source.startswith("![quote]")
+    assert "![blocked-fence]" in plan.content
+    assert "![blocked-indent]" in plan.content
+    assert "`![inline]" in plan.content
+    assert "``![nested]" in plan.content
+    assert "![mismatched]" in plan.content
+    assert "\\![escaped]" in plan.content
+    assert "![quote]" not in plan.content
     assert "![one]" not in plan.content
-    assert "![two]" not in plan.content
+    assert "![outside]" in plan.content
+    assert {warning.kind for warning in plan.warnings} == {"invalid-root"}

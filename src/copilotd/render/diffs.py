@@ -27,22 +27,24 @@ async def render_diff(
 ) -> DiffRenderPlan | None:
     patch = _structured_patch(structured_result)
     source = "structured"
+    raw_bytes: bytes | None = None
     if patch is None and cwd is not None:
         resolved = await asyncio.to_thread(lambda: cwd.expanduser().resolve())
         if not await asyncio.to_thread(resolved.is_dir):
             raise ValueError(f"diff working directory does not exist: {resolved}")
-        patch_bytes = await _git_diff_bytes(resolved, output_limit)
-        patch = patch_bytes.decode("utf-8", errors="surrogateescape")
+        raw_bytes = await _git_diff_bytes(resolved, output_limit)
+        patch = raw_bytes.decode("utf-8", errors="replace")
         source = "local-git"
     if patch is None or not patch:
         return None
-    encoded = patch.encode("utf-8", errors="surrogateescape")
+    display_patch = _safe_text(patch)
+    encoded = raw_bytes if raw_bytes is not None else display_patch.encode("utf-8")
     if len(encoded) > output_limit:
         raise RuntimeError(f"{source} diff exceeds the {output_limit}-byte safety limit")
-    if len(patch) <= inline_limit and "```" not in patch:
+    if len(display_patch) <= inline_limit and "```" not in display_patch:
         return DiffRenderPlan(
             source=source,
-            content=f"**Code changes** · `{source}`\n```diff\n{patch}\n```",
+            content=f"**Code changes** · `{source}`\n```diff\n{display_patch}\n```",
             assets=(),
             byte_count=len(encoded),
         )
@@ -83,16 +85,16 @@ async def _git_diff_bytes(resolved: Path, output_limit: int) -> bytes:
             remaining = output_limit - len(stdout)
             if remaining <= 0:
                 await _terminate_and_reap(process)
-                await _await_stream_task(stderr_task)
+                await stderr_task
                 raise RuntimeError(f"git diff exceeds the {output_limit}-byte safety limit")
             if len(chunk) > remaining:
                 stdout.extend(chunk[:remaining])
                 await _terminate_and_reap(process)
-                await _await_stream_task(stderr_task)
+                await stderr_task
                 raise RuntimeError(f"git diff exceeds the {output_limit}-byte safety limit")
             stdout.extend(chunk)
         returncode = await process.wait()
-        stderr = await _await_stream_task(stderr_task)
+        stderr = await stderr_task
         if returncode != 0:
             detail = stderr.decode("utf-8", errors="replace")[:1000]
             raise RuntimeError(f"git diff failed ({returncode}): {detail}")
@@ -116,10 +118,6 @@ async def _read_bounded(stream: asyncio.StreamReader, limit: int) -> bytes:
             buffer.extend(chunk[: max(0, limit - len(buffer))])
 
 
-async def _await_stream_task(task: asyncio.Task[bytes]) -> bytes:
-    return await task
-
-
 async def _terminate_and_reap(process: asyncio.subprocess.Process) -> None:
     if process.returncode is not None:
         return
@@ -129,6 +127,10 @@ async def _terminate_and_reap(process: asyncio.subprocess.Process) -> None:
     except TimeoutError:
         process.kill()
         await process.wait()
+
+
+def _safe_text(value: str) -> str:
+    return value.encode("utf-8", errors="replace").decode("utf-8")
 
 
 def _structured_patch(result: Mapping[str, Any] | None) -> str | None:

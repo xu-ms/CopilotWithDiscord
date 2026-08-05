@@ -15,6 +15,7 @@ from copilotd.core.models import AdaptedEvent, RenderIntent
 from copilotd.storage.database import Database
 
 FenceValidator = Callable[[int, int], Awaitable[bool]]
+_DIFF_OUTPUT_LIMIT = 8 * 1024 * 1024
 
 
 class RenderPlanner:
@@ -166,16 +167,21 @@ class RenderPlanner:
         )
         if artifact is not None:
             artifact_key = f"{idempotency_key}:artifact"
+            artifact_finalized = bool(artifact.get("finalized", True))
             intents.append(
                 RenderIntent(
                     id=str(uuid.uuid5(uuid.NAMESPACE_URL, artifact_key)),
                     session_id=event.sdk_session_id,
                     logical_seq=event.inbox_seq,
                     lane="artifact",
-                    coalesce_key=None,
+                    coalesce_key=(
+                        None
+                        if artifact.get("coalesce_key") is None
+                        else str(artifact["coalesce_key"])
+                    ),
                     idempotency_key=artifact_key,
                     payload=artifact,
-                    finalized=True,
+                    finalized=artifact_finalized,
                 )
             )
         diff = _diff_render_payload(event)
@@ -740,32 +746,50 @@ class JournalReducer:
         await cursor.close()
         if row is None:
             return False, None
+        if event.raw_type == "tool.execution_progress" and _tool_partial_text(data) is None:
+            return bool(row["spilled"]), None
+        content = str(row["content"])
+        source = "durable-stream"
+        verbatim = True
         if event.raw_type == "tool.execution_complete":
+            completion, completion_source, completion_verbatim = _tool_display_text(
+                data,
+                success=bool(data.get("success")),
+            )
+            if completion:
+                if completion.startswith(content):
+                    content = completion
+                elif not content.startswith(completion):
+                    content = (
+                        f"{content}\n\n--- completion payload "
+                        f"({completion_source}) ---\n{completion}"
+                    )
+                source = f"durable-stream+{completion_source}"
+                verbatim = completion_verbatim
             await connection.execute(
                 """
                 UPDATE tool_output_streams
-                SET finalized = 1, updated_at = ?
+                SET content = ?, finalized = 1, updated_at = ?
                 WHERE session_id = ? AND tool_call_id = ?
                 """,
-                (now, event.sdk_session_id, tool_call_id),
+                (content, now, event.sdk_session_id, tool_call_id),
             )
-        content = str(row["content"])
         spilled = bool(row["spilled"]) or len(content.encode("utf-8")) >= 64 * 1024
         if not spilled:
             return False, None
-        if bool(row["artifact_emitted"]):
-            return True, None
-        await connection.execute(
-            """
-            UPDATE tool_output_streams
-            SET artifact_emitted = 1, spilled = 1, updated_at = ?
-            WHERE session_id = ? AND tool_call_id = ?
-              AND artifact_emitted = 0
-            """,
-            (now, event.sdk_session_id, tool_call_id),
-        )
+        if not bool(row["artifact_emitted"]):
+            await connection.execute(
+                """
+                UPDATE tool_output_streams
+                SET artifact_emitted = 1, spilled = 1, updated_at = ?
+                WHERE session_id = ? AND tool_call_id = ?
+                  AND artifact_emitted = 0
+                """,
+                (now, event.sdk_session_id, tool_call_id),
+            )
         filename = f"tool-partial-{tool_call_id[:12]}.txt"
         line_count = content.count("\n") + 1
+        finalized = event.raw_type == "tool.execution_complete"
         return True, {
             "type": "tool_output_artifact",
             "content": (
@@ -773,9 +797,10 @@ class JournalReducer:
                 f"`{line_count:,}` lines; verbatim durable stream attached as "
                 f"`{filename}`."
             ),
-            "finalized": True,
-            "tool_source": "durable-stream",
-            "verbatim": True,
+            "finalized": finalized,
+            "coalesce_key": f"tool-spill:{tool_call_id}",
+            "tool_source": source,
+            "verbatim": verbatim,
             "attachments": [
                 {
                     "filename": filename,
@@ -2544,10 +2569,13 @@ def _tool_display_text(
         return None, "missing", False
     error = data.get("error")
     if isinstance(error, dict):
-        exact = error.get("message")
-        if exact is None:
-            exact = json.dumps(error, ensure_ascii=False, indent=2, sort_keys=True)
-        return str(exact), "error", True
+        if set(error) == {"message"}:
+            return str(error["message"]), "error", True
+        return (
+            json.dumps(error, ensure_ascii=False, indent=2, sort_keys=True),
+            "error",
+            True,
+        )
     if error is not None:
         return str(error), "error", True
     return None, "error", True
@@ -2559,7 +2587,6 @@ def _tool_partial_text(data: dict[str, Any]) -> str | None:
         "outputDelta",
         "partialOutput",
         "progressOutput",
-        "progressMessage",
     ):
         value = data.get(key)
         if isinstance(value, str) and value:
@@ -2607,6 +2634,21 @@ def _diff_render_payload(event: AdaptedEvent) -> dict[str, Any] | None:
                 "attachments": [],
             }
         return None
+    encoded_patch = patch.encode("utf-8", errors="replace")
+    if len(encoded_patch) > _DIFF_OUTPUT_LIMIT:
+        return {
+            "type": "diff",
+            "content": (
+                "**Code changes**\nStructured diff exceeds the 8 MiB render safety "
+                "limit; exact source remains in the durable event journal."
+            ),
+            "source": source,
+            "oversized": True,
+            "byte_count": len(encoded_patch),
+            "finalized": True,
+            "attachments": [],
+        }
+    patch = encoded_patch.decode("utf-8")
     tool_call_id = str(data.get("toolCallId", "diff"))
     if len(patch) <= 1600 and "```" not in patch:
         content = f"**Code changes** · `{source}`\n```diff\n{patch}\n```"

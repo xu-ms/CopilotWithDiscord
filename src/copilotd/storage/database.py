@@ -193,6 +193,35 @@ class Database:
                         await connection.execute(
                             f"ALTER TABLE {table} ADD COLUMN {name} {declaration}"
                         )
+        if await self._table_exists("session_bindings"):
+            await self.execute(
+                """
+                UPDATE session_bindings
+                SET session_config_snapshot = '{"session_options":{}}',
+                    channel_config_snapshot =
+                        '{"channel_config_version":1,"layout":"text",'
+                        || '"mention_required":false}',
+                    config_snapshot_state = 'verified'
+                WHERE config_snapshot_state = 'legacy_unverified'
+                """
+            )
+        if await self._table_exists("session_creation_intents"):
+            await self.execute(
+                """
+                UPDATE session_creation_intents
+                SET project_config_snapshot =
+                        '{"project_config_version":1,"session_options":{}}',
+                    channel_config_snapshot =
+                        '{"channel_config_version":1,"layout":"text",'
+                        || '"mention_required":false}',
+                    layout = 'text',
+                    project_config_version = 1,
+                    channel_config_version = 1,
+                    config_snapshot_state = 'verified'
+                WHERE config_snapshot_state = 'legacy_unverified'
+                  AND state NOT IN ('creating', 'unknown')
+                """
+            )
 
     async def _table_exists(self, name: str) -> bool:
         row = await self.fetchone(

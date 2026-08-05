@@ -297,144 +297,38 @@ def extract_local_markdown_images(
     in_fence = False
     fence_char = ""
     fence_len = 0
-
+    in_indented_code = False
     for line in source.splitlines(keepends=True):
         text = _strip_newline(line)
+        stripped = _strip_blockquote_prefix(text)
         if in_fence:
             pieces.append(line)
-            if _is_fence_closer(text, fence_char, fence_len):
+            if _is_fence_closer(stripped, fence_char, fence_len):
                 in_fence = False
             continue
-        fence = _parse_fence_marker(text)
+        if in_indented_code:
+            if text.strip() == "" or _is_indented_code_line(stripped):
+                pieces.append(line)
+                continue
+            in_indented_code = False
+        fence = _parse_fence_marker(stripped)
         if fence is not None:
             pieces.append(line)
             fence_char, fence_len = fence
             in_fence = True
             continue
-
-        inline_ticks = 0
-        index = 0
-        line_out: list[str] = []
-        while index < len(text):
-            character = text[index]
-            if character == "\\":
-                if index + 1 < len(text):
-                    line_out.append(text[index : index + 2])
-                    index += 2
-                else:
-                    line_out.append(character)
-                    index += 1
-                continue
-            if character == "`":
-                run = 1
-                while index + run < len(text) and text[index + run] == "`":
-                    run += 1
-                line_out.append("`" * run)
-                if inline_ticks == 0:
-                    inline_ticks = run
-                elif inline_ticks == run:
-                    inline_ticks = 0
-                index += run
-                continue
-            if inline_ticks > 0:
-                line_out.append(character)
-                index += 1
-                continue
-            if text.startswith("![", index):
-                candidate = _scan_markdown_image_candidate(text, index)
-                if candidate is None:
-                    line_out.append(character)
-                    index += 1
-                    continue
-                end, source_text, alt_text, target = candidate
-                path_text, title = _parse_markdown_image_target(target)
-                if path_text is None:
-                    warnings.append(
-                        MarkdownImageWarning(
-                            kind="invalid-target",
-                            message="image target could not be parsed",
-                            source=source_text,
-                        )
-                    )
-                    line_out.append(source_text)
-                    index = end
-                    continue
-                resolved, warning = _resolve_markdown_image_path(path_text, roots)
-                if warning is not None:
-                    warnings.append(
-                        MarkdownImageWarning(
-                            kind=warning,
-                            message=(
-                                "image path is outside allowed roots"
-                                if warning == "invalid-root"
-                                else "image path is missing"
-                            ),
-                            source=source_text,
-                        )
-                    )
-                    line_out.append(source_text)
-                    index = end
-                    continue
-                if not resolved.is_file():
-                    warnings.append(
-                        MarkdownImageWarning(
-                            kind="missing-image",
-                            message="image path does not point to a file",
-                            source=source_text,
-                        )
-                    )
-                    line_out.append(source_text)
-                    index = end
-                    continue
-                if not _is_supported_image(resolved):
-                    warnings.append(
-                        MarkdownImageWarning(
-                            kind="unsupported-image",
-                            message="local Markdown image is not a verified image file",
-                            source=source_text,
-                        )
-                    )
-                    line_out.append(source_text)
-                    index = end
-                    continue
-                attachments.append(
-                    MarkdownImageAttachmentPlan(
-                        source=source_text,
-                        path=path_text,
-                        resolved_path=str(resolved),
-                        alt_text=alt_text,
-                        title=title,
-                        filename=resolved.name,
-                    )
-                )
-                index = end
-                continue
-            line_out.append(character)
-            index += 1
-        pieces.append("".join(line_out))
+        if _is_indented_code_line(stripped):
+            pieces.append(line)
+            in_indented_code = True
+            continue
+        pieces.append(_extract_images_from_line(text, roots, warnings, attachments))
         if line.endswith("\n"):
             pieces.append("\n")
-
     content = "".join(pieces)
     batches = tuple(
         tuple(attachments[index : index + 10]) for index in range(0, len(attachments), 10)
     )
-    rebatches: list[MarkdownImageAttachmentPlan] = []
-    for batch_index, batch in enumerate(batches, start=1):
-        for item in batch:
-            rebatches.append(
-                MarkdownImageAttachmentPlan(
-                    source=item.source,
-                    path=item.path,
-                    resolved_path=item.resolved_path,
-                    alt_text=item.alt_text,
-                    title=item.title,
-                    filename=item.filename,
-                    batch_index=batch_index,
-                    batch_size=len(batch),
-                )
-            )
-    batches = tuple(
+    rebatches = tuple(
         tuple(
             MarkdownImageAttachmentPlan(
                 source=item.source,
@@ -450,12 +344,126 @@ def extract_local_markdown_images(
         )
         for batch_index, batch in enumerate(batches, start=1)
     )
+    flattened = tuple(item for batch in rebatches for item in batch)
     return MarkdownImageExtractionPlan(
         content=content,
-        attachments=tuple(rebatches),
-        batches=batches,
+        attachments=flattened,
+        batches=rebatches,
         warnings=tuple(warnings),
     )
+
+
+def _extract_images_from_line(
+    text: str,
+    roots: tuple[Path, ...],
+    warnings: list[MarkdownImageWarning],
+    attachments: list[MarkdownImageAttachmentPlan],
+) -> str:
+    pieces: list[str] = []
+    index = 0
+    inline_code_delim: int | None = None
+    while index < len(text):
+        character = text[index]
+        if character == "\\":
+            if index + 1 < len(text):
+                pieces.append(text[index : index + 2])
+                index += 2
+            else:
+                pieces.append(character)
+                index += 1
+            continue
+        if character == "`":
+            run = _backtick_run_length(text, index)
+            pieces.append("`" * run)
+            if inline_code_delim is None:
+                inline_code_delim = run
+            elif run == inline_code_delim:
+                inline_code_delim = None
+            index += run
+            continue
+        if inline_code_delim is not None:
+            pieces.append(character)
+            index += 1
+            continue
+        if text.startswith("![", index):
+            candidate = _scan_markdown_image_candidate(text, index)
+            if candidate is None:
+                pieces.append(character)
+                index += 1
+                continue
+            end, source_text, alt_text, target = candidate
+            path_text, title = _parse_markdown_image_target(target)
+            if path_text is None:
+                warnings.append(
+                    MarkdownImageWarning(
+                        kind="invalid-target",
+                        message="image target could not be parsed",
+                        source=source_text,
+                    )
+                )
+                pieces.append(source_text)
+                index = end
+                continue
+            resolved, warning = _resolve_markdown_image_path(path_text, roots)
+            if warning is not None:
+                warnings.append(
+                    MarkdownImageWarning(
+                        kind=warning,
+                        message=(
+                            "image path is outside allowed roots"
+                            if warning == "invalid-root"
+                            else "image path is missing"
+                        ),
+                        source=source_text,
+                    )
+                )
+                pieces.append(source_text)
+                index = end
+                continue
+            if not resolved.is_file():
+                warnings.append(
+                    MarkdownImageWarning(
+                        kind="missing-image",
+                        message="image path does not point to a file",
+                        source=source_text,
+                    )
+                )
+                pieces.append(source_text)
+                index = end
+                continue
+            if not _is_supported_image(resolved):
+                warnings.append(
+                    MarkdownImageWarning(
+                        kind="unsupported-image",
+                        message="local Markdown image is not a verified image file",
+                        source=source_text,
+                    )
+                )
+                pieces.append(source_text)
+                index = end
+                continue
+            attachments.append(
+                MarkdownImageAttachmentPlan(
+                    source=source_text,
+                    path=path_text,
+                    resolved_path=str(resolved),
+                    alt_text=alt_text,
+                    title=title,
+                    filename=resolved.name,
+                )
+            )
+            index = end
+            continue
+        pieces.append(character)
+        index += 1
+    return "".join(pieces)
+
+
+def _backtick_run_length(text: str, index: int) -> int:
+    run = 1
+    while index + run < len(text) and text[index + run] == "`":
+        run += 1
+    return run
 
 
 def _scan_markdown_image_candidate(text: str, index: int) -> tuple[int, str, str, str] | None:
@@ -523,6 +531,25 @@ def _find_matching_markdown_paren(text: str, start: int) -> int | None:
     return None
 
 
+def _strip_blockquote_prefix(text: str) -> str:
+    value = text
+    while True:
+        spaces = len(value) - len(value.lstrip(" "))
+        if spaces > 3:
+            return value
+        cursor = spaces
+        if cursor >= len(value) or value[cursor] != ">":
+            return value
+        cursor += 1
+        if cursor < len(value) and value[cursor] == " ":
+            cursor += 1
+        value = value[cursor:]
+
+
+def _is_indented_code_line(text: str) -> bool:
+    return text.startswith("	") or text.startswith("    ")
+
+
 def _parse_fence_marker(text: str) -> tuple[str, int] | None:
     match = _FENCE_RE.match(text)
     if match is None:
@@ -532,7 +559,9 @@ def _parse_fence_marker(text: str) -> tuple[str, int] | None:
 
 
 def _is_fence_closer(text: str, fence_char: str, fence_len: int) -> bool:
-    return re.fullmatch(rf"[ \t]*{re.escape(fence_char)}{{{fence_len},}}[ \t]*", text) is not None
+    return (
+        re.fullmatch(rf"[ 	]*{re.escape(fence_char)}{{{fence_len},}}[ 	]*", text) is not None
+    )
 
 
 def split_table_row(line: str) -> list[str]:
@@ -541,7 +570,6 @@ def split_table_row(line: str) -> list[str]:
         value = value[1:]
     if value.endswith("|") and not value.endswith("\\|"):
         value = value[:-1]
-
     cells: list[str] = []
     current: list[str] = []
     escaped = False

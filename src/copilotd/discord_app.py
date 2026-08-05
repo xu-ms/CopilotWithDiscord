@@ -118,6 +118,7 @@ class CopilotDiscordBot(commands.Bot):
                 discord_file_max_bytes=settings.attachment_file_max_bytes,
                 discord_message_max_bytes=settings.attachment_message_max_bytes,
                 runtime_inline_blob_max_bytes=settings.attachment_blob_max_bytes,
+                runtime_serialized_frame_max_bytes=(settings.attachment_runtime_frame_max_bytes),
             ),
         )
         self.heartbeat = HeartbeatWriter(self.database, settings.heartbeat_path)
@@ -1662,6 +1663,7 @@ class CopilotDiscordBot(commands.Bot):
             command_or_url: str,
             args_json: str = "[]",
             headers_json: str = "{}",
+            project_env_refs: str = "",
             enabled: bool = True,
         ) -> None:
             async def operation(_: CommandInvocation) -> str:
@@ -1671,7 +1673,16 @@ class CopilotDiscordBot(commands.Bot):
                         "command": command_or_url,
                         "args": _parse_json_list(args_json, field="args_json"),
                     }
+                    references = [
+                        value.strip() for value in project_env_refs.split(",") if value.strip()
+                    ]
+                    if references:
+                        config["project_env_refs"] = references
                 else:
+                    if project_env_refs.strip():
+                        raise CDInputError(
+                            "project_env_refs are supported only for stdio MCP servers"
+                        )
                     config = {
                         "url": command_or_url,
                         "headers": _parse_json_object(

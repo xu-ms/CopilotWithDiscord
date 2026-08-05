@@ -1,3 +1,4 @@
+import asyncio
 import json
 from pathlib import Path
 from typing import Any
@@ -41,6 +42,26 @@ class FakeTransport:
         if self.failures:
             raise self.failures.pop(0)
         self.edited.append((message_id, lane, payload))
+
+
+class HungTransport(FakeTransport):
+    def __init__(self) -> None:
+        super().__init__()
+        self.started = asyncio.Event()
+        self.release = asyncio.Event()
+
+    async def send(
+        self,
+        *,
+        session_id: str,
+        lane: str,
+        payload: dict[str, Any],
+        idempotency_key: str,
+    ) -> str:
+        del session_id, lane, payload, idempotency_key
+        self.started.set()
+        await self.release.wait()
+        return "unexpected"
 
 
 async def _insert_outbox(
@@ -167,6 +188,60 @@ async def test_drain_waits_for_final_rate_limit_retry(tmp_path: Path) -> None:
     assert delivered == 1
     assert dict(state) == {"state": "sent", "attempts": 2}
     assert len(transport.sent) == 1
+
+
+@pytest.mark.asyncio
+async def test_cancelled_dispatch_restores_all_claims_to_pending(
+    tmp_path: Path,
+) -> None:
+    async with Database(tmp_path / "cancelled-claim.sqlite3") as database:
+        await _insert_outbox(
+            database,
+            item_id="hung",
+            sequence=1,
+            payload={"content": "hung", "finalized": True},
+        )
+        await _insert_outbox(
+            database,
+            item_id="also-claimed",
+            sequence=2,
+            payload={"content": "second", "finalized": True},
+            coalesce_key="assistant:message-2",
+        )
+        transport = HungTransport()
+        dispatcher = RenderOutboxDispatcher(database, transport)
+        task = asyncio.create_task(dispatcher.dispatch_once(limit=2))
+        await transport.started.wait()
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        states = await database.fetchall("SELECT id, state FROM render_outbox ORDER BY logical_seq")
+
+    assert [dict(row) for row in states] == [
+        {"id": "hung", "state": "pending"},
+        {"id": "also-claimed", "state": "pending"},
+    ]
+
+
+@pytest.mark.asyncio
+async def test_drain_deadline_bounds_hung_delivery_and_restores_claim(
+    tmp_path: Path,
+) -> None:
+    async with Database(tmp_path / "hung-drain.sqlite3") as database:
+        await _insert_outbox(
+            database,
+            item_id="hung",
+            sequence=1,
+            payload={"content": "hung", "finalized": True},
+        )
+        transport = HungTransport()
+        dispatcher = RenderOutboxDispatcher(database, transport)
+
+        delivered = await dispatcher.drain(deadline_seconds=0.05)
+        row = await database.fetchone("SELECT state FROM render_outbox WHERE id = 'hung'")
+
+    assert delivered == 0
+    assert row["state"] == "pending"
 
 
 @pytest.mark.asyncio

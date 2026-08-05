@@ -317,6 +317,86 @@ async def test_legacy_creation_intent_fails_closed_without_new_thread(
 
 
 @pytest.mark.asyncio
+async def test_v11_backfill_verifies_bindings_and_only_blocks_ambiguous_intents(
+    tmp_path: Path,
+) -> None:
+    home = tmp_path / "home"
+    home.mkdir()
+    database_path = tmp_path / "upgrade-backfill.sqlite3"
+    async with Database(database_path) as database:
+        bindings = SessionBindingRepository(database)
+        await bindings.create(
+            thread_id="thread-upgrade",
+            sdk_session_id="session-upgrade",
+            cwd_snapshot=home,
+            project_source="implicit-home",
+        )
+        projects = ProjectRegistry(database, resolved_home=home)
+        await projects.initialize()
+        project = await projects.resolve("channel-upgrade")
+        config = await projects.session_config_snapshot("channel-upgrade")
+        intents = CreationIntentRepository(database)
+        await intents.reserve(
+            source_kind="message",
+            source_id="attached-source",
+            project=project,
+            config=config,
+        )
+        await intents.reserve(
+            source_kind="message",
+            source_id="ambiguous-source",
+            project=project,
+            config=config,
+        )
+        await database.execute(
+            """
+            UPDATE session_bindings
+            SET config_snapshot_state = 'legacy_unverified',
+                session_config_snapshot = '{}',
+                channel_config_snapshot = '{}'
+            WHERE thread_id = 'thread-upgrade'
+            """
+        )
+        await database.execute(
+            """
+            UPDATE session_creation_intents
+            SET config_snapshot_state = 'legacy_unverified',
+                project_config_snapshot = '{}',
+                channel_config_snapshot = '{}',
+                state = CASE source_id
+                    WHEN 'attached-source' THEN 'attached'
+                    ELSE 'creating'
+                END
+            """
+        )
+
+    bridge = FakeBridge()
+    threads = FakeThreads()
+    async with Database(database_path) as database:
+        binding = await SessionBindingRepository(database).by_thread("thread-upgrade")
+        attached = await CreationIntentRepository(database).by_source(
+            source_kind="message",
+            source_id="attached-source",
+        )
+        ambiguous = await CreationIntentRepository(database).by_source(
+            source_kind="message",
+            source_id="ambiguous-source",
+        )
+        _service, sessions = await _build_service(database, home, bridge, threads)
+        failures = await sessions.eager_resume()
+
+        assert binding is not None
+        assert binding.config_snapshot_state == "verified"
+        assert binding.session_config_snapshot == {"session_options": {}}
+        assert attached is not None and attached.config_snapshot_state == "verified"
+        assert ambiguous is not None
+        assert ambiguous.config_snapshot_state == "legacy_unverified"
+        assert failures == {}
+        assert bridge.resume_calls == 1
+        await sessions.shutdown()
+
+
+@pytest.mark.asyncio
 async def test_concurrent_duplicate_delivery_creates_exactly_one_thread(
     tmp_path: Path,
 ) -> None:

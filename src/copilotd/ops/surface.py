@@ -13,25 +13,23 @@ from copilotd.config import Settings
 from copilotd.ops.service import ServiceManager
 from copilotd.storage.database import Database
 
-_SECRET_KEY = r"(?:authorization|token|secret|password|cookie|(?:x[-_ ]?)?api[-_ ]?key)"
-_REDACTION_SENTINEL = "__CD_REDACTED__"
-_JSON_QUOTED_SECRET = re.compile(
-    rf'(?i)(?P<prefix>["\']?{_SECRET_KEY}["\']?\s*:\s*)"(?P<value>(?:\\.|[^"\\])*)"'
+_AUTH_HEADER_RE = re.compile(
+    r"(?im)(?P<prefix>\b(?:proxy-)?authorization\b\s*[:=]\s*)"
+    r"(?:(?:basic|bearer)\s+)?[^\r\n]*"
 )
-_JSON_SINGLE_SECRET = re.compile(
-    rf"(?i)(?P<prefix>[\"']?{_SECRET_KEY}[\"']?\s*:\s*)'(?P<value>(?:\\.|[^'\\])*)'"
+_COOKIE_HEADER_RE = re.compile(r"(?im)(?P<prefix>\b(?:set-cookie|cookie)\b\s*[:=]\s*)[^\r\n]*")
+_TEXT_KEY = r'(?:["\'][^"\r\n]{1,128}["\']|[A-Za-z0-9][A-Za-z0-9._:/-]{0,127})'
+_GENERIC_DOUBLE_RE = re.compile(
+    rf"(?i)(?P<key>{_TEXT_KEY})(?P<sep>\s*[:=]\s*)"
+    r'"(?!\[redacted\])(?P<value>(?:\\.|[^"\\])*)"'
 )
-_QUOTED_GENERIC_SECRET = re.compile(
-    rf'(?i)(?P<prefix>["\']?{_SECRET_KEY}["\']?\s*(?:[:=]|\s+)\s*(?:bearer\s+)?)'
-    r'"(?!__CD_REDACTED__)(?P<value>(?:\\.|[^"\\])*)"'
+_GENERIC_SINGLE_RE = re.compile(
+    rf"(?i)(?P<key>{_TEXT_KEY})(?P<sep>\s*[:=]\s*)"
+    r"'(?!\[redacted\])(?P<value>(?:\\.|[^'\\])*)'"
 )
-_QUOTED_GENERIC_SINGLE_SECRET = re.compile(
-    rf"(?i)(?P<prefix>[\"']?{_SECRET_KEY}[\"']?\s*(?:[:=]|\s+)\s*(?:bearer\s+)?)"
-    r"'(?!__CD_REDACTED__)(?P<value>(?:\\.|[^'\\])*)'"
-)
-_UNQUOTED_SECRET = re.compile(
-    rf'(?i)(?P<prefix>["\']?{_SECRET_KEY}["\']?\s*(?:[:=]|\s+)\s*(?:bearer\s+)?)'
-    r"(?P<value>[^\s,;)}\]\"']+)"
+_GENERIC_UNQUOTED_RE = re.compile(
+    rf"(?i)(?P<key>{_TEXT_KEY})(?P<sep>\s*[:=]\s*)"
+    r"(?P<value>(?!\[redacted\])[^\s,;)}\]\"\']+)"
 )
 
 
@@ -210,7 +208,10 @@ def _redact_structure(value: Any, *, sensitive: bool = False) -> Any:
     if isinstance(value, Mapping):
         redacted: dict[Any, Any] = {}
         for key, item in value.items():
-            redacted[key] = _redact_structure(item, sensitive=sensitive or _is_sensitive_key(key))
+            redacted[key] = _redact_structure(
+                item,
+                sensitive=sensitive or _is_sensitive_key(key),
+            )
         return redacted
     if isinstance(value, list):
         return [_redact_structure(item, sensitive=sensitive) for item in value]
@@ -227,38 +228,66 @@ def _redact_structure(value: Any, *, sensitive: bool = False) -> Any:
 
 def _is_sensitive_key(key: Any) -> bool:
     normalized = re.sub(r"[^a-z0-9]+", "", str(key).lower())
-    return any(
-        token in normalized
-        for token in (
-            "authorization",
-            "token",
-            "secret",
-            "password",
-            "cookie",
-            "apikey",
-        )
+    if not normalized:
+        return False
+    direct_tokens = (
+        "authorization",
+        "cookie",
+        "setcookie",
+        "token",
+        "password",
+        "apikey",
+        "awssecretaccesskey",
+        "accesstoken",
+        "accesssecret",
+        "accesskey",
+        "clienttoken",
+        "clientsecret",
+        "clientkey",
+        "privatetoken",
+        "privatesecret",
+        "privatekey",
+        "sessiontoken",
+        "refreshtoken",
     )
+    if any(token in normalized for token in direct_tokens):
+        return True
+    if (
+        "aws" in normalized
+        and "secret" in normalized
+        and "access" in normalized
+        and "key" in normalized
+    ):
+        return True
+    if any(
+        prefix in normalized for prefix in ("access", "client", "private", "session", "refresh")
+    ) and any(suffix in normalized for suffix in ("key", "token", "secret")):
+        return True
+    return False
 
 
 def _redact_text(value: str) -> str:
-    redacted = _JSON_QUOTED_SECRET.sub(
-        lambda match: f'{match.group("prefix")}"{_REDACTION_SENTINEL}"',
-        value,
-    )
-    redacted = _JSON_SINGLE_SECRET.sub(
-        lambda match: f"{match.group('prefix')}'{_REDACTION_SENTINEL}'",
-        redacted,
-    )
-    redacted = _QUOTED_GENERIC_SECRET.sub(
-        lambda match: f"{match.group('prefix')}{_REDACTION_SENTINEL}",
-        redacted,
-    )
-    redacted = _QUOTED_GENERIC_SINGLE_SECRET.sub(
-        lambda match: f"{match.group('prefix')}{_REDACTION_SENTINEL}",
-        redacted,
-    )
-    redacted = _UNQUOTED_SECRET.sub(
-        lambda match: f"{match.group('prefix')}{_REDACTION_SENTINEL}",
-        redacted,
-    )
-    return redacted.replace(_REDACTION_SENTINEL, "[redacted]")
+    redacted = _GENERIC_DOUBLE_RE.sub(_redact_generic_double, value)
+    redacted = _GENERIC_SINGLE_RE.sub(_redact_generic_single, redacted)
+    redacted = _GENERIC_UNQUOTED_RE.sub(_redact_generic_unquoted, redacted)
+    redacted = _AUTH_HEADER_RE.sub(lambda match: f"{match.group('prefix')}[redacted]", redacted)
+    redacted = _COOKIE_HEADER_RE.sub(lambda match: f"{match.group('prefix')}[redacted]", redacted)
+    return redacted
+
+
+def _redact_generic_double(match: re.Match[str]) -> str:
+    if not _is_sensitive_key(match.group("key")):
+        return match.group(0)
+    return f'{match.group("key")}{match.group("sep")}"[redacted]"'
+
+
+def _redact_generic_single(match: re.Match[str]) -> str:
+    if not _is_sensitive_key(match.group("key")):
+        return match.group(0)
+    return f"{match.group('key')}{match.group('sep')}'[redacted]'"
+
+
+def _redact_generic_unquoted(match: re.Match[str]) -> str:
+    if not _is_sensitive_key(match.group("key")):
+        return match.group(0)
+    return f"{match.group('key')}{match.group('sep')}[redacted]"

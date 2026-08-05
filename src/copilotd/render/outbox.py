@@ -89,14 +89,21 @@ class RenderOutboxDispatcher:
             timestamp = time.time() if live_clock else now
             items = await self._claim(limit=limit, now=timestamp)
             delivered = 0
-            for item in items:
+            for index, item in enumerate(items):
                 delivery_now = time.time() if live_clock else timestamp
-                if await self._deliver(
-                    item,
-                    now=delivery_now,
-                    live_clock=live_clock,
-                ):
-                    delivered += 1
+                try:
+                    if await self._deliver(
+                        item,
+                        now=delivery_now,
+                        live_clock=live_clock,
+                    ):
+                        delivered += 1
+                except asyncio.CancelledError:
+                    await self._restore_claims(items[index:])
+                    raise
+                except Exception:
+                    await self._restore_claims(items[index:])
+                    raise
             return delivered
 
     async def drain(
@@ -110,7 +117,14 @@ class RenderOutboxDispatcher:
         deadline = time.monotonic() + deadline_seconds
         delivered = 0
         while True:
-            count = await self.dispatch_once(limit=limit)
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return delivered
+            try:
+                async with asyncio.timeout(remaining):
+                    count = await self.dispatch_once(limit=limit)
+            except TimeoutError:
+                return delivered
             delivered += count
             pending = await self._database.fetchone(
                 """
@@ -129,6 +143,30 @@ class RenderOutboxDispatcher:
                 0.01 if next_attempt is None else max(0.01, float(next_attempt) - time.time())
             )
             await asyncio.sleep(min(eligibility_wait, 0.25, remaining))
+
+    async def _restore_claims(self, items: list[OutboxItem]) -> None:
+        if not items:
+            return
+        identifiers = [item.id for item in items]
+        placeholders = ", ".join("?" for _ in identifiers)
+        timestamp = time.time()
+
+        async def restore() -> None:
+            await self._database.execute(
+                f"""
+                UPDATE render_outbox
+                SET state = 'pending', next_attempt_at = MIN(next_attempt_at, ?),
+                    updated_at = ?
+                WHERE id IN ({placeholders}) AND state = 'sending'
+                """,
+                (timestamp, timestamp, *identifiers),
+            )
+
+        task = asyncio.create_task(restore())
+        try:
+            await asyncio.shield(task)
+        except asyncio.CancelledError:
+            await task
 
     async def _claim(self, *, limit: int, now: float) -> list[OutboxItem]:
         async with self._database.transaction() as connection:

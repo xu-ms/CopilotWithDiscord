@@ -36,13 +36,14 @@ class _FakeStream:
 
 
 class _FakeProcess:
-    def __init__(self, stdout: bytes, stderr: bytes = b"") -> None:
+    def __init__(self, stdout: bytes, stderr: bytes = b"", *, auto_finish: bool) -> None:
         self.stdout = _FakeStream(stdout)
         self.stderr = _FakeStream(stderr)
         self.returncode = None
         self.terminated = False
         self.killed = False
         self._wait_event = asyncio.Event()
+        self._auto_finish = auto_finish
 
     def terminate(self) -> None:
         self.terminated = True
@@ -53,6 +54,10 @@ class _FakeProcess:
         self._wait_event.set()
 
     async def wait(self) -> int:
+        if self._auto_finish and self.returncode is None:
+            self.returncode = 0
+            self._wait_event.set()
+            return self.returncode
         await self._wait_event.wait()
         return self.returncode or 0
 
@@ -87,6 +92,30 @@ async def test_diff_renderer_prefers_structured_and_safely_falls_back_to_local_g
     assert local.source == "local-git"
     assert "-before" in local.content
     assert "+after" in local.content
+
+
+@pytest.mark.asyncio
+async def test_non_utf8_git_output_uses_replacement_text_and_raw_bytes_attachment(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    raw = b"diff --git a/file b/file\nindex 1..2\n+\x80\xff\n"
+
+    async def factory(*args: object, **kwargs: object) -> _FakeProcess:
+        return _FakeProcess(raw, auto_finish=True)
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", factory)
+
+    inline = await render_diff(cwd=tmp_path, inline_limit=10_000, output_limit=10_000)
+    assert inline is not None
+    assert "\ufffd" in inline.content
+    inline.content.encode("utf-8")
+    assert inline.byte_count == len(raw)
+
+    attachment = await render_diff(cwd=tmp_path, inline_limit=0, output_limit=10_000)
+    assert attachment is not None
+    assert attachment.assets[0].content == raw
+    assert attachment.content.endswith("changes.diff`.")
 
 
 @pytest.mark.asyncio
@@ -125,7 +154,7 @@ async def test_local_git_diff_streaming_enforces_cap_and_terminates_the_process(
     created: list[_FakeProcess] = []
 
     async def fake_create_subprocess_exec(*args: object, **kwargs: object) -> _FakeProcess:
-        fake = _FakeProcess(stdout_bytes)
+        fake = _FakeProcess(stdout_bytes, auto_finish=False)
         created.append(fake)
         return fake
 
