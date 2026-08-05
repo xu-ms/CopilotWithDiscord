@@ -427,6 +427,131 @@ async def test_user_message_and_send_response_orderings_keep_one_submission(
 
 
 @pytest.mark.asyncio
+async def test_external_same_prompt_callback_before_acceptance_is_reclassified(
+    tmp_path: Path,
+) -> None:
+    session_id = str(uuid4())
+    external_event_id = str(uuid4())
+    accepted_id = str(uuid4())
+    async with Database(tmp_path / "external-before-acceptance.sqlite3") as database:
+        await CapabilityRegistry(
+            Settings(_env_file=None, data_dir=tmp_path)
+        ).activate(
+            database,
+            {
+                "runtime_version": "1.0.73",
+                "protocol_version": 3,
+                "ping_protocol_version": 3,
+            },
+        )
+        bindings = SessionBindingRepository(database)
+        binding = await bindings.create(
+            thread_id="thread-external-before-acceptance",
+            sdk_session_id=session_id,
+            cwd_snapshot=tmp_path,
+            project_source="implicit-home",
+        )
+        bridge = FakeBridge(session_id)
+        runtime = SessionRuntime(
+            database=database,
+            bridge=bridge,
+            bindings=bindings,
+            owner_leases=OwnerLeaseStore(database),
+            owner_id="process-external-before-acceptance",
+            binding=binding,
+        )
+        await runtime.attach_create()
+
+        async def external_callback_first(prompt: str, **kwargs: Any) -> str:
+            bridge.handle.sent.append((prompt, kwargs))
+            bridge.ingress(
+                _event(
+                    UserMessageData(content=prompt),
+                    SessionEventType.USER_MESSAGE,
+                    event_id=UUID(external_event_id),
+                )
+            )
+            assert runtime.inbox is not None
+            await runtime.inbox.join()
+            return accepted_id
+
+        bridge.handle.send = external_callback_first  # type: ignore[method-assign]
+        assert (
+            await runtime.send("same prompt", idempotency_key="same-prompt")
+            == accepted_id
+        )
+        provisional = await database.fetchall(
+            """
+            SELECT origin, state, accepted_message_id, observed_user_event_id,
+                   correlation_basis
+            FROM submissions WHERE sdk_session_id = ? ORDER BY origin
+            """,
+            (session_id,),
+        )
+
+        assert [dict(row) for row in provisional] == [
+            {
+                "origin": "app_message",
+                "state": "submitted",
+                "accepted_message_id": accepted_id,
+                "observed_user_event_id": None,
+                "correlation_basis": None,
+            },
+            {
+                "origin": "runtime_observed",
+                "state": "observed_active",
+                "accepted_message_id": None,
+                "observed_user_event_id": external_event_id,
+                "correlation_basis": "acceptance_id_mismatch_runtime_observed",
+            },
+        ]
+
+        bridge.ingress(
+            _event(
+                UserMessageData(content="same prompt"),
+                SessionEventType.USER_MESSAGE,
+                event_id=UUID(accepted_id),
+            )
+        )
+        assert runtime.inbox is not None
+        await runtime.inbox.join()
+        reconciled = await database.fetchall(
+            """
+            SELECT origin, state, accepted_message_id, observed_user_event_id
+            FROM submissions WHERE sdk_session_id = ? ORDER BY origin
+            """,
+            (session_id,),
+        )
+        leases = await database.fetchall(
+            """
+            SELECT source_id, state FROM liveness_leases
+            WHERE sdk_session_id = ? AND kind = 'submission'
+            ORDER BY source_id
+            """,
+            (session_id,),
+        )
+        await runtime.shutdown()
+
+    assert len(reconciled) == 2
+    assert [dict(row) for row in reconciled] == [
+        {
+            "origin": "app_message",
+            "state": "observed_active",
+            "accepted_message_id": accepted_id,
+            "observed_user_event_id": accepted_id,
+        },
+        {
+            "origin": "runtime_observed",
+            "state": "observed_active",
+            "accepted_message_id": None,
+            "observed_user_event_id": external_event_id,
+        },
+    ]
+    assert len(leases) == 2
+    assert all(row["state"] == "active" for row in leases)
+
+
+@pytest.mark.asyncio
 async def test_runtime_routes_user_input_through_durable_interaction(
     tmp_path: Path,
 ) -> None:

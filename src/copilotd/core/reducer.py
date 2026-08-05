@@ -1093,19 +1093,52 @@ class JournalReducer:
             message_id = str(data["message_id"])
             cursor = await connection.execute(
                 """
-                SELECT accepted_message_id FROM submissions
+                SELECT state, accepted_message_id, observed_user_event_id
+                FROM submissions
                 WHERE submission_id = ? AND sdk_session_id = ?
                 """,
                 (submission_id, event.sdk_session_id),
             )
             accepted = await cursor.fetchone()
             await cursor.close()
+            if accepted is None:
+                return
+            if accepted["state"] == "rejected":
+                await self._record_runtime_incident_once(
+                    connection,
+                    event,
+                    kind="submission_acceptance_after_rejection",
+                    detail={
+                        "submission_id": submission_id,
+                        "message_id": message_id,
+                    },
+                )
+                return
             if (
-                accepted is not None
-                and accepted["accepted_message_id"] is not None
+                accepted["accepted_message_id"] is None
+                and accepted["observed_user_event_id"] is not None
+                and str(accepted["observed_user_event_id"]) != message_id
+                and await self._capability_evidenced(
+                    connection,
+                    "accepted_user_event_id_mapping",
+                )
+            ):
+                await self._split_observed_submission(
+                    connection,
+                    event,
+                    submission_id=submission_id,
+                    app_state="submitted",
+                    runtime_correlation_basis=(
+                        "acceptance_id_mismatch_runtime_observed"
+                    ),
+                    incident_kind="provisional_user_event_acceptance_mismatch",
+                    now=now,
+                )
+            if (
+                accepted["accepted_message_id"] is not None
                 and str(accepted["accepted_message_id"]) != message_id
             ):
-                await self._record_runtime_incident(
+                await self._record_runtime_incident_once(
                     connection,
                     event,
                     kind="submission_acceptance_conflict",
@@ -1195,12 +1228,16 @@ class JournalReducer:
                     """
                     UPDATE submissions
                     SET state = CASE
+                            WHEN state = 'rejected'
+                            THEN state
                             WHEN observed_user_event_id IS NOT NULL
                               OR accepted_message_id IS NOT NULL
                             THEN state
                             ELSE 'submitted_unknown'
                         END,
                         terminal_at = CASE
+                            WHEN state = 'rejected'
+                            THEN terminal_at
                             WHEN observed_user_event_id IS NOT NULL
                               OR accepted_message_id IS NOT NULL
                             THEN terminal_at
@@ -1255,18 +1292,47 @@ class JournalReducer:
             else:
                 cursor = await connection.execute(
                     """
-                    SELECT observed_user_event_id FROM submissions
+                    SELECT state, accepted_message_id, observed_user_event_id
+                    FROM submissions
                     WHERE submission_id = ? AND sdk_session_id = ?
                     """,
                     (submission_id, event.sdk_session_id),
                 )
                 rejected = await cursor.fetchone()
                 await cursor.close()
-                if rejected is not None and rejected["observed_user_event_id"] is not None:
-                    await self._split_observed_rejected_submission(
+                if rejected is None or rejected["state"] == "rejected":
+                    return
+                if rejected["accepted_message_id"] is not None:
+                    await self._record_runtime_incident_once(
+                        connection,
+                        event,
+                        kind="submission_rejection_after_acceptance",
+                        detail={
+                            "submission_id": submission_id,
+                            "accepted_message_id": str(
+                                rejected["accepted_message_id"]
+                            ),
+                        },
+                    )
+                    await connection.execute(
+                        """
+                        UPDATE message_queue
+                        SET state = 'submitted', updated_at = ?
+                        WHERE id = ? AND state IN (
+                            'local_queued', 'submitting', 'submitted_unknown'
+                        )
+                        """,
+                        (now, submission_id),
+                    )
+                    return
+                if rejected["observed_user_event_id"] is not None:
+                    await self._split_observed_submission(
                         connection,
                         event,
                         submission_id=submission_id,
+                        app_state="rejected",
+                        runtime_correlation_basis="rejected_send_runtime_observed",
+                        incident_kind="rejected_send_observed_as_runtime_message",
                         now=now,
                     )
                 else:
@@ -2142,12 +2208,15 @@ class JournalReducer:
                 now=now,
             )
 
-    async def _split_observed_rejected_submission(
+    async def _split_observed_submission(
         self,
         connection: Any,
         event: AdaptedEvent,
         *,
         submission_id: str,
+        app_state: str,
+        runtime_correlation_basis: str,
+        incident_kind: str,
         now: float,
     ) -> None:
         cursor = await connection.execute(
@@ -2185,7 +2254,7 @@ class JournalReducer:
                    prompt_hash, requested_mode, requested_delivery, observed_delivery,
                    state, accepted_message_id, accepted_at,
                    observed_user_event_id, observed_origin_hint,
-                   'rejected_send_runtime_observed', autopilot_objective_id,
+                   ?, autopilot_objective_id,
                    task_completion_outcome, completion_basis,
                    COALESCE(observed_at, created_at), idle_at,
                    observed_at, observed_interaction_id, objective_status,
@@ -2194,7 +2263,11 @@ class JournalReducer:
             FROM submissions WHERE submission_id = ?
             ON CONFLICT(submission_id) DO NOTHING
             """,
-            (runtime_submission_id, submission_id),
+            (
+                runtime_submission_id,
+                runtime_correlation_basis,
+                submission_id,
+            ),
         )
         for table in (
             "submission_segments",
@@ -2224,25 +2297,31 @@ class JournalReducer:
         await connection.execute(
             """
             UPDATE submissions
-            SET state = 'rejected', accepted_message_id = NULL,
+            SET state = ?, accepted_message_id = NULL,
                 accepted_at = NULL, observed_user_event_id = NULL,
                 observed_origin_hint = NULL, observed_delivery = NULL,
                 observed_at = NULL, observed_interaction_id = NULL,
                 correlation_basis = NULL, autopilot_objective_id = NULL,
                 task_completion_outcome = NULL, completion_basis = NULL,
                 objective_status = NULL, task_complete_event_id = NULL,
-                abort_event_id = NULL, idle_at = NULL, terminal_at = ?,
+                abort_event_id = NULL, idle_at = NULL,
+                terminal_at = CASE WHEN ? = 'rejected' THEN ? ELSE NULL END,
                 continuation_count = 0
             WHERE submission_id = ?
             """,
-            (event.received_at, submission_id),
+            (
+                app_state,
+                app_state,
+                event.received_at,
+                submission_id,
+            ),
         )
-        await self._record_runtime_incident(
+        await self._record_runtime_incident_once(
             connection,
             event,
-            kind="rejected_send_observed_as_runtime_message",
+            kind=incident_kind,
             detail={
-                "rejected_submission_id": submission_id,
+                "app_submission_id": submission_id,
                 "runtime_submission_id": runtime_submission_id,
                 "user_event_id": user_event_id,
             },
@@ -2369,6 +2448,11 @@ class JournalReducer:
                 if (
                     content_hash is not None
                     and candidate["prompt_hash"] == content_hash
+                    and (
+                        not exact_mapping
+                        or candidate["accepted_message_id"] is None
+                        or str(candidate["accepted_message_id"]) == event.event_id
+                    )
                     and (
                         observed_mode is None
                         or candidate["requested_mode"] is None
@@ -3057,6 +3141,45 @@ class JournalReducer:
             ),
         )
 
+    async def _record_runtime_incident_once(
+        self,
+        connection: Any,
+        event: AdaptedEvent,
+        *,
+        kind: str,
+        detail: dict[str, Any],
+    ) -> None:
+        encoded = json.dumps(detail, ensure_ascii=False, sort_keys=True)
+        cursor = await connection.execute(
+            """
+            SELECT 1 FROM runtime_incidents
+            WHERE session_id = ? AND kind = ? AND detail = ?
+            LIMIT 1
+            """,
+            (event.sdk_session_id, kind, encoded),
+        )
+        existing = await cursor.fetchone()
+        await cursor.close()
+        if existing is not None:
+            return
+        await connection.execute(
+            """
+            INSERT INTO runtime_incidents(
+                timestamp, runtime_generation, session_id, kind,
+                last_inbox_seq, last_sdk_receive_seq, detail
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                event.received_at,
+                event.generation,
+                event.sdk_session_id,
+                kind,
+                event.inbox_seq,
+                event.sdk_receive_seq,
+                encoded,
+            ),
+        )
+
     async def _capability_evidenced(
         self,
         connection: Any,
@@ -3204,6 +3327,108 @@ class JournalReducer:
                 ),
             )
 
+    async def _reopen_submission_for_task(
+        self,
+        connection: Any,
+        event: AdaptedEvent,
+        *,
+        submission_id: str,
+        task_id: str,
+        correlation_basis: str,
+        evidence_time: float,
+    ) -> bool:
+        cursor = await connection.execute(
+            """
+            SELECT state, terminal_at FROM submissions
+            WHERE submission_id = ? AND sdk_session_id = ?
+            """,
+            (submission_id, event.sdk_session_id),
+        )
+        submission = await cursor.fetchone()
+        await cursor.close()
+        if submission is None:
+            return False
+        if submission["state"] != "semantic_complete":
+            return True
+        if (
+            submission["terminal_at"] is None
+            or float(submission["terminal_at"]) > evidence_time
+        ):
+            await self._record_runtime_incident_once(
+                connection,
+                event,
+                kind="stale_task_evidence_ignored_for_completed_submission",
+                detail={
+                    "task_id": task_id,
+                    "submission_id": submission_id,
+                    "correlation_basis": correlation_basis,
+                    "evidence_time": evidence_time,
+                    "terminal_at": submission["terminal_at"],
+                },
+            )
+            return False
+        cursor = await connection.execute(
+            """
+            UPDATE submissions
+            SET state = 'loop_idle', completion_basis = NULL, terminal_at = NULL
+            WHERE submission_id = ? AND sdk_session_id = ?
+              AND state = 'semantic_complete' AND terminal_at <= ?
+            """,
+            (submission_id, event.sdk_session_id, evidence_time),
+        )
+        reopened = cursor.rowcount == 1
+        await cursor.close()
+        if not reopened:
+            return False
+        await connection.execute(
+            """
+            UPDATE submission_segments
+            SET state = 'loop_idle'
+            WHERE submission_id = ?
+              AND segment_index = (
+                  SELECT MAX(segment_index) FROM submission_segments
+                  WHERE submission_id = ?
+              )
+              AND state = 'semantic_complete'
+            """,
+            (submission_id, submission_id),
+        )
+        await connection.execute(
+            """
+            INSERT INTO liveness_leases(
+                sdk_session_id, lease_id, kind, source_id,
+                runtime_generation, owner_fence_token, state,
+                acquired_at, refreshed_at
+            ) VALUES (?, ?, 'submission', ?, ?, ?, 'active', ?, ?)
+            ON CONFLICT(sdk_session_id, lease_id) DO UPDATE SET
+                state = 'active',
+                runtime_generation = excluded.runtime_generation,
+                owner_fence_token = excluded.owner_fence_token,
+                refreshed_at = excluded.refreshed_at,
+                released_at = NULL
+            """,
+            (
+                event.sdk_session_id,
+                f"submission:{submission_id}",
+                submission_id,
+                event.generation,
+                event.fence_token,
+                evidence_time,
+                evidence_time,
+            ),
+        )
+        await self._record_runtime_incident_once(
+            connection,
+            event,
+            kind="late_task_reopened_submission",
+            detail={
+                "task_id": task_id,
+                "submission_id": submission_id,
+                "correlation_basis": correlation_basis,
+            },
+        )
+        return True
+
     async def _resolve_task_submission(
         self,
         connection: Any,
@@ -3224,9 +3449,24 @@ class JournalReducer:
         existing = await cursor.fetchone()
         await cursor.close()
         if existing is not None:
+            submission_id = str(existing["submission_id"])
+            correlation_basis = str(existing["correlation_basis"])
+            if not await self._reopen_submission_for_task(
+                connection,
+                event,
+                submission_id=submission_id,
+                task_id=task_id,
+                correlation_basis=correlation_basis,
+                evidence_time=evidence_time,
+            ):
+                return None, None, (
+                    None
+                    if existing["objective_id"] is None
+                    else str(existing["objective_id"])
+                )
             return (
-                str(existing["submission_id"]),
-                str(existing["correlation_basis"]),
+                submission_id,
+                correlation_basis,
                 (
                     None
                     if existing["objective_id"] is None
@@ -3260,6 +3500,15 @@ class JournalReducer:
                     },
                 )
                 return None, None, objective_id
+            if not await self._reopen_submission_for_task(
+                connection,
+                event,
+                submission_id=explicit_submission_id,
+                task_id=task_id,
+                correlation_basis="explicit_submission_id",
+                evidence_time=evidence_time,
+            ):
+                return None, None, objective_id
             return explicit_submission_id, "explicit_submission_id", objective_id
 
         if objective_id is not None:
@@ -3273,8 +3522,18 @@ class JournalReducer:
             objective_candidates = await cursor.fetchall()
             await cursor.close()
             if len(objective_candidates) == 1:
+                submission_id = str(objective_candidates[0]["submission_id"])
+                if not await self._reopen_submission_for_task(
+                    connection,
+                    event,
+                    submission_id=submission_id,
+                    task_id=task_id,
+                    correlation_basis="objective_id",
+                    evidence_time=evidence_time,
+                ):
+                    return None, None, objective_id
                 return (
-                    str(objective_candidates[0]["submission_id"]),
+                    submission_id,
                     "objective_id",
                     objective_id,
                 )
@@ -3304,7 +3563,17 @@ class JournalReducer:
         candidates = await cursor.fetchall()
         await cursor.close()
         if len(candidates) == 1:
-            return str(candidates[0]["submission_id"]), "single_active_submission", None
+            submission_id = str(candidates[0]["submission_id"])
+            if not await self._reopen_submission_for_task(
+                connection,
+                event,
+                submission_id=submission_id,
+                task_id=task_id,
+                correlation_basis="single_active_submission",
+                evidence_time=evidence_time,
+            ):
+                return None, None, None
+            return submission_id, "single_active_submission", None
         if not candidates:
             cursor = await connection.execute(
                 """
@@ -3327,58 +3596,15 @@ class JournalReducer:
                 and float(latest["terminal_at"]) <= evidence_time
             ):
                 submission_id = str(latest["submission_id"])
-                await connection.execute(
-                    """
-                    UPDATE submissions
-                    SET state = 'loop_idle', completion_basis = NULL,
-                        terminal_at = NULL
-                    WHERE submission_id = ? AND state = 'semantic_complete'
-                    """,
-                    (submission_id,),
-                )
-                await connection.execute(
-                    """
-                    UPDATE submission_segments
-                    SET state = 'loop_idle'
-                    WHERE submission_id = ?
-                      AND segment_index = (
-                          SELECT MAX(segment_index) FROM submission_segments
-                          WHERE submission_id = ?
-                      )
-                      AND state = 'semantic_complete'
-                    """,
-                    (submission_id, submission_id),
-                )
-                await connection.execute(
-                    """
-                    INSERT INTO liveness_leases(
-                        sdk_session_id, lease_id, kind, source_id,
-                        runtime_generation, owner_fence_token, state,
-                        acquired_at, refreshed_at
-                    ) VALUES (?, ?, 'submission', ?, ?, ?, 'active', ?, ?)
-                    ON CONFLICT(sdk_session_id, lease_id) DO UPDATE SET
-                        state = 'active',
-                        runtime_generation = excluded.runtime_generation,
-                        owner_fence_token = excluded.owner_fence_token,
-                        refreshed_at = excluded.refreshed_at,
-                        released_at = NULL
-                    """,
-                    (
-                        event.sdk_session_id,
-                        f"submission:{submission_id}",
-                        submission_id,
-                        event.generation,
-                        event.fence_token,
-                        evidence_time,
-                        evidence_time,
-                    ),
-                )
-                await self._record_runtime_incident(
+                if not await self._reopen_submission_for_task(
                     connection,
                     event,
-                    kind="late_task_reopened_submission",
-                    detail={"task_id": task_id, "submission_id": submission_id},
-                )
+                    submission_id=submission_id,
+                    task_id=task_id,
+                    correlation_basis="late_task_after_idle",
+                    evidence_time=evidence_time,
+                ):
+                    return None, None, None
                 return submission_id, "late_task_after_idle", None
         if candidates:
             await self._record_runtime_incident(

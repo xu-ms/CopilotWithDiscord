@@ -1152,21 +1152,11 @@ async def test_explicit_rejection_moves_early_callback_to_runtime_observed_submi
                 source="internal",
                 session_id=session_id,
             ),
-            _adapted(
-                "copilotd.submission.accepted",
-                {
-                    "submission_id": "submission-app",
-                    "message_id": user_event_id,
-                },
-                4,
-                source="internal",
-                session_id=session_id,
-            ),
             AdaptedEvent(
                 sdk_session_id=session_id,
                 generation=1,
                 fence_token=7,
-                inbox_seq=5,
+                inbox_seq=4,
                 source="sdk",
                 raw_type="user.message",
                 raw_payload={
@@ -1175,13 +1165,13 @@ async def test_explicit_rejection_moves_early_callback_to_runtime_observed_submi
                 },
                 reducer_hash="early-user-message",
                 persistence_class="durable",
-                received_at=105,
+                received_at=104,
                 event_id=user_event_id,
             ),
             _adapted(
                 "copilotd.submission.rejected",
                 {"submission_id": "submission-app"},
-                6,
+                5,
                 source="internal",
                 session_id=session_id,
             ),
@@ -1224,8 +1214,8 @@ async def test_explicit_rejection_moves_early_callback_to_runtime_observed_submi
             "submission_id": segment["submission_id"],
             "origin": "runtime_observed",
             "state": "observed_active",
-            "accepted_message_id": user_event_id,
-            "accepted_at": 104,
+            "accepted_message_id": None,
+            "accepted_at": None,
             "observed_user_event_id": user_event_id,
             "correlation_basis": "rejected_send_runtime_observed",
         },
@@ -1233,6 +1223,140 @@ async def test_explicit_rejection_moves_early_callback_to_runtime_observed_submi
     assert lease["source_id"] == segment["submission_id"]
     assert lease["state"] == "active"
     assert queue["state"] == "rejected"
+
+
+@pytest.mark.asyncio
+async def test_definitive_acceptance_and_rejection_conflicts_are_monotonic(
+    tmp_path: Path,
+) -> None:
+    session_id = "session-receipt-conflicts"
+    accepted_id = str(uuid4())
+    rejected_then_accepted_id = str(uuid4())
+    async with Database(tmp_path / "receipt-conflicts.sqlite3") as database:
+        await _insert_projection_binding(database, session_id)
+        events = [
+            _adapted(
+                "copilotd.submission.queued",
+                {
+                    "submission_id": "accepted-first",
+                    "thread_id": "thread-projection",
+                    "prompt": "accepted first",
+                    "prompt_hash": hashlib.sha256(b"accepted first").hexdigest(),
+                    "requested_mode": "interactive",
+                },
+                1,
+                source="internal",
+                session_id=session_id,
+            ),
+            _adapted(
+                "copilotd.submission.accepted",
+                {"submission_id": "accepted-first", "message_id": accepted_id},
+                2,
+                source="internal",
+                session_id=session_id,
+            ),
+            _adapted(
+                "copilotd.submission.rejected",
+                {"submission_id": "accepted-first"},
+                3,
+                source="internal",
+                session_id=session_id,
+            ),
+            _adapted(
+                "copilotd.submission.rejected",
+                {"submission_id": "accepted-first"},
+                4,
+                source="internal",
+                session_id=session_id,
+            ),
+            _adapted(
+                "copilotd.submission.queued",
+                {
+                    "submission_id": "rejected-first",
+                    "thread_id": "thread-projection",
+                    "prompt": "rejected first",
+                    "prompt_hash": hashlib.sha256(b"rejected first").hexdigest(),
+                    "requested_mode": "interactive",
+                },
+                5,
+                source="internal",
+                session_id=session_id,
+            ),
+            _adapted(
+                "copilotd.submission.rejected",
+                {"submission_id": "rejected-first"},
+                6,
+                source="internal",
+                session_id=session_id,
+            ),
+            _adapted(
+                "copilotd.submission.accepted",
+                {
+                    "submission_id": "rejected-first",
+                    "message_id": rejected_then_accepted_id,
+                },
+                7,
+                source="internal",
+                session_id=session_id,
+            ),
+            _adapted(
+                "copilotd.submission.accepted",
+                {
+                    "submission_id": "rejected-first",
+                    "message_id": rejected_then_accepted_id,
+                },
+                8,
+                source="internal",
+                session_id=session_id,
+            ),
+            _adapted(
+                "copilotd.submission.acceptance_unknown",
+                {"submission_id": "rejected-first"},
+                9,
+                source="internal",
+                session_id=session_id,
+            ),
+        ]
+        assert await JournalReducer(database).persist(events) == len(events)
+        submissions = await database.fetchall(
+            """
+            SELECT submission_id, state, accepted_message_id
+            FROM submissions WHERE sdk_session_id = ? ORDER BY submission_id
+            """,
+            (session_id,),
+        )
+        queue = await database.fetchall(
+            "SELECT id, state FROM message_queue ORDER BY id"
+        )
+        incidents = await database.fetchall(
+            """
+            SELECT kind, COUNT(*) AS count FROM runtime_incidents
+            WHERE session_id = ?
+            GROUP BY kind ORDER BY kind
+            """,
+            (session_id,),
+        )
+
+    assert [dict(row) for row in submissions] == [
+        {
+            "submission_id": "accepted-first",
+            "state": "submitted",
+            "accepted_message_id": accepted_id,
+        },
+        {
+            "submission_id": "rejected-first",
+            "state": "rejected",
+            "accepted_message_id": None,
+        },
+    ]
+    assert [dict(row) for row in queue] == [
+        {"id": "accepted-first", "state": "submitted"},
+        {"id": "rejected-first", "state": "rejected"},
+    ]
+    assert [dict(row) for row in incidents] == [
+        {"kind": "submission_acceptance_after_rejection", "count": 1},
+        {"kind": "submission_rejection_after_acceptance", "count": 1},
+    ]
 
 
 @pytest.mark.asyncio
@@ -2085,3 +2209,291 @@ async def test_task_discovered_after_quiet_completion_reopens_latest_submission(
         "state": "semantic_complete",
         "completion_basis": "tasks_terminal_quiet",
     }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("link_field", "expected_basis"),
+    [
+        ("submissionId", "explicit_submission_id"),
+        ("objectiveId", "objective_id"),
+    ],
+)
+async def test_explicit_late_task_links_reopen_and_reacquire_submission(
+    tmp_path: Path,
+    link_field: str,
+    expected_basis: str,
+) -> None:
+    session_id = f"session-explicit-task-{link_field}"
+
+    def requested(topic: str, seq: int) -> AdaptedEvent:
+        return _adapted(
+            "copilotd.snapshot.requested",
+            {"topic": topic},
+            seq,
+            source="internal",
+            session_id=session_id,
+        )
+
+    def observed(
+        topic: str,
+        seq: int,
+        epoch: int,
+        payload: dict[str, Any],
+    ) -> AdaptedEvent:
+        return _adapted(
+            "copilotd.snapshot.observed",
+            {
+                "topic": topic,
+                "epoch": epoch,
+                "snapshot_id": f"explicit-{link_field}-{topic}-{epoch}",
+                "query_start_sdk_receive_seq": 0,
+                "query_end_sdk_receive_seq": 0,
+                "observed_at": 100 + seq,
+                "payload": payload,
+            },
+            seq,
+            source="internal",
+            session_id=session_id,
+        )
+
+    async with Database(
+        tmp_path / f"explicit-task-{link_field}.sqlite3"
+    ) as database:
+        await _insert_projection_binding(database, session_id)
+        reducer = JournalReducer(database)
+        initial = [
+            _adapted(
+                "user.message",
+                {"content": "explicit late task", "agentMode": "interactive"},
+                1,
+                session_id=session_id,
+            ),
+            _adapted(
+                "session.idle",
+                {"aborted": False},
+                2,
+                session_id=session_id,
+            ),
+            requested("tasks", 3),
+            observed("tasks", 4, 1, {"tasks": []}),
+            requested("activity", 5),
+            observed(
+                "activity",
+                6,
+                1,
+                {
+                    "processing": False,
+                    "has_active_work": False,
+                    "abortable": False,
+                },
+            ),
+            requested("queue", 7),
+            observed("queue", 8, 1, {"items": [], "steering_messages": []}),
+        ]
+        assert await reducer.persist(initial) == len(initial)
+        submission = await database.fetchone(
+            "SELECT submission_id, state FROM submissions WHERE sdk_session_id = ?",
+            (session_id,),
+        )
+        assert submission["state"] == "semantic_complete"
+        objective_id = "objective-explicit"
+        if link_field == "objectiveId":
+            await database.execute(
+                """
+                UPDATE submissions SET autopilot_objective_id = ?
+                WHERE submission_id = ?
+                """,
+                (objective_id, submission["submission_id"]),
+            )
+        link_value = (
+            str(submission["submission_id"])
+            if link_field == "submissionId"
+            else objective_id
+        )
+        running_task = {
+            "id": "explicit-task",
+            "status": "running",
+            "type": "agent",
+            "description": "Explicit worker",
+            link_field: link_value,
+        }
+        assert await reducer.persist(
+            [
+                requested("tasks", 9),
+                observed("tasks", 10, 2, {"tasks": [running_task]}),
+            ]
+        ) == 2
+        reopened = await database.fetchone(
+            "SELECT state, terminal_at FROM submissions WHERE submission_id = ?",
+            (submission["submission_id"],),
+        )
+        link = await database.fetchone(
+            """
+            SELECT submission_id, state, correlation_basis
+            FROM submission_task_links WHERE task_id = 'explicit-task'
+            """
+        )
+        lease = await database.fetchone(
+            """
+            SELECT state FROM liveness_leases
+            WHERE sdk_session_id = ? AND kind = 'submission'
+              AND source_id = ?
+            """,
+            (session_id, submission["submission_id"]),
+        )
+        assert dict(reopened) == {"state": "loop_idle", "terminal_at": None}
+        assert dict(link) == {
+            "submission_id": submission["submission_id"],
+            "state": "running",
+            "correlation_basis": expected_basis,
+        }
+        assert lease["state"] == "active"
+
+        completed_task = {**running_task, "status": "completed"}
+        terminal = [
+            requested("tasks", 11),
+            observed("tasks", 12, 3, {"tasks": [completed_task]}),
+            requested("activity", 13),
+            observed(
+                "activity",
+                14,
+                2,
+                {
+                    "processing": False,
+                    "has_active_work": False,
+                    "abortable": False,
+                },
+            ),
+            requested("queue", 15),
+            observed("queue", 16, 2, {"items": [], "steering_messages": []}),
+        ]
+        assert await reducer.persist(terminal) == len(terminal)
+        settled = await database.fetchone(
+            """
+            SELECT state, completion_basis FROM submissions
+            WHERE submission_id = ?
+            """,
+            (submission["submission_id"],),
+        )
+
+    assert dict(settled) == {
+        "state": "semantic_complete",
+        "completion_basis": "tasks_terminal_quiet",
+    }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("link_field", ["submissionId", "objectiveId"])
+async def test_stale_explicit_task_snapshot_cannot_reopen_completed_submission(
+    tmp_path: Path,
+    link_field: str,
+) -> None:
+    session_id = f"session-stale-explicit-{link_field}"
+    submission_id = "completed-submission"
+    objective_id = "completed-objective"
+    async with Database(
+        tmp_path / f"stale-explicit-{link_field}.sqlite3"
+    ) as database:
+        await _insert_projection_binding(database, session_id)
+        await database.execute(
+            """
+            INSERT INTO submissions(
+                submission_id, sdk_session_id, origin, requested_mode,
+                state, completion_basis, autopilot_objective_id,
+                created_at, observed_at, idle_at, terminal_at
+            ) VALUES (
+                ?, ?, 'runtime_observed', 'interactive',
+                'semantic_complete', 'loop_idle', ?,
+                100, 100, 110, 200
+            )
+            """,
+            (
+                submission_id,
+                session_id,
+                objective_id if link_field == "objectiveId" else None,
+            ),
+        )
+        await database.execute(
+            """
+            INSERT INTO liveness_leases(
+                sdk_session_id, lease_id, kind, source_id,
+                runtime_generation, owner_fence_token, state,
+                acquired_at, refreshed_at, released_at
+            ) VALUES (?, ?, 'submission', ?, 1, 7, 'released', 100, 200, 200)
+            """,
+            (
+                session_id,
+                f"submission:{submission_id}",
+                submission_id,
+            ),
+        )
+        link_value = submission_id if link_field == "submissionId" else objective_id
+        reducer = JournalReducer(database)
+        events = [
+            _adapted(
+                "copilotd.snapshot.requested",
+                {"topic": "tasks"},
+                1,
+                source="internal",
+                session_id=session_id,
+            ),
+            _adapted(
+                "copilotd.snapshot.observed",
+                {
+                    "topic": "tasks",
+                    "epoch": 1,
+                    "snapshot_id": f"stale-explicit-{link_field}",
+                    "query_start_sdk_receive_seq": 0,
+                    "query_end_sdk_receive_seq": 0,
+                    "observed_at": 150,
+                    "payload": {
+                        "tasks": [
+                            {
+                                "id": "stale-task",
+                                "status": "running",
+                                "type": "agent",
+                                link_field: link_value,
+                            }
+                        ]
+                    },
+                },
+                2,
+                source="internal",
+                session_id=session_id,
+            ),
+        ]
+        assert await reducer.persist(events) == len(events)
+        submission = await database.fetchone(
+            """
+            SELECT state, completion_basis, terminal_at
+            FROM submissions WHERE submission_id = ?
+            """,
+            (submission_id,),
+        )
+        link = await database.fetchone(
+            "SELECT 1 FROM submission_task_links WHERE task_id = 'stale-task'"
+        )
+        lease = await database.fetchone(
+            """
+            SELECT state FROM liveness_leases
+            WHERE sdk_session_id = ? AND kind = 'submission'
+              AND source_id = ?
+            """,
+            (session_id, submission_id),
+        )
+        incident = await database.fetchone(
+            """
+            SELECT kind FROM runtime_incidents
+            WHERE kind = 'stale_task_evidence_ignored_for_completed_submission'
+            """
+        )
+
+    assert dict(submission) == {
+        "state": "semantic_complete",
+        "completion_basis": "loop_idle",
+        "terminal_at": 200,
+    }
+    assert link is None
+    assert lease["state"] == "released"
+    assert incident["kind"] == "stale_task_evidence_ignored_for_completed_submission"
