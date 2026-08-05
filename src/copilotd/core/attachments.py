@@ -4,6 +4,7 @@ import asyncio
 import base64
 import hashlib
 import io
+import json
 import os
 import re
 import time
@@ -141,26 +142,27 @@ class AttachmentService:
 
     async def sdk_attachments(self, manifest_id: str) -> list[dict[str, Any]]:
         items = await self._verified_items(manifest_id)
+        limits = self._resolved_limits()
+        budget = max(0, limits.message_max_bytes - 2)
+        emitted_items = 0
         result: list[dict[str, Any]] = []
         for item in items:
             if item.sdk_attachment_kind == "blob":
-                data = await asyncio.to_thread(_read_and_encode_blob, item.local_path)
-                result.append(
-                    {
-                        "type": "blob",
-                        "data": data,
-                        "mimeType": item.mime_type,
-                        "displayName": item.original_name,
-                    }
-                )
-            else:
-                result.append(
-                    {
-                        "type": "file",
-                        "path": str(item.local_path),
-                        "displayName": item.original_name,
-                    }
-                )
+                blob, cost = await asyncio.to_thread(_load_inline_blob, item)
+                request_cost = cost + (1 if emitted_items else 0)
+                if request_cost <= budget:
+                    result.append(blob)
+                    budget -= request_cost
+                    emitted_items += 1
+                    continue
+            result.append(
+                {
+                    "type": "file",
+                    "path": str(item.local_path),
+                    "displayName": item.original_name,
+                }
+            )
+            emitted_items += 1
         return result
 
     async def _begin_manifest(
@@ -393,9 +395,23 @@ def _sha256_hex(content: bytes) -> str:
     return hashlib.sha256(content).hexdigest()
 
 
-def _read_and_encode_blob(path: Path) -> str:
-    content = path.read_bytes()
-    return base64.b64encode(content).decode("ascii")
+def _load_inline_blob(item: _StoredItem) -> tuple[dict[str, Any], int]:
+    content = item.local_path.read_bytes()
+    data = base64.b64encode(content).decode("ascii")
+    payload = {
+        "type": "blob",
+        "data": data,
+        "mimeType": item.mime_type,
+        "displayName": item.original_name,
+    }
+    serialized = json.dumps(
+        payload,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    cost = len(serialized.encode("utf-8"))
+    return payload, cost
 
 
 def _matches_integrity(item: _StoredItem) -> bool:

@@ -147,6 +147,29 @@ async def test_rate_limit_uses_exact_retry_after_and_does_not_lose_item(
 
 
 @pytest.mark.asyncio
+async def test_drain_waits_for_final_rate_limit_retry(tmp_path: Path) -> None:
+    async with Database(tmp_path / "drain-rate-limit.sqlite3") as database:
+        await _insert_outbox(
+            database,
+            item_id="final",
+            sequence=1,
+            payload={"content": "final", "finalized": True},
+        )
+        transport = FakeTransport()
+        transport.failures.append(RenderRateLimited(0.02))
+        dispatcher = RenderOutboxDispatcher(database, transport)
+
+        delivered = await dispatcher.drain(deadline_seconds=0.5)
+        state = await database.fetchone(
+            "SELECT state, attempts FROM render_outbox WHERE id = 'final'"
+        )
+
+    assert delivered == 1
+    assert dict(state) == {"state": "sent", "attempts": 2}
+    assert len(transport.sent) == 1
+
+
+@pytest.mark.asyncio
 async def test_transient_failure_blocks_after_three_attempts(tmp_path: Path) -> None:
     async with Database(tmp_path / "transient.sqlite3") as database:
         await _insert_outbox(
@@ -209,9 +232,7 @@ async def test_taskdeck_coalesces_pending_updates_and_final_bypasses_cadence(
             payload={"content": "terminal", "finalized": True},
         )
         assert await dispatcher.dispatch_once(now=102) == 1
-        states = await database.fetchall(
-            "SELECT state FROM render_outbox ORDER BY logical_seq"
-        )
+        states = await database.fetchall("SELECT state FROM render_outbox ORDER BY logical_seq")
 
     assert [row["state"] for row in states] == ["sent", "superseded", "sent"]
     assert transport.edited[-1] == (

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
 import time
 import uuid
@@ -71,6 +72,8 @@ class RenderPlanner:
         event: AdaptedEvent,
         *,
         payload_override: dict[str, Any] | None = None,
+        artifact_override: dict[str, Any] | None = None,
+        suppress_default_artifact: bool = False,
     ) -> list[RenderIntent]:
         if payload_override is not None and payload_override.get("suppress"):
             return []
@@ -156,7 +159,11 @@ class RenderPlanner:
                 finalized=finalized,
             )
         ]
-        artifact = _tool_output_artifact(event)
+        artifact = (
+            artifact_override
+            if artifact_override is not None or suppress_default_artifact
+            else _tool_output_artifact(event)
+        )
         if artifact is not None:
             artifact_key = f"{idempotency_key}:artifact"
             intents.append(
@@ -245,6 +252,11 @@ class JournalReducer:
                     event,
                     now=now,
                 )
+                suppress_default_artifact, artifact_override = await self._cumulative_tool_artifact(
+                    connection,
+                    event,
+                    now=now,
+                )
                 await connection.execute(
                     """
                     UPDATE session_bindings
@@ -271,7 +283,16 @@ class JournalReducer:
                         event.fence_token,
                     ),
                 )
-                for intent in self._planner.plan(event, payload_override=render_payload):
+                planner_parameters = inspect.signature(self._planner.plan).parameters
+                planner_kwargs: dict[str, Any] = {
+                    "payload_override": render_payload,
+                }
+                if "artifact_override" in planner_parameters:
+                    planner_kwargs.update(
+                        artifact_override=artifact_override,
+                        suppress_default_artifact=suppress_default_artifact,
+                    )
+                for intent in self._planner.plan(event, **planner_kwargs):
                     await connection.execute(
                         """
                         INSERT INTO render_outbox(
@@ -620,41 +641,8 @@ class JournalReducer:
 
         if event.raw_type not in {"assistant.message_delta", "assistant.message"}:
             return None
-        data = event.raw_payload.get("data", {})
-        if not isinstance(data, dict) or event.message_id is None:
+        if event.message_id is None:
             return None
-        if event.raw_type == "assistant.message_delta":
-            delta = str(data.get("deltaContent", ""))
-            agent_id = event.agent_id or ""
-            await connection.execute(
-                """
-                INSERT INTO render_streams(
-                    session_id, message_id, agent_id, content, finalized, updated_at
-                ) VALUES (?, ?, ?, ?, 0, ?)
-                ON CONFLICT(session_id, message_id, agent_id) DO UPDATE SET
-                    content = CASE
-                        WHEN render_streams.finalized = 1 THEN render_streams.content
-                        ELSE render_streams.content || excluded.content
-                    END,
-                    updated_at = excluded.updated_at
-                """,
-                (event.sdk_session_id, event.message_id, agent_id, delta, now),
-            )
-        else:
-            content = str(data.get("content", ""))
-            agent_id = event.agent_id or ""
-            await connection.execute(
-                """
-                INSERT INTO render_streams(
-                    session_id, message_id, agent_id, content, finalized, updated_at
-                ) VALUES (?, ?, ?, ?, 1, ?)
-                ON CONFLICT(session_id, message_id, agent_id) DO UPDATE SET
-                    content = excluded.content,
-                    finalized = 1,
-                    updated_at = excluded.updated_at
-                """,
-                (event.sdk_session_id, event.message_id, agent_id, content, now),
-            )
         cursor = await connection.execute(
             """
             SELECT content, finalized FROM render_streams
@@ -672,6 +660,131 @@ class JournalReducer:
             "finalized": bool(stream["finalized"]),
         }
 
+    async def _accumulate_render_stream(
+        self,
+        connection: Any,
+        event: AdaptedEvent,
+        *,
+        data: dict[str, Any],
+        now: float,
+    ) -> str:
+        agent_id = event.agent_id or ""
+        if event.raw_type == "assistant.message_delta":
+            delta = str(data.get("deltaContent", ""))
+            await connection.execute(
+                """
+                INSERT INTO render_streams(
+                    session_id, message_id, agent_id, content, finalized, updated_at
+                ) VALUES (?, ?, ?, ?, 0, ?)
+                ON CONFLICT(session_id, message_id, agent_id) DO UPDATE SET
+                    content = CASE
+                        WHEN render_streams.finalized = 1 THEN render_streams.content
+                        ELSE render_streams.content || excluded.content
+                    END,
+                    updated_at = excluded.updated_at
+                """,
+                (event.sdk_session_id, event.message_id, agent_id, delta, now),
+            )
+        else:
+            content = str(data.get("content", ""))
+            await connection.execute(
+                """
+                INSERT INTO render_streams(
+                    session_id, message_id, agent_id, content, finalized, updated_at
+                ) VALUES (?, ?, ?, ?, 1, ?)
+                ON CONFLICT(session_id, message_id, agent_id) DO UPDATE SET
+                    content = excluded.content,
+                    finalized = 1,
+                    updated_at = excluded.updated_at
+                """,
+                (event.sdk_session_id, event.message_id, agent_id, content, now),
+            )
+        cursor = await connection.execute(
+            """
+            SELECT content FROM render_streams
+            WHERE session_id = ? AND message_id = ? AND agent_id = ?
+            """,
+            (event.sdk_session_id, event.message_id, agent_id),
+        )
+        row = await cursor.fetchone()
+        await cursor.close()
+        return "" if row is None else str(row["content"])
+
+    async def _cumulative_tool_artifact(
+        self,
+        connection: Any,
+        event: AdaptedEvent,
+        *,
+        now: float,
+    ) -> tuple[bool, dict[str, Any] | None]:
+        if event.raw_type not in {
+            "tool.execution_progress",
+            "tool.execution_complete",
+        }:
+            return False, None
+        data = event.raw_payload.get("data", event.raw_payload)
+        if not isinstance(data, dict):
+            return False, None
+        tool_call_id = _value(data, "toolCallId")
+        if tool_call_id is None:
+            return False, None
+        cursor = await connection.execute(
+            """
+            SELECT content, spilled, artifact_emitted
+            FROM tool_output_streams
+            WHERE session_id = ? AND tool_call_id = ?
+            """,
+            (event.sdk_session_id, tool_call_id),
+        )
+        row = await cursor.fetchone()
+        await cursor.close()
+        if row is None:
+            return False, None
+        if event.raw_type == "tool.execution_complete":
+            await connection.execute(
+                """
+                UPDATE tool_output_streams
+                SET finalized = 1, updated_at = ?
+                WHERE session_id = ? AND tool_call_id = ?
+                """,
+                (now, event.sdk_session_id, tool_call_id),
+            )
+        content = str(row["content"])
+        spilled = bool(row["spilled"]) or len(content.encode("utf-8")) >= 64 * 1024
+        if not spilled:
+            return False, None
+        if bool(row["artifact_emitted"]):
+            return True, None
+        await connection.execute(
+            """
+            UPDATE tool_output_streams
+            SET artifact_emitted = 1, spilled = 1, updated_at = ?
+            WHERE session_id = ? AND tool_call_id = ?
+              AND artifact_emitted = 0
+            """,
+            (now, event.sdk_session_id, tool_call_id),
+        )
+        filename = f"tool-partial-{tool_call_id[:12]}.txt"
+        line_count = content.count("\n") + 1
+        return True, {
+            "type": "tool_output_artifact",
+            "content": (
+                f"**Tool partial spill** — `{len(content):,}` characters / "
+                f"`{line_count:,}` lines; verbatim durable stream attached as "
+                f"`{filename}`."
+            ),
+            "finalized": True,
+            "tool_source": "durable-stream",
+            "verbatim": True,
+            "attachments": [
+                {
+                    "filename": filename,
+                    "media_type": "text/plain",
+                    "content": content,
+                }
+            ],
+        }
+
     async def _apply_domain_state(
         self,
         connection: Any,
@@ -682,6 +795,17 @@ class JournalReducer:
         data = event.raw_payload.get("data", event.raw_payload)
         if not isinstance(data, dict):
             return
+        stream_content: str | None = None
+        if (
+            event.raw_type in {"assistant.message_delta", "assistant.message"}
+            and event.message_id is not None
+        ):
+            stream_content = await self._accumulate_render_stream(
+                connection,
+                event,
+                data=data,
+                now=now,
+            )
         if event.raw_type in RenderPlanner._USAGE_TYPES:
             await connection.execute(
                 """
@@ -738,7 +862,12 @@ class JournalReducer:
                         content = tool_output_streams.content || excluded.content,
                         spilled = MAX(
                             tool_output_streams.spilled,
-                            LENGTH(tool_output_streams.content || excluded.content) >= 65536
+                            LENGTH(
+                                CAST(
+                                    tool_output_streams.content || excluded.content
+                                    AS BLOB
+                                )
+                            ) >= 65536
                         ),
                         updated_at = excluded.updated_at
                     """,
@@ -786,7 +915,19 @@ class JournalReducer:
         if event.raw_type == "copilotd.tasks.snapshot":
             await self._apply_task_snapshot(connection, event, data=data, now=now)
         elif _is_task_projection_event(event):
-            await self._update_task_projection(connection, event, data=data, now=now)
+            projection_data = data
+            if event.agent_id is not None and stream_content is not None:
+                projection_data = {
+                    **data,
+                    "content": stream_content,
+                    "deltaContent": stream_content,
+                }
+            await self._update_task_projection(
+                connection,
+                event,
+                data=projection_data,
+                now=now,
+            )
         if event.raw_type == "copilotd.interaction.requested":
             interaction_id = str(data["interaction_id"])
             await connection.execute(

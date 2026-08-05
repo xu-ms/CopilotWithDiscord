@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
@@ -30,28 +31,14 @@ async def render_diff(
         resolved = await asyncio.to_thread(lambda: cwd.expanduser().resolve())
         if not await asyncio.to_thread(resolved.is_dir):
             raise ValueError(f"diff working directory does not exist: {resolved}")
-        process = await asyncio.create_subprocess_exec(
-            "git",
-            "-C",
-            str(resolved),
-            "--no-pager",
-            "diff",
-            "--no-ext-diff",
-            "--",
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        stdout, stderr = await process.communicate()
-        if process.returncode != 0:
-            detail = stderr.decode("utf-8", errors="replace")[:1000]
-            raise RuntimeError(f"git diff failed ({process.returncode}): {detail}")
-        if len(stdout) > output_limit:
-            raise RuntimeError(f"git diff exceeds the {output_limit}-byte safety limit")
-        patch = stdout.decode("utf-8", errors="replace")
+        patch_bytes = await _git_diff_bytes(resolved, output_limit)
+        patch = patch_bytes.decode("utf-8", errors="surrogateescape")
         source = "local-git"
     if patch is None or not patch:
         return None
-    encoded = patch.encode("utf-8")
+    encoded = patch.encode("utf-8", errors="surrogateescape")
+    if len(encoded) > output_limit:
+        raise RuntimeError(f"{source} diff exceeds the {output_limit}-byte safety limit")
     if len(patch) <= inline_limit and "```" not in patch:
         return DiffRenderPlan(
             source=source,
@@ -70,6 +57,78 @@ async def render_diff(
         assets=(asset,),
         byte_count=len(encoded),
     )
+
+
+async def _git_diff_bytes(resolved: Path, output_limit: int) -> bytes:
+    process = await asyncio.create_subprocess_exec(
+        "git",
+        "-C",
+        str(resolved),
+        "--no-pager",
+        "diff",
+        "--no-ext-diff",
+        "--",
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    assert process.stdout is not None
+    assert process.stderr is not None
+    stdout = bytearray()
+    stderr_task = asyncio.create_task(_read_bounded(process.stderr, 8192))
+    try:
+        while True:
+            chunk = await process.stdout.read(65536)
+            if not chunk:
+                break
+            remaining = output_limit - len(stdout)
+            if remaining <= 0:
+                await _terminate_and_reap(process)
+                await _await_stream_task(stderr_task)
+                raise RuntimeError(f"git diff exceeds the {output_limit}-byte safety limit")
+            if len(chunk) > remaining:
+                stdout.extend(chunk[:remaining])
+                await _terminate_and_reap(process)
+                await _await_stream_task(stderr_task)
+                raise RuntimeError(f"git diff exceeds the {output_limit}-byte safety limit")
+            stdout.extend(chunk)
+        returncode = await process.wait()
+        stderr = await _await_stream_task(stderr_task)
+        if returncode != 0:
+            detail = stderr.decode("utf-8", errors="replace")[:1000]
+            raise RuntimeError(f"git diff failed ({returncode}): {detail}")
+        return bytes(stdout)
+    except BaseException:
+        if process.returncode is None:
+            await _terminate_and_reap(process)
+        stderr_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError, Exception):
+            await stderr_task
+        raise
+
+
+async def _read_bounded(stream: asyncio.StreamReader, limit: int) -> bytes:
+    buffer = bytearray()
+    while True:
+        chunk = await stream.read(65536)
+        if not chunk:
+            return bytes(buffer)
+        if len(buffer) < limit:
+            buffer.extend(chunk[: max(0, limit - len(buffer))])
+
+
+async def _await_stream_task(task: asyncio.Task[bytes]) -> bytes:
+    return await task
+
+
+async def _terminate_and_reap(process: asyncio.subprocess.Process) -> None:
+    if process.returncode is not None:
+        return
+    process.terminate()
+    try:
+        await asyncio.wait_for(process.wait(), timeout=0.5)
+    except TimeoutError:
+        process.kill()
+        await process.wait()
 
 
 def _structured_patch(result: Mapping[str, Any] | None) -> str | None:

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from pathlib import Path
 from typing import Any
 
@@ -16,8 +17,9 @@ from copilotd.storage.database import Database
 
 
 class FakeMessage:
-    def __init__(self, message_id: int) -> None:
+    def __init__(self, message_id: int, *, nonce: str | None = None) -> None:
         self.id = message_id
+        self.nonce = nonce
         self.deleted = False
         self.edits: list[dict[str, Any]] = []
 
@@ -33,14 +35,21 @@ class FakeThread:
         self.messages: dict[int, FakeMessage] = {}
         self.send_calls = 0
 
-    async def send(self, **_kwargs: Any) -> FakeMessage:
+    async def send(self, **kwargs: Any) -> FakeMessage:
         self.send_calls += 1
-        message = FakeMessage(100 + self.send_calls)
+        message = FakeMessage(
+            100 + self.send_calls,
+            nonce=None if kwargs.get("nonce") is None else str(kwargs["nonce"]),
+        )
         self.messages[message.id] = message
         return message
 
     async def fetch_message(self, message_id: int) -> FakeMessage:
         return self.messages[message_id]
+
+    async def history(self, **_kwargs: Any) -> Any:
+        for message in reversed(self.messages.values()):
+            yield message
 
 
 @pytest.mark.asyncio
@@ -94,6 +103,171 @@ async def test_render_batches_checkpoint_each_message_and_retry_idempotently(
         {"batch_index": 0, "discord_message_id": "101", "attachment_count": 0},
         {"batch_index": 1, "discord_message_id": "102", "attachment_count": 1},
     ]
+
+
+@pytest.mark.asyncio
+async def test_post_send_crash_reconciles_nonce_without_duplicate(
+    tmp_path: Path,
+) -> None:
+    bot = CopilotDiscordBot(Settings(data_dir=tmp_path))
+    thread = FakeThread()
+    plan = DiscordRenderPlan((DiscordRenderBatch("crash-safe"),))
+    crashed = False
+
+    async def crash_after_send(_index: int, _message_id: str) -> None:
+        nonlocal crashed
+        if not crashed:
+            crashed = True
+            raise RuntimeError("simulated process crash")
+
+    async with Database(tmp_path / "post-send-crash.sqlite3") as database:
+        bot.database = database
+        bot._after_render_send_hook = crash_after_send
+        with pytest.raises(RuntimeError, match="simulated process crash"):
+            await bot._deliver_render_plan(
+                thread=thread,
+                session_id="session-crash",
+                payload={"finalized": True},
+                plan=plan,
+                delivery_id="event:crash",
+            )
+        prepared = await database.fetchone(
+            """
+            SELECT state, discord_message_id FROM render_batch_intents
+            WHERE session_id = 'session-crash'
+            """
+        )
+        assert dict(prepared) == {
+            "state": "prepared",
+            "discord_message_id": None,
+        }
+        for offset in range(250):
+            message_id = 1000 + offset
+            thread.messages[message_id] = FakeMessage(message_id)
+
+        bot._after_render_send_hook = None
+        reconciled = await bot._deliver_render_plan(
+            thread=thread,
+            session_id="session-crash",
+            payload={"finalized": True},
+            plan=plan,
+            delivery_id="event:crash",
+        )
+        checkpoint = await database.fetchone(
+            """
+            SELECT state, discord_message_id FROM render_batch_intents
+            WHERE session_id = 'session-crash'
+            """
+        )
+
+    assert reconciled == "101"
+    assert thread.send_calls == 1
+    assert dict(checkpoint) == {
+        "state": "sent",
+        "discord_message_id": "101",
+    }
+
+
+@pytest.mark.asyncio
+async def test_edit_followup_crash_reconciles_without_orphan_duplicate(
+    tmp_path: Path,
+) -> None:
+    bot = CopilotDiscordBot(Settings(data_dir=tmp_path))
+    thread = FakeThread()
+    initial_plan = DiscordRenderPlan((DiscordRenderBatch("initial"),))
+    edited_plan = DiscordRenderPlan(
+        (
+            DiscordRenderBatch("edited"),
+            DiscordRenderBatch("follow-up"),
+        )
+    )
+
+    async def crash_on_followup(index: int, _message_id: str) -> None:
+        if index == 1:
+            raise RuntimeError("crash after edit follow-up")
+
+    async with Database(tmp_path / "edit-crash.sqlite3") as database:
+        bot.database = database
+        first_id = await bot._deliver_render_plan(
+            thread=thread,
+            session_id="session-edit",
+            payload={"finalized": False},
+            plan=initial_plan,
+            delivery_id="event:initial",
+        )
+        first_message = thread.messages[int(first_id)]
+        bot._after_render_send_hook = crash_on_followup
+        with pytest.raises(RuntimeError, match="crash after edit follow-up"):
+            await bot._deliver_render_plan(
+                thread=thread,
+                session_id="session-edit",
+                payload={"finalized": True},
+                plan=edited_plan,
+                delivery_id="event:edit",
+                first_message=first_message,
+            )
+
+        bot._after_render_send_hook = None
+        await bot._deliver_render_plan(
+            thread=thread,
+            session_id="session-edit",
+            payload={"finalized": True},
+            plan=edited_plan,
+            delivery_id="event:edit",
+            first_message=first_message,
+        )
+        edit_batches = await database.fetchall(
+            """
+            SELECT batch_index, discord_message_id
+            FROM render_attachment_batches
+            WHERE render_message_id = 'event:edit'
+            ORDER BY batch_index
+            """
+        )
+
+    assert thread.send_calls == 2
+    assert [dict(row) for row in edit_batches] == [
+        {"batch_index": 0, "discord_message_id": "101"},
+        {"batch_index": 1, "discord_message_id": "102"},
+    ]
+
+
+class BlockingDispatcher:
+    def __init__(self) -> None:
+        self.entered = asyncio.Event()
+        self.release = asyncio.Event()
+        self.active = 0
+        self.drained = False
+
+    async def dispatch_once(self) -> int:
+        self.active += 1
+        self.entered.set()
+        await self.release.wait()
+        self.active -= 1
+        return 0
+
+    async def drain(self) -> int:
+        assert self.active == 0
+        self.drained = True
+        return 0
+
+
+@pytest.mark.asyncio
+async def test_render_consumer_stops_before_shutdown_drain(tmp_path: Path) -> None:
+    bot = CopilotDiscordBot(Settings(data_dir=tmp_path))
+    dispatcher = BlockingDispatcher()
+    bot.dispatcher = dispatcher
+    bot._render_task = asyncio.create_task(bot._render_loop())
+    await dispatcher.entered.wait()
+
+    stopping = asyncio.create_task(bot._stop_render_consumer())
+    await asyncio.sleep(0)
+    assert not stopping.done()
+    dispatcher.release.set()
+    await stopping
+    await dispatcher.drain()
+
+    assert dispatcher.drained is True
 
 
 @pytest.mark.asyncio

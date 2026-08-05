@@ -33,6 +33,7 @@ async def test_initial_migration_creates_full_schema(tmp_path: Path) -> None:
         "render_streams",
         "render_attachment_batches",
         "render_attachment_checkpoints",
+        "render_batch_intents",
         "render_parent_diagnostics",
         "runtime_incidents",
         "runtime_schedules",
@@ -79,7 +80,7 @@ async def test_migrations_are_idempotent(tmp_path: Path) -> None:
     async with Database(database_path) as database:
         rows = await database.fetchall("SELECT version FROM schema_migrations")
 
-    assert [row["version"] for row in rows] == list(range(1, 11))
+    assert [row["version"] for row in rows] == list(range(1, 12))
 
 
 @pytest.mark.asyncio

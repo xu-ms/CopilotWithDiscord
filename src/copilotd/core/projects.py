@@ -36,6 +36,33 @@ class ProjectSnapshot:
 
 
 @dataclass(frozen=True, slots=True)
+class ProjectSessionConfigSnapshot:
+    project_id: str | None
+    source: ProjectSource
+    root_path: Path
+    cwd: Path
+    project_config_version: int
+    channel_config_version: int
+    layout: str
+    mention_required: bool
+    session_options: dict[str, Any]
+
+    def project_payload(self) -> dict[str, Any]:
+        return {
+            "project_id": self.project_id,
+            "project_config_version": self.project_config_version,
+            "session_options": self.session_options,
+        }
+
+    def channel_payload(self) -> dict[str, Any]:
+        return {
+            "channel_config_version": self.channel_config_version,
+            "layout": self.layout,
+            "mention_required": self.mention_required,
+        }
+
+
+@dataclass(frozen=True, slots=True)
 class ProjectEnvEntry:
     project_id: str
     channel_id: str
@@ -244,6 +271,109 @@ class ProjectRegistry:
         if row is None:
             return "text", False, 1
         return row["layout"], bool(row["mention_required"]), row["config_version"]
+
+    async def session_config_snapshot(
+        self,
+        channel_id: str,
+    ) -> ProjectSessionConfigSnapshot:
+        project = await self.resolve(channel_id)
+        layout, mention_required, channel_version = await self.channel_settings(channel_id)
+        if project.project_id is None:
+            return ProjectSessionConfigSnapshot(
+                project_id=None,
+                source=project.source,
+                root_path=project.root_path,
+                cwd=project.cwd,
+                project_config_version=project.config_version,
+                channel_config_version=channel_version,
+                layout=layout,
+                mention_required=mention_required,
+                session_options={},
+            )
+
+        env_entries = await self.list_project_env(channel_id, reveal=True)
+        mcp_entries = await self.list_mcp_servers(channel_id, reveal=True)
+        skill_entries = await self.list_skill_dirs(channel_id)
+        plugin_entries = await self.list_plugin_dirs(channel_id)
+        agent_entries = await self.list_custom_agents(channel_id)
+        latest_project = await self.resolve(channel_id)
+        latest_layout, latest_mention, latest_channel_version = await self.channel_settings(
+            channel_id
+        )
+        if (
+            latest_project.project_id != project.project_id
+            or latest_project.config_version != project.config_version
+            or latest_channel_version != channel_version
+            or latest_layout != layout
+            or latest_mention != mention_required
+        ):
+            raise ProjectConflictError(
+                "project configuration changed while creating a session snapshot"
+            )
+
+        project_env = {entry.name: entry.value for entry in env_entries}
+        referenced_env: set[str] = set()
+        mcp_servers: dict[str, dict[str, Any]] = {}
+        for entry in mcp_entries:
+            if not entry.enabled:
+                continue
+            server, references = await asyncio.to_thread(
+                _sdk_mcp_server_config,
+                entry,
+                project_env,
+                project.root_path,
+            )
+            mcp_servers[entry.name] = server
+            referenced_env.update(references)
+        unapplied_env = sorted(set(project_env) - referenced_env)
+        if unapplied_env:
+            raise ProjectValidationError(
+                "project environment variables cannot be applied by this SDK unless "
+                "referenced by an enabled stdio MCP server: " + ", ".join(unapplied_env)
+            )
+
+        skill_directories = [
+            str(await asyncio.to_thread(_validate_directory, entry.path))
+            for entry in skill_entries
+            if entry.enabled
+        ]
+        plugin_directories = [
+            str(await asyncio.to_thread(_validate_directory, entry.path))
+            for entry in plugin_entries
+            if entry.enabled
+        ]
+        custom_agents = [
+            {
+                "name": entry.name,
+                "display_name": entry.name,
+                "description": entry.description,
+                "prompt": entry.prompt,
+                "tools": list(entry.tools),
+            }
+            for entry in agent_entries
+            if entry.enabled
+        ]
+        options: dict[str, Any] = {}
+        if mcp_servers:
+            options["mcp_servers"] = mcp_servers
+        if skill_directories:
+            options["enable_skills"] = True
+            options["skill_directories"] = skill_directories
+        if plugin_directories:
+            options["plugin_directories"] = plugin_directories
+        if custom_agents:
+            options["custom_agents"] = custom_agents
+        return ProjectSessionConfigSnapshot(
+            project_id=project.project_id,
+            source=project.source,
+            root_path=project.root_path,
+            cwd=project.cwd,
+            project_config_version=project.config_version,
+            channel_config_version=channel_version,
+            layout=layout,
+            mention_required=mention_required,
+            session_options=options,
+        )
 
     async def list_project_env(
         self,
@@ -1108,3 +1238,57 @@ def _redact_mcp_config(config: Mapping[str, Any]) -> dict[str, Any]:
         if "env" in redacted and isinstance(redacted["env"], dict):
             redacted["env"] = {key: "[redacted]" for key in redacted["env"]}
     return redacted
+
+
+def _sdk_mcp_server_config(
+    entry: ProjectMcpServerEntry,
+    project_env: Mapping[str, str],
+    project_root: Path,
+) -> tuple[dict[str, Any], set[str]]:
+    config = _jsonable_copy(entry.config)
+    common = {"tools", "timeout"}
+    allowed = (
+        common | {"command", "args", "env", "project_env_refs", "cwd"}
+        if entry.transport == "stdio"
+        else common | {"url", "headers"}
+    )
+    unknown = sorted(set(config) - allowed)
+    if unknown:
+        raise ProjectValidationError(
+            f"MCP server {entry.name} has unsupported SDK fields: {', '.join(unknown)}"
+        )
+    result: dict[str, Any] = {
+        "type": entry.transport,
+    }
+    references: set[str] = set()
+    if entry.transport == "stdio":
+        result["command"] = str(config["command"])
+        if "args" in config:
+            result["args"] = _validate_string_list(config["args"], kind="MCP args")
+        environment = dict(config.get("env", {}))
+        for name in config.get("project_env_refs", []):
+            if name not in project_env:
+                raise ProjectValidationError(
+                    f"MCP server {entry.name} references missing project variable {name}"
+                )
+            environment[name] = project_env[name]
+            references.add(name)
+        if environment:
+            result["env"] = environment
+        if "cwd" in config:
+            cwd = Path(str(config["cwd"]))
+            if not cwd.is_absolute():
+                cwd = project_root / cwd
+            result["working_directory"] = str(_validate_directory(cwd))
+    else:
+        result["url"] = str(config["url"])
+        if "headers" in config:
+            result["headers"] = dict(config["headers"])
+    if "tools" in config:
+        result["tools"] = _validate_string_list(config["tools"], kind="MCP tools")
+    if "timeout" in config:
+        timeout = config["timeout"]
+        if not isinstance(timeout, int) or isinstance(timeout, bool) or timeout <= 0:
+            raise ProjectValidationError("MCP timeout must be a positive integer")
+        result["timeout"] = timeout
+    return result, references

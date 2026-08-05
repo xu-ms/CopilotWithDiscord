@@ -4,6 +4,7 @@ import asyncio
 import json
 import re
 import time
+from collections.abc import Mapping
 from dataclasses import asdict
 from pathlib import Path
 from typing import Any
@@ -12,9 +13,25 @@ from copilotd.config import Settings
 from copilotd.ops.service import ServiceManager
 from copilotd.storage.database import Database
 
-_SECRET = re.compile(
-    r"(?i)\b(authorization|token|secret|password|cookie)\b"
-    r"(\s*(?::|=)\s*|\s+Bearer\s+)([^\s,\"']+)"
+_SECRET_KEY = r"(?:authorization|token|secret|password|cookie|(?:x[-_ ]?)?api[-_ ]?key)"
+_REDACTION_SENTINEL = "__CD_REDACTED__"
+_JSON_QUOTED_SECRET = re.compile(
+    rf'(?i)(?P<prefix>["\']?{_SECRET_KEY}["\']?\s*:\s*)"(?P<value>(?:\\.|[^"\\])*)"'
+)
+_JSON_SINGLE_SECRET = re.compile(
+    rf"(?i)(?P<prefix>[\"']?{_SECRET_KEY}[\"']?\s*:\s*)'(?P<value>(?:\\.|[^'\\])*)'"
+)
+_QUOTED_GENERIC_SECRET = re.compile(
+    rf'(?i)(?P<prefix>["\']?{_SECRET_KEY}["\']?\s*(?:[:=]|\s+)\s*(?:bearer\s+)?)'
+    r'"(?!__CD_REDACTED__)(?P<value>(?:\\.|[^"\\])*)"'
+)
+_QUOTED_GENERIC_SINGLE_SECRET = re.compile(
+    rf"(?i)(?P<prefix>[\"']?{_SECRET_KEY}[\"']?\s*(?:[:=]|\s+)\s*(?:bearer\s+)?)"
+    r"'(?!__CD_REDACTED__)(?P<value>(?:\\.|[^'\\])*)'"
+)
+_UNQUOTED_SECRET = re.compile(
+    rf'(?i)(?P<prefix>["\']?{_SECRET_KEY}["\']?\s*(?:[:=]|\s+)\s*(?:bearer\s+)?)'
+    r"(?P<value>[^\s,;)}\]\"']+)"
 )
 
 
@@ -103,17 +120,13 @@ class LocalOpsSurface:
             """,
             (session_id, session_id),
         )
-        return {
-            "bindings": [dict(row) for row in bindings],
-            "capabilities": [dict(row) for row in capabilities],
-            "incidents": [
-                {
-                    **dict(row),
-                    "stderr_tail": _redact(str(row["stderr_tail"] or ""))[-4000:],
-                }
-                for row in incidents
-            ],
-        }
+        return _redact_structure(
+            {
+                "bindings": [dict(row) for row in bindings],
+                "capabilities": [dict(row) for row in capabilities],
+                "incidents": [dict(row) for row in incidents],
+            }
+        )
 
     async def debug(self, *, level: str, duration_minutes: int) -> dict[str, Any]:
         normalized = level.lower()
@@ -155,7 +168,7 @@ class LocalOpsSurface:
             text = await asyncio.to_thread(_read_tail, path, min(remaining, 16 * 1024))
             if correlation_id:
                 text = "\n".join(line for line in text.splitlines() if correlation_id in line)
-            text = _redact(text)
+            text = _redact_text(text)
             result[path.name] = text
             remaining -= len(text.encode("utf-8"))
         return {
@@ -175,11 +188,13 @@ class LocalOpsSurface:
             """,
             (session_id, session_id),
         )
-        return {
-            "session_id": session_id,
-            "events": [dict(row) for row in reversed(rows)],
-            "bounded_to": 250,
-        }
+        return _redact_structure(
+            {
+                "session_id": session_id,
+                "events": [dict(row) for row in reversed(rows)],
+                "bounded_to": 250,
+            }
+        )
 
 
 def _read_tail(path: Path, limit: int) -> str:
@@ -191,5 +206,59 @@ def _read_tail(path: Path, limit: int) -> str:
     return content.decode("utf-8", errors="replace")
 
 
-def _redact(value: str) -> str:
-    return _SECRET.sub(r"\1\2[redacted]", value)
+def _redact_structure(value: Any, *, sensitive: bool = False) -> Any:
+    if isinstance(value, Mapping):
+        redacted: dict[Any, Any] = {}
+        for key, item in value.items():
+            redacted[key] = _redact_structure(item, sensitive=sensitive or _is_sensitive_key(key))
+        return redacted
+    if isinstance(value, list):
+        return [_redact_structure(item, sensitive=sensitive) for item in value]
+    if isinstance(value, tuple):
+        return tuple(_redact_structure(item, sensitive=sensitive) for item in value)
+    if sensitive:
+        return "[redacted]"
+    if isinstance(value, str):
+        return _redact_text(value)
+    if isinstance(value, bytes):
+        return _redact_text(value.decode("utf-8", errors="replace"))
+    return value
+
+
+def _is_sensitive_key(key: Any) -> bool:
+    normalized = re.sub(r"[^a-z0-9]+", "", str(key).lower())
+    return any(
+        token in normalized
+        for token in (
+            "authorization",
+            "token",
+            "secret",
+            "password",
+            "cookie",
+            "apikey",
+        )
+    )
+
+
+def _redact_text(value: str) -> str:
+    redacted = _JSON_QUOTED_SECRET.sub(
+        lambda match: f'{match.group("prefix")}"{_REDACTION_SENTINEL}"',
+        value,
+    )
+    redacted = _JSON_SINGLE_SECRET.sub(
+        lambda match: f"{match.group('prefix')}'{_REDACTION_SENTINEL}'",
+        redacted,
+    )
+    redacted = _QUOTED_GENERIC_SECRET.sub(
+        lambda match: f"{match.group('prefix')}{_REDACTION_SENTINEL}",
+        redacted,
+    )
+    redacted = _QUOTED_GENERIC_SINGLE_SECRET.sub(
+        lambda match: f"{match.group('prefix')}{_REDACTION_SENTINEL}",
+        redacted,
+    )
+    redacted = _UNQUOTED_SECRET.sub(
+        lambda match: f"{match.group('prefix')}{_REDACTION_SENTINEL}",
+        redacted,
+    )
+    return redacted.replace(_REDACTION_SENTINEL, "[redacted]")

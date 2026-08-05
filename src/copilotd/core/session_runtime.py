@@ -5,7 +5,7 @@ import hashlib
 import json
 import time
 import uuid
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Mapping
 from enum import StrEnum
 from typing import Any, Literal, Protocol, TypeVar, cast
 
@@ -71,6 +71,7 @@ class RuntimeBridge(Protocol):
         on_user_input_request: Any,
         on_exit_plan_mode_request: Any,
         on_auto_mode_switch_request: Any,
+        session_config: dict[str, Any] | None = None,
     ) -> SessionHandle: ...
 
     async def resume_session(
@@ -83,6 +84,7 @@ class RuntimeBridge(Protocol):
         on_user_input_request: Any,
         on_exit_plan_mode_request: Any,
         on_auto_mode_switch_request: Any,
+        session_config: dict[str, Any] | None = None,
     ) -> SessionHandle: ...
 
     async def ensure_allow_all(self, session: SessionHandle) -> Any: ...
@@ -1714,38 +1716,58 @@ class SessionRuntime:
             raise CDCapabilityError("native task actions are not available")
         if task_id is None:
             raise CDCapabilityError("this TaskDeck card has no addressable task ID")
+        operation_key = f"task-action:{interaction_id}:{action}:{task_id}"
+
+        async def dispatch() -> Mapping[str, Any]:
+            await self._assert_owned_handle()
+            if action == "cancel":
+                return await self._task_action_adapter.cancel_task(
+                    session_id=self.binding.sdk_session_id,
+                    task_id=task_id,
+                )
+            if action == "promote":
+                return await self._task_action_adapter.promote_task(
+                    session_id=self.binding.sdk_session_id,
+                    task_id=task_id,
+                )
+            if action == "message":
+                return await self._task_action_adapter.message_task(
+                    session_id=self.binding.sdk_session_id,
+                    task_id=task_id,
+                    message=normalized_message,
+                )
+            return await self._task_action_adapter.remove_task(
+                session_id=self.binding.sdk_session_id,
+                task_id=task_id,
+            )
+
+        normalized_message = ""
         if action == "cancel":
             if state not in {"running", "idle"}:
                 raise CDSessionStateError("only running or idle tasks can be cancelled")
-            result = await self._task_action_adapter.cancel_task(
-                session_id=self.binding.sdk_session_id,
-                task_id=task_id,
-            )
         elif action == "promote":
             if state not in {"running", "idle"} or not bool(card["can_promote"]):
                 raise CDSessionStateError("this task cannot be promoted")
-            result = await self._task_action_adapter.promote_task(
-                session_id=self.binding.sdk_session_id,
-                task_id=task_id,
-            )
         elif action == "message":
             if str(card["kind"]) != "agent" or state not in {"running", "idle"}:
                 raise CDSessionStateError("only active agent tasks accept messages")
-            normalized = "" if message is None else message.strip()
-            if not normalized:
+            normalized_message = "" if message is None else message.strip()
+            if not normalized_message:
                 raise CDInputError("task message cannot be empty")
-            result = await self._task_action_adapter.message_task(
-                session_id=self.binding.sdk_session_id,
-                task_id=task_id,
-                message=normalized,
-            )
         else:
             if state not in {"completed", "failed", "cancelled"}:
                 raise CDSessionStateError("only terminal tasks can be removed")
-            result = await self._task_action_adapter.remove_task(
-                session_id=self.binding.sdk_session_id,
-                task_id=task_id,
-            )
+        result = await self._require_mailbox().submit(
+            kind=f"task_{action}",
+            idempotency_key=operation_key,
+            input_payload={
+                "action": action,
+                "task_id": task_id,
+                "message": normalized_message or None,
+            },
+            operation=dispatch,
+        )
+        if action == "remove":
             await self._database.execute(
                 """
                 DELETE FROM task_card_projections
@@ -1754,7 +1776,7 @@ class SessionRuntime:
                 (self.binding.sdk_session_id, panel_id, card_token),
             )
         await self.refresh_taskdeck(interaction_id=interaction_id)
-        return {"status": "updated", "result": dict(result)}
+        return {"status": "updated", "result": dict(result or {})}
 
     async def refresh_taskdeck(self, *, interaction_id: str) -> None:
         state = await self._database.fetchone(
@@ -2021,6 +2043,10 @@ class SessionRuntime:
         async with self._lifecycle_lock:
             if self.state != RuntimeState.DETACHED:
                 raise SessionNotReady(f"runtime cannot attach from state {self.state}")
+            if self.binding.config_snapshot_state != "verified":
+                raise SessionNotReady(
+                    "legacy session has no verified project configuration snapshot"
+                )
             self.state = RuntimeState.ATTACHING
             self._lease = await self._owner_leases.acquire(
                 self.binding.sdk_session_id,
@@ -2034,29 +2060,38 @@ class SessionRuntime:
             self._start_components()
 
             try:
+                raw_options = self.binding.session_config_snapshot.get(
+                    "session_options",
+                    {},
+                )
+                if not isinstance(raw_options, dict):
+                    raise SessionNotReady("session configuration snapshot is invalid")
+                session_options = dict(raw_options)
                 if create:
-                    handle = await self._sdk_call(
-                        self._bridge.create_session(
-                            session_id=self.binding.sdk_session_id,
-                            working_directory=str(self.binding.cwd_snapshot),
-                            on_event=self._ingress,
-                            on_user_input_request=self._handle_user_input_request,
-                            on_exit_plan_mode_request=self._handle_exit_plan_mode_request,
-                            on_auto_mode_switch_request=self._handle_auto_mode_switch_request,
-                        )
-                    )
+                    create_kwargs = {
+                        "session_id": self.binding.sdk_session_id,
+                        "working_directory": str(self.binding.cwd_snapshot),
+                        "on_event": self._ingress,
+                        "on_user_input_request": self._handle_user_input_request,
+                        "on_exit_plan_mode_request": self._handle_exit_plan_mode_request,
+                        "on_auto_mode_switch_request": self._handle_auto_mode_switch_request,
+                    }
+                    if session_options:
+                        create_kwargs["session_config"] = session_options
+                    handle = await self._sdk_call(self._bridge.create_session(**create_kwargs))
                 else:
-                    handle = await self._sdk_call(
-                        self._bridge.resume_session(
-                            session_id=self.binding.sdk_session_id,
-                            working_directory=str(self.binding.cwd_snapshot),
-                            on_event=self._ingress,
-                            continue_pending_work=continue_pending_work,
-                            on_user_input_request=self._handle_user_input_request,
-                            on_exit_plan_mode_request=self._handle_exit_plan_mode_request,
-                            on_auto_mode_switch_request=self._handle_auto_mode_switch_request,
-                        )
-                    )
+                    resume_kwargs = {
+                        "session_id": self.binding.sdk_session_id,
+                        "working_directory": str(self.binding.cwd_snapshot),
+                        "on_event": self._ingress,
+                        "continue_pending_work": continue_pending_work,
+                        "on_user_input_request": self._handle_user_input_request,
+                        "on_exit_plan_mode_request": self._handle_exit_plan_mode_request,
+                        "on_auto_mode_switch_request": self._handle_auto_mode_switch_request,
+                    }
+                    if session_options:
+                        resume_kwargs["session_config"] = session_options
+                    handle = await self._sdk_call(self._bridge.resume_session(**resume_kwargs))
                 if handle.session_id != self.binding.sdk_session_id:
                     raise RuntimeError("SDK returned a different session ID")
             except Exception as error:

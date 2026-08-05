@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import io
 import json
 import re
@@ -8,6 +9,7 @@ import time
 import uuid
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -133,6 +135,9 @@ class CopilotDiscordBot(commands.Bot):
         self._tasks = TaskRegistry()
         self._owner_id = f"discord:{uuid.uuid4()}"
         self._commands_registered = False
+        self._render_stop = asyncio.Event()
+        self._render_task: asyncio.Task[None] | None = None
+        self._after_render_send_hook: Callable[[int, str], Awaitable[None]] | None = None
 
     async def setup_hook(self) -> None:
         await self.database.open()
@@ -181,7 +186,10 @@ class CopilotDiscordBot(commands.Bot):
                 error=error,
             )
         self.dispatcher = RenderOutboxDispatcher(self.database, self)
-        self._tasks.create(self._render_loop(), name="discord-render-outbox")
+        self._render_task = self._tasks.create(
+            self._render_loop(),
+            name="discord-render-outbox",
+        )
         self._tasks.create(self.heartbeat.run(), name="copilotd-heartbeat")
         self._register_application_commands()
         if self.settings.discord_guild_id is not None:
@@ -194,6 +202,7 @@ class CopilotDiscordBot(commands.Bot):
     async def close(self) -> None:
         self.heartbeat.set_gateway("down")
         self.heartbeat.runtime_state = "down"
+        await self._stop_render_consumer()
         if self.dispatcher is not None:
             await self.dispatcher.drain()
         if self.sessions is not None:
@@ -605,6 +614,70 @@ class CopilotDiscordBot(commands.Bot):
                 if first_message_id is None and index == 0:
                     first_message_id = delivered_ids[index]
                 continue
+            nonce = _render_batch_nonce(
+                session_id,
+                delivery_id,
+                agent_id,
+                index,
+            )
+            payload_hash = _render_batch_hash(batch)
+            intent = await self.database.fetchone(
+                """
+                SELECT nonce, payload_hash, state, discord_message_id, created_at
+                FROM render_batch_intents
+                WHERE session_id = ? AND render_message_id = ?
+                  AND agent_id = ? AND batch_index = ?
+                """,
+                (session_id, delivery_id, agent_id, index),
+            )
+            if intent is None:
+                await self.database.execute(
+                    """
+                    INSERT INTO render_batch_intents(
+                        session_id, render_message_id, agent_id, batch_index,
+                        nonce, payload_hash, state, created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, 'prepared', ?, ?)
+                    """,
+                    (
+                        session_id,
+                        delivery_id,
+                        agent_id,
+                        index,
+                        nonce,
+                        payload_hash,
+                        now,
+                        now,
+                    ),
+                )
+            elif str(intent["nonce"]) != nonce or str(intent["payload_hash"]) != payload_hash:
+                raise RenderPermanentError(f"render batch intent changed for {delivery_id}:{index}")
+
+            reconciled_message_id: str | None = None
+            if intent is not None and intent["discord_message_id"] is not None:
+                reconciled_message_id = str(intent["discord_message_id"])
+            elif intent is not None and (first_message is None or index > 0):
+                reconciled = await self._find_message_by_nonce(
+                    thread,
+                    nonce,
+                    created_at=float(intent["created_at"]),
+                )
+                if reconciled is not None:
+                    reconciled_message_id = str(reconciled.id)
+            if reconciled_message_id is not None:
+                if first_message_id is None:
+                    first_message_id = reconciled_message_id
+                await self._checkpoint_render_batch(
+                    session_id=session_id,
+                    delivery_id=delivery_id,
+                    agent_id=agent_id,
+                    index=index,
+                    discord_message_id=reconciled_message_id,
+                    first_message_id=str(first_message_id),
+                    attachment_count=len(batch.assets),
+                    now=now,
+                )
+                continue
+
             if index == 0 and first_message is not None:
                 await first_message.edit(
                     content=batch.content or "\u200b",
@@ -628,60 +701,23 @@ class CopilotDiscordBot(commands.Bot):
                         else None
                     ),
                     silent=True,
+                    nonce=nonce,
                 )
                 discord_message_id = str(sent.id)
             if first_message_id is None:
                 first_message_id = discord_message_id
-            async with self.database.transaction() as connection:
-                await connection.execute(
-                    """
-                    INSERT INTO render_attachment_batches(
-                        session_id, render_message_id, agent_id, batch_index,
-                        discord_message_id, idempotency_key, attachment_count,
-                        created_at, updated_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    ON CONFLICT(session_id, render_message_id, agent_id, batch_index)
-                    DO NOTHING
-                    """,
-                    (
-                        session_id,
-                        delivery_id,
-                        agent_id,
-                        index,
-                        discord_message_id,
-                        f"{delivery_id}:batch:{index}",
-                        len(batch.assets),
-                        now,
-                        now,
-                    ),
-                )
-                await connection.execute(
-                    """
-                    INSERT INTO render_attachment_checkpoints(
-                        session_id, render_message_id, agent_id,
-                        first_discord_message_id, next_batch_index,
-                        finalized, updated_at
-                    ) VALUES (?, ?, ?, ?, ?, 0, ?)
-                    ON CONFLICT(session_id, render_message_id, agent_id) DO UPDATE SET
-                        first_discord_message_id = COALESCE(
-                            render_attachment_checkpoints.first_discord_message_id,
-                            excluded.first_discord_message_id
-                        ),
-                        next_batch_index = MAX(
-                            render_attachment_checkpoints.next_batch_index,
-                            excluded.next_batch_index
-                        ),
-                        updated_at = excluded.updated_at
-                    """,
-                    (
-                        session_id,
-                        delivery_id,
-                        agent_id,
-                        first_message_id,
-                        index + 1,
-                        now,
-                    ),
-                )
+            if self._after_render_send_hook is not None:
+                await self._after_render_send_hook(index, discord_message_id)
+            await self._checkpoint_render_batch(
+                session_id=session_id,
+                delivery_id=delivery_id,
+                agent_id=agent_id,
+                index=index,
+                discord_message_id=discord_message_id,
+                first_message_id=str(first_message_id),
+                attachment_count=len(batch.assets),
+                now=now,
+            )
         if first_message_id is None:
             raise RenderPermanentError("render plan did not produce a Discord message")
         await self.database.execute(
@@ -706,6 +742,110 @@ class CopilotDiscordBot(commands.Bot):
                 current_delivery_id=delivery_id,
             )
         return str(first_message_id)
+
+    async def _checkpoint_render_batch(
+        self,
+        *,
+        session_id: str,
+        delivery_id: str,
+        agent_id: str,
+        index: int,
+        discord_message_id: str,
+        first_message_id: str,
+        attachment_count: int,
+        now: float,
+    ) -> None:
+        async with self.database.transaction() as connection:
+            await connection.execute(
+                """
+                UPDATE render_batch_intents
+                SET state = 'sent', discord_message_id = ?, updated_at = ?
+                WHERE session_id = ? AND render_message_id = ?
+                  AND agent_id = ? AND batch_index = ?
+                """,
+                (
+                    discord_message_id,
+                    now,
+                    session_id,
+                    delivery_id,
+                    agent_id,
+                    index,
+                ),
+            )
+            await connection.execute(
+                """
+                INSERT INTO render_attachment_batches(
+                    session_id, render_message_id, agent_id, batch_index,
+                    discord_message_id, idempotency_key, attachment_count,
+                    created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(session_id, render_message_id, agent_id, batch_index)
+                DO UPDATE SET
+                    discord_message_id = excluded.discord_message_id,
+                    attachment_count = excluded.attachment_count,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    session_id,
+                    delivery_id,
+                    agent_id,
+                    index,
+                    discord_message_id,
+                    f"{delivery_id}:batch:{index}",
+                    attachment_count,
+                    now,
+                    now,
+                ),
+            )
+            await connection.execute(
+                """
+                INSERT INTO render_attachment_checkpoints(
+                    session_id, render_message_id, agent_id,
+                    first_discord_message_id, next_batch_index,
+                    finalized, updated_at
+                ) VALUES (?, ?, ?, ?, ?, 0, ?)
+                ON CONFLICT(session_id, render_message_id, agent_id) DO UPDATE SET
+                    first_discord_message_id = COALESCE(
+                        render_attachment_checkpoints.first_discord_message_id,
+                        excluded.first_discord_message_id
+                    ),
+                    next_batch_index = MAX(
+                        render_attachment_checkpoints.next_batch_index,
+                        excluded.next_batch_index
+                    ),
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    session_id,
+                    delivery_id,
+                    agent_id,
+                    first_message_id,
+                    index + 1,
+                    now,
+                ),
+            )
+
+    async def _find_message_by_nonce(
+        self,
+        thread: discord.Thread,
+        nonce: str,
+        *,
+        created_at: float,
+    ) -> discord.Message | None:
+        history = getattr(thread, "history", None)
+        if not callable(history):
+            return None
+        try:
+            async for message in history(
+                limit=None,
+                after=datetime.fromtimestamp(max(0, created_at - 1), UTC),
+                oldest_first=False,
+            ):
+                if str(getattr(message, "nonce", "")) == nonce:
+                    return message
+        except discord.HTTPException as error:
+            raise _render_delivery_error(error) from error
+        return None
 
     async def _prune_previous_render_batches(
         self,
@@ -761,14 +901,41 @@ class CopilotDiscordBot(commands.Bot):
                     """,
                     (session_id, render_message_id, agent_id),
                 )
+                await connection.execute(
+                    """
+                    DELETE FROM render_batch_intents
+                    WHERE session_id = ? AND render_message_id = ? AND agent_id = ?
+                    """,
+                    (session_id, render_message_id, agent_id),
+                )
 
     async def _render_loop(self) -> None:
-        while True:
+        while not self._render_stop.is_set():
             dispatcher = self.dispatcher
             if dispatcher is None:
                 return
             delivered = await dispatcher.dispatch_once()
-            await asyncio.sleep(0.2 if delivered else 1.0)
+            try:
+                await asyncio.wait_for(
+                    self._render_stop.wait(),
+                    timeout=0.2 if delivered else 1.0,
+                )
+            except TimeoutError:
+                pass
+
+    async def _stop_render_consumer(self) -> None:
+        self._render_stop.set()
+        task = self._render_task
+        if task is None:
+            return
+        try:
+            async with asyncio.timeout(5):
+                await asyncio.gather(task, return_exceptions=True)
+        except TimeoutError:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+        finally:
+            self._render_task = None
 
     async def _thread_for_session(self, session_id: str) -> discord.Thread:
         binding = await self._require_bindings().by_session(session_id)
@@ -2325,24 +2492,28 @@ class DiscordThreadGateway:
         source_id: str,
         name: str,
         creation_token: str,
+        layout: str,
     ) -> ThreadReference:
         channel = await self._channel(channel_id)
         thread_name = f"{name[:75]} [cd:{creation_token[:8]}]"
-        if isinstance(channel, discord.TextChannel):
+        if layout == "text" and isinstance(channel, discord.TextChannel):
             try:
                 source = await channel.fetch_message(int(source_id))
             except (discord.NotFound, ValueError):
                 source = await channel.send(f"Starting copilotD session `{creation_token[:8]}`")
             thread = await source.create_thread(name=thread_name, auto_archive_duration=1440)
             return ThreadReference(str(thread.id))
-        if isinstance(channel, discord.ForumChannel):
+        if layout == "forum" and isinstance(channel, discord.ForumChannel):
             created = await channel.create_thread(
                 name=thread_name,
                 content=f"Starting copilotD session `{creation_token[:8]}`",
                 auto_archive_duration=1440,
             )
             return ThreadReference(str(created.thread.id))
-        raise ValueError("sessions can only be created in text or forum channels")
+        raise ValueError(
+            f"configured `{layout}` layout does not match Discord channel type "
+            f"`{type(channel).__name__}`"
+        )
 
     async def _channel(
         self,
@@ -3081,6 +3252,32 @@ def _message_parent_channel_id(message: discord.Message) -> str:
 def _payload_session_hint(payload: dict[str, Any]) -> str | None:
     value = payload.get("session_id")
     return None if value is None else str(value)
+
+
+def _render_batch_nonce(
+    session_id: str,
+    delivery_id: str,
+    agent_id: str,
+    index: int,
+) -> str:
+    value = uuid.uuid5(
+        uuid.NAMESPACE_URL,
+        f"copilotd:{session_id}:{delivery_id}:{agent_id}:{index}",
+    )
+    return str(value.int & ((1 << 63) - 1))
+
+
+def _render_batch_hash(batch: DiscordRenderBatch) -> str:
+    digest = hashlib.sha256()
+    digest.update(batch.content.encode("utf-8"))
+    for asset in batch.assets:
+        digest.update(b"\0")
+        digest.update(asset.filename.encode("utf-8"))
+        digest.update(b"\0")
+        digest.update(asset.media_type.encode("utf-8"))
+        digest.update(b"\0")
+        digest.update(asset.content)
+    return digest.hexdigest()
 
 
 def _append_assets_to_batches(

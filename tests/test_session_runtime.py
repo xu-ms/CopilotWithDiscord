@@ -233,6 +233,43 @@ def _message_delta() -> SessionEvent:
 
 
 @pytest.mark.asyncio
+async def test_legacy_unverified_binding_fails_before_sdk_attach(tmp_path: Path) -> None:
+    session_id = str(uuid4())
+    async with Database(tmp_path / "legacy-binding.sqlite3") as database:
+        bindings = SessionBindingRepository(database)
+        await bindings.create(
+            thread_id="thread-legacy",
+            sdk_session_id=session_id,
+            cwd_snapshot=tmp_path,
+            project_source="implicit-home",
+        )
+        await database.execute(
+            """
+            UPDATE session_bindings
+            SET config_snapshot_state = 'legacy_unverified'
+            WHERE thread_id = 'thread-legacy'
+            """
+        )
+        binding = await bindings.by_thread("thread-legacy")
+        assert binding is not None
+        bridge = FakeBridge(session_id)
+        runtime = SessionRuntime(
+            database=database,
+            bridge=bridge,
+            bindings=bindings,
+            owner_leases=OwnerLeaseStore(database),
+            owner_id="process-legacy",
+            binding=binding,
+        )
+
+        with pytest.raises(SessionNotReady, match="no verified project"):
+            await runtime.attach_create()
+
+        assert bridge.create_calls == 0
+        assert runtime.state == RuntimeState.DETACHED
+
+
+@pytest.mark.asyncio
 async def test_runtime_preregisters_ingress_stays_alive_after_idle_and_closes_cleanly(
     tmp_path: Path,
 ) -> None:
@@ -1501,6 +1538,14 @@ async def test_taskdeck_actions_are_state_gated_and_adapter_backed(
             message_id="message-taskdeck",
             interaction_id="promote",
         )
+        promoted_duplicate = await runtime.perform_taskdeck_action(
+            panel_id="panel",
+            card_token="card",
+            expected_revision=1,
+            action="promote",
+            message_id="message-taskdeck",
+            interaction_id="promote",
+        )
         messaged = await runtime.perform_taskdeck_action(
             panel_id="panel",
             card_token="card",
@@ -1537,6 +1582,7 @@ async def test_taskdeck_actions_are_state_gated_and_adapter_backed(
 
         assert stale["status"] == "stale"
         assert promoted["status"] == "updated"
+        assert promoted_duplicate["status"] == "updated"
         assert messaged["status"] == "updated"
         assert downloaded["status"] == "download"
         assert downloaded["content"] == "full detail"
@@ -1552,6 +1598,43 @@ async def test_taskdeck_actions_are_state_gated_and_adapter_backed(
                 (session_id,),
             )
             is None
+        )
+        await database.execute(
+            """
+            INSERT INTO task_card_projections(
+                sdk_session_id, panel_id, card_token, card_key, task_id,
+                kind, title, state, dependencies_json, artifact_links_json,
+                can_promote, first_seen_at, revision, last_progress_at
+            ) VALUES (?, 'panel', 'card-fenced', 'task:2', 'task-2',
+                      'background', 'Fenced worker', 'running', '[]', '[]',
+                      0, 2, 1, 2)
+            """,
+            (session_id,),
+        )
+        await database.execute(
+            """
+            UPDATE session_owner_leases SET expires_at = 0
+            WHERE sdk_session_id = ?
+            """,
+            (session_id,),
+        )
+        with pytest.raises(OperationAmbiguous, match="owner fence lost"):
+            await runtime.perform_taskdeck_action(
+                panel_id="panel",
+                card_token="card-fenced",
+                expected_revision=1,
+                action="cancel",
+                message_id="message-taskdeck",
+                interaction_id="fenced-cancel",
+            )
+        assert all(call[0] != "cancel" for call in actions.calls)
+        await database.execute(
+            """
+            UPDATE session_owner_leases
+            SET expires_at = CAST(strftime('%s', 'now') AS REAL) + 60
+            WHERE sdk_session_id = ?
+            """,
+            (session_id,),
         )
         await runtime.shutdown()
 

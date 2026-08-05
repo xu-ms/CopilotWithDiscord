@@ -22,6 +22,10 @@ from copilotd.render.markdown import (
 )
 
 
+def _write_png(path: Path) -> None:
+    Image.new("RGB", (1, 1), (255, 0, 0)).save(path)
+
+
 def test_markdown_ast_parses_structural_blocks_and_spans() -> None:
     source = (
         "Paragraph one\n"
@@ -92,7 +96,7 @@ async def test_markdown_split_plan_adds_continuation_marker_and_attaches_oversiz
 
 
 @pytest.mark.asyncio
-async def test_local_markdown_image_extraction_validates_roots_removes_once_and_batches(
+async def test_local_markdown_image_extraction_skips_fenced_inline_escaped_literals_and_batches(
     tmp_path: Path,
 ) -> None:
     root = tmp_path / "allowed"
@@ -100,20 +104,19 @@ async def test_local_markdown_image_extraction_validates_roots_removes_once_and_
     images = []
     for index in range(11):
         image = root / f"img{index:02d}.png"
-        Image.new("RGB", (2, 2), (index, 0, 0)).save(image)
+        _write_png(image)
         images.append(image)
     outside = tmp_path / "outside.png"
-    Image.new("RGB", (2, 2), "red").save(outside)
-    non_image = root / "secret.txt"
-    non_image.write_text("not an image")
+    outside.write_bytes(b"outside")
 
     source = (
         f"intro ![one]({images[0].name}) and again ![one]({images[0].name})\n"
+        f"```text\n![code]({images[2].name})\n```\n"
+        f"`![inline]({images[3].name})` and \\![escaped]({images[4].name})\n"
         f"![two]({images[1].name})\n"
         f"![missing](missing.png)\n"
         f"![outside]({outside})\n"
         f"![remote](https://example.com/image.png)\n"
-        f"![not-image]({non_image.name})\n"
         + " ".join(f"![{index}]({image.name})" for index, image in enumerate(images[2:], start=2))
     )
 
@@ -127,6 +130,9 @@ async def test_local_markdown_image_extraction_validates_roots_removes_once_and_
     assert plan.attachments[0].resolved_path == str(images[0].resolve())
     assert plan.attachments[0].batch_index == 1
     assert plan.attachments[-1].batch_index == 2
+    assert f"![code]({images[2].name})" in plan.content
+    assert f"`![inline]({images[3].name})`" in plan.content
+    assert "\\![escaped](" in plan.content
     assert "missing.png" in plan.content
     assert str(outside) in plan.content
     assert "https://example.com/image.png" in plan.content
@@ -134,8 +140,6 @@ async def test_local_markdown_image_extraction_validates_roots_removes_once_and_
         "missing-image",
         "invalid-root",
         "invalid-target",
-        "unsupported-image",
     }
     assert "![one]" not in plan.content
     assert "![two]" not in plan.content
-    assert "secret.txt" in plan.content

@@ -441,6 +441,73 @@ async def test_partial_tool_spill_and_fenced_diff_are_attached_losslessly(
 
 
 @pytest.mark.asyncio
+async def test_tool_spill_uses_durable_cumulative_stream(tmp_path: Path) -> None:
+    chunks = ("a" * (40 * 1024), "b" * (40 * 1024))
+    adapted = [
+        EventAdapter().adapt(
+            InboxEnvelope(
+                sdk_session_id="session-cumulative-tool",
+                generation=1,
+                fence_token=1,
+                inbox_seq=index,
+                source="internal",
+                payload={
+                    "type": "tool.execution_progress",
+                    "data": {
+                        "toolCallId": "cumulative-tool",
+                        "outputDelta": chunk,
+                    },
+                },
+                received_at=100 + index,
+                internal_event_id=f"cumulative-{index}",
+            )
+        )
+        for index, chunk in enumerate(chunks, start=1)
+    ]
+    adapted.append(
+        EventAdapter().adapt(
+            InboxEnvelope(
+                sdk_session_id="session-cumulative-tool",
+                generation=1,
+                fence_token=1,
+                inbox_seq=3,
+                source="internal",
+                payload={
+                    "type": "tool.execution_complete",
+                    "data": {
+                        "toolCallId": "cumulative-tool",
+                        "success": True,
+                        "result": {"content": "done"},
+                    },
+                },
+                received_at=103,
+                internal_event_id="cumulative-complete",
+            )
+        )
+    )
+    async with Database(tmp_path / "cumulative-tool.sqlite3") as database:
+        assert await JournalReducer(database).persist(adapted) == 3
+        rows = await database.fetchall("SELECT payload FROM render_outbox WHERE lane = 'artifact'")
+        stream = await database.fetchone(
+            """
+            SELECT content, spilled, artifact_emitted, finalized
+            FROM tool_output_streams
+            WHERE session_id = 'session-cumulative-tool'
+              AND tool_call_id = 'cumulative-tool'
+            """
+        )
+
+    assert len(rows) == 1
+    payload = json.loads(rows[0]["payload"])
+    assert payload["attachments"][0]["content"] == "".join(chunks)
+    assert payload["tool_source"] == "durable-stream"
+    assert stream["content"] == "".join(chunks)
+    assert stream["spilled"] == 1
+    assert stream["artifact_emitted"] == 1
+    assert stream["finalized"] == 1
+
+
+@pytest.mark.asyncio
 async def test_correlated_idle_emits_model_token_context_duration_footer(
     tmp_path: Path,
 ) -> None:
@@ -647,6 +714,71 @@ async def test_subagent_output_stays_in_one_collapsed_taskdeck(tmp_path: Path) -
     assert final_payload["taskdeck"]["expanded"] is False
     assert final_payload["taskdeck"]["options"][0]["label"] == "Parser investigator"
     assert lease["state"] == "released"
+
+
+@pytest.mark.asyncio
+async def test_agent_deltas_assemble_before_taskdeck_projection(tmp_path: Path) -> None:
+    started = SessionEvent(
+        data=SubagentStartedData(
+            agent_description="Stream a result",
+            agent_display_name="Streaming agent",
+            agent_name="stream-agent",
+            tool_call_id="tool-agent-stream",
+        ),
+        id=uuid4(),
+        timestamp=datetime.now(UTC),
+        type=SessionEventType.SUBAGENT_STARTED,
+        agent_id="agent-stream",
+    )
+    deltas = [
+        SessionEvent(
+            data=AssistantMessageDeltaData(
+                delta_content=content,
+                message_id="agent-stream-message",
+            ),
+            id=uuid4(),
+            timestamp=datetime.now(UTC),
+            type=SessionEventType.ASSISTANT_MESSAGE_DELTA,
+            agent_id="agent-stream",
+        )
+        for content in ("hel", "lo")
+    ]
+    adapter = EventAdapter()
+    adapted = [
+        adapter.adapt(
+            InboxEnvelope(
+                sdk_session_id="session-agent-stream",
+                generation=1,
+                fence_token=1,
+                inbox_seq=index,
+                source="sdk",
+                payload=event,
+                received_at=100 + index,
+                sdk_receive_seq=index,
+            )
+        )
+        for index, event in enumerate((started, *deltas), start=1)
+    ]
+
+    async with Database(tmp_path / "agent-stream.sqlite3") as database:
+        assert await JournalReducer(database).persist(adapted) == 3
+        stream = await database.fetchone(
+            """
+            SELECT content, finalized FROM render_streams
+            WHERE session_id = 'session-agent-stream'
+              AND message_id = 'agent-stream-message'
+              AND agent_id = 'agent-stream'
+            """
+        )
+        card = await database.fetchone(
+            """
+            SELECT progress_summary FROM task_card_projections
+            WHERE sdk_session_id = 'session-agent-stream'
+            """
+        )
+
+    assert dict(stream) == {"content": "hello", "finalized": 0}
+    assert card["progress_summary"] == "hello"
 
 
 @pytest.mark.asyncio

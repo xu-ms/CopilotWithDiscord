@@ -11,7 +11,7 @@ from typing import Any
 
 import aiosqlite
 
-_CORE_MIGRATION_VERSION = 10
+_CORE_MIGRATION_VERSION = 11
 
 
 class Database:
@@ -99,6 +99,7 @@ class Database:
         await self._ensure_render_streams_agent_schema()
         await self._ensure_render_attachment_delivery_schema()
         await self._ensure_task_surface_columns()
+        await self._ensure_review_hardening_columns()
 
     async def _ensure_render_streams_agent_schema(self) -> None:
         if not await self._table_exists("render_streams"):
@@ -160,6 +161,38 @@ class Database:
                     await connection.execute(
                         f"ALTER TABLE task_card_projections ADD COLUMN {name} {declaration}"
                     )
+
+    async def _ensure_review_hardening_columns(self) -> None:
+        additions = {
+            "tool_output_streams": {
+                "artifact_emitted": "INTEGER NOT NULL DEFAULT 0",
+                "finalized": "INTEGER NOT NULL DEFAULT 0",
+            },
+            "session_creation_intents": {
+                "project_config_snapshot": "TEXT NOT NULL DEFAULT '{}'",
+                "channel_config_snapshot": "TEXT NOT NULL DEFAULT '{}'",
+                "layout": "TEXT NOT NULL DEFAULT 'text'",
+                "project_config_version": "INTEGER NOT NULL DEFAULT 1",
+                "channel_config_version": "INTEGER NOT NULL DEFAULT 1",
+                "config_snapshot_state": ("TEXT NOT NULL DEFAULT 'legacy_unverified'"),
+            },
+            "session_bindings": {
+                "session_config_snapshot": "TEXT NOT NULL DEFAULT '{}'",
+                "channel_config_snapshot": "TEXT NOT NULL DEFAULT '{}'",
+                "config_snapshot_state": ("TEXT NOT NULL DEFAULT 'legacy_unverified'"),
+            },
+        }
+        for table, columns in additions.items():
+            if not await self._table_exists(table):
+                continue
+            rows = await self.fetchall(f"PRAGMA table_info({table})")
+            existing = {str(row["name"]) for row in rows}
+            async with self.transaction() as connection:
+                for name, declaration in columns.items():
+                    if name not in existing:
+                        await connection.execute(
+                            f"ALTER TABLE {table} ADD COLUMN {name} {declaration}"
+                        )
 
     async def _table_exists(self, name: str) -> bool:
         row = await self.fetchone(

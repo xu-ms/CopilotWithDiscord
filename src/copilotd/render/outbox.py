@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import inspect
 import json
@@ -75,6 +76,7 @@ class RenderOutboxDispatcher:
         self._claim_timeout_seconds = claim_timeout_seconds
         self._max_transient_attempts = max_transient_attempts
         self._last_delivery: dict[tuple[str, str], float] = {}
+        self._dispatch_lock = asyncio.Lock()
 
     async def dispatch_once(
         self,
@@ -82,22 +84,51 @@ class RenderOutboxDispatcher:
         limit: int = 20,
         now: float | None = None,
     ) -> int:
-        timestamp = time.time() if now is None else now
-        items = await self._claim(limit=limit, now=timestamp)
-        delivered = 0
-        for item in items:
-            if await self._deliver(item, now=timestamp):
-                delivered += 1
-        return delivered
+        async with self._dispatch_lock:
+            live_clock = now is None
+            timestamp = time.time() if live_clock else now
+            items = await self._claim(limit=limit, now=timestamp)
+            delivered = 0
+            for item in items:
+                delivery_now = time.time() if live_clock else timestamp
+                if await self._deliver(
+                    item,
+                    now=delivery_now,
+                    live_clock=live_clock,
+                ):
+                    delivered += 1
+            return delivered
 
-    async def drain(self, *, max_iterations: int = 100, limit: int = 50) -> int:
+    async def drain(
+        self,
+        *,
+        deadline_seconds: float = 10,
+        limit: int = 50,
+    ) -> int:
+        if deadline_seconds <= 0:
+            raise ValueError("drain deadline must be positive")
+        deadline = time.monotonic() + deadline_seconds
         delivered = 0
-        for _ in range(max_iterations):
+        while True:
             count = await self.dispatch_once(limit=limit)
             delivered += count
-            if count == 0:
-                break
-        return delivered
+            pending = await self._database.fetchone(
+                """
+                SELECT COUNT(*) AS count, MIN(next_attempt_at) AS next_attempt_at
+                FROM render_outbox
+                WHERE state IN ('pending', 'sending')
+                """
+            )
+            if pending is None or int(pending["count"]) == 0:
+                return delivered
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return delivered
+            next_attempt = pending["next_attempt_at"]
+            eligibility_wait = (
+                0.01 if next_attempt is None else max(0.01, float(next_attempt) - time.time())
+            )
+            await asyncio.sleep(min(eligibility_wait, 0.25, remaining))
 
     async def _claim(self, *, limit: int, now: float) -> list[OutboxItem]:
         async with self._database.transaction() as connection:
@@ -163,7 +194,13 @@ class RenderOutboxDispatcher:
                     )
             return items
 
-    async def _deliver(self, item: OutboxItem, *, now: float) -> bool:
+    async def _deliver(
+        self,
+        item: OutboxItem,
+        *,
+        now: float,
+        live_clock: bool,
+    ) -> bool:
         logical_key = item.coalesce_key or item.id
         payload_hash = _payload_hash(item.payload)
         mapping = await self._database.fetchone(
@@ -213,20 +250,26 @@ class RenderOutboxDispatcher:
                         payload=item.payload,
                     )
         except RenderRateLimited as error:
-            await self._retry(item, next_attempt_at=now + error.retry_after, now=now)
+            retry_now = time.time() if live_clock else now
+            await self._retry(
+                item,
+                next_attempt_at=retry_now + error.retry_after,
+                now=retry_now,
+            )
             return False
         except RenderTransientError:
+            retry_now = time.time() if live_clock else now
             if item.attempts >= self._max_transient_attempts:
-                await self._block(item, now=now)
+                await self._block(item, now=retry_now)
             else:
                 await self._retry(
                     item,
-                    next_attempt_at=now + min(2 ** (item.attempts - 1), 30),
-                    now=now,
+                    next_attempt_at=retry_now + min(2 ** (item.attempts - 1), 30),
+                    now=retry_now,
                 )
             return False
         except RenderPermanentError:
-            await self._block(item, now=now)
+            await self._block(item, now=time.time() if live_clock else now)
             return False
 
         self._last_delivery[delivery_key] = time.monotonic()

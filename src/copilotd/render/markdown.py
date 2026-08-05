@@ -293,72 +293,136 @@ def extract_local_markdown_images(
     roots = tuple(Path(root).resolve() for root in allowed_roots)
     warnings: list[MarkdownImageWarning] = []
     attachments: list[MarkdownImageAttachmentPlan] = []
+    pieces: list[str] = []
+    in_fence = False
+    fence_char = ""
+    fence_len = 0
 
-    def replace(match: re.Match[str]) -> str:
-        alt_text = match.group("alt")
-        target = match.group("target").strip()
-        path_text, title = _parse_markdown_image_target(target)
-        if path_text is None:
-            warnings.append(
-                MarkdownImageWarning(
-                    kind="invalid-target",
-                    message="image target could not be parsed",
-                    source=match.group(0),
-                )
-            )
-            return match.group(0)
-        resolved, warning = _resolve_markdown_image_path(path_text, roots)
-        if warning is not None:
-            warnings.append(
-                MarkdownImageWarning(
-                    kind=warning,
-                    message=(
-                        "image path is outside allowed roots"
-                        if warning == "invalid-root"
-                        else "image path is missing"
-                    ),
-                    source=match.group(0),
-                )
-            )
-            return match.group(0)
-        if not resolved.is_file():
-            warnings.append(
-                MarkdownImageWarning(
-                    kind="missing-image",
-                    message="image path does not point to a file",
-                    source=match.group(0),
-                )
-            )
-            return match.group(0)
-        if not _is_supported_image(resolved):
-            warnings.append(
-                MarkdownImageWarning(
-                    kind="unsupported-image",
-                    message="local Markdown image is not a verified image file",
-                    source=match.group(0),
-                )
-            )
-            return match.group(0)
-        attachments.append(
-            MarkdownImageAttachmentPlan(
-                source=match.group(0),
-                path=path_text,
-                resolved_path=str(resolved),
-                alt_text=alt_text,
-                title=title,
-                filename=resolved.name,
-            )
-        )
-        return ""
+    for line in source.splitlines(keepends=True):
+        text = _strip_newline(line)
+        if in_fence:
+            pieces.append(line)
+            if _is_fence_closer(text, fence_char, fence_len):
+                in_fence = False
+            continue
+        fence = _parse_fence_marker(text)
+        if fence is not None:
+            pieces.append(line)
+            fence_char, fence_len = fence
+            in_fence = True
+            continue
 
-    stripped = _IMAGE_RE.sub(replace, source)
+        inline_ticks = 0
+        index = 0
+        line_out: list[str] = []
+        while index < len(text):
+            character = text[index]
+            if character == "\\":
+                if index + 1 < len(text):
+                    line_out.append(text[index : index + 2])
+                    index += 2
+                else:
+                    line_out.append(character)
+                    index += 1
+                continue
+            if character == "`":
+                run = 1
+                while index + run < len(text) and text[index + run] == "`":
+                    run += 1
+                line_out.append("`" * run)
+                if inline_ticks == 0:
+                    inline_ticks = run
+                elif inline_ticks == run:
+                    inline_ticks = 0
+                index += run
+                continue
+            if inline_ticks > 0:
+                line_out.append(character)
+                index += 1
+                continue
+            if text.startswith("![", index):
+                candidate = _scan_markdown_image_candidate(text, index)
+                if candidate is None:
+                    line_out.append(character)
+                    index += 1
+                    continue
+                end, source_text, alt_text, target = candidate
+                path_text, title = _parse_markdown_image_target(target)
+                if path_text is None:
+                    warnings.append(
+                        MarkdownImageWarning(
+                            kind="invalid-target",
+                            message="image target could not be parsed",
+                            source=source_text,
+                        )
+                    )
+                    line_out.append(source_text)
+                    index = end
+                    continue
+                resolved, warning = _resolve_markdown_image_path(path_text, roots)
+                if warning is not None:
+                    warnings.append(
+                        MarkdownImageWarning(
+                            kind=warning,
+                            message=(
+                                "image path is outside allowed roots"
+                                if warning == "invalid-root"
+                                else "image path is missing"
+                            ),
+                            source=source_text,
+                        )
+                    )
+                    line_out.append(source_text)
+                    index = end
+                    continue
+                if not resolved.is_file():
+                    warnings.append(
+                        MarkdownImageWarning(
+                            kind="missing-image",
+                            message="image path does not point to a file",
+                            source=source_text,
+                        )
+                    )
+                    line_out.append(source_text)
+                    index = end
+                    continue
+                if not _is_supported_image(resolved):
+                    warnings.append(
+                        MarkdownImageWarning(
+                            kind="unsupported-image",
+                            message="local Markdown image is not a verified image file",
+                            source=source_text,
+                        )
+                    )
+                    line_out.append(source_text)
+                    index = end
+                    continue
+                attachments.append(
+                    MarkdownImageAttachmentPlan(
+                        source=source_text,
+                        path=path_text,
+                        resolved_path=str(resolved),
+                        alt_text=alt_text,
+                        title=title,
+                        filename=resolved.name,
+                    )
+                )
+                index = end
+                continue
+            line_out.append(character)
+            index += 1
+        pieces.append("".join(line_out))
+        if line.endswith("\n"):
+            pieces.append("\n")
+
+    content = "".join(pieces)
     batches = tuple(
         tuple(attachments[index : index + 10]) for index in range(0, len(attachments), 10)
     )
-    rebatched: list[MarkdownImageAttachmentPlan] = []
+    rebatches: list[MarkdownImageAttachmentPlan] = []
     for batch_index, batch in enumerate(batches, start=1):
         for item in batch:
-            rebatched.append(
+            rebatches.append(
                 MarkdownImageAttachmentPlan(
                     source=item.source,
                     path=item.path,
@@ -370,7 +434,7 @@ def extract_local_markdown_images(
                     batch_size=len(batch),
                 )
             )
-    rebatches = tuple(
+    batches = tuple(
         tuple(
             MarkdownImageAttachmentPlan(
                 source=item.source,
@@ -387,11 +451,88 @@ def extract_local_markdown_images(
         for batch_index, batch in enumerate(batches, start=1)
     )
     return MarkdownImageExtractionPlan(
-        content=stripped,
-        attachments=tuple(rebatched),
-        batches=rebatches,
+        content=content,
+        attachments=tuple(rebatches),
+        batches=batches,
         warnings=tuple(warnings),
     )
+
+
+def _scan_markdown_image_candidate(text: str, index: int) -> tuple[int, str, str, str] | None:
+    if not text.startswith("![", index):
+        return None
+    alt_start = index + 2
+    alt_end = _find_matching_markdown_bracket(text, alt_start)
+    if alt_end is None:
+        return None
+    target_start = alt_end + 1
+    if target_start >= len(text) or text[target_start] != "(":
+        return None
+    target_end = _find_matching_markdown_paren(text, target_start + 1)
+    if target_end is None:
+        return None
+    source = text[index : target_end + 1]
+    alt_text = text[alt_start:alt_end]
+    target = text[target_start + 1 : target_end]
+    return target_end + 1, source, alt_text, target
+
+
+def _find_matching_markdown_bracket(text: str, start: int) -> int | None:
+    depth = 0
+    escaped = False
+    index = start
+    while index < len(text):
+        character = text[index]
+        if escaped:
+            escaped = False
+        elif character == "\\":
+            escaped = True
+        elif character == "[":
+            depth += 1
+        elif character == "]":
+            if depth == 0:
+                return index
+            depth -= 1
+        index += 1
+    return None
+
+
+def _find_matching_markdown_paren(text: str, start: int) -> int | None:
+    depth = 1
+    escaped = False
+    quote: str | None = None
+    index = start
+    while index < len(text):
+        character = text[index]
+        if escaped:
+            escaped = False
+        elif character == "\\":
+            escaped = True
+        elif quote is not None:
+            if character == quote:
+                quote = None
+        elif character in {'"', "'"}:
+            quote = character
+        elif character == "(":
+            depth += 1
+        elif character == ")":
+            depth -= 1
+            if depth == 0:
+                return index
+        index += 1
+    return None
+
+
+def _parse_fence_marker(text: str) -> tuple[str, int] | None:
+    match = _FENCE_RE.match(text)
+    if match is None:
+        return None
+    fence = match.group("fence")
+    return fence[0], len(fence)
+
+
+def _is_fence_closer(text: str, fence_char: str, fence_len: int) -> bool:
+    return re.fullmatch(rf"[ \t]*{re.escape(fence_char)}{{{fence_len},}}[ \t]*", text) is not None
 
 
 def split_table_row(line: str) -> list[str]:
@@ -737,6 +878,85 @@ def _parse_markdown_image_target(target: str) -> tuple[str | None, str | None]:
     if re.match(r"^[a-zA-Z][a-zA-Z0-9+.-]*:", path):
         return None, None
     return path, title
+
+
+def _scan_markdown_image_candidate(text: str, index: int) -> tuple[int, str, str, str] | None:
+    if not text.startswith("![", index):
+        return None
+    alt_start = index + 2
+    alt_end = _find_matching_markdown_bracket(text, alt_start)
+    if alt_end is None:
+        return None
+    target_start = alt_end + 1
+    if target_start >= len(text) or text[target_start] != "(":
+        return None
+    target_end = _find_matching_markdown_paren(text, target_start + 1)
+    if target_end is None:
+        return None
+    source = text[index : target_end + 1]
+    alt_text = text[alt_start:alt_end]
+    target = text[target_start + 1 : target_end]
+    return target_end + 1, source, alt_text, target
+
+
+def _find_matching_markdown_bracket(text: str, start: int) -> int | None:
+    depth = 0
+    escaped = False
+    index = start
+    while index < len(text):
+        character = text[index]
+        if escaped:
+            escaped = False
+        elif character == "\\":
+            escaped = True
+        elif character == "[":
+            depth += 1
+        elif character == "]":
+            if depth == 0:
+                return index
+            depth -= 1
+        index += 1
+    return None
+
+
+def _find_matching_markdown_paren(text: str, start: int) -> int | None:
+    depth = 1
+    escaped = False
+    quote: str | None = None
+    index = start
+    while index < len(text):
+        character = text[index]
+        if escaped:
+            escaped = False
+        elif character == "\\":
+            escaped = True
+        elif quote is not None:
+            if character == quote:
+                quote = None
+        elif character in {'"', "'"}:
+            quote = character
+        elif character == "(":
+            depth += 1
+        elif character == ")":
+            depth -= 1
+            if depth == 0:
+                return index
+        index += 1
+    return None
+
+
+def _parse_fence_marker(text: str) -> tuple[str, int] | None:
+    match = _FENCE_RE.match(text)
+    if match is None:
+        return None
+    fence = match.group("fence")
+    return fence[0], len(fence)
+
+
+def _is_fence_closer(text: str, fence_char: str, fence_len: int) -> bool:
+    return (
+        re.fullmatch(rf"[ 	]*{re.escape(fence_char)}{{{fence_len},}}[ 	]*", text) is not None
+    )
 
 
 def _resolve_markdown_image_path(

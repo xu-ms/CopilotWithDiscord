@@ -116,7 +116,9 @@ class CopilotBridge:
         on_user_input_request: Callable[..., Any] | None = None,
         on_exit_plan_mode_request: Callable[..., Any] | None = None,
         on_auto_mode_switch_request: Callable[..., Any] | None = None,
+        session_config: dict[str, Any] | None = None,
     ) -> CopilotSession:
+        options = session_config or {}
         return await self.client.create_session(
             session_id=session_id,
             working_directory=working_directory,
@@ -128,6 +130,11 @@ class CopilotBridge:
             on_user_input_request=on_user_input_request,
             on_exit_plan_mode_request=on_exit_plan_mode_request,
             on_auto_mode_switch_request=on_auto_mode_switch_request,
+            mcp_servers=cast(Any, options.get("mcp_servers")),
+            custom_agents=cast(Any, options.get("custom_agents")),
+            enable_skills=cast(bool | None, options.get("enable_skills")),
+            skill_directories=cast(Any, options.get("skill_directories")),
+            plugin_directories=cast(Any, options.get("plugin_directories")),
         )
 
     async def resume_session(
@@ -140,7 +147,9 @@ class CopilotBridge:
         on_user_input_request: Callable[..., Any] | None = None,
         on_exit_plan_mode_request: Callable[..., Any] | None = None,
         on_auto_mode_switch_request: Callable[..., Any] | None = None,
+        session_config: dict[str, Any] | None = None,
     ) -> CopilotSession:
+        options = session_config or {}
         return await self.client.resume_session(
             session_id,
             working_directory=working_directory,
@@ -153,6 +162,11 @@ class CopilotBridge:
             on_user_input_request=on_user_input_request,
             on_exit_plan_mode_request=on_exit_plan_mode_request,
             on_auto_mode_switch_request=on_auto_mode_switch_request,
+            mcp_servers=cast(Any, options.get("mcp_servers")),
+            custom_agents=cast(Any, options.get("custom_agents")),
+            enable_skills=cast(bool | None, options.get("enable_skills")),
+            skill_directories=cast(Any, options.get("skill_directories")),
+            plugin_directories=cast(Any, options.get("plugin_directories")),
         )
 
     async def ensure_allow_all(self, session: CopilotSession) -> PermissionPosture:
