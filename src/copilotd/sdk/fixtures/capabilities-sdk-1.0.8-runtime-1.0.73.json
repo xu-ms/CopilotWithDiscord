@@ -37,6 +37,11 @@
       "evidence_kind": "live-rpc-fixture",
       "detail": "metadata.contextInfo returned a typed snapshot"
     },
+    "config_reattach": {
+      "supported": true,
+      "evidence_kind": "live-extension-acceptance",
+      "detail": "same owner fence reattached the same session ID with a new config generation; MCP and custom-agent readback matched"
+    },
     "detached_continuation": {
       "supported": false,
       "evidence_kind": "live-sidecar-fixture",
@@ -46,6 +51,21 @@
       "supported": true,
       "evidence_kind": "live-rpc-fixture",
       "detail": "eventLog.tail/read returned opaque cursors, cursor status, and event batches"
+    },
+    "managed_permission_handler": {
+      "supported": true,
+      "evidence_kind": "live-extension-acceptance",
+      "detail": "ordinary shell, write, and MCP requests returned approve-once; create/resume opts into managed settings when a session token exists, and resolved/enforced policy events drive user-not-available"
+    },
+    "mcp_http": {
+      "supported": true,
+      "evidence_kind": "live-extension-acceptance",
+      "detail": "disposable loopback HTTP MCP reached connected and listed tools after host-provided OAuth"
+    },
+    "mcp_stdio": {
+      "supported": true,
+      "evidence_kind": "live-extension-acceptance",
+      "detail": "disposable stdio MCP reached connected and exposed the expected tool inventory"
     },
     "model_config": {
       "supported": true,
@@ -82,6 +102,36 @@
       "evidence_kind": "live-callback-fixture",
       "detail": "create and resume received events through callbacks supplied before the RPC"
     },
+    "protocol_elicitation": {
+      "supported": true,
+      "evidence_kind": "live-extension-acceptance",
+      "detail": "disposable MCP elicitation invoked the typed handler and emitted requested/completed"
+    },
+    "protocol_external_tool": {
+      "supported": true,
+      "evidence_kind": "live-extension-acceptance",
+      "detail": "registered external tool handler ran exactly once and emitted requested/completed"
+    },
+    "protocol_mcp_headers_response": {
+      "supported": true,
+      "evidence_kind": "live-rpc-negative-id",
+      "detail": "generated headers response RPC was accepted by runtime and returned false for a missing request ID"
+    },
+    "protocol_mcp_oauth": {
+      "supported": true,
+      "evidence_kind": "live-extension-acceptance",
+      "detail": "loopback OAuth challenge invoked host token handler, connected, listed tools, and emitted required/completed"
+    },
+    "protocol_sampling_response": {
+      "supported": true,
+      "evidence_kind": "live-rpc-negative-id",
+      "detail": "generated sampling response RPC returned false for a missing request ID; a real MCP sampling attempt did not emit a request on this runtime"
+    },
+    "protocol_session_limits_response": {
+      "supported": true,
+      "evidence_kind": "live-rpc-negative-id",
+      "detail": "generated session-limit response RPC returned false for a missing request ID; no editable limit was created"
+    },
     "reasoning_summary_readback": {
       "supported": false,
       "evidence_kind": "checked-negative-fixture",
@@ -96,6 +146,16 @@
       "supported": true,
       "evidence_kind": "live-rpc-fixture",
       "detail": "agent list/get-current returned typed results"
+    },
+    "session_extension_config": {
+      "supported": true,
+      "evidence_kind": "live-extension-acceptance",
+      "detail": "create and resume accepted immutable MCP, custom-agent, skill, disabled-skill, plugin, and environment-reference option shapes"
+    },
+    "session_hooks": {
+      "supported": true,
+      "evidence_kind": "live-extension-acceptance",
+      "detail": "prompt-submitted, session-start/end, pre/post tool, and pre-MCP callbacks executed on a disposable turn; all typed callbacks are registered and untriggered callbacks remain explicit in evidence"
     },
     "session_mode": {
       "supported": true,

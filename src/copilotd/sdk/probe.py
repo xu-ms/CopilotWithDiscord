@@ -388,6 +388,26 @@ class SdkProbe:
                 "live-rpc-probe",
                 {"read": event_log_read, "tail": event_log_tail},
             ),
+            "config_reattach": _evidence(
+                None,
+                "unprobed",
+                "run sdk-probe --live-extensions for same-fence reattach acceptance",
+            ),
+            "managed_permission_handler": _evidence(
+                None,
+                "unprobed",
+                "run sdk-probe --live-extensions for permission-handler acceptance",
+            ),
+            "mcp_http": _evidence(
+                None,
+                "unprobed",
+                "run sdk-probe --live-extensions for disposable HTTP MCP acceptance",
+            ),
+            "mcp_stdio": _evidence(
+                None,
+                "unprobed",
+                "run sdk-probe --live-extensions for disposable stdio MCP acceptance",
+            ),
             "model_config": _evidence(
                 None,
                 "unprobed",
@@ -433,6 +453,36 @@ class SdkProbe:
                     "callback_survived_idle": live.get("callback_survived_idle"),
                 },
             ),
+            "protocol_elicitation": _evidence(
+                None,
+                "unprobed",
+                "run sdk-probe --live-extensions for MCP elicitation acceptance",
+            ),
+            "protocol_external_tool": _evidence(
+                None,
+                "unprobed",
+                "run sdk-probe --live-extensions for external-tool acceptance",
+            ),
+            "protocol_mcp_headers_response": _evidence(
+                None,
+                "unprobed",
+                "run sdk-probe --live-extensions for MCP header response RPC gate",
+            ),
+            "protocol_mcp_oauth": _evidence(
+                None,
+                "unprobed",
+                "run sdk-probe --live-extensions for MCP OAuth acceptance",
+            ),
+            "protocol_sampling_response": _evidence(
+                None,
+                "unprobed",
+                "run sdk-probe --live-extensions for sampling response RPC gate",
+            ),
+            "protocol_session_limits_response": _evidence(
+                None,
+                "unprobed",
+                "run sdk-probe --live-extensions for session-limit response RPC gate",
+            ),
             "reasoning_summary_readback": _evidence(
                 None,
                 "unprobed",
@@ -448,9 +498,18 @@ class SdkProbe:
                 "live-rpc-probe",
                 {"list": live.get("agents"), "current": live.get("agent_current")},
             ),
+            "session_extension_config": _evidence(
+                None,
+                "unprobed",
+                "run sdk-probe --live-extensions for create/resume config acceptance",
+            ),
+            "session_hooks": _evidence(
+                None,
+                "unprobed",
+                "run sdk-probe --live-extensions for callback hook acceptance",
+            ),
             "session_mode": _evidence(
-                _supported(live.get("mode_initial"))
-                and _supported(live.get("mode_autopilot")),
+                _supported(live.get("mode_initial")) and _supported(live.get("mode_autopilot")),
                 "live-rpc-probe",
                 {
                     "initial": live.get("mode_initial"),

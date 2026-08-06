@@ -12,6 +12,10 @@ from typing import Protocol
 from aiosqlite import Row
 
 from copilotd.core.bindings import SessionBinding, SessionBindingRepository
+from copilotd.core.extensions import (
+    ExtensionConfigRepository,
+    ExtensionConfigSnapshot,
+)
 from copilotd.core.projects import ProjectRegistry, ProjectSnapshot
 from copilotd.core.session_runtime import RuntimeState, SessionAttachUnknown, SessionRuntime
 from copilotd.storage.database import Database
@@ -38,6 +42,8 @@ class CreationIntent:
     cwd_snapshot: Path
     sdk_session_id: str
     thread_id: str | None
+    desired_session_config_version: int
+    desired_session_config_hash: str | None
     state: CreationState
 
 
@@ -85,6 +91,7 @@ class CreationIntentRepository:
         source_kind: str,
         source_id: str,
         project: ProjectSnapshot,
+        extension_config: ExtensionConfigSnapshot | None = None,
         now: float | None = None,
     ) -> tuple[CreationIntent, bool]:
         timestamp = time.time() if now is None else now
@@ -117,6 +124,12 @@ class CreationIntentRepository:
                 cwd_snapshot=project.cwd,
                 sdk_session_id=str(uuid.uuid4()),
                 thread_id=None,
+                desired_session_config_version=(
+                    1 if extension_config is None else extension_config.version
+                ),
+                desired_session_config_hash=(
+                    None if extension_config is None else extension_config.config_hash
+                ),
                 state=CreationState.RESERVED,
             )
             await connection.execute(
@@ -124,8 +137,9 @@ class CreationIntentRepository:
                 INSERT INTO session_creation_intents(
                     creation_token, source_kind, source_id, project_source,
                     project_id, cwd_snapshot, sdk_session_id, state,
+                    desired_session_config_version, desired_session_config_hash,
                     created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     intent.creation_token,
@@ -136,6 +150,8 @@ class CreationIntentRepository:
                     str(intent.cwd_snapshot),
                     intent.sdk_session_id,
                     intent.state.value,
+                    intent.desired_session_config_version,
+                    intent.desired_session_config_hash,
                     timestamp,
                     timestamp,
                 ),
@@ -234,9 +250,7 @@ class SessionRegistry:
                 try:
                     await runtime.shutdown()
                 except Exception as cleanup_error:
-                    failures[binding.thread_id] = (
-                        f"{error}; cleanup failed: {cleanup_error}"
-                    )
+                    failures[binding.thread_id] = f"{error}; cleanup failed: {cleanup_error}"
         return failures
 
     async def shutdown(self) -> None:
@@ -261,12 +275,14 @@ class SessionCreationService:
         bindings: SessionBindingRepository,
         sessions: SessionRegistry,
         threads: ThreadGateway,
+        extension_configs: ExtensionConfigRepository | None = None,
     ) -> None:
         self._projects = projects
         self._intents = intents
         self._bindings = bindings
         self._sessions = sessions
         self._threads = threads
+        self._extension_configs = extension_configs
         self._source_locks: dict[tuple[str, str], _SourceCreationLock] = {}
         self._source_locks_guard = asyncio.Lock()
 
@@ -305,10 +321,16 @@ class SessionCreationService:
         send_initial_prompt: bool,
     ) -> SessionRuntime:
         project = await self._projects.resolve(channel_id)
+        extension_config = (
+            None
+            if self._extension_configs is None
+            else await self._extension_configs.latest(project)
+        )
         intent, _ = await self._intents.reserve(
             source_kind=source_kind,
             source_id=source_id,
             project=project,
+            extension_config=extension_config,
         )
         if intent.thread_id is None:
             reference = await self._threads.find_thread(
@@ -337,6 +359,8 @@ class SessionCreationService:
                 cwd_snapshot=intent.cwd_snapshot,
                 project_source=intent.project_source,
                 project_id=intent.project_id,
+                desired_session_config_version=intent.desired_session_config_version,
+                desired_session_config_hash=intent.desired_session_config_hash,
             )
 
         runtime = self._sessions.for_thread(intent.thread_id)
@@ -413,5 +437,7 @@ def _row_to_intent(row: Row) -> CreationIntent:
         cwd_snapshot=Path(row["cwd_snapshot"]),
         sdk_session_id=row["sdk_session_id"],
         thread_id=row["thread_id"],
+        desired_session_config_version=row["desired_session_config_version"],
+        desired_session_config_hash=row["desired_session_config_hash"],
         state=CreationState(row["state"]),
     )

@@ -29,6 +29,14 @@ The implementation follows [`docs/copilotD-detailed-design.md`](docs/copilotD-de
 - Durable Copilot input requests: ask-user choices/freeform, Plan exit actions, and
   auto-mode-switch prompts render in-place and settle exactly once without blocking
   event reduction.
+- Immutable, versioned create/resume configuration for custom agents, skill/plugin
+  directories, disabled skills, stdio/HTTP MCP servers, and environment references,
+  including same-owner-fence config reattach and restart recovery.
+- Typed callback hooks with redacted audit projections; managed-aware permission
+  handling; JSON-Schema elicitation; MCP OAuth; and exactly-once protocol response
+  planes for external tools, limits, sampling, and dynamic MCP headers.
+- Durable mode/model per-field reconciliation (including gated reasoning-summary
+  readback), MCP/extension health, and stale-aware usage/context projections.
 - Background task `refresh/list` reconciliation, disappearance-to-unknown handling,
   usage/status rendering, and lossless attachment delivery for tool output at or above
   8000 characters; oversized Discord uploads are split into ordered lossless parts.
@@ -87,6 +95,14 @@ disposable persistent session:
 
 ```bash
 .venv/bin/copilotd sdk-probe --live
+```
+
+The full protocol/extension acceptance uses disposable local stdio and HTTP MCP
+servers, requires the selected runtime to be authenticated, sanitizes its evidence,
+and removes every temporary session:
+
+```bash
+.venv/bin/copilotd sdk-probe --live-extensions
 ```
 
 Runtime data, cache, and logs use platform-specific user directories. Override them

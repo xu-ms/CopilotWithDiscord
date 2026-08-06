@@ -78,9 +78,7 @@ def _adapted(
         event_id=event_id,
         internal_event_id=None if source == "sdk" else f"{raw_type}:{inbox_seq}",
         turn_id=None if data.get("turnId") is None else str(data["turnId"]),
-        interaction_id=(
-            None if data.get("interactionId") is None else str(data["interactionId"])
-        ),
+        interaction_id=(None if data.get("interactionId") is None else str(data["interactionId"])),
     )
 
 
@@ -430,9 +428,7 @@ async def test_reducer_materializes_full_stream_content_for_each_outbox_edit(
         ]
 
         assert await JournalReducer(database).persist(adapted) == 3
-        rows = await database.fetchall(
-            "SELECT payload FROM render_outbox ORDER BY logical_seq"
-        )
+        rows = await database.fetchall("SELECT payload FROM render_outbox ORDER BY logical_seq")
         stream = await database.fetchone(
             "SELECT content, finalized FROM render_streams WHERE message_id = 'message-1'"
         )
@@ -604,7 +600,8 @@ async def test_wire_requested_and_completed_events_pair_by_request_id(
         assert await JournalReducer(database).persist(events) == 2
         row = await database.fetchone(
             """
-            SELECT requested_type, requested_event_id, completed_event_id, state
+            SELECT requested_type, requested_event_id, completed_event_id,
+                   wire_state, response_state
             FROM protocol_requests WHERE request_id = 'request-1'
             """
         )
@@ -613,7 +610,352 @@ async def test_wire_requested_and_completed_events_pair_by_request_id(
         "requested_type": "user_input.requested",
         "requested_event_id": "event-requested",
         "completed_event_id": "event-completed",
-        "state": "completed",
+        "wire_state": "paired",
+        "response_state": "delegated",
+    }
+
+
+@pytest.mark.asyncio
+async def test_external_mode_change_marks_drift_without_overwriting_desired(
+    tmp_path: Path,
+) -> None:
+    async with Database(tmp_path / "mode-drift.sqlite3") as database:
+        await _insert_projection_binding(database, "session-mode-drift")
+        reducer = JournalReducer(database)
+        await reducer.persist(
+            [
+                _adapted(
+                    "session.mode_changed",
+                    {"newMode": "autopilot", "previousMode": "interactive"},
+                    1,
+                    session_id="session-mode-drift",
+                )
+            ]
+        )
+        drifted = await database.fetchone(
+            """
+            SELECT desired_mode, runtime_mode, pending_mode,
+                   mode_reconciliation_state, mode_drift
+            FROM session_bindings WHERE sdk_session_id = 'session-mode-drift'
+            """
+        )
+        await reducer.persist(
+            [
+                _adapted(
+                    "copilotd.mode.pending",
+                    {"mode": "autopilot", "transition_id": "mode-transition"},
+                    2,
+                    source="internal",
+                    session_id="session-mode-drift",
+                ),
+                _adapted(
+                    "copilotd.mode.observed",
+                    {"mode": "autopilot", "transition_id": "mode-transition"},
+                    3,
+                    source="internal",
+                    session_id="session-mode-drift",
+                ),
+            ]
+        )
+        reconciled = await database.fetchone(
+            """
+            SELECT desired_mode, runtime_mode, pending_mode,
+                   mode_reconciliation_state, mode_drift
+            FROM session_bindings WHERE sdk_session_id = 'session-mode-drift'
+            """
+        )
+
+    assert dict(drifted) == {
+        "desired_mode": "interactive",
+        "runtime_mode": "autopilot",
+        "pending_mode": None,
+        "mode_reconciliation_state": "drift",
+        "mode_drift": 1,
+    }
+    assert dict(reconciled) == {
+        "desired_mode": "autopilot",
+        "runtime_mode": "autopilot",
+        "pending_mode": None,
+        "mode_reconciliation_state": "synced",
+        "mode_drift": 0,
+    }
+
+
+@pytest.mark.asyncio
+async def test_model_event_uses_per_field_mask_and_preserves_external_drift(
+    tmp_path: Path,
+) -> None:
+    async with Database(tmp_path / "model-fields.sqlite3") as database:
+        await _insert_projection_binding(database, "session-model-fields")
+        await database.execute(
+            """
+            UPDATE session_bindings
+            SET desired_model_config = ?,
+                runtime_model_config = ?,
+                model_confirmation_mask = ?
+            WHERE sdk_session_id = 'session-model-fields'
+            """,
+            (
+                json.dumps(
+                    {
+                        "modelId": "old-model",
+                        "confirmationMask": ["modelId"],
+                    }
+                ),
+                json.dumps(
+                    {
+                        "modelId": "old-model",
+                        "knownFields": ["modelId"],
+                    }
+                ),
+                json.dumps(["modelId"]),
+            ),
+        )
+        reducer = JournalReducer(database)
+        await reducer.persist(
+            [
+                _adapted(
+                    "session.model_change",
+                    {
+                        "newModel": "new-model",
+                        "reasoningSummary": "concise",
+                    },
+                    1,
+                    session_id="session-model-fields",
+                )
+            ]
+        )
+        drifted = await database.fetchone(
+            """
+            SELECT desired_model_config, runtime_model_config,
+                   model_reconciliation_state, model_drift
+            FROM session_bindings WHERE sdk_session_id = 'session-model-fields'
+            """
+        )
+        observation = await database.fetchone(
+            """
+            SELECT model_id, reasoning_summary, known_fields, source
+            FROM model_config_observations
+            """
+        )
+
+    assert json.loads(drifted["desired_model_config"])["modelId"] == "old-model"
+    assert json.loads(drifted["runtime_model_config"]) == {
+        "knownFields": ["modelId", "reasoningSummary"],
+        "modelId": "new-model",
+        "reasoningSummary": "concise",
+    }
+    assert drifted["model_reconciliation_state"] == "drift"
+    assert drifted["model_drift"] == 1
+    assert dict(observation) == {
+        "model_id": "new-model",
+        "reasoning_summary": "concise",
+        "known_fields": '["modelId", "reasoningSummary"]',
+        "source": "session.model_change",
+    }
+
+
+@pytest.mark.asyncio
+async def test_rejected_model_change_uses_semantic_mask_for_synced_state(
+    tmp_path: Path,
+) -> None:
+    desired = {
+        "modelId": "model-a",
+        "confirmationMask": ["modelId"],
+    }
+    runtime = {
+        "modelId": "model-a",
+        "reasoningEffort": "high",
+        "knownFields": ["modelId", "reasoningEffort"],
+    }
+    async with Database(tmp_path / "model-rejected.sqlite3") as database:
+        await _insert_projection_binding(database, "session-model-rejected")
+        await database.execute(
+            """
+            UPDATE session_bindings
+            SET desired_model_config = ?,
+                runtime_model_config = ?,
+                pending_model_config = ?,
+                pending_model_transition_id = 'transition-rejected',
+                model_reconciliation_state = 'pending'
+            WHERE sdk_session_id = 'session-model-rejected'
+            """,
+            (
+                json.dumps(desired),
+                json.dumps(runtime),
+                json.dumps(
+                    {
+                        "modelId": "model-b",
+                        "confirmationMask": ["modelId"],
+                    }
+                ),
+            ),
+        )
+        await JournalReducer(database).persist(
+            [
+                _adapted(
+                    "copilotd.model.rejected",
+                    {"transition_id": "transition-rejected"},
+                    1,
+                    source="internal",
+                    session_id="session-model-rejected",
+                )
+            ]
+        )
+        row = await database.fetchone(
+            """
+            SELECT pending_model_config, pending_model_transition_id,
+                   model_reconciliation_state, model_drift
+            FROM session_bindings
+            WHERE sdk_session_id = 'session-model-rejected'
+            """
+        )
+
+    assert dict(row) == {
+        "pending_model_config": None,
+        "pending_model_transition_id": None,
+        "model_reconciliation_state": "synced",
+        "model_drift": 0,
+    }
+
+
+@pytest.mark.asyncio
+async def test_stale_rejections_do_not_overwrite_newer_pending_transitions(
+    tmp_path: Path,
+) -> None:
+    async with Database(tmp_path / "stale-rejections.sqlite3") as database:
+        await _insert_projection_binding(database, "session-stale-rejections")
+        await database.execute(
+            """
+            UPDATE session_bindings
+            SET pending_mode = 'autopilot',
+                pending_mode_transition_id = 'mode-new',
+                mode_reconciliation_state = 'pending',
+                pending_model_config = '{"modelId":"model-new"}',
+                pending_model_transition_id = 'model-new',
+                model_reconciliation_state = 'pending',
+                pending_session_config_version = 2,
+                pending_session_config_hash = 'config-new',
+                pending_session_config_transition_id = 'config-new',
+                session_config_state = 'pending'
+            WHERE sdk_session_id = 'session-stale-rejections'
+            """
+        )
+        await JournalReducer(database).persist(
+            [
+                _adapted(
+                    "copilotd.mode.rejected",
+                    {"transition_id": "mode-old"},
+                    1,
+                    source="internal",
+                    session_id="session-stale-rejections",
+                ),
+                _adapted(
+                    "copilotd.model.rejected",
+                    {"transition_id": "model-old"},
+                    2,
+                    source="internal",
+                    session_id="session-stale-rejections",
+                ),
+                _adapted(
+                    "copilotd.config.rejected",
+                    {"transition_id": "config-old"},
+                    3,
+                    source="internal",
+                    session_id="session-stale-rejections",
+                ),
+            ]
+        )
+        row = await database.fetchone(
+            """
+            SELECT pending_mode, pending_mode_transition_id,
+                   mode_reconciliation_state,
+                   pending_model_config, pending_model_transition_id,
+                   model_reconciliation_state,
+                   pending_session_config_version,
+                   pending_session_config_hash,
+                   pending_session_config_transition_id,
+                   session_config_state
+            FROM session_bindings
+            WHERE sdk_session_id = 'session-stale-rejections'
+            """
+        )
+
+    assert dict(row) == {
+        "pending_mode": "autopilot",
+        "pending_mode_transition_id": "mode-new",
+        "mode_reconciliation_state": "pending",
+        "pending_model_config": '{"modelId":"model-new"}',
+        "pending_model_transition_id": "model-new",
+        "model_reconciliation_state": "pending",
+        "pending_session_config_version": 2,
+        "pending_session_config_hash": "config-new",
+        "pending_session_config_transition_id": "config-new",
+        "session_config_state": "pending",
+    }
+
+
+@pytest.mark.asyncio
+async def test_managed_settings_events_drive_durable_permission_block_state(
+    tmp_path: Path,
+) -> None:
+    async with Database(tmp_path / "managed-settings.sqlite3") as database:
+        await _insert_projection_binding(database, "session-managed-settings")
+        reducer = JournalReducer(database)
+        await reducer.persist(
+            [
+                _adapted(
+                    "session.managed_settings_resolved",
+                    {
+                        "bypassPermissionsDisabled": True,
+                        "failClosed": False,
+                        "managedKeys": ["bypassPermissions"],
+                    },
+                    1,
+                    session_id="session-managed-settings",
+                )
+            ]
+        )
+        blocked = await database.fetchone(
+            """
+            SELECT managed_settings_state, managed_permissions_blocked,
+                   permission_posture
+            FROM session_bindings
+            WHERE sdk_session_id = 'session-managed-settings'
+            """
+        )
+        await reducer.persist(
+            [
+                _adapted(
+                    "session.managed_settings_resolved",
+                    {
+                        "bypassPermissionsDisabled": False,
+                        "failClosed": False,
+                        "managedKeys": [],
+                    },
+                    2,
+                    session_id="session-managed-settings",
+                )
+            ]
+        )
+        unblocked = await database.fetchone(
+            """
+            SELECT managed_settings_state, managed_permissions_blocked,
+                   permission_posture
+            FROM session_bindings
+            WHERE sdk_session_id = 'session-managed-settings'
+            """
+        )
+
+    assert dict(blocked) == {
+        "managed_settings_state": "resolved",
+        "managed_permissions_blocked": 1,
+        "permission_posture": "platform_blocked",
+    }
+    assert dict(unblocked) == {
+        "managed_settings_state": "resolved",
+        "managed_permissions_blocked": 0,
+        "permission_posture": "unverified",
     }
 
 
@@ -818,9 +1160,7 @@ async def test_user_message_correlation_retains_facts_and_creates_runtime_observ
             4,
             session_id=session_id,
         )
-        assert await JournalReducer(database).persist(
-            [queued, accepted, observed, external]
-        ) == 4
+        assert await JournalReducer(database).persist([queued, accepted, observed, external]) == 4
         submissions = await database.fetchall(
             """
             SELECT origin, state, observed_user_event_id, correlation_basis
@@ -1075,9 +1415,7 @@ async def test_acceptance_receipts_are_monotonic_across_unknown_and_duplicates(
             FROM submissions WHERE submission_id = 'submission-1'
             """
         )
-        queue = await database.fetchone(
-            "SELECT state FROM message_queue WHERE id = 'submission-1'"
-        )
+        queue = await database.fetchone("SELECT state FROM message_queue WHERE id = 'submission-1'")
         lease = await database.fetchone(
             """
             SELECT state FROM liveness_leases
@@ -1327,9 +1665,7 @@ async def test_definitive_acceptance_and_rejection_conflicts_are_monotonic(
             """,
             (session_id,),
         )
-        queue = await database.fetchall(
-            "SELECT id, state FROM message_queue ORDER BY id"
-        )
+        queue = await database.fetchall("SELECT id, state FROM message_queue ORDER BY id")
         incidents = await database.fetchall(
             """
             SELECT kind, COUNT(*) AS count FROM runtime_incidents
@@ -1368,9 +1704,7 @@ async def test_unknown_acceptance_mapping_capability_is_not_treated_as_supported
     session_id = "session-unknown-mapping"
     accepted_id = str(uuid4())
     async with Database(tmp_path / "unknown-mapping.sqlite3") as database:
-        await CapabilityRegistry(
-            Settings(_env_file=None, data_dir=tmp_path)
-        ).activate(
+        await CapabilityRegistry(Settings(_env_file=None, data_dir=tmp_path)).activate(
             database,
             {
                 "runtime_version": "1.0.73",
@@ -1565,9 +1899,7 @@ async def test_model_turn_projection_and_interactive_idle_are_semantically_termi
             """,
             (session_id,),
         )
-        segment = await database.fetchone(
-            "SELECT state, idle_at FROM submission_segments"
-        )
+        segment = await database.fetchone("SELECT state, idle_at FROM submission_segments")
         lease = await database.fetchone(
             "SELECT state FROM liveness_leases WHERE sdk_session_id = ?",
             (session_id,),
@@ -1910,38 +2242,41 @@ async def test_linked_task_terminal_waits_for_late_activity_and_queue_quiet_snap
     async with Database(tmp_path / "linked-task-quiet.sqlite3") as database:
         await _insert_projection_binding(database, session_id)
         reducer = JournalReducer(database)
-        assert await reducer.persist(
-            [
-                _adapted(
-                    "user.message",
-                    {"content": "start worker", "agentMode": "interactive"},
-                    1,
-                    session_id=session_id,
-                ),
-                requested("tasks", 2),
-                observed(
-                    "tasks",
-                    3,
-                    1,
-                    {
-                        "tasks": [
-                            {
-                                "id": "task-1",
-                                "status": "running",
-                                "type": "agent",
-                                "description": "Worker",
-                            }
-                        ]
-                    },
-                ),
-                _adapted(
-                    "session.idle",
-                    {"aborted": False},
-                    4,
-                    session_id=session_id,
-                ),
-            ]
-        ) == 4
+        assert (
+            await reducer.persist(
+                [
+                    _adapted(
+                        "user.message",
+                        {"content": "start worker", "agentMode": "interactive"},
+                        1,
+                        session_id=session_id,
+                    ),
+                    requested("tasks", 2),
+                    observed(
+                        "tasks",
+                        3,
+                        1,
+                        {
+                            "tasks": [
+                                {
+                                    "id": "task-1",
+                                    "status": "running",
+                                    "type": "agent",
+                                    "description": "Worker",
+                                }
+                            ]
+                        },
+                    ),
+                    _adapted(
+                        "session.idle",
+                        {"aborted": False},
+                        4,
+                        session_id=session_id,
+                    ),
+                ]
+            )
+            == 4
+        )
         initial = await database.fetchone(
             """
             SELECT state FROM submissions WHERE sdk_session_id = ?
@@ -1958,64 +2293,73 @@ async def test_linked_task_terminal_waits_for_late_activity_and_queue_quiet_snap
         assert link["state"] == "running"
         assert link["correlation_basis"] == "single_active_submission"
 
-        assert await reducer.persist(
-            [
-                requested("tasks", 5),
-                observed(
-                    "tasks",
-                    6,
-                    2,
-                    {
-                        "tasks": [
-                            {
-                                "id": "task-1",
-                                "status": "completed",
-                                "type": "agent",
-                                "description": "Worker",
-                            }
-                        ]
-                    },
-                ),
-            ]
-        ) == 2
+        assert (
+            await reducer.persist(
+                [
+                    requested("tasks", 5),
+                    observed(
+                        "tasks",
+                        6,
+                        2,
+                        {
+                            "tasks": [
+                                {
+                                    "id": "task-1",
+                                    "status": "completed",
+                                    "type": "agent",
+                                    "description": "Worker",
+                                }
+                            ]
+                        },
+                    ),
+                ]
+            )
+            == 2
+        )
         after_task = await database.fetchone(
             "SELECT state FROM submissions WHERE sdk_session_id = ?",
             (session_id,),
         )
         assert after_task["state"] == "loop_idle"
 
-        assert await reducer.persist(
-            [
-                requested("activity", 7),
-                observed(
-                    "activity",
-                    8,
-                    1,
-                    {
-                        "processing": False,
-                        "has_active_work": False,
-                        "abortable": False,
-                    },
-                ),
-            ]
-        ) == 2
+        assert (
+            await reducer.persist(
+                [
+                    requested("activity", 7),
+                    observed(
+                        "activity",
+                        8,
+                        1,
+                        {
+                            "processing": False,
+                            "has_active_work": False,
+                            "abortable": False,
+                        },
+                    ),
+                ]
+            )
+            == 2
+        )
         after_activity = await database.fetchone(
             "SELECT state FROM submissions WHERE sdk_session_id = ?",
             (session_id,),
         )
         assert after_activity["state"] == "loop_idle"
 
-        assert await reducer.persist(
-            [
-                requested("queue", 9),
-                observed(
-                    "queue",
-                    10,
-                    1,
-                    {"items": [], "steering_messages": []},
-                ),
-            ]
-        ) == 2
+        assert (
+            await reducer.persist(
+                [
+                    requested("queue", 9),
+                    observed(
+                        "queue",
+                        10,
+                        1,
+                        {"items": [], "steering_messages": []},
+                    ),
+                ]
+            )
+            == 2
+        )
         terminal = await database.fetchone(
             """
             SELECT state, completion_basis FROM submissions
@@ -2203,9 +2547,7 @@ async def test_task_discovered_after_quiet_completion_reopens_latest_submission(
             observed("queue", 16, 2, {"items": [], "steering_messages": []}),
         ]
         assert await reducer.persist(terminal) == len(terminal)
-        settled = await database.fetchone(
-            "SELECT state, completion_basis FROM submissions"
-        )
+        settled = await database.fetchone("SELECT state, completion_basis FROM submissions")
 
     assert dict(settled) == {
         "state": "semantic_complete",
@@ -2259,9 +2601,7 @@ async def test_explicit_late_task_links_reopen_and_reacquire_submission(
             session_id=session_id,
         )
 
-    async with Database(
-        tmp_path / f"explicit-task-{link_field}.sqlite3"
-    ) as database:
+    async with Database(tmp_path / f"explicit-task-{link_field}.sqlite3") as database:
         await _insert_projection_binding(database, session_id)
         reducer = JournalReducer(database)
         initial = [
@@ -2309,9 +2649,7 @@ async def test_explicit_late_task_links_reopen_and_reacquire_submission(
                 (objective_id, submission["submission_id"]),
             )
         link_value = (
-            str(submission["submission_id"])
-            if link_field == "submissionId"
-            else objective_id
+            str(submission["submission_id"]) if link_field == "submissionId" else objective_id
         )
         running_task = {
             "id": "explicit-task",
@@ -2320,12 +2658,15 @@ async def test_explicit_late_task_links_reopen_and_reacquire_submission(
             "description": "Explicit worker",
             link_field: link_value,
         }
-        assert await reducer.persist(
-            [
-                requested("tasks", 9),
-                observed("tasks", 10, 2, {"tasks": [running_task]}),
-            ]
-        ) == 2
+        assert (
+            await reducer.persist(
+                [
+                    requested("tasks", 9),
+                    observed("tasks", 10, 2, {"tasks": [running_task]}),
+                ]
+            )
+            == 2
+        )
         reopened = await database.fetchone(
             "SELECT state, terminal_at FROM submissions WHERE submission_id = ?",
             (submission["submission_id"],),
@@ -2394,9 +2735,7 @@ async def test_stale_explicit_task_snapshot_cannot_reopen_completed_submission(
     session_id = f"session-stale-explicit-{link_field}"
     submission_id = "completed-submission"
     objective_id = "completed-objective"
-    async with Database(
-        tmp_path / f"stale-explicit-{link_field}.sqlite3"
-    ) as database:
+    async with Database(tmp_path / f"stale-explicit-{link_field}.sqlite3") as database:
         await _insert_projection_binding(database, session_id)
         await database.execute(
             """

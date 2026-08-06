@@ -70,14 +70,10 @@ async def test_startup_inventory_settles_only_expired_owner_work_before_ready(
         binding = await database.fetchone(
             "SELECT attachment_state, permission_posture FROM session_bindings"
         )
-        operation = await database.fetchone(
-            "SELECT state, error_code FROM session_operations"
-        )
+        operation = await database.fetchone("SELECT state, error_code FROM session_operations")
         submission = await database.fetchone("SELECT state FROM submissions")
         liveness = await database.fetchone("SELECT state FROM liveness_leases")
-        creation = await database.fetchone(
-            "SELECT state FROM session_creation_intents"
-        )
+        creation = await database.fetchone("SELECT state FROM session_creation_intents")
         run = await database.fetchone(
             "SELECT status, detail FROM startup_recovery_runs WHERE run_id = ?",
             (report.run_id,),
@@ -150,3 +146,119 @@ async def test_startup_recovery_preserves_acceptance_evidence_for_backfill(
         "accepted_message_id": "7e543dd8-4483-4c1a-ab7f-bf99dbad6d4c",
         "accepted_at": 105,
     }
+
+
+@pytest.mark.asyncio
+async def test_startup_recovery_preserves_pending_config_and_marks_runtime_unknown(
+    tmp_path: Path,
+) -> None:
+    async with Database(tmp_path / "startup-config.sqlite3") as database:
+        await database.execute(
+            """
+            INSERT INTO session_bindings(
+                thread_id, project_source, cwd_snapshot, sdk_session_id,
+                attachment_state, runtime_generation, owner_fence_token,
+                desired_session_config_version, desired_session_config_hash,
+                pending_session_config_version, pending_session_config_hash,
+                pending_session_config_transition_id,
+                runtime_session_config_version, runtime_session_config_hash,
+                session_config_state,
+                pending_mode, pending_mode_transition_id, runtime_mode,
+                pending_model_config, pending_model_transition_id,
+                runtime_model_config, created_at, updated_at
+            ) VALUES (
+                'thread-config', 'home', '/tmp', 'session-config',
+                'attached', 1, 1,
+                1, 'hash-1', 2, 'hash-2', 'config-transition',
+                1, 'hash-1', 'pending',
+                'autopilot', 'mode-transition', 'interactive',
+                '{"modelId":"new"}', 'model-transition',
+                '{"modelId":"old"}', 1, 1
+            )
+            """
+        )
+        await OwnerLeaseStore(database, ttl_seconds=60).acquire(
+            "session-config",
+            "dead-owner",
+            now=100,
+        )
+        for table in ("context_projections", "usage_projections"):
+            await database.execute(
+                f"""
+                INSERT INTO {table}(
+                    sdk_session_id, runtime_generation, owner_fence_token,
+                    source_type, payload_json, observed_at, stale
+                ) VALUES ('session-config', 1, 1, 'event', '{{}}', 101, 0)
+                """
+            )
+        await database.execute(
+            """
+            INSERT INTO protocol_requests(
+                sdk_session_id, generation, request_id, requested_type,
+                requested_event_id, requested_at, wire_state,
+                response_plane, response_state, response_attempt_id, updated_at
+            ) VALUES (
+                'session-config', 1, 'request-1',
+                'sampling.requested', 'event-1', 101, 'requested',
+                'app_rpc', 'responding', 'attempt-1', 101
+            )
+            """
+        )
+        await database.execute(
+            """
+            INSERT INTO protocol_response_attempts(
+                attempt_id, sdk_session_id, generation, owner_fence_token,
+                request_id, response_plane, response_hash, state, started_at
+            ) VALUES (
+                'attempt-1', 'session-config', 1, 1, 'request-1',
+                'app_rpc', 'hash', 'started', 101
+            )
+            """
+        )
+
+        report = await StartupRecoveryInventory(database).run(now=200)
+        binding = await database.fetchone(
+            """
+            SELECT attachment_state, pending_session_config_version,
+                   pending_session_config_hash, runtime_session_config_version,
+                   runtime_session_config_hash, session_config_state,
+                   pending_mode, runtime_mode, mode_reconciliation_state,
+                   pending_model_config, runtime_model_config,
+                   model_reconciliation_state
+            FROM session_bindings
+            """
+        )
+        request = await database.fetchone("SELECT response_state FROM protocol_requests")
+        attempt = await database.fetchone(
+            "SELECT state, error_code FROM protocol_response_attempts"
+        )
+        stale = await database.fetchall(
+            """
+            SELECT stale FROM context_projections
+            UNION ALL
+            SELECT stale FROM usage_projections
+            """
+        )
+
+    assert report.unknown_protocol_responses == 1
+    assert report.stale_runtime_projections == 2
+    assert dict(binding) == {
+        "attachment_state": "recovery_unknown",
+        "pending_session_config_version": 2,
+        "pending_session_config_hash": "hash-2",
+        "runtime_session_config_version": None,
+        "runtime_session_config_hash": None,
+        "session_config_state": "unknown",
+        "pending_mode": "autopilot",
+        "runtime_mode": "unknown",
+        "mode_reconciliation_state": "unknown",
+        "pending_model_config": '{"modelId":"new"}',
+        "runtime_model_config": None,
+        "model_reconciliation_state": "unknown",
+    }
+    assert request["response_state"] == "unknown"
+    assert dict(attempt) == {
+        "state": "unknown",
+        "error_code": "startup_recovery",
+    }
+    assert [row["stale"] for row in stale] == [1, 1]

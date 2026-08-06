@@ -18,15 +18,13 @@ PINNED_SDK_VERSION = "1.0.8"
 PINNED_RUNTIME_VERSION = "1.0.73"
 PINNED_PROTOCOL_VERSION = 3
 PINNED_GENERATED_EVENT_COUNT = 114
-PINNED_GENERATED_EVENT_SHA256 = (
-    "b7aed29d812cf032a5f68343b95b15c5f1c6735bde5140670692e6fa5fd0d1a2"
-)
+PINNED_GENERATED_EVENT_SHA256 = "b7aed29d812cf032a5f68343b95b15c5f1c6735bde5140670692e6fa5fd0d1a2"
 MAIN_BRANCH_ONLY_EVENTS = (
     "factory.run_updated",
     "session.context_cleared",
 )
 CHECKED_CAPABILITY_FIXTURE_SHA256 = (
-    "9761fd6239d5c02c5d9b85a25c80a241b2da445c55e2258a8d48d3a47b0cc813"
+    "83c95eda60f87d90388cadd64254a3922b99cbab90ccb04947913e0d9e534e6a"
 )
 
 _REQUIRED_CAPABILITIES = frozenset(
@@ -37,6 +35,10 @@ _REQUIRED_CAPABILITIES = frozenset(
         "context_info",
         "detached_continuation",
         "event_log",
+        "config_reattach",
+        "managed_permission_handler",
+        "mcp_http",
+        "mcp_stdio",
         "model_config",
         "models",
         "native_queue_snapshot",
@@ -44,9 +46,17 @@ _REQUIRED_CAPABILITIES = frozenset(
         "permission_allow_all",
         "persistent_history",
         "pre_registered_on_event",
+        "protocol_elicitation",
+        "protocol_external_tool",
+        "protocol_mcp_headers_response",
+        "protocol_mcp_oauth",
+        "protocol_sampling_response",
+        "protocol_session_limits_response",
         "reasoning_summary_readback",
         "remote",
         "selected_agent",
+        "session_extension_config",
+        "session_hooks",
         "session_mode",
         "sessions_check_in_use",
         "task_snapshot",
@@ -60,6 +70,9 @@ _REQUIRED_STARTUP_CAPABILITIES = frozenset(
         "permission_allow_all",
         "persistent_history",
         "pre_registered_on_event",
+        "managed_permission_handler",
+        "session_extension_config",
+        "session_hooks",
         "session_mode",
     }
 )
@@ -169,9 +182,7 @@ class CapabilityManifest:
                     str(name): CapabilityEvidence(
                         name=str(name),
                         supported=(
-                            None
-                            if evidence["supported"] is None
-                            else bool(evidence["supported"])
+                            None if evidence["supported"] is None else bool(evidence["supported"])
                         ),
                         evidence_kind=str(evidence["evidence_kind"]),
                         detail=evidence["detail"],
@@ -190,9 +201,7 @@ class CapabilityManifest:
 
     def validate(self) -> None:
         if self.schema_version != CAPABILITY_SCHEMA_VERSION:
-            raise CapabilityFixtureError(
-                f"unsupported capability schema {self.schema_version}"
-            )
+            raise CapabilityFixtureError(f"unsupported capability schema {self.schema_version}")
         if self.identity.protocol_version != self.identity.ping_protocol_version:
             raise CapabilityFixtureError("fixture protocol versions disagree")
         installed_events = sorted(item.value for item in SessionEventType)
@@ -204,12 +213,9 @@ class CapabilityManifest:
                 )
             if self.generated_event_sha256 != PINNED_GENERATED_EVENT_SHA256:
                 raise CapabilityFixtureError("SDK 1.0.8 event inventory hash is invalid")
-        if (
-            self.identity.sdk_version == version("github-copilot-sdk")
-            and (
-                self.generated_event_count != len(installed_events)
-                or self.generated_event_sha256 != installed_hash
-            )
+        if self.identity.sdk_version == version("github-copilot-sdk") and (
+            self.generated_event_count != len(installed_events)
+            or self.generated_event_sha256 != installed_hash
         ):
             raise CapabilityFixtureError(
                 "fixture generated-event inventory does not match the installed SDK"
@@ -280,9 +286,7 @@ class CapabilityManifest:
         return manifest
 
     def require_startup_capabilities(self) -> None:
-        missing = sorted(
-            name for name in _REQUIRED_STARTUP_CAPABILITIES if not self.supports(name)
-        )
+        missing = sorted(name for name in _REQUIRED_STARTUP_CAPABILITIES if not self.supports(name))
         if missing:
             raise RequiredCapabilityMissing(
                 f"required runtime capabilities are not evidenced: {', '.join(missing)}"
@@ -312,8 +316,7 @@ class CapabilityManifest:
                 "main_branch_only": list(self.main_branch_only_events),
             },
             "capabilities": {
-                name: evidence.to_dict()
-                for name, evidence in sorted(self.capabilities.items())
+                name: evidence.to_dict() for name, evidence in sorted(self.capabilities.items())
             },
             "fixture": {
                 "path": str(self.fixture_path),
@@ -332,9 +335,7 @@ class CapabilityRegistry:
     ) -> None:
         self._settings = settings
         self._checked_fixture_path = checked_fixture_path or (
-            Path(__file__).parent
-            / "fixtures"
-            / "capabilities-sdk-1.0.8-runtime-1.0.73.json"
+            Path(__file__).parent / "fixtures" / "capabilities-sdk-1.0.8-runtime-1.0.73.json"
         )
         self._checked_fixture_sha256 = checked_fixture_sha256
 
@@ -370,11 +371,7 @@ class CapabilityRegistry:
         checked = self.load_checked()
         candidates = [manifest for manifest in (local, checked) if manifest is not None]
         if local is not None and local.matches(identity):
-            manifest = (
-                local.with_checked_fallback(checked)
-                if checked.matches(identity)
-                else local
-            )
+            manifest = local.with_checked_fallback(checked) if checked.matches(identity) else local
             manifest.require_startup_capabilities()
             return manifest
         if checked.matches(identity):
@@ -388,9 +385,7 @@ class CapabilityRegistry:
             )
             for item in candidates
         )
-        actual = (
-            f"{identity.sdk_version}/{identity.runtime_version}/{identity.protocol_version}"
-        )
+        actual = f"{identity.sdk_version}/{identity.runtime_version}/{identity.protocol_version}"
         raise RuntimeIdentityMismatch(
             f"runtime identity {actual} has no checked capability evidence; expected {expected}"
         )

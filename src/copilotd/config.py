@@ -3,7 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from platformdirs import user_cache_path, user_data_path, user_log_path
-from pydantic import Field, SecretStr, field_validator, model_validator
+from pydantic import AliasChoices, Field, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from copilotd.storage.leases import (
@@ -24,19 +24,27 @@ class Settings(BaseSettings):
         extra="ignore",
     )
 
-    data_dir: Path = Field(
-        default_factory=lambda: user_data_path("copilotD", ensure_exists=False)
-    )
+    data_dir: Path = Field(default_factory=lambda: user_data_path("copilotD", ensure_exists=False))
     cache_dir: Path = Field(
         default_factory=lambda: user_cache_path("copilotD", ensure_exists=False)
     )
     log_dir: Path = Field(default_factory=lambda: user_log_path("copilotD", ensure_exists=False))
     resolved_home: Path = Field(default_factory=lambda: Path.home().expanduser().resolve())
     discord_token: SecretStr | None = None
+    github_token: SecretStr | None = Field(
+        default=None,
+        validation_alias=AliasChoices(
+            "COPILOTD_GITHUB_TOKEN",
+            "COPILOT_GITHUB_TOKEN",
+            "GH_TOKEN",
+            "GITHUB_TOKEN",
+        ),
+    )
     discord_guild_id: int | None = None
     mention_required: bool = False
     log_level: str = "INFO"
     sdk_log_level: str = "info"
+    sdk_no_auto_login: bool = False
     sdk_shutdown_timeout_seconds: float = 10
     runtime_uri: str | None = None
     runtime_connection_token: SecretStr | None = None
@@ -58,9 +66,7 @@ class Settings(BaseSettings):
     @classmethod
     def validate_lease_ttl(cls, value: int) -> int:
         if value < MUTATION_HEADROOM_SECONDS + RENEWAL_JITTER_MARGIN_SECONDS:
-            raise ValueError(
-                "owner lease TTL must exceed mutation headroom by the jitter margin"
-            )
+            raise ValueError("owner lease TTL must exceed mutation headroom by the jitter margin")
         return value
 
     @field_validator("owner_lease_renew_seconds")

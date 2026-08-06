@@ -41,20 +41,23 @@ def test_discord_command_manifest_has_core_modes_and_no_deleted_roots(tmp_path: 
         "steer",
         "queue",
     } <= roots
-    assert not {
-        "copilot",
-        "workflow",
-        "max-turns",
-        "mode",
-        "goal",
-        "bare",
-        "tools",
-        "cost",
-        "budget",
-        "limits",
-        "pr",
-        "delegate",
-    } & roots
+    assert (
+        not {
+            "copilot",
+            "workflow",
+            "max-turns",
+            "mode",
+            "goal",
+            "bare",
+            "tools",
+            "cost",
+            "budget",
+            "limits",
+            "pr",
+            "delegate",
+        }
+        & roots
+    )
 
 
 def test_discord_registration_omits_commands_without_capability_evidence(
@@ -99,9 +102,7 @@ before
 after
 """.strip()
 
-    rendered, assets = await _discord_render(
-        {"content": content, "finalized": True}
-    )
+    rendered, assets = await _discord_render({"content": content, "finalized": True})
 
     assert "before" in rendered
     assert "alpha" in rendered
@@ -197,9 +198,7 @@ def test_taskdeck_view_uses_short_in_place_controls() -> None:
                 "page_count": 2,
                 "selected_card_token": "card-a",
                 "expanded": False,
-                "options": [
-                    {"label": "Worker A", "value": "card-a", "state": "running"}
-                ],
+                "options": [{"label": "Worker A", "value": "card-a", "state": "running"}],
             }
         }
     )
@@ -215,7 +214,7 @@ def test_taskdeck_view_uses_short_in_place_controls() -> None:
     assert all(len(custom_id) < 100 for custom_id in custom_ids)
 
 
-def test_interaction_view_uses_indexed_select_and_freeform_modal_button() -> None:
+def test_interaction_view_uses_bounded_buttons_and_freeform_modal_button() -> None:
     interaction_id = "4ed74879-92fb-47c5-9ee9-81dde5079ab1"
     view = _render_view(
         {
@@ -231,9 +230,9 @@ def test_interaction_view_uses_indexed_select_and_freeform_modal_button() -> Non
     )
 
     assert view is not None
-    select, button = view.children
-    assert select.custom_id == f"cdi:{interaction_id}:select"
-    assert [option.value for option in select.options] == ["0", "1"]
+    first, second, button = view.children
+    assert first.custom_id == f"cdi:{interaction_id}:choice-0"
+    assert second.custom_id == f"cdi:{interaction_id}:choice-1"
     assert button.custom_id == f"cdi:{interaction_id}:freeform"
     assert all(item.custom_id and len(item.custom_id) < 100 for item in view.children)
 
@@ -251,6 +250,47 @@ def test_resolved_interaction_removes_controls() -> None:
         )
         is None
     )
+
+
+def test_elicitation_view_exposes_bounded_form_decline_and_cancel_controls() -> None:
+    interaction_id = "93f3e059-3ec9-45e6-80a5-2df3ea3ca42f"
+    view = _render_view(
+        {
+            "interaction": {
+                "interaction_id": interaction_id,
+                "kind": "elicitation",
+                "state": "pending",
+                "form": {
+                    "fields": [
+                        {
+                            "name": "label",
+                            "value_type": "string",
+                            "required": True,
+                            "title": "Label",
+                            "description": None,
+                            "enum": [],
+                            "default": None,
+                            "minimum": None,
+                            "maximum": None,
+                            "min_length": 1,
+                            "max_length": 20,
+                            "min_items": None,
+                            "max_items": None,
+                            "item_enum": [],
+                        }
+                    ]
+                },
+            }
+        }
+    )
+
+    assert view is not None
+    assert [item.custom_id for item in view.children] == [
+        f"cdi:{interaction_id}:form",
+        f"cdi:{interaction_id}:decline",
+        f"cdi:{interaction_id}:cancel",
+    ]
+    assert all(item.custom_id and len(item.custom_id) < 100 for item in view.children)
 
 
 @pytest.mark.asyncio

@@ -22,17 +22,30 @@ async def test_initial_migration_creates_full_schema(tmp_path: Path) -> None:
         "custom_agents",
         "event_journal",
         "execution_health",
+        "extension_runtime_projections",
         "global_config",
+        "hook_audit_events",
         "liveness_leases",
         "mcp_servers",
+        "mcp_server_projections",
         "message_queue",
+        "model_config_observations",
         "model_turns",
         "native_queue_items",
         "pending_interactions",
+        "permission_audit_events",
         "plugin_dirs",
         "project_env",
+        "project_extension_config_generations",
+        "project_extension_custom_agents",
+        "project_extension_disabled_skills",
+        "project_extension_env_refs",
+        "project_extension_mcp_servers",
+        "project_extension_plugin_dirs",
+        "project_extension_skill_dirs",
         "projects",
         "protocol_requests",
+        "protocol_response_attempts",
         "reconciliation_state",
         "render_messages",
         "render_outbox",
@@ -44,6 +57,8 @@ async def test_initial_migration_creates_full_schema(tmp_path: Path) -> None:
         "schema_migrations",
         "session_bindings",
         "session_creation_intents",
+        "session_error_projections",
+        "session_limit_projections",
         "session_operations",
         "session_owner_leases",
         "skill_dirs",
@@ -54,7 +69,10 @@ async def test_initial_migration_creates_full_schema(tmp_path: Path) -> None:
         "submission_task_links",
         "task_card_projections",
         "taskdeck_panel_state",
+        "agent_loop_projections",
+        "context_projections",
         "usage_samples",
+        "usage_projections",
     }
 
     async with Database(database_path) as database:
@@ -82,7 +100,7 @@ async def test_migrations_are_idempotent(tmp_path: Path) -> None:
     async with Database(database_path) as database:
         rows = await database.fetchall("SELECT version FROM schema_migrations")
 
-    assert [row["version"] for row in rows] == list(range(1, 10))
+    assert [row["version"] for row in rows] == [*range(1, 10), *range(15, 20)]
 
 
 @pytest.mark.asyncio
@@ -114,16 +132,12 @@ async def test_foundation_migration_upgrades_existing_v7_database(tmp_path: Path
     connection.close()
 
     async with Database(database_path) as database:
-        versions = await database.fetchall(
-            "SELECT version FROM schema_migrations ORDER BY version"
-        )
+        versions = await database.fetchall("SELECT version FROM schema_migrations ORDER BY version")
         capability_columns = await database.fetchall("PRAGMA table_info(capabilities)")
         event_columns = await database.fetchall("PRAGMA table_info(event_journal)")
-        tables = await database.fetchall(
-            "SELECT name FROM sqlite_master WHERE type = 'table'"
-        )
+        tables = await database.fetchall("SELECT name FROM sqlite_master WHERE type = 'table'")
 
-    assert [row["version"] for row in versions] == list(range(1, 10))
+    assert [row["version"] for row in versions] == [*range(1, 10), *range(15, 20)]
     assert "protocol_version" in {row["name"] for row in capability_columns}
     assert {
         "schema_version",
@@ -139,6 +153,94 @@ async def test_foundation_migration_upgrades_existing_v7_database(tmp_path: Path
         "submission_segments",
         "submission_task_links",
     } <= {row["name"] for row in tables}
+
+
+@pytest.mark.asyncio
+async def test_protocol_migration_preserves_legacy_response_planes(
+    tmp_path: Path,
+) -> None:
+    database_path = tmp_path / "protocol-v9.sqlite3"
+    connection = sqlite3.connect(database_path)
+    connection.execute(
+        """
+        CREATE TABLE schema_migrations (
+            version INTEGER PRIMARY KEY,
+            name TEXT NOT NULL,
+            applied_at REAL NOT NULL
+        )
+        """
+    )
+    migration_root = resources.files("copilotd.storage.migrations")
+    for migration in sorted(
+        item
+        for item in migration_root.iterdir()
+        if item.name.endswith(".sql") and int(item.name.partition("_")[0]) <= 9
+    ):
+        connection.executescript(migration.read_text(encoding="utf-8"))
+        version = int(migration.name.partition("_")[0])
+        connection.execute(
+            "INSERT INTO schema_migrations VALUES (?, ?, ?)",
+            (version, migration.name, time.time()),
+        )
+    connection.executemany(
+        """
+        INSERT INTO protocol_requests(
+            sdk_session_id, generation, request_id, requested_type,
+            requested_event_id, completed_event_id, state
+        ) VALUES ('session-1', 1, ?, ?, ?, ?, ?)
+        """,
+        [
+            (
+                "limit-pending",
+                "session_limits_exhausted.requested",
+                "event-limit-pending",
+                None,
+                "requested",
+            ),
+            (
+                "sampling-completed",
+                "sampling.requested",
+                "event-sampling-requested",
+                "event-sampling-completed",
+                "completed",
+            ),
+            (
+                "oauth-pending",
+                "mcp.oauth_required",
+                "event-oauth-pending",
+                None,
+                "requested",
+            ),
+        ],
+    )
+    connection.commit()
+    connection.close()
+
+    async with Database(database_path) as database:
+        rows = await database.fetchall(
+            """
+            SELECT request_id, response_plane, response_state
+            FROM protocol_requests ORDER BY request_id
+            """
+        )
+
+    assert [dict(row) for row in rows] == [
+        {
+            "request_id": "limit-pending",
+            "response_plane": "app_rpc",
+            "response_state": "pending",
+        },
+        {
+            "request_id": "oauth-pending",
+            "response_plane": "sdk_handler",
+            "response_state": "delegated",
+        },
+        {
+            "request_id": "sampling-completed",
+            "response_plane": "app_rpc",
+            "response_state": "completed",
+        },
+    ]
 
 
 @pytest.mark.asyncio

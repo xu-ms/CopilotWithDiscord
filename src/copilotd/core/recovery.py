@@ -21,6 +21,8 @@ class RecoveryInventoryReport:
     orphaned_liveness: int
     unknown_runtime_schedules: int
     unknown_creation_intents: int
+    unknown_protocol_responses: int
+    stale_runtime_projections: int
     dispatch_unknown_runs: int
     target_unknown_runs: int
     retry_wait_runs: int
@@ -69,6 +71,38 @@ class StartupRecoveryInventory:
                   )
                 """,
                 (timestamp, timestamp),
+            )
+            counts["unknown_protocol_responses"] = await _update_count(
+                connection,
+                """
+                UPDATE protocol_response_attempts
+                SET state = 'unknown', error_code = 'startup_recovery',
+                    settled_at = COALESCE(settled_at, ?)
+                WHERE state = 'started'
+                  AND NOT EXISTS (
+                      SELECT 1 FROM session_owner_leases AS owner
+                      WHERE owner.sdk_session_id =
+                            protocol_response_attempts.sdk_session_id
+                        AND owner.fence_token =
+                            protocol_response_attempts.owner_fence_token
+                        AND owner.expires_at > ?
+                  )
+                """,
+                (timestamp, timestamp),
+            )
+            await connection.execute(
+                """
+                UPDATE protocol_requests
+                SET response_state = 'unknown', updated_at = ?
+                WHERE response_state = 'responding'
+                  AND EXISTS (
+                      SELECT 1 FROM protocol_response_attempts AS attempt
+                      WHERE attempt.attempt_id =
+                            protocol_requests.response_attempt_id
+                        AND attempt.state = 'unknown'
+                  )
+                """,
+                (timestamp,),
             )
             if expired:
                 placeholders = ", ".join("?" for _ in expired)
@@ -133,6 +167,18 @@ class StartupRecoveryInventory:
                     UPDATE session_bindings
                     SET attachment_state = 'recovery_unknown',
                         permission_posture = 'unknown',
+                        runtime_mode = 'unknown',
+                        mode_reconciliation_state = 'unknown',
+                        mode_drift = 0,
+                        runtime_model_config = NULL,
+                        model_reconciliation_state = 'unknown',
+                        model_drift = 0,
+                        runtime_session_config_version = NULL,
+                        runtime_session_config_hash = NULL,
+                        session_config_state = 'unknown',
+                        session_config_drift = 0,
+                        managed_settings_state = 'unknown',
+                        managed_permissions_blocked = 0,
                         updated_at = ?, row_version = row_version + 1
                     WHERE sdk_session_id IN ({placeholders})
                       AND attachment_state IN (
@@ -141,6 +187,26 @@ class StartupRecoveryInventory:
                     """,
                     (timestamp, *expired),
                 )
+                stale_projection_count = 0
+                for table in (
+                    "context_projections",
+                    "usage_projections",
+                    "session_limit_projections",
+                    "extension_runtime_projections",
+                    "mcp_server_projections",
+                    "agent_loop_projections",
+                    "session_error_projections",
+                ):
+                    stale_projection_count += await _update_count(
+                        connection,
+                        f"""
+                        UPDATE {table}
+                        SET stale = 1
+                        WHERE sdk_session_id IN ({placeholders}) AND stale = 0
+                        """,
+                        tuple(expired),
+                    )
+                counts["stale_runtime_projections"] = stale_projection_count
             else:
                 for key in (
                     "unknown_submissions",
@@ -150,6 +216,7 @@ class StartupRecoveryInventory:
                     "unknown_runtime_schedules",
                 ):
                     counts[key] = 0
+                counts["stale_runtime_projections"] = 0
 
             counts["unknown_creation_intents"] = await _update_count(
                 connection,

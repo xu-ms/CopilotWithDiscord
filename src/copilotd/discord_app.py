@@ -17,6 +17,12 @@ from discord.ext import commands
 from copilotd.config import Settings
 from copilotd.core.attachments import AttachmentError, AttachmentService
 from copilotd.core.bindings import SessionBinding, SessionBindingRepository
+from copilotd.core.extensions import ExtensionConfigRepository
+from copilotd.core.interactions import (
+    DiscordInteractionAdapter,
+    ElicitationField,
+    ElicitationForm,
+)
 from copilotd.core.projects import ProjectRegistry
 from copilotd.core.recovery import RecoveryInventoryReport, StartupRecoveryInventory
 from copilotd.core.session_runtime import SessionRuntime
@@ -69,6 +75,7 @@ class CopilotDiscordBot(commands.Bot):
         self.heartbeat = HeartbeatWriter(self.database, settings.heartbeat_path)
         self.projects: ProjectRegistry | None = None
         self.bindings: SessionBindingRepository | None = None
+        self.extension_configs: ExtensionConfigRepository | None = None
         self.sessions: SessionRegistry | None = None
         self.creation: SessionCreationService | None = None
         self.dispatcher: RenderOutboxDispatcher | None = None
@@ -85,6 +92,7 @@ class CopilotDiscordBot(commands.Bot):
         )
         await self.projects.initialize()
         self.bindings = SessionBindingRepository(self.database)
+        self.extension_configs = ExtensionConfigRepository(self.database)
         leases = OwnerLeaseStore(
             self.database,
             ttl_seconds=self.settings.owner_lease_ttl_seconds,
@@ -120,6 +128,7 @@ class CopilotDiscordBot(commands.Bot):
                 attachment_resolver=self.attachment_service.sdk_attachments,
                 capabilities=self.capabilities,
                 task_registry=self._tasks,
+                extension_configs=self.extension_configs,
             )
 
         self.sessions = SessionRegistry(self.bindings, runtime_factory)
@@ -129,6 +138,7 @@ class CopilotDiscordBot(commands.Bot):
             bindings=self.bindings,
             sessions=self.sessions,
             threads=DiscordThreadGateway(self),
+            extension_configs=self.extension_configs,
         )
         self._tasks.create(
             self._task_failure_loop(),
@@ -251,13 +261,8 @@ class CopilotDiscordBot(commands.Bot):
 
     async def on_interaction(self, interaction: discord.Interaction) -> None:
         data = interaction.data
-        custom_id = (
-            str(data.get("custom_id", "")) if isinstance(data, dict) else ""
-        )
-        if (
-            interaction.type == discord.InteractionType.component
-            and custom_id.startswith("cdi:")
-        ):
+        custom_id = str(data.get("custom_id", "")) if isinstance(data, dict) else ""
+        if interaction.type == discord.InteractionType.component and custom_id.startswith("cdi:"):
             await self._handle_direct_interaction(interaction, custom_id)
             return
         if (
@@ -289,9 +294,7 @@ class CopilotDiscordBot(commands.Bot):
             return
         values = data.get("values")
         card_token = (
-            str(values[0])
-            if action == "select" and isinstance(values, list) and values
-            else None
+            str(values[0]) if action == "select" and isinstance(values, list) and values else None
         )
         await interaction.response.defer()
         runtime = await self._interaction_runtime(interaction)
@@ -331,8 +334,46 @@ class CopilotDiscordBot(commands.Bot):
             return
         _, interaction_id, action = parts
         if action == "freeform":
+            await interaction.response.send_modal(InteractionResponseModal(self, interaction_id))
+            return
+        if action == "form":
+            row = await self.database.fetchone(
+                """
+                SELECT form_schema FROM pending_interactions
+                WHERE interaction_id = ? AND state = 'pending'
+                """,
+                (interaction_id,),
+            )
+            if row is None or row["form_schema"] is None:
+                await interaction.response.send_message(
+                    "This Copilot form has expired.",
+                    ephemeral=True,
+                )
+                return
+            form = ElicitationForm.from_dict(json.loads(str(row["form_schema"])))
             await interaction.response.send_modal(
-                InteractionResponseModal(self, interaction_id)
+                ElicitationResponseModal(self, interaction_id, form)
+            )
+            return
+        runtime = await self._interaction_runtime(interaction)
+        if action in {"decline", "cancel"}:
+            result = await runtime.respond_interaction(
+                interaction_id,
+                action=action,
+            )
+            await interaction.response.send_message(
+                _interaction_result_text(result),
+                ephemeral=True,
+            )
+            return
+        if action.startswith("choice-") and action.removeprefix("choice-").isdigit():
+            result = await runtime.respond_interaction(
+                interaction_id,
+                selection=int(action.removeprefix("choice-")),
+            )
+            await interaction.response.send_message(
+                _interaction_result_text(result),
+                ephemeral=True,
             )
             return
         data = interaction.data
@@ -348,7 +389,6 @@ class CopilotDiscordBot(commands.Bot):
                 ephemeral=True,
             )
             return
-        runtime = await self._interaction_runtime(interaction)
         result = await runtime.respond_interaction(
             interaction_id,
             selection=int(values[0]),
@@ -386,9 +426,7 @@ class CopilotDiscordBot(commands.Bot):
                     prompt or "Please inspect the attached files.",
                     idempotency_key=f"discord-message:{message.id}",
                     attachments=sdk_attachments,
-                    attachment_manifest_id=(
-                        None if prepared is None else prepared.manifest_id
-                    ),
+                    attachment_manifest_id=(None if prepared is None else prepared.manifest_id),
                 )
             except AttachmentError as error:
                 await message.reply(f"copilotD could not prepare the attachments: `{error}`")
@@ -734,9 +772,7 @@ class CopilotDiscordBot(commands.Bot):
                 ]
                 multiplier = billing.get("multiplier")
                 suffix = (
-                    f"; multiplier {multiplier:g}"
-                    if isinstance(multiplier, int | float)
-                    else ""
+                    f"; multiplier {multiplier:g}" if isinstance(multiplier, int | float) else ""
                 )
                 lines.append(
                     f"- `{item['id']}` — {item['name']}"
@@ -1070,6 +1106,85 @@ class InteractionResponseModal(discord.ui.Modal):
         )
 
 
+class ElicitationResponseModal(discord.ui.Modal):
+    def __init__(
+        self,
+        bot: CopilotDiscordBot,
+        interaction_id: str,
+        form: ElicitationForm,
+    ) -> None:
+        super().__init__(title="Copilot form")
+        self._bot = bot
+        self._interaction_id = interaction_id
+        self._form = form
+        self._inputs: list[tuple[ElicitationField, discord.ui.TextInput[Any]]] = []
+        self._json_input: discord.ui.TextInput[Any] | None = None
+        if len(form.fields) > DiscordInteractionAdapter.MODAL_FIELD_LIMIT:
+            self._json_input = discord.ui.TextInput(
+                label="Form values as JSON",
+                style=discord.TextStyle.paragraph,
+                required=True,
+                max_length=4000,
+                placeholder='{"field": "value"}',
+            )
+            self.add_item(self._json_input)
+            return
+        for field in form.fields:
+            default = field.default
+            rendered_default = (
+                json.dumps(list(default))
+                if isinstance(default, tuple)
+                else None
+                if default is None
+                else str(default).lower()
+                if isinstance(default, bool)
+                else str(default)
+            )
+            text_input = discord.ui.TextInput(
+                label=_bounded_discord_text(field.title, 45),
+                style=(
+                    discord.TextStyle.paragraph
+                    if field.value_type == "array"
+                    else discord.TextStyle.short
+                ),
+                required=field.required,
+                default=rendered_default,
+                max_length=min(field.max_length or 4000, 4000),
+                placeholder=_elicitation_placeholder(field),
+            )
+            self._inputs.append((field, text_input))
+            self.add_item(text_input)
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        try:
+            if self._json_input is not None:
+                decoded = json.loads(str(self._json_input.value))
+                if not isinstance(decoded, dict):
+                    raise ValueError("form JSON must be an object")
+                content = decoded
+            else:
+                content = {
+                    field.name: _coerce_elicitation_value(field, str(item.value))
+                    for field, item in self._inputs
+                    if str(item.value) or field.required
+                }
+        except (ValueError, json.JSONDecodeError) as error:
+            await interaction.response.send_message(
+                f"Invalid form response: {error}",
+                ephemeral=True,
+            )
+            return
+        runtime = await self._bot._interaction_runtime(interaction)
+        result = await runtime.respond_interaction(
+            self._interaction_id,
+            form_content=content,
+        )
+        await interaction.response.send_message(
+            _interaction_result_text(result),
+            ephemeral=True,
+        )
+
+
 async def _discord_render(payload: dict[str, Any]) -> tuple[str, list[TableAsset]]:
     content = str(payload.get("content", ""))
     if not payload.get("finalized"):
@@ -1143,10 +1258,42 @@ def _render_view(payload: dict[str, Any]) -> discord.ui.View | None:
 
 
 def _interaction_view(metadata: dict[str, Any]) -> discord.ui.View:
-    interaction_id = str(metadata["interaction_id"])
+    plan = DiscordInteractionAdapter.plan(metadata)
+    interaction_id = plan.interaction_id
     view = discord.ui.View(timeout=None)
-    choices = metadata.get("choices")
-    if isinstance(choices, list) and choices:
+    if plan.form is not None:
+        view.add_item(
+            discord.ui.Button(
+                label="Fill form",
+                style=discord.ButtonStyle.primary,
+                custom_id=f"cdi:{interaction_id}:form",
+            )
+        )
+        view.add_item(
+            discord.ui.Button(
+                label="Decline",
+                style=discord.ButtonStyle.secondary,
+                custom_id=f"cdi:{interaction_id}:decline",
+            )
+        )
+        view.add_item(
+            discord.ui.Button(
+                label="Cancel",
+                style=discord.ButtonStyle.secondary,
+                custom_id=f"cdi:{interaction_id}:cancel",
+            )
+        )
+        return view
+    if plan.kind != "mcp_oauth" and plan.use_buttons:
+        for index, choice in enumerate(plan.choices):
+            view.add_item(
+                discord.ui.Button(
+                    label=_bounded_discord_text(choice, 80),
+                    style=discord.ButtonStyle.primary,
+                    custom_id=f"cdi:{interaction_id}:choice-{index}",
+                )
+            )
+    elif plan.kind != "mcp_oauth" and plan.use_select:
         view.add_item(
             discord.ui.Select(
                 custom_id=f"cdi:{interaction_id}:select",
@@ -1156,20 +1303,18 @@ def _interaction_view(metadata: dict[str, Any]) -> discord.ui.View:
                         label=_bounded_discord_text(str(choice), 100),
                         value=str(index),
                     )
-                    for index, choice in enumerate(choices[:25])
+                    for index, choice in enumerate(plan.choices)
                 ],
             )
         )
-    if metadata.get("kind") == "user_input" and (
-        metadata.get("allowFreeform")
-        or (isinstance(choices, list) and len(choices) > 25)
+    if plan.allow_freeform or (
+        plan.kind == "exit_plan_mode" and len(plan.choices) > DiscordInteractionAdapter.SELECT_LIMIT
     ):
         view.add_item(
             discord.ui.Button(
                 label=(
                     "Enter a choice"
-                    if isinstance(choices, list)
-                    and len(choices) > 25
+                    if len(plan.choices) > DiscordInteractionAdapter.SELECT_LIMIT
                     and not metadata.get("allowFreeform")
                     else "Write a response"
                 ),
@@ -1177,7 +1322,50 @@ def _interaction_view(metadata: dict[str, Any]) -> discord.ui.View:
                 custom_id=f"cdi:{interaction_id}:freeform",
             )
         )
+    if plan.kind == "mcp_oauth":
+        view.add_item(
+            discord.ui.Button(
+                label="Cancel authorization",
+                style=discord.ButtonStyle.danger,
+                custom_id=f"cdi:{interaction_id}:cancel",
+            )
+        )
     return view
+
+
+def _elicitation_placeholder(field: ElicitationField) -> str | None:
+    if field.enum:
+        return _bounded_discord_text(
+            "Allowed: " + ", ".join(str(item) for item in field.enum),
+            100,
+        )
+    if field.value_type == "boolean":
+        return "true or false"
+    if field.value_type == "array":
+        return 'JSON array, for example ["one", "two"]'
+    if field.description:
+        return _bounded_discord_text(field.description, 100)
+    return None
+
+
+def _coerce_elicitation_value(field: ElicitationField, value: str) -> Any:
+    if field.value_type == "string":
+        return value
+    if field.value_type == "integer":
+        return int(value)
+    if field.value_type == "number":
+        return float(value)
+    if field.value_type == "boolean":
+        normalized = value.strip().lower()
+        if normalized in {"true", "yes", "1"}:
+            return True
+        if normalized in {"false", "no", "0"}:
+            return False
+        raise ValueError(f"{field.name} must be true or false")
+    decoded = json.loads(value)
+    if not isinstance(decoded, list):
+        raise ValueError(f"{field.name} must be a JSON array")
+    return decoded
 
 
 def _taskdeck_view(payload: dict[str, Any]) -> discord.ui.View | None:
@@ -1243,10 +1431,7 @@ def _interaction_result_text(result: str) -> str:
 
 
 def _discord_files(assets: list[TableAsset]) -> list[discord.File]:
-    return [
-        discord.File(io.BytesIO(asset.content), filename=asset.filename)
-        for asset in assets
-    ]
+    return [discord.File(io.BytesIO(asset.content), filename=asset.filename) for asset in assets]
 
 
 def _prepare_discord_assets(
@@ -1274,9 +1459,7 @@ def _prepare_discord_assets(
             start = part_index * max_bytes
             prepared.append(
                 TableAsset(
-                    filename=(
-                        f"{stem}.part-{part_index + 1:03d}-of-{part_count:03d}{suffix}"
-                    ),
+                    filename=(f"{stem}.part-{part_index + 1:03d}-of-{part_count:03d}{suffix}"),
                     media_type=asset.media_type,
                     content=asset.content[start : start + max_bytes],
                 )
