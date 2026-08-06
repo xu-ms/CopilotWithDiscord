@@ -22,6 +22,7 @@ from copilotd.core.interactions import interaction_target_mode
 from copilotd.core.mailbox import (
     CommandMailbox,
     OperationAmbiguous,
+    OperationDeferred,
     OperationRejected,
     OperationState,
     OperationStore,
@@ -163,7 +164,7 @@ class SessionNotReady(RuntimeError):
     pass
 
 
-class SubmissionClaimDeferred(OperationRejected):
+class SubmissionClaimDeferred(OperationDeferred):
     pass
 
 
@@ -285,87 +286,173 @@ class SessionRuntime:
         agent_mode: AgentMode | None = None,
         origin: str = "app_message",
     ) -> str:
+        if attachments and attachment_manifest_id is None:
+            raise SessionNotReady("attachments require a durable manifest")
+        submission_id = str(
+            uuid.uuid5(
+                uuid.NAMESPACE_URL,
+                f"copilotd:{self.binding.sdk_session_id}:submission:{idempotency_key}",
+            )
+        )
+        prompt_hash = hashlib.sha256(prompt.encode()).hexdigest()
         async with self._admission_lock:
             if not self._accepting_sends:
                 raise SessionNotReady("session is not accepting new messages")
-            await self._assert_dispatchable()
-            effective_agent_mode = agent_mode or self.binding.desired_mode
-            if effective_agent_mode not in {"interactive", "plan", "autopilot", "shell"}:
-                raise SessionNotReady(f"unsupported message mode: {effective_agent_mode}")
-            submission_id = str(
-                uuid.uuid5(
-                    uuid.NAMESPACE_URL,
-                    f"copilotd:{self.binding.sdk_session_id}:submission:{idempotency_key}",
-                )
-            )
-            prompt_hash = hashlib.sha256(prompt.encode()).hexdigest()
-            model_row = await self._database.fetchone(
+            snapshot = await self._database.fetchone(
                 """
-                SELECT desired_model_config, desired_agent, desired_session_config_version
-                FROM session_bindings WHERE thread_id = ?
+                SELECT q.prompt, q.attachment_manifest_id,
+                       q.requested_mode_snapshot,
+                       q.requested_model_config_snapshot,
+                       q.requested_agent_snapshot,
+                       q.requested_session_config_version,
+                       q.dispatch_attempt,
+                       s.prompt_hash, s.requested_delivery, s.origin,
+                       s.attachment_count
+                FROM message_queue q
+                JOIN submissions s ON s.submission_id = q.id
+                WHERE q.id = ? AND q.thread_id = ?
                 """,
-                (self.binding.thread_id,),
+                (submission_id, self.binding.thread_id),
             )
-            if model_row is None:
-                raise SessionNotReady("session execution configuration is unavailable")
-            await self._require_inbox().commit_internal(
-                {
-                    "type": "copilotd.submission.queued",
-                    "data": {
-                        "submission_id": submission_id,
-                        "thread_id": self.binding.thread_id,
-                        "origin": origin,
-                        "prompt": prompt,
-                        "prompt_hash": prompt_hash,
-                        "correlation_id": idempotency_key,
-                        "attachment_manifest_id": attachment_manifest_id,
-                        "attachment_count": len(attachments or []),
-                        "requested_mode": effective_agent_mode,
-                        "requested_model_config": json.loads(
-                            model_row["desired_model_config"]
-                        ),
-                        "requested_agent": model_row["desired_agent"],
-                        "requested_session_config_version": model_row[
-                            "desired_session_config_version"
-                        ],
-                        "requested_delivery": mode,
-                        "created_at": time.time(),
+            if snapshot is None:
+                await self._assert_dispatchable()
+                effective_agent_mode = agent_mode or self.binding.desired_mode
+                if effective_agent_mode not in {
+                    "interactive",
+                    "plan",
+                    "autopilot",
+                    "shell",
+                }:
+                    raise SessionNotReady(
+                        f"unsupported message mode: {effective_agent_mode}"
+                    )
+                model_row = await self._database.fetchone(
+                    """
+                    SELECT desired_model_config, desired_agent,
+                           desired_session_config_version
+                    FROM session_bindings WHERE thread_id = ?
+                    """,
+                    (self.binding.thread_id,),
+                )
+                if model_row is None:
+                    raise SessionNotReady(
+                        "session execution configuration is unavailable"
+                    )
+                await self._require_inbox().commit_internal(
+                    {
+                        "type": "copilotd.submission.queued",
+                        "data": {
+                            "submission_id": submission_id,
+                            "thread_id": self.binding.thread_id,
+                            "origin": origin,
+                            "prompt": prompt,
+                            "prompt_hash": prompt_hash,
+                            "correlation_id": idempotency_key,
+                            "attachment_manifest_id": attachment_manifest_id,
+                            "attachment_count": len(attachments or []),
+                            "requested_mode": effective_agent_mode,
+                            "requested_model_config": json.loads(
+                                model_row["desired_model_config"]
+                            ),
+                            "requested_agent": model_row["desired_agent"],
+                            "requested_session_config_version": model_row[
+                                "desired_session_config_version"
+                            ],
+                            "requested_delivery": mode,
+                            "created_at": time.time(),
+                        },
                     },
-                },
-                internal_event_id=f"submission:{submission_id}:queued",
-            )
-            self._volatile_attachments[submission_id] = attachments
+                    internal_event_id=f"submission:{submission_id}:queued",
+                )
+                snapshot = await self._database.fetchone(
+                    """
+                    SELECT q.prompt, q.attachment_manifest_id,
+                           q.requested_mode_snapshot,
+                           q.requested_model_config_snapshot,
+                           q.requested_agent_snapshot,
+                           q.requested_session_config_version,
+                           q.dispatch_attempt,
+                           s.prompt_hash, s.requested_delivery, s.origin,
+                           s.attachment_count
+                    FROM message_queue q
+                    JOIN submissions s ON s.submission_id = q.id
+                    WHERE q.id = ? AND q.thread_id = ?
+                    """,
+                    (submission_id, self.binding.thread_id),
+                )
+            if snapshot is None:
+                raise SessionNotReady(
+                    "submission admission was rejected by lifecycle fencing"
+                )
+            if (
+                str(snapshot["prompt_hash"]) != prompt_hash
+                or snapshot["attachment_manifest_id"] != attachment_manifest_id
+                or (
+                    agent_mode is not None
+                    and str(snapshot["requested_mode_snapshot"]) != agent_mode
+                )
+                or str(snapshot["requested_delivery"]) != mode
+                or str(snapshot["origin"]) != origin
+                or (
+                    attachments is not None
+                    and len(attachments) != int(snapshot["attachment_count"])
+                )
+            ):
+                raise ValueError(
+                    "idempotency key was reused with a different immutable submission"
+                )
+            self._volatile_attachments.setdefault(submission_id, attachments)
 
         if mode == "immediate":
-            attempt_row = await self._database.fetchone(
-                "SELECT dispatch_attempt FROM message_queue WHERE id = ?",
-                (submission_id,),
-            )
-            dispatch_attempt = (
-                0 if attempt_row is None else int(attempt_row["dispatch_attempt"])
-            )
-            operation_key = (
-                idempotency_key
-                if dispatch_attempt == 0
-                else f"{idempotency_key}:{dispatch_attempt}"
-            )
+            async with self._queue_dispatch_lock:
+                current = await self._database.fetchone(
+                    """
+                    SELECT s.state, s.accepted_message_id, q.dispatch_attempt
+                    FROM submissions s
+                    JOIN message_queue q ON q.id = s.submission_id
+                    WHERE s.submission_id = ?
+                    """,
+                    (submission_id,),
+                )
+                if current is None:
+                    raise SessionNotReady("immediate submission disappeared")
+                if current["accepted_message_id"] is not None:
+                    return str(current["accepted_message_id"])
+                if current["state"] in {"submitted_unknown", "outcome_unknown"}:
+                    raise OperationAmbiguous(
+                        "immediate submission outcome is already unknown"
+                    )
+                if current["state"] != "local_queued":
+                    raise OperationRejected(
+                        f"immediate submission is {current['state']}"
+                    )
+                dispatch_attempt = int(current["dispatch_attempt"])
+                operation_key = (
+                    idempotency_key
+                    if dispatch_attempt == 0
+                    else f"{idempotency_key}:{dispatch_attempt}"
+                )
             return await self._dispatch_submission(
                 submission_id=submission_id,
                 idempotency_key=operation_key,
-                prompt=prompt,
-                prompt_hash=prompt_hash,
-                attachment_manifest_id=attachment_manifest_id,
+                prompt=str(snapshot["prompt"]),
+                prompt_hash=str(snapshot["prompt_hash"]),
+                attachment_manifest_id=snapshot["attachment_manifest_id"],
                 attachments=attachments,
                 mode=mode,
-                agent_mode=effective_agent_mode,
+                agent_mode=cast(
+                    AgentMode,
+                    str(snapshot["requested_mode_snapshot"]),
+                ),
                 dispatch_attempt=dispatch_attempt,
                 requested_model_config=json.loads(
-                    str(model_row["desired_model_config"])
+                    str(snapshot["requested_model_config_snapshot"])
                 ),
-                requested_agent=str(model_row["desired_agent"]),
+                requested_agent=str(snapshot["requested_agent_snapshot"]),
                 requested_session_config_version=int(
-                    model_row["desired_session_config_version"]
+                    snapshot["requested_session_config_version"]
                 ),
+                requested_attachment_count=int(snapshot["attachment_count"]),
             )
         dispatched = await self._dispatch_next_queued()
         if dispatched is not None and dispatched[0] == submission_id:
@@ -408,7 +495,7 @@ class SessionRuntime:
                 return None
             row = await self._database.fetchone(
                 """
-                SELECT q.*, s.prompt_hash, s.requested_delivery
+                SELECT q.*, s.prompt_hash, s.requested_delivery, s.attachment_count
                 FROM message_queue AS q
                 JOIN submissions AS s ON s.submission_id = q.id
                 WHERE q.thread_id = ? AND q.state = 'local_queued'
@@ -534,6 +621,7 @@ class SessionRuntime:
                 requested_session_config_version=int(
                     row["requested_session_config_version"]
                 ),
+                requested_attachment_count=int(row["attachment_count"]),
             )
             return str(row["id"]), message_id
 
@@ -552,6 +640,7 @@ class SessionRuntime:
         requested_model_config: dict[str, Any],
         requested_agent: str,
         requested_session_config_version: int,
+        requested_attachment_count: int,
     ) -> str:
         inbox = self._require_inbox()
         if attachment_manifest_id is not None:
@@ -562,6 +651,21 @@ class SessionRuntime:
             attachments = await self._attachment_resolver(attachment_manifest_id)
         elif attachments:
             raise SessionNotReady("attachments require a durable manifest")
+        if len(attachments or []) != requested_attachment_count:
+            raise SessionNotReady(
+                "durable attachment manifest count does not match submission snapshot"
+            )
+
+        async def requeue_fence_deferred() -> None:
+            requeued = await self._requeue_pre_send_without_reducer(
+                submission_id,
+                operation_idempotency_key=f"send:{idempotency_key}",
+                dispatch_attempt=dispatch_attempt,
+            )
+            if not requeued:
+                raise OperationAmbiguous(
+                    f"submission {submission_id} changed before pre-send requeue"
+                )
 
         async def dispatch() -> str:
             claim = await self._claim_submission(
@@ -579,6 +683,7 @@ class SessionRuntime:
                 )
             try:
                 await self._assert_claimed_dispatchable(
+                    require_quiet=mode != "immediate",
                     requested_mode=agent_mode,
                     requested_model_config=requested_model_config,
                     requested_agent=requested_agent,
@@ -587,20 +692,33 @@ class SessionRuntime:
                     ),
                 )
             except Exception as error:
-                await inbox.commit_internal(
-                    {
-                        "type": "copilotd.submission.pre_send_deferred",
-                        "data": {
-                            "submission_id": submission_id,
-                            "dispatch_attempt": dispatch_attempt,
-                            "error_type": type(error).__name__,
+                owner_current = await self._is_current_owner()
+                if self.state == RuntimeState.FENCED or not owner_current:
+                    self.state = RuntimeState.FENCED
+                    if self._mailbox is not None:
+                        self._mailbox.freeze()
+                    requeued = await self._requeue_pre_send_without_reducer(
+                        submission_id,
+                        operation_idempotency_key=f"send:{idempotency_key}",
+                        dispatch_attempt=dispatch_attempt,
+                    )
+                    if not requeued:
+                        raise
+                else:
+                    await inbox.commit_internal(
+                        {
+                            "type": "copilotd.submission.pre_send_deferred",
+                            "data": {
+                                "submission_id": submission_id,
+                                "dispatch_attempt": dispatch_attempt,
+                                "error_type": type(error).__name__,
+                            },
                         },
-                    },
-                    internal_event_id=(
-                        f"submission:{submission_id}:pre-send-deferred:"
-                        f"{dispatch_attempt}"
-                    ),
-                )
+                        internal_event_id=(
+                            f"submission:{submission_id}:pre-send-deferred:"
+                            f"{dispatch_attempt}"
+                        ),
+                    )
                 raise SubmissionClaimDeferred(
                     f"submission {submission_id} lost readiness before SDK send"
                 ) from error
@@ -624,9 +742,25 @@ class SessionRuntime:
                     "agent_mode": agent_mode,
                 },
                 operation=dispatch,
+                defer_on_fence_loss=True,
+                on_fence_deferred=requeue_fence_deferred,
             )
         except SubmissionClaimDeferred:
             raise
+        except OperationDeferred as error:
+            requeued = await self._requeue_pre_send_without_reducer(
+                submission_id,
+                operation_idempotency_key=f"send:{idempotency_key}",
+                dispatch_attempt=dispatch_attempt,
+            )
+            if not requeued:
+                raise OperationAmbiguous(
+                    f"submission {submission_id} could not be requeued after "
+                    "a deterministic pre-send fence failure"
+                ) from error
+            raise SubmissionClaimDeferred(
+                f"submission {submission_id} was requeued before SDK send"
+            ) from error
         except OperationRejected:
             await inbox.commit_internal(
                 {
@@ -721,6 +855,111 @@ class SessionRuntime:
             },
             internal_event_id=f"queue:{submission_id}:{state}",
         )
+
+    async def _requeue_pre_send_without_reducer(
+        self,
+        submission_id: str,
+        *,
+        operation_idempotency_key: str,
+        dispatch_attempt: int,
+    ) -> bool:
+        now = time.time()
+        async with self._database.transaction() as connection:
+            cursor = await connection.execute(
+                """
+                SELECT s.state AS submission_state, s.source_operation_id,
+                       s.accepted_message_id, s.observed_user_event_id,
+                       q.state AS queue_state, q.dispatch_attempt,
+                       o.operation_id
+                FROM submissions s
+                JOIN message_queue q ON q.id = s.submission_id
+                JOIN session_operations o
+                  ON o.sdk_session_id = s.sdk_session_id
+                 AND o.idempotency_key = ?
+                WHERE s.submission_id = ? AND s.sdk_session_id = ?
+                """,
+                (
+                    operation_idempotency_key,
+                    submission_id,
+                    self.binding.sdk_session_id,
+                ),
+            )
+            row = await cursor.fetchone()
+            await cursor.close()
+            if row is None:
+                return False
+            observed_attempt = int(row["dispatch_attempt"])
+            if (
+                observed_attempt > dispatch_attempt
+                and row["submission_state"] == "local_queued"
+                and row["queue_state"] == "local_queued"
+            ):
+                return True
+            if (
+                observed_attempt != dispatch_attempt
+                or row["accepted_message_id"] is not None
+                or row["observed_user_event_id"] is not None
+            ):
+                return False
+            operation_id = str(row["operation_id"])
+            states = (str(row["submission_state"]), str(row["queue_state"]))
+            if states == ("local_queued", "local_queued"):
+                source_matches = row["source_operation_id"] is None
+            else:
+                source_matches = (
+                    states
+                    in {
+                        ("submitting", "submitting"),
+                        ("submitted_unknown", "submitted_unknown"),
+                    }
+                    and row["source_operation_id"] == operation_id
+                )
+            if not source_matches:
+                return False
+            updated_submission = await connection.execute(
+                """
+                UPDATE submissions
+                SET state = 'local_queued', source_operation_id = NULL,
+                    send_started_at = NULL, terminal_at = NULL
+                WHERE submission_id = ?
+                  AND state = ?
+                  AND accepted_message_id IS NULL
+                  AND observed_user_event_id IS NULL
+                """,
+                (submission_id, row["submission_state"]),
+            )
+            requeued = updated_submission.rowcount == 1
+            await updated_submission.close()
+            if not requeued:
+                return False
+            updated_queue = await connection.execute(
+                """
+                UPDATE message_queue
+                SET state = 'local_queued',
+                    dispatch_attempt = dispatch_attempt + 1,
+                    updated_at = ?
+                WHERE id = ? AND state = ? AND dispatch_attempt = ?
+                """,
+                (now, submission_id, row["queue_state"], dispatch_attempt),
+            )
+            queue_requeued = updated_queue.rowcount == 1
+            await updated_queue.close()
+            if not queue_requeued:
+                raise RuntimeError(
+                    f"submission {submission_id} queue changed during pre-send requeue"
+                )
+            await connection.execute(
+                """
+                UPDATE schedule_runs
+                SET status = 'submitting', send_started_at = NULL,
+                    last_progress_at = ?, updated_at = ?
+                WHERE result_submission_id = ?
+                  AND status = 'submitting'
+                  AND accepted_message_id IS NULL
+                """,
+                (now, now, submission_id),
+            )
+            return True
 
     async def _refresh_readiness(
         self,
@@ -2166,20 +2405,27 @@ class SessionRuntime:
             await self._query_snapshot_topic(topic)
         await self._require_inbox().join()
 
-    async def shutdown(self) -> None:
+    async def shutdown(self, *, emergency: bool = False) -> None:
         """Stop app workers without claiming that an in-flight SDK operation succeeded."""
         async with self._lifecycle_lock:
             if self.state == RuntimeState.CLOSED:
                 return
+            fenced_shutdown = self.state == RuntimeState.FENCED
+            emergency = emergency or fenced_shutdown
             async with self._admission_lock:
                 self._accepting_sends = False
             if self._mailbox is not None:
                 self._mailbox.freeze()
-            if self._inbox is not None and self._reducer is not None:
+            if (
+                not emergency
+                and self._inbox is not None
+                and self._reducer is not None
+            ):
                 await self._force_active_unknown()
             current = await self._bindings.by_thread(self.binding.thread_id)
             if (
-                current is not None
+                not fenced_shutdown
+                and current is not None
                 and current.runtime_generation == self.binding.runtime_generation
                 and current.owner_fence_token == self.binding.owner_fence_token
                 and current.attachment_state
@@ -2192,7 +2438,10 @@ class SessionRuntime:
             ):
                 self.binding = await self._bindings.mark_recovery_unknown(current)
                 self.state = RuntimeState.RECOVERY_UNKNOWN
-            await self._stop_components(release_owner=True)
+            await self._stop_components(
+                release_owner=True,
+                emergency=emergency,
+            )
             if self.state not in {RuntimeState.RECOVERY_UNKNOWN, RuntimeState.FENCED}:
                 self.state = RuntimeState.DETACHED
 
@@ -2884,6 +3133,7 @@ class SessionRuntime:
     async def _assert_claimed_dispatchable(
         self,
         *,
+        require_quiet: bool,
         requested_mode: AgentMode,
         requested_model_config: dict[str, Any],
         requested_agent: str,
@@ -2891,7 +3141,7 @@ class SessionRuntime:
     ) -> None:
         await self._assert_dispatchable()
         readiness = await self._refresh_readiness()
-        if (
+        if require_quiet and (
             readiness["processing"]
             or readiness["hasActiveWork"]
             or readiness["pendingItems"]
@@ -2941,6 +3191,59 @@ class SessionRuntime:
             != requested_session_config_version
         ):
             raise SessionNotReady("claimed queue session-config snapshot drifted")
+        await self._assert_pre_send_fence()
+
+    async def _assert_pre_send_fence(self) -> None:
+        lease = self._lease
+        if self.state != RuntimeState.READY or self._handle is None:
+            raise SessionNotReady(f"session runtime is {self.state}")
+        if (
+            lease is None
+            or lease.sdk_session_id != self.binding.sdk_session_id
+            or lease.owner_id != self._owner_id
+            or lease.fence_token != self.binding.owner_fence_token
+        ):
+            self.state = RuntimeState.FENCED
+            if self._mailbox is not None:
+                self._mailbox.freeze()
+            raise FenceLost(f"owner fence lost for session {self.binding.sdk_session_id}")
+        now = time.time()
+        current = await self._database.fetchone(
+            """
+            SELECT 1
+            FROM session_bindings b
+            JOIN session_owner_leases l
+              ON l.sdk_session_id = b.sdk_session_id
+             AND l.fence_token = b.owner_fence_token
+            WHERE b.thread_id = ? AND b.sdk_session_id = ?
+              AND b.runtime_generation = ?
+              AND b.owner_fence_token = ?
+              AND b.attachment_state = 'attached'
+              AND l.owner_id = ?
+              AND l.expires_at - ? >= ?
+            """,
+            (
+                self.binding.thread_id,
+                self.binding.sdk_session_id,
+                self.binding.runtime_generation,
+                self.binding.owner_fence_token,
+                self._owner_id,
+                now,
+                MUTATION_HEADROOM_SECONDS,
+            ),
+        )
+        if current is None:
+            if not await self._is_current_owner():
+                self.state = RuntimeState.FENCED
+                if self._mailbox is not None:
+                    self._mailbox.freeze()
+                raise FenceLost(
+                    f"owner fence lost for session {self.binding.sdk_session_id}"
+                )
+            raise FenceLost(
+                f"owner lease lacks mutation headroom for "
+                f"{self.binding.sdk_session_id}"
+            )
 
     async def _assert_owned_handle(
         self,
@@ -3002,7 +3305,12 @@ class SessionRuntime:
         except TimeoutError:
             task.add_done_callback(_consume_task_result)
 
-    async def _stop_components(self, *, release_owner: bool) -> None:
+    async def _stop_components(
+        self,
+        *,
+        release_owner: bool,
+        emergency: bool = False,
+    ) -> None:
         self._accepting_sends = False
         errors: list[Exception] = []
         overflow_task = self._overflow_task
@@ -3025,9 +3333,14 @@ class SessionRuntime:
             self._permission_reconcile_task = None
         if self._mailbox is not None:
             try:
-                await self._mailbox.stop(
-                    timeout_seconds=self._shutdown_timeout_seconds
-                )
+                if emergency:
+                    await self._mailbox.emergency_stop(
+                        timeout_seconds=self._shutdown_timeout_seconds
+                    )
+                else:
+                    await self._mailbox.stop(
+                        timeout_seconds=self._shutdown_timeout_seconds
+                    )
             except Exception as error:
                 errors.append(error)
             self._mailbox = None
@@ -3037,9 +3350,14 @@ class SessionRuntime:
             self._renewal_task = None
         if self._reducer is not None:
             try:
-                await self._reducer.stop(
-                    timeout_seconds=self._shutdown_timeout_seconds
-                )
+                if emergency:
+                    await self._reducer.emergency_stop(
+                        timeout_seconds=self._shutdown_timeout_seconds
+                    )
+                else:
+                    await self._reducer.stop(
+                        timeout_seconds=self._shutdown_timeout_seconds
+                    )
             except Exception as error:
                 errors.append(error)
             self._reducer = None
@@ -3052,6 +3370,9 @@ class SessionRuntime:
         if release_owner and lease is not None:
             try:
                 await self._owner_leases.release(lease)
+            except FenceLost as error:
+                if not emergency:
+                    errors.append(error)
             except Exception as error:
                 errors.append(error)
         if errors:

@@ -1792,6 +1792,19 @@ async def _worktree_blockers(
     blockers.extend(
         f"owner_lease:{row['sdk_session_id']}:{row['owner_id']}" for row in leases
     )
+    queued = await _fetchall(
+        connection,
+        """
+        SELECT q.id, q.state
+        FROM message_queue q
+        JOIN session_bindings b ON b.thread_id = q.thread_id
+        WHERE b.project_id = ?
+          AND q.state NOT IN ('cancelled', 'submitted', 'failed')
+        ORDER BY q.position, q.id
+        """,
+        (project_id,),
+    )
+    blockers.extend(f"queue:{row['id']}:{row['state']}" for row in queued)
     live = await _fetchall(
         connection,
         """

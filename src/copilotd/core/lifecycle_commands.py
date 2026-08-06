@@ -80,77 +80,85 @@ class SchedulerCommandService:
         misfire_policy: MisfirePolicy = MisfirePolicy.LATEST,
         now: float | None = None,
     ) -> ScheduleDefinition:
-        row = await self._database.fetchone(
-            """
-            SELECT * FROM session_bindings
-            WHERE thread_id = ? AND binding_intent IN ('active', 'closed')
-            """,
-            (thread_id,),
-        )
-        if row is None:
-            raise LifecycleCommandError(
-                "message schedules require an existing session thread",
-                code="CD-SCHEDULE-TARGET-001",
+        async with self._database.transaction() as connection:
+            cursor = await connection.execute(
+                """
+                SELECT * FROM session_bindings
+                WHERE thread_id = ? AND binding_intent IN ('active', 'closed')
+                """,
+                (thread_id,),
             )
-        project_timezone = timezone
-        if project_timezone is None:
-            if row["project_id"] is None:
-                snapshot_channel = (
-                    str(json.loads(row["project_snapshot_json"])["channel_id"])
-                    if row["project_snapshot_json"]
-                    else channel_id
+            row = await cursor.fetchone()
+            await cursor.close()
+            if row is None:
+                raise LifecycleCommandError(
+                    "message schedules require an existing session thread",
+                    code="CD-SCHEDULE-TARGET-001",
                 )
-                if snapshot_channel is None:
-                    raise LifecycleCommandError(
-                        "legacy implicit-home sessions require timezone or channel_id",
-                        code="CD-SCHEDULE-TZ-002",
+            project_timezone = timezone
+            if project_timezone is None:
+                if row["project_id"] is None:
+                    snapshot_channel = (
+                        str(json.loads(row["project_snapshot_json"])["channel_id"])
+                        if row["project_snapshot_json"]
+                        else channel_id
                     )
-                project_timezone = await self._projects.channel_timezone(snapshot_channel)
-            else:
-                project_timezone = (
-                    await self._projects.project_by_id(str(row["project_id"]))
-                ).timezone
-        target = {
-            "thread_id": str(row["thread_id"]),
-            "sdk_session_id": str(row["sdk_session_id"]),
-            "project_id": row["project_id"],
-            "project_source": str(row["project_source"]),
-            "cwd_snapshot": str(row["cwd_snapshot"]),
-            "project_snapshot": (
-                None
-                if row["project_snapshot_json"] is None
-                else json.loads(str(row["project_snapshot_json"]))
-            ),
-            "session_config": (
-                None
-                if row["session_config_snapshot_json"] is None
-                else json.loads(str(row["session_config_snapshot_json"]))
-            ),
-            "execution_config": {
-                "mode": str(row["desired_mode"]),
-                "model_config": json.loads(str(row["desired_model_config"])),
-                "agent": str(row["desired_agent"]),
-                "session_config_version": int(row["desired_session_config_version"]),
-            },
-        }
-        return await self._repository.create(
-            kind=ScheduleKind.MESSAGE,
-            expression=expression,
-            timezone=str(project_timezone),
-            payload={"text": text},
-            target_snapshot=target,
-            project_id=row["project_id"],
-            thread_id=thread_id,
-            channel_id=(
-                channel_id
-                if target["project_snapshot"] is None
-                else str(target["project_snapshot"]["channel_id"])
-            ),
-            name=name,
-            created_by=created_by,
-            misfire_policy=misfire_policy,
-            now=now,
-        )
+                    if snapshot_channel is None:
+                        raise LifecycleCommandError(
+                            "legacy implicit-home sessions require timezone or channel_id",
+                            code="CD-SCHEDULE-TZ-002",
+                        )
+                    project_timezone = await self._projects.channel_timezone(
+                        snapshot_channel
+                    )
+                else:
+                    project_timezone = (
+                        await self._projects.project_by_id(str(row["project_id"]))
+                    ).timezone
+            target = {
+                "thread_id": str(row["thread_id"]),
+                "sdk_session_id": str(row["sdk_session_id"]),
+                "project_id": row["project_id"],
+                "project_source": str(row["project_source"]),
+                "cwd_snapshot": str(row["cwd_snapshot"]),
+                "project_snapshot": (
+                    None
+                    if row["project_snapshot_json"] is None
+                    else json.loads(str(row["project_snapshot_json"]))
+                ),
+                "session_config": (
+                    None
+                    if row["session_config_snapshot_json"] is None
+                    else json.loads(str(row["session_config_snapshot_json"]))
+                ),
+                "execution_config": {
+                    "mode": str(row["desired_mode"]),
+                    "model_config": json.loads(str(row["desired_model_config"])),
+                    "agent": str(row["desired_agent"]),
+                    "session_config_version": int(
+                        row["desired_session_config_version"]
+                    ),
+                },
+            }
+            return await self._repository.create(
+                kind=ScheduleKind.MESSAGE,
+                expression=expression,
+                timezone=str(project_timezone),
+                payload={"text": text},
+                target_snapshot=target,
+                project_id=row["project_id"],
+                thread_id=thread_id,
+                channel_id=(
+                    channel_id
+                    if target["project_snapshot"] is None
+                    else str(target["project_snapshot"]["channel_id"])
+                ),
+                name=name,
+                created_by=created_by,
+                misfire_policy=misfire_policy,
+                now=now,
+                connection=connection,
+            )
 
     async def create_new_session(
         self,

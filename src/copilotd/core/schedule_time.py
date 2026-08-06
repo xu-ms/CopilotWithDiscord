@@ -269,13 +269,14 @@ def _cron_next(
         second=0,
         microsecond=0,
     )
-    window = _transition_window(zone, after_utc)
+    window = _overlap_window(zone, after_utc)
     cursor = local_after - window
     best: float | None = None
+    iterator = croniter(expression, cursor)
     horizon_year = min(datetime.max.year, local_after.year + _CRON_SEARCH_YEARS)
     while cursor.year <= horizon_year:
         try:
-            wall = croniter(expression, cursor).get_next(datetime)
+            wall = iterator.get_next(datetime)
         except (CroniterBadDateError, OverflowError, ValueError) as error:
             raise ScheduleTimeError(
                 "cron expression has no resolvable future occurrence"
@@ -344,13 +345,14 @@ def _cron_previous_or_at(
         second=0,
         microsecond=0,
     )
-    window = _transition_window(zone, through_utc)
+    window = _overlap_window(zone, through_utc)
     cursor = local_through + window
     best: float | None = None
+    iterator = croniter(expression, cursor)
     horizon_year = max(datetime.min.year, local_through.year - _CRON_SEARCH_YEARS)
     while cursor.year >= horizon_year:
         try:
-            wall = croniter(expression, cursor).get_prev(datetime)
+            wall = iterator.get_prev(datetime)
         except (CroniterBadDateError, OverflowError, ValueError) as error:
             raise ScheduleTimeError(
                 "cron expression has no resolvable previous occurrence"
@@ -473,7 +475,24 @@ def _transition_window(zone: ZoneInfo, around_utc: float) -> timedelta:
         if observed is not None:
             offsets.append(observed.total_seconds())
     spread = 0 if not offsets else max(offsets) - min(offsets)
-    return timedelta(seconds=max(3 * 3_600, spread + 2 * 3_600))
+    return (
+        timedelta(0)
+        if spread == 0
+        else timedelta(seconds=spread + 2 * 3_600)
+    )
+
+
+def _overlap_window(zone: ZoneInfo, around_utc: float) -> timedelta:
+    wall = datetime.fromtimestamp(around_utc, zone).replace(tzinfo=None)
+    candidates = _resolve_wall_time(
+        wall,
+        zone,
+        gap_policy="skip",
+        fold_policy="both",
+    )
+    if len(candidates) != 2:
+        return timedelta(0)
+    return timedelta(seconds=candidates[1] - candidates[0])
 
 
 def _rfc3339(timestamp: float) -> str:

@@ -92,7 +92,7 @@ async def test_migrations_are_idempotent(tmp_path: Path) -> None:
     async with Database(database_path) as database:
         rows = await database.fetchall("SELECT version FROM schema_migrations")
 
-    assert [row["version"] for row in rows] == [*range(1, 10), 20, 21, 22, 23]
+    assert [row["version"] for row in rows] == [*range(1, 10), 20, 21, 22, 23, 24]
 
 
 @pytest.mark.asyncio
@@ -133,7 +133,14 @@ async def test_foundation_migration_upgrades_existing_v7_database(tmp_path: Path
             "SELECT name FROM sqlite_master WHERE type = 'table'"
         )
 
-    assert [row["version"] for row in versions] == [*range(1, 10), 20, 21, 22, 23]
+    assert [row["version"] for row in versions] == [
+        *range(1, 10),
+        20,
+        21,
+        22,
+        23,
+        24,
+    ]
     assert "protocol_version" in {row["name"] for row in capability_columns}
     assert {
         "schema_version",
@@ -149,6 +156,124 @@ async def test_foundation_migration_upgrades_existing_v7_database(tmp_path: Path
         "submission_segments",
         "submission_task_links",
     } <= {row["name"] for row in tables}
+
+
+@pytest.mark.asyncio
+async def test_v24_repairs_links_for_existing_v23_database(tmp_path: Path) -> None:
+    database_path = tmp_path / "upgrade-v23.sqlite3"
+    connection = sqlite3.connect(database_path)
+    connection.execute(
+        """
+        CREATE TABLE schema_migrations (
+            version INTEGER PRIMARY KEY,
+            name TEXT NOT NULL,
+            applied_at REAL NOT NULL
+        )
+        """
+    )
+    migration_root = resources.files("copilotd.storage.migrations")
+    for migration in sorted(
+        item
+        for item in migration_root.iterdir()
+        if item.name.endswith(".sql") and int(item.name.partition("_")[0]) <= 23
+    ):
+        connection.executescript(migration.read_text(encoding="utf-8"))
+        version = int(migration.name.partition("_")[0])
+        connection.execute(
+            "INSERT INTO schema_migrations VALUES (?, ?, ?)",
+            (version, migration.name, time.time()),
+        )
+    connection.execute(
+        """
+        INSERT INTO session_bindings(
+            thread_id, project_source, cwd_snapshot, sdk_session_id,
+            created_at, updated_at
+        ) VALUES ('thread-1', 'implicit-home', '/tmp', 'session-1', 1, 1)
+        """
+    )
+    connection.execute(
+        """
+        INSERT INTO schedules(
+            id, thread_id, kind, expression, timezone, payload,
+            target_snapshot, misfire_policy, state, created_at, updated_at
+        ) VALUES ('schedule-1', 'thread-1', 'message', 'cron:0 9 * * *',
+                  'UTC', '{}', '{}', 'latest', 'enabled', 1, 1)
+        """
+    )
+    connection.execute(
+        """
+        INSERT INTO schedule_runs(
+            run_id, schedule_id, planned_key, planned_at_utc, status,
+            created_at, updated_at
+        ) VALUES ('run-1', 'schedule-1', 'manual:1', 1, 'submitting', 1, 1)
+        """
+    )
+    connection.execute(
+        """
+        INSERT INTO submissions(
+            submission_id, sdk_session_id, origin, schedule_run_id, state, created_at
+        ) VALUES ('old', 'session-1', 'app_schedule', 'run-1', 'cancelled', 1)
+        """
+    )
+    connection.execute(
+        """
+        INSERT INTO submissions(
+            submission_id, sdk_session_id, origin, parent_submission_id,
+            state, created_at
+        ) VALUES ('new', 'session-1', 'app_schedule', 'old', 'local_queued', 2)
+        """
+    )
+    connection.execute(
+        """
+        INSERT INTO message_queue(
+            id, thread_id, schedule_run_id, prompt,
+            requested_mode_snapshot, requested_model_config_snapshot,
+            requested_session_config_version, position, state, created_at, updated_at
+        ) VALUES ('old', 'thread-1', 'run-1', 'old', 'interactive', '{}',
+                  1, 1, 'cancelled', 1, 1)
+        """
+    )
+    connection.execute(
+        """
+        INSERT INTO message_queue(
+            id, thread_id, prompt, requested_mode_snapshot,
+            requested_model_config_snapshot, requested_session_config_version,
+            position, state, replaces_id, created_at, updated_at
+        ) VALUES ('new', 'thread-1', 'new', 'interactive', '{}',
+                  1, 2, 'local_queued', 'old', 2, 2)
+        """
+    )
+    connection.execute(
+        """
+        UPDATE schedule_runs SET result_submission_id = 'new'
+        WHERE run_id = 'run-1'
+        """
+    )
+    connection.commit()
+    connection.close()
+
+    async with Database(database_path) as database:
+        queue = await database.fetchall(
+            """
+            SELECT id, schedule_run_id, dispatch_attempt
+            FROM message_queue ORDER BY id
+            """
+        )
+        submissions = await database.fetchall(
+            """
+            SELECT submission_id, schedule_run_id
+            FROM submissions ORDER BY submission_id
+            """
+        )
+
+    assert [dict(row) for row in queue] == [
+        {"id": "new", "schedule_run_id": "run-1", "dispatch_attempt": 0},
+        {"id": "old", "schedule_run_id": None, "dispatch_attempt": 0},
+    ]
+    assert [dict(row) for row in submissions] == [
+        {"submission_id": "new", "schedule_run_id": "run-1"},
+        {"submission_id": "old", "schedule_run_id": None},
+    ]
 
 
 @pytest.mark.asyncio

@@ -1,5 +1,7 @@
 import argparse
+import asyncio
 import json
+import signal
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -11,6 +13,7 @@ from copilotd.acceptance.live_scheduler_worktree import (
     LiveAuthenticationError,
     LiveSchedulerWorktreeHarness,
     ResultArchive,
+    _kill_and_reap,
     _run_crash_child,
     run_from_args,
 )
@@ -81,6 +84,36 @@ async def test_crash_child_requires_matching_parent_nonce(tmp_path: Path) -> Non
 
     with pytest.raises(LiveAcceptanceError, match="nonce"):
         await _run_crash_child(config, parent_nonce="wrong")
+
+
+@pytest.mark.asyncio
+async def test_cancelled_crash_cleanup_still_sigkills_and_reaps_child() -> None:
+    class FakeProcess:
+        def __init__(self) -> None:
+            self.returncode: int | None = None
+            self.wait_started = asyncio.Event()
+            self.release_wait = asyncio.Event()
+            self.signal: int | None = None
+
+        def send_signal(self, value: int) -> None:
+            self.signal = value
+
+        async def wait(self) -> int:
+            self.wait_started.set()
+            await self.release_wait.wait()
+            self.returncode = -signal.SIGKILL
+            return self.returncode
+
+    process = FakeProcess()
+    cleanup = asyncio.create_task(_kill_and_reap(process))
+    await process.wait_started.wait()
+    cleanup.cancel()
+    process.release_wait.set()
+
+    with pytest.raises(asyncio.CancelledError):
+        await cleanup
+    assert process.signal == signal.SIGKILL
+    assert process.returncode == -signal.SIGKILL
 
 
 @pytest.mark.asyncio

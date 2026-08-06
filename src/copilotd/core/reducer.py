@@ -917,6 +917,35 @@ class JournalReducer:
             )
         elif event.raw_type == "copilotd.submission.queued":
             submission_id = str(data["submission_id"])
+            admission = await _fetchone_row(
+                connection,
+                """
+                SELECT 1
+                FROM session_bindings b
+                LEFT JOIN projects p ON p.id = b.project_id
+                WHERE b.thread_id = ? AND b.sdk_session_id = ?
+                  AND b.binding_intent IN ('active', 'closed')
+                  AND b.attachment_state = 'attached'
+                  AND b.runtime_generation = ?
+                  AND b.owner_fence_token = ?
+                  AND (
+                      p.id IS NULL
+                      OR p.state != 'closing'
+                         AND NOT (
+                             p.project_kind = 'worktree'
+                             AND p.state = 'retired'
+                         )
+                  )
+                """,
+                (
+                    str(data["thread_id"]),
+                    event.sdk_session_id,
+                    event.generation,
+                    event.fence_token,
+                ),
+            )
+            if admission is None:
+                return
             await connection.execute(
                 """
                 INSERT INTO submissions(
@@ -4496,6 +4525,23 @@ class EventReducerWorker:
                     await asyncio.gather(worker, return_exceptions=True)
             except TimeoutError:
                 worker.add_done_callback(_consume_task_result)
+        finally:
+            self._task = None
+            self._inbox.close()
+
+    async def emergency_stop(self, *, timeout_seconds: float = 5) -> None:
+        if self._task is None:
+            self._inbox.close()
+            return
+        self._stopping = True
+        self._inbox.close_sdk()
+        worker = self._task
+        worker.cancel()
+        try:
+            async with asyncio.timeout(timeout_seconds):
+                await asyncio.gather(worker, return_exceptions=True)
+        except TimeoutError:
+            worker.add_done_callback(_consume_task_result)
         finally:
             self._task = None
             self._inbox.close()

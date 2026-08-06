@@ -9,6 +9,7 @@ import pytest
 from discord.ext import commands
 
 from copilotd.config import Settings
+from copilotd.core.task_registry import TaskFailure
 from copilotd.discord_app import (
     CopilotDiscordBot,
     _discord_render,
@@ -25,6 +26,7 @@ from copilotd.render.outbox import (
 )
 from copilotd.render.tables import TableAsset
 from copilotd.sdk.capabilities import CapabilityRegistry
+from copilotd.storage.database import Database
 
 
 def test_discord_command_manifest_has_core_modes_and_no_deleted_roots(tmp_path: Path) -> None:
@@ -101,6 +103,88 @@ async def test_bot_teardown_is_idempotent(tmp_path: Path) -> None:
     await bot.close()
     await bot.close()
 
+    bot.bridge.stop.assert_awaited_once()
+    bot.database.close.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_cancelled_close_caller_does_not_poison_shared_teardown(
+    tmp_path: Path,
+) -> None:
+    bot = CopilotDiscordBot(Settings(data_dir=tmp_path))
+    stop_started = asyncio.Event()
+    allow_stop = asyncio.Event()
+
+    async def delayed_stop() -> None:
+        stop_started.set()
+        await allow_stop.wait()
+
+    bot.bridge.stop = AsyncMock(side_effect=delayed_stop)
+    bot.database.close = AsyncMock()
+    first = asyncio.create_task(bot.close())
+    await stop_started.wait()
+    first.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await first
+    allow_stop.set()
+
+    await bot.close()
+
+    assert bot._closed_once
+    bot.bridge.stop.assert_awaited_once()
+    bot.database.close.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_fatal_worker_runs_full_application_teardown(tmp_path: Path) -> None:
+    bot = CopilotDiscordBot(Settings(data_dir=tmp_path))
+    bot.bridge.stop = AsyncMock()
+    bot.database.close = AsyncMock()
+    supervisor = bot._tasks.create(
+        bot._task_failure_loop(),
+        name="test-failure-supervisor",
+    )
+    await bot._tasks.errors.put(
+        TaskFailure(
+            name="failed-worker",
+            source="test",
+            session_id=None,
+            runtime_generation=None,
+            error=RuntimeError("worker failed"),
+        )
+    )
+
+    await asyncio.wait_for(supervisor, timeout=2)
+
+    assert bot._closed_once
+    bot.bridge.stop.assert_awaited_once()
+    bot.database.close.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_fatal_diagnostic_failure_still_runs_teardown(tmp_path: Path) -> None:
+    bot = CopilotDiscordBot(Settings(data_dir=tmp_path))
+    bot.bridge.stop = AsyncMock()
+    bot.database.execute = AsyncMock(side_effect=OSError("database unavailable"))
+    bot.database.close = AsyncMock()
+    supervisor = bot._tasks.create(
+        bot._task_failure_loop(),
+        name="test-diagnostic-failure-supervisor",
+    )
+    await bot._tasks.errors.put(
+        TaskFailure(
+            name="failed-reducer",
+            source="event-reducer",
+            session_id="session-1",
+            runtime_generation=1,
+            error=RuntimeError("reducer failed"),
+        )
+    )
+
+    await asyncio.wait_for(supervisor, timeout=2)
+
+    assert isinstance(bot._fatal_diagnostic_error, OSError)
+    assert bot._closed_once
     bot.bridge.stop.assert_awaited_once()
     bot.database.close.assert_awaited_once()
 
@@ -309,14 +393,13 @@ async def test_critical_task_failure_closes_gateway_and_persists_incident(
     )
     await asyncio.wait_for(gateway_closed.wait(), timeout=1)
     await supervisor
-    incident = await bot.database.fetchone(
-        """
-        SELECT runtime_generation, kind, detail
-        FROM runtime_incidents WHERE session_id = 'session-1'
-        """
-    )
-    await bot._tasks.cancel_all()
-    await bot.database.close()
+    async with Database(bot.settings.database_path) as database:
+        incident = await database.fetchone(
+            """
+            SELECT runtime_generation, kind, detail
+            FROM runtime_incidents WHERE session_id = 'session-1'
+            """
+        )
 
     assert isinstance(bot._fatal_worker_error, RuntimeError)
     assert bot.heartbeat.runtime_state == "down"

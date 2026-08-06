@@ -311,13 +311,21 @@ class SessionRegistry:
                     )
         return failures
 
-    async def shutdown(self) -> None:
+    async def shutdown(
+        self,
+        *,
+        emergency_session_id: str | None = None,
+    ) -> None:
         runtimes = list(self._runtimes.values())
         self._runtimes.clear()
         errors: list[Exception] = []
         for runtime in runtimes:
             try:
-                await runtime.shutdown()
+                await runtime.shutdown(
+                    emergency=(
+                        emergency_session_id == runtime.binding.sdk_session_id
+                    )
+                )
             except Exception as error:
                 errors.append(error)
         if errors:

@@ -63,9 +63,19 @@ class TaskRegistry:
         task.add_done_callback(self._on_done)
         return task
 
-    async def cancel_all(self, *, wait_seconds: float = 10) -> None:
+    async def cancel_all(
+        self,
+        *,
+        wait_seconds: float = 10,
+        exclude: frozenset[asyncio.Task[Any]] = frozenset(),
+    ) -> None:
         self._closing = True
-        tasks = list(self._tasks)
+        current = asyncio.current_task()
+        tasks = [
+            task
+            for task in self._tasks
+            if task is not current and task not in exclude
+        ]
         for task in tasks:
             task.cancel()
         if tasks:

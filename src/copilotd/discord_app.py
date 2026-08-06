@@ -102,10 +102,14 @@ class CopilotDiscordBot(commands.Bot):
         self._owner_id = f"discord:{uuid.uuid4()}"
         self._commands_registered = False
         self._fatal_worker_error: BaseException | None = None
+        self._fatal_diagnostic_error: Exception | None = None
         self._restart_task: asyncio.Task[None] | None = None
         self.restart_requested = False
         self._close_lock = asyncio.Lock()
         self._closed_once = False
+        self._shutdown_task: asyncio.Task[None] | None = None
+        self._fatal_session_id: str | None = None
+        self._shutdown_initiator: asyncio.Task[Any] | None = None
 
     async def setup_hook(self) -> None:
         await self.database.open()
@@ -226,78 +230,101 @@ class CopilotDiscordBot(commands.Bot):
 
     async def close(self) -> None:
         async with self._close_lock:
-            if self._closed_once:
-                return
-            self._closed_once = True
-            self.heartbeat.set_gateway("down")
-            self.heartbeat.runtime_state = "down"
-            errors: list[Exception] = []
-            if self.scheduler_worker is not None:
-                try:
-                    await self.scheduler_worker.stop()
-                except Exception as error:
-                    errors.append(error)
-            if self.sessions is not None:
-                try:
-                    await self.sessions.shutdown()
-                except Exception as error:
-                    errors.append(error)
+            if self._shutdown_task is None:
+                self._shutdown_task = asyncio.create_task(
+                    self._close_once(),
+                    name="copilotd-shutdown",
+                )
+            shutdown = self._shutdown_task
+        await asyncio.shield(shutdown)
+
+    async def _close_once(self) -> None:
+        self.heartbeat.set_gateway("down")
+        self.heartbeat.runtime_state = "down"
+        errors: list[Exception] = []
+        if self.scheduler_worker is not None:
             try:
-                await self._tasks.cancel_all()
+                await self.scheduler_worker.stop()
             except Exception as error:
                 errors.append(error)
+        if self.sessions is not None:
             try:
-                await self.bridge.stop()
+                await self.sessions.shutdown(
+                    emergency_session_id=self._fatal_session_id,
+                )
             except Exception as error:
                 errors.append(error)
-            try:
-                await self.database.close()
-            except Exception as error:
-                errors.append(error)
+        try:
+            excluded = (
+                frozenset()
+                if self._shutdown_initiator is None
+                else frozenset({self._shutdown_initiator})
+            )
+            await self._tasks.cancel_all(exclude=excluded)
+        except Exception as error:
+            errors.append(error)
+        try:
+            await self.bridge.stop()
+        except Exception as error:
+            errors.append(error)
+        try:
+            await self.database.close()
+        except Exception as error:
+            errors.append(error)
+        try:
             await super().close()
-            if errors:
-                raise ExceptionGroup("copilotD shutdown failed", errors)
+        except Exception as error:
+            errors.append(error)
+        self._closed_once = True
+        if errors:
+            raise ExceptionGroup("copilotD shutdown failed", errors)
 
     async def _task_failure_loop(self) -> None:
         while True:
             failure = await self._tasks.errors.get()
             try:
-                self.heartbeat.runtime_state = "down"
-                await logger.aerror(
-                    "background_task_failed",
-                    task_name=failure.name,
-                    source=failure.source,
-                    session_id=failure.session_id,
-                    runtime_generation=failure.runtime_generation,
-                    error_type=type(failure.error).__name__,
-                    error=str(failure.error),
-                )
-                if failure.session_id is not None:
-                    await self.database.execute(
-                        """
-                        INSERT INTO runtime_incidents(
-                            timestamp, runtime_generation, session_id,
-                            kind, detail
-                        ) VALUES (?, ?, ?, 'background_task_failed', ?)
-                        """,
-                        (
-                            time.time(),
-                            failure.runtime_generation or 0,
-                            failure.session_id,
-                            json.dumps(
-                                {
-                                    "task_name": failure.name,
-                                    "source": failure.source,
-                                    "error_type": type(failure.error).__name__,
-                                    "message": str(failure.error),
-                                },
-                                sort_keys=True,
-                            ),
-                        ),
-                    )
                 self._fatal_worker_error = failure.error
+                self._fatal_session_id = failure.session_id
+                self._shutdown_initiator = asyncio.current_task()
+                self.heartbeat.runtime_state = "down"
                 self.heartbeat.set_gateway("down")
-                await super().close()
+                try:
+                    await logger.aerror(
+                        "background_task_failed",
+                        task_name=failure.name,
+                        source=failure.source,
+                        session_id=failure.session_id,
+                        runtime_generation=failure.runtime_generation,
+                        error_type=type(failure.error).__name__,
+                        error=str(failure.error),
+                    )
+                    if failure.session_id is not None:
+                        await self.database.execute(
+                            """
+                            INSERT INTO runtime_incidents(
+                                timestamp, runtime_generation, session_id,
+                                kind, detail
+                            ) VALUES (?, ?, ?, 'background_task_failed', ?)
+                            """,
+                            (
+                                time.time(),
+                                failure.runtime_generation or 0,
+                                failure.session_id,
+                                json.dumps(
+                                    {
+                                        "task_name": failure.name,
+                                        "source": failure.source,
+                                        "error_type": type(failure.error).__name__,
+                                        "message": str(failure.error),
+                                    },
+                                    sort_keys=True,
+                                ),
+                            ),
+                        )
+                except Exception as diagnostic_error:
+                    self._fatal_diagnostic_error = diagnostic_error
+                finally:
+                    await self.close()
                 return
             finally:
                 self._tasks.errors.task_done()

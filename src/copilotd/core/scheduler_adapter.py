@@ -18,7 +18,11 @@ from copilotd.core.scheduler import (
     ScheduleRun,
 )
 from copilotd.core.session_runtime import RuntimeState
-from copilotd.core.sessions import SessionCreationService, SessionRegistry
+from copilotd.core.sessions import (
+    SessionCreationService,
+    SessionCreationUnknown,
+    SessionRegistry,
+)
 from copilotd.sdk.capabilities import CapabilityManifest
 from copilotd.storage.database import Database
 
@@ -111,12 +115,19 @@ class ApplicationSchedulerAdapter:
                 config_snapshot=config,
                 preallocated_session_id=run.result_session_id,
             )
-        except Exception as error:
+        except SessionCreationUnknown as error:
             raise SchedulerDispatchError(
                 str(error),
                 category=SchedulerErrorCategory.TARGET,
                 code=type(error).__name__,
                 target_unknown=True,
+            ) from error
+        except Exception as error:
+            raise SchedulerDispatchError(
+                str(error),
+                category=SchedulerErrorCategory.TARGET,
+                code=type(error).__name__,
+                retryable=True,
             ) from error
         return ScheduledTarget(
             project_id=runtime.binding.project_id,

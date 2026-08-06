@@ -254,17 +254,19 @@ class SchedulerRepository:
         misfire_grace_seconds: float | None = None,
         now: float | None = None,
         schedule_id: str | None = None,
+        connection: Connection | None = None,
     ) -> ScheduleDefinition:
         timestamp = time.time() if now is None else now
         parsed = parse_schedule(expression, timezone, anchor_utc=timestamp)
         next_run = parsed.next_after(timestamp)
         identifier = str(uuid.uuid4()) if schedule_id is None else schedule_id
-        async with self._database.transaction() as connection:
+
+        async def insert(active_connection: Connection) -> None:
             await _require_scheduler_admission(
-                connection,
+                active_connection,
                 project_id=project_id,
             )
-            await connection.execute(
+            await active_connection.execute(
                 """
                 INSERT INTO schedules(
                     id, project_id, thread_id, channel_id, kind, expression,
@@ -294,6 +296,11 @@ class SchedulerRepository:
                     timestamp,
                 ),
             )
+        if connection is None:
+            async with self._database.transaction() as active_connection:
+                await insert(active_connection)
+        else:
+            await insert(connection)
         return await self.require(identifier)
 
     async def require(self, schedule_id: str) -> ScheduleDefinition:
@@ -634,17 +641,31 @@ class SchedulerRepository:
                         AND target_started_at IS NULL
                         AND send_started_at IS NULL
                     )
+                    OR (
+                        status = 'submitting'
+                        AND COALESCE(lease_expires_at, 0) <= ?
+                        AND send_started_at IS NULL
+                        AND NOT EXISTS (
+                            SELECT 1 FROM message_queue q
+                            WHERE q.schedule_run_id = schedule_runs.run_id
+                              AND q.state NOT IN ('cancelled', 'failed')
+                        )
+                    )
                 )
                 ORDER BY planned_at_utc, created_at, run_id
                 LIMIT 1
                 """,
-                (now, now),
+                (now, now, now),
             )
             if row is None:
                 return None
             old_state = ScheduleRunState(str(row["status"]))
             attempt = int(row["attempt"])
-            if old_state in {ScheduleRunState.PENDING, ScheduleRunState.RETRY_WAIT}:
+            if old_state in {
+                ScheduleRunState.PENDING,
+                ScheduleRunState.RETRY_WAIT,
+                ScheduleRunState.SUBMITTING,
+            }:
                 attempt += 1
             if attempt > SCHEDULE_MAX_ATTEMPTS:
                 await self._finalize_in_transaction(
@@ -886,7 +907,8 @@ class SchedulerRepository:
                 """
                 SELECT b.runtime_generation, b.owner_fence_token,
                        b.binding_intent, b.attachment_state,
-                       b.permission_posture,
+                       b.permission_posture, p.state AS project_state,
+                       p.project_kind,
                        EXISTS (
                            SELECT 1 FROM session_owner_leases l
                            WHERE l.sdk_session_id = b.sdk_session_id
@@ -894,6 +916,7 @@ class SchedulerRepository:
                              AND l.expires_at > ?
                        ) AS owner_current
                 FROM session_bindings b
+                LEFT JOIN projects p ON p.id = b.project_id
                 WHERE b.thread_id = ? AND b.sdk_session_id = ?
                 """,
                 (now, target.thread_id, target.sdk_session_id),
@@ -904,6 +927,11 @@ class SchedulerRepository:
                 or binding["attachment_state"] != "attached"
                 or binding["permission_posture"] != "verified_allow_all"
                 or not bool(binding["owner_current"])
+                or binding["project_state"] == "closing"
+                or (
+                    binding["project_kind"] == "worktree"
+                    and binding["project_state"] == "retired"
+                )
             ):
                 raise SchedulerDispatchError(
                     "scheduled target lost attached runtime ownership before enqueue",
@@ -1522,13 +1550,14 @@ class SchedulerRepository:
                 SET status = 'submitting', lease_owner = NULL, lease_expires_at = NULL,
                     updated_at = ?, last_progress_at = ?
                 WHERE status IN ('claimed', 'submitting', 'retry_wait')
+                  AND COALESCE(lease_expires_at, 0) <= ?
                   AND EXISTS (
                       SELECT 1 FROM message_queue
                       WHERE schedule_run_id = schedule_runs.run_id
                         AND state NOT IN ('cancelled', 'failed')
                   )
                 """,
-                (now, now),
+                (now, now, now),
             )
             counts["dispatch_unknown"] = await _update_count(
                 connection,
@@ -1539,6 +1568,7 @@ class SchedulerRepository:
                     error_code = 'startup_send_boundary', terminal_at = ?,
                     updated_at = ?
                 WHERE status IN ('claimed', 'submitting')
+                  AND COALESCE(lease_expires_at, 0) <= ?
                   AND send_started_at IS NOT NULL
                   AND NOT EXISTS (
                       SELECT 1 FROM submissions
@@ -1549,7 +1579,7 @@ class SchedulerRepository:
                         )
                   )
                 """,
-                (now, now),
+                (now, now, now),
             )
             counts["reconciled_target"] = await _update_count(
                 connection,
@@ -1573,6 +1603,10 @@ class SchedulerRepository:
                     error_category = NULL, error_code = 'resume_creation_intent',
                     error_detail = NULL, updated_at = ?, last_progress_at = ?
                 WHERE status IN ('claimed', 'submitting', 'target_unknown')
+                  AND (
+                      status = 'target_unknown'
+                      OR COALESCE(lease_expires_at, 0) <= ?
+                  )
                   AND session_create_started_at IS NOT NULL
                   AND result_thread_id IS NULL
                   AND send_started_at IS NULL
@@ -1592,25 +1626,27 @@ class SchedulerRepository:
                       WHERE schedule_run_id = schedule_runs.run_id
                   )
                 """,
-                (now, now, now),
+                (now, now, now, now),
             )
             counts["target_unknown"] = await _update_count(
                 connection,
                 """
                 UPDATE schedule_runs
-                SET status = 'target_unknown', lease_owner = NULL,
-                    lease_expires_at = NULL, error_category = 'target',
-                    error_code = 'startup_target_boundary', terminal_at = ?,
-                    updated_at = ?
+                SET status = 'retry_wait', retry_at = ?, lease_owner = NULL,
+                    lease_expires_at = NULL, error_category = NULL,
+                    error_code = 'resume_unreconciled_target',
+                    error_detail = NULL, updated_at = ?, last_progress_at = ?
                 WHERE status IN ('claimed', 'submitting')
+                  AND COALESCE(lease_expires_at, 0) <= ?
                   AND session_create_started_at IS NOT NULL
                   AND result_thread_id IS NULL
+                  AND send_started_at IS NULL
                   AND NOT EXISTS (
                       SELECT 1 FROM message_queue
                       WHERE schedule_run_id = schedule_runs.run_id
                   )
                 """,
-                (now, now),
+                (now, now, now, now),
             )
             counts["known_target_retry"] = await _update_count(
                 connection,
@@ -1621,6 +1657,7 @@ class SchedulerRepository:
                     error_code = 'resume_known_target', error_detail = NULL,
                     updated_at = ?, last_progress_at = ?
                 WHERE status IN ('claimed', 'submitting')
+                  AND COALESCE(lease_expires_at, 0) <= ?
                   AND session_create_started_at IS NOT NULL
                   AND result_thread_id IS NOT NULL
                   AND result_session_id IS NOT NULL
@@ -1630,7 +1667,7 @@ class SchedulerRepository:
                       WHERE schedule_run_id = schedule_runs.run_id
                   )
                 """,
-                (now, now, now),
+                (now, now, now, now),
             )
             counts["retry_wait"] = await _update_count(
                 connection,
@@ -1639,6 +1676,7 @@ class SchedulerRepository:
                 SET status = 'retry_wait', lease_owner = NULL,
                     lease_expires_at = NULL, retry_at = ?, updated_at = ?
                 WHERE status IN ('claimed', 'submitting')
+                  AND COALESCE(lease_expires_at, 0) <= ?
                   AND send_started_at IS NULL
                   AND session_create_started_at IS NULL
                   AND NOT EXISTS (
@@ -1646,7 +1684,7 @@ class SchedulerRepository:
                       WHERE schedule_run_id = schedule_runs.run_id
                   )
                 """,
-                (now, now),
+                (now, now, now),
             )
             counts["outcome_unknown"] = await _update_count(
                 connection,
@@ -2138,6 +2176,10 @@ class SchedulerWorker:
 
     async def _dispatch(self, run: ScheduleRun) -> None:
         definition = await self._repository.require(run.schedule_id)
+        recovering_new_session_target = (
+            definition.kind == ScheduleKind.NEW_SESSION
+            and run.session_create_started_at is not None
+        )
         run = await self._repository.mark_target_started(
             run,
             self._owner_id,
@@ -2152,6 +2194,15 @@ class SchedulerWorker:
         try:
             if definition.kind == ScheduleKind.MESSAGE:
                 target = await self._adapter.prepare_message_target(definition, run)
+            elif recovering_new_session_target:
+                target = await self._adapter.reconcile_target(definition, run)
+                if target is None:
+                    raise SchedulerDispatchError(
+                        "new-session target reconciliation has not completed",
+                        category=SchedulerErrorCategory.TARGET,
+                        code="new_session_target_reconcile_pending",
+                        retryable=True,
+                    )
             else:
                 target = await self._adapter.prepare_new_session_target(definition, run)
             run = await self._repository.record_target(

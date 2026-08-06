@@ -7,6 +7,7 @@ import hmac
 import json
 import os
 import re
+import signal
 import sys
 import tempfile
 import time
@@ -458,22 +459,32 @@ class LiveSchedulerWorktreeHarness:
             stdout=asyncio.subprocess.DEVNULL,
             stderr=asyncio.subprocess.DEVNULL,
         )
-        deadline = asyncio.get_running_loop().time() + self.timeout_seconds
-        while not await asyncio.to_thread(marker.exists):
+        try:
+            deadline = asyncio.get_running_loop().time() + self.timeout_seconds
+            while not await asyncio.to_thread(marker.exists):
+                if process.returncode is not None:
+                    raise LiveAcceptanceError(
+                        "crash child exited before acceptance with code "
+                        f"{process.returncode}"
+                    )
+                if asyncio.get_running_loop().time() >= deadline:
+                    raise TimeoutError("crash child did not persist acceptance")
+                await asyncio.sleep(0.1)
+            child = json.loads(
+                await asyncio.to_thread(marker.read_text, encoding="utf-8")
+            )
             if process.returncode is not None:
                 raise LiveAcceptanceError(
-                    f"crash child exited before acceptance with code {process.returncode}"
+                    "crash child exited after marker before parent SIGKILL"
                 )
-            if asyncio.get_running_loop().time() >= deadline:
-                process.kill()
-                await process.wait()
-                raise TimeoutError("crash child did not persist acceptance")
-            await asyncio.sleep(0.1)
-        child = json.loads(
-            await asyncio.to_thread(marker.read_text, encoding="utf-8")
-        )
-        process.kill()
-        await process.wait()
+            returncode = await _kill_and_reap(process)
+            if returncode != -signal.SIGKILL:
+                raise LiveAcceptanceError(
+                    f"crash child exit was {returncode}, expected SIGKILL"
+                )
+        finally:
+            if process.returncode is None:
+                await _kill_and_reap(process)
         await asyncio.sleep(0.5)
 
         crash_database = Database(Path(str(child["database_path"])))
@@ -981,6 +992,17 @@ async def _git(
             f"disposable Git command failed: git {arguments[0]}"
         )
     return int(process.returncode or 0), decoded_stdout, decoded_stderr
+
+
+async def _kill_and_reap(process: asyncio.subprocess.Process) -> int:
+    if process.returncode is None:
+        process.send_signal(signal.SIGKILL)
+    waiter = asyncio.create_task(process.wait())
+    try:
+        return await asyncio.shield(waiter)
+    except asyncio.CancelledError:
+        await waiter
+        raise
 
 
 def _sanitize(value: Any, *, key: str = "") -> Any:

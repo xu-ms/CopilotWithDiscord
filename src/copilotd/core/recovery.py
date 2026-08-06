@@ -158,16 +158,34 @@ class StartupRecoveryInventory:
                 UPDATE session_creation_intents
                 SET state = 'unknown', updated_at = ?
                 WHERE state = 'creating'
+                  AND NOT EXISTS (
+                      SELECT 1 FROM session_owner_leases owner
+                      WHERE owner.sdk_session_id =
+                            session_creation_intents.sdk_session_id
+                        AND owner.expires_at > ?
+                  )
+                  AND NOT EXISTS (
+                      SELECT 1 FROM schedule_runs run
+                      WHERE session_creation_intents.source_kind = 'schedule'
+                        AND run.run_id = session_creation_intents.source_id
+                        AND run.lease_expires_at > ?
+                  )
                 """,
-                (timestamp,),
+                (timestamp, timestamp, timestamp),
             )
             counts["target_unknown_runs"] = await _update_count(
                 connection,
                 """
                 UPDATE schedule_runs
-                SET status = 'target_unknown', updated_at = ?
+                SET status = 'retry_wait', retry_at = ?,
+                    lease_owner = NULL, lease_expires_at = NULL,
+                    error_category = NULL,
+                    error_code = 'resume_unreconciled_target',
+                    error_detail = NULL, updated_at = ?
                 WHERE status IN ('claimed', 'dispatching', 'submitting')
+                  AND COALESCE(lease_expires_at, 0) <= ?
                   AND session_create_started_at IS NOT NULL
+                  AND send_started_at IS NULL
                   AND result_thread_id IS NULL
                   AND NOT EXISTS (
                       SELECT 1 FROM message_queue
@@ -184,7 +202,7 @@ class StartupRecoveryInventory:
                         )
                   )
                 """,
-                (timestamp,),
+                (timestamp, timestamp, timestamp),
             )
             counts["dispatch_unknown_runs"] = await _update_count(
                 connection,
@@ -192,6 +210,7 @@ class StartupRecoveryInventory:
                 UPDATE schedule_runs
                 SET status = 'dispatch_unknown', updated_at = ?
                 WHERE status IN ('dispatching', 'submitting')
+                  AND COALESCE(lease_expires_at, 0) <= ?
                   AND send_started_at IS NOT NULL
                   AND accepted_message_id IS NULL
                   AND NOT EXISTS (
@@ -203,7 +222,7 @@ class StartupRecoveryInventory:
                         )
                   )
                 """,
-                (timestamp,),
+                (timestamp, timestamp),
             )
             counts["retry_wait_runs"] = await _update_count(
                 connection,

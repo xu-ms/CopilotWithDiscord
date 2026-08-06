@@ -1,6 +1,7 @@
 import asyncio
 import json
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -256,3 +257,64 @@ async def test_legacy_message_schedule_requires_real_channel_timezone_and_valid_
             )
 
     assert definition.timezone == "Asia/Shanghai"
+
+
+@pytest.mark.asyncio
+async def test_message_binding_validation_and_schedule_insert_share_transaction(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    home = tmp_path / "home"
+    await asyncio.to_thread(home.mkdir)
+    async with Database(tmp_path / "schedule-binding-atomic.sqlite3") as database:
+        projects = ProjectRegistry(database, resolved_home=home)
+        await projects.initialize()
+        bindings = SessionBindingRepository(database)
+        await bindings.create(
+            thread_id="thread-1",
+            sdk_session_id="session-1",
+            cwd_snapshot=home,
+            project_source="implicit-home",
+        )
+        repository = SchedulerRepository(database)
+        commands = SchedulerCommandService(database, projects, repository)
+        insertion_entered = asyncio.Event()
+        allow_insertion = asyncio.Event()
+        original_create = repository.create
+
+        async def paused_create(**kwargs: Any) -> object:
+            assert kwargs["connection"] is not None
+            insertion_entered.set()
+            await allow_insertion.wait()
+            return await original_create(**kwargs)
+
+        monkeypatch.setattr(repository, "create", paused_create)
+        creation = asyncio.create_task(
+            commands.create_message(
+                thread_id="thread-1",
+                expression="at:2030-01-01T00:00:00Z",
+                text="atomic",
+                timezone="UTC",
+                created_by="user",
+            )
+        )
+        await insertion_entered.wait()
+        invalidation = asyncio.create_task(
+            database.execute(
+                """
+                UPDATE session_bindings SET binding_intent = 'deleting'
+                WHERE thread_id = 'thread-1'
+                """
+            )
+        )
+        await asyncio.sleep(0)
+        assert not invalidation.done()
+        allow_insertion.set()
+        definition = await creation
+        await invalidation
+        schedule = await database.fetchone(
+            "SELECT thread_id FROM schedules WHERE id = ?",
+            (definition.id,),
+        )
+
+    assert schedule["thread_id"] == "thread-1"

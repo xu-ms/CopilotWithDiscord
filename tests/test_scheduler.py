@@ -1037,18 +1037,110 @@ async def test_recovery_classifies_every_dispatch_boundary_without_reenqueue(
         "reconciled_target": 1,
         "target_unknown": 1,
         "known_target_retry": 1,
-        "retry_wait": 1,
+        "retry_wait": 0,
         "outcome_unknown": 0,
     }
     assert states[queued.run_id] == ScheduleRunState.SUBMITTING
     assert states[dispatching.run_id] == ScheduleRunState.DISPATCH_UNKNOWN
-    assert states[targeting.run_id] == ScheduleRunState.TARGET_UNKNOWN
+    assert states[targeting.run_id] == ScheduleRunState.RETRY_WAIT
     assert states[known_target.run_id] == ScheduleRunState.RETRY_WAIT
     assert states[intent_target.run_id] == ScheduleRunState.RETRY_WAIT
-    assert states[stale.run_id] == ScheduleRunState.RETRY_WAIT
+    assert states[stale.run_id] == ScheduleRunState.CLAIMED
     assert queue_count[0] == 1
-    assert target_render["session_id"] == "thread:thread-1"
+    assert target_render is None
     assert reconciled["result_thread_id"] == "intent-thread"
+
+
+@pytest.mark.asyncio
+async def test_recovered_new_session_waits_for_lease_and_reconciles_retryably(
+    tmp_path: Path,
+) -> None:
+    async with Database(tmp_path / "new-session-reconcile.sqlite3") as database:
+        repository = SchedulerRepository(database)
+        await repository.recover(now=0)
+        definition = await repository.create(
+            kind=ScheduleKind.NEW_SESSION,
+            expression="at:2030-01-01T00:00:00Z",
+            timezone="UTC",
+            payload={"text": "scheduled"},
+            target_snapshot={"execution_config": {}},
+            now=0,
+        )
+        run = await repository.run_now(definition.id, now=1, manual_id="recovery")
+        target = ScheduledTarget(
+            project_id=None,
+            thread_id="recovered-thread",
+            sdk_session_id="recovered-session",
+        )
+        await _insert_binding(
+            database,
+            thread_id=target.thread_id,
+            session_id=target.sdk_session_id,
+        )
+        await database.execute(
+            """
+            UPDATE schedule_runs
+            SET status = 'submitting', target_started_at = 1,
+                session_create_started_at = 1,
+                result_session_id = ?, lease_owner = 'dead-worker',
+                lease_expires_at = 100, attempt = 1, fence_token = 1
+            WHERE run_id = ?
+            """,
+            (target.sdk_session_id, run.run_id),
+        )
+
+        class RecoveringAdapter(DeterministicSchedulerAdapter):
+            def __init__(self) -> None:
+                super().__init__()
+                self.fail_reconcile = True
+                self.reconcile_calls: list[str] = []
+
+            async def prepare_new_session_target(
+                self,
+                _definition: ScheduleDefinition,
+                _run: ScheduleRun,
+            ) -> ScheduledTarget:
+                raise AssertionError("recovery must not create a second target")
+
+            async def reconcile_target(
+                self,
+                _definition: ScheduleDefinition,
+                recovered_run: ScheduleRun,
+            ) -> ScheduledTarget | None:
+                self.reconcile_calls.append(recovered_run.run_id)
+                if self.fail_reconcile:
+                    raise SchedulerDispatchError(
+                        "stale target owner still holds its lease",
+                        category=SchedulerErrorCategory.RUNTIME,
+                        code="stale_target_owner",
+                        retryable=True,
+                    )
+                return target
+
+        adapter = RecoveringAdapter()
+        clock = FakeClock(50)
+        worker = SchedulerWorker(repository, adapter, owner_id="recovery", clock=clock)
+
+        assert await worker.tick() == 0
+        assert adapter.reconcile_calls == []
+        clock.advance(51)
+        assert await worker.tick() == 1
+        retrying = await repository.get_run(run.run_id)
+        assert retrying.status == ScheduleRunState.RETRY_WAIT
+        assert retrying.error_code == "stale_target_owner"
+
+        adapter.fail_reconcile = False
+        clock.advance(30)
+        assert await worker.tick() == 1
+        recovered = await repository.get_run(run.run_id)
+        queue = await database.fetchone(
+            "SELECT schedule_run_id FROM message_queue WHERE schedule_run_id = ?",
+            (run.run_id,),
+        )
+
+    assert adapter.reconcile_calls == [run.run_id, run.run_id]
+    assert recovered.status == ScheduleRunState.SUBMITTING
+    assert queue["schedule_run_id"] == run.run_id
 
 
 @pytest.mark.asyncio

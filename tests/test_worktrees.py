@@ -5,8 +5,14 @@ from pathlib import Path
 
 import pytest
 
-from copilotd.core.bindings import BindingConflict, SessionBindingRepository
+from copilotd.core.bindings import (
+    AttachmentState,
+    BindingConflict,
+    SessionBindingRepository,
+)
+from copilotd.core.inbox import ReducerInbox
 from copilotd.core.projects import ProjectConfigError, ProjectRegistry
+from copilotd.core.reducer import EventReducerWorker, JournalReducer
 from copilotd.core.scheduler import (
     ScheduleConflict,
     ScheduleKind,
@@ -553,11 +559,79 @@ async def test_close_fence_blocks_new_session_and_schedule_references(
             parent_project_id=project_id,
             name="closing fence",
         )
+        bindings = SessionBindingRepository(database)
+        await bindings.create(
+            thread_id="stale-thread",
+            sdk_session_id="stale-session",
+            cwd_snapshot=created.path,
+            project_source="explicit",
+            project_id=created.project_id,
+        )
+        await database.execute(
+            """
+            UPDATE session_bindings
+            SET binding_intent = 'closed', attachment_state = 'absent',
+                runtime_remote_mode = 'off', runtime_generation = 1,
+                owner_fence_token = 7
+            WHERE thread_id = 'stale-thread'
+            """
+        )
+        stale_binding = await bindings.by_thread("stale-thread")
+        assert stale_binding is not None
         row = await database.fetchone(
             "SELECT * FROM project_worktrees WHERE intent_id = ?",
             (created.intent_id,),
         )
         await manager._begin_close(row, now=time.time())
+        with pytest.raises(BindingConflict, match="closing"):
+            await bindings.activate(stale_binding)
+        owner_leases = OwnerLeaseStore(database)
+        late_lease = await owner_leases.acquire("stale-session", "late-owner")
+        with pytest.raises(BindingConflict, match="closing"):
+            await bindings.begin_attachment(
+                thread_id="stale-thread",
+                lease=late_lease,
+                state=AttachmentState.RESUMING,
+            )
+        await owner_leases.release(late_lease)
+        await database.execute(
+            """
+            UPDATE session_bindings SET attachment_state = 'attached'
+            WHERE thread_id = 'stale-thread'
+            """
+        )
+        inbox = ReducerInbox(
+            sdk_session_id="stale-session",
+            generation=1,
+            fence_token=7,
+            capacity=16,
+            thread_id="stale-thread",
+        )
+        reducer = EventReducerWorker(
+            inbox=inbox,
+            reducer=JournalReducer(database),
+            batch_size=4,
+        )
+        reducer.start()
+        await inbox.commit_internal(
+            {
+                "type": "copilotd.submission.queued",
+                "data": {
+                    "submission_id": "stale-submission",
+                    "thread_id": "stale-thread",
+                    "prompt": "must not enqueue",
+                    "requested_mode": "interactive",
+                },
+            },
+            internal_event_id="stale-after-close",
+        )
+        stale_queue = await database.fetchone(
+            """
+            SELECT COUNT(*) FROM message_queue
+            WHERE id = 'stale-submission'
+            """
+        )
+        await reducer.stop()
 
         with pytest.raises(BindingConflict, match="closing"):
             await SessionBindingRepository(database).create(
@@ -585,6 +659,7 @@ async def test_close_fence_blocks_new_session_and_schedule_references(
         await manager.recover()
 
     assert not created.path.exists()
+    assert stale_queue[0] == 0
 
 
 @pytest.mark.asyncio

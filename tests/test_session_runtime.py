@@ -1,4 +1,5 @@
 import asyncio
+import time
 from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
@@ -335,6 +336,54 @@ async def test_runtime_preregisters_ingress_stays_alive_after_idle_and_closes_cl
 
 
 @pytest.mark.asyncio
+async def test_immediate_delivery_steers_active_turn_while_queue_waits_for_quiet(
+    tmp_path: Path,
+) -> None:
+    session_id = str(uuid4())
+    async with Database(tmp_path / "immediate-steering.sqlite3") as database:
+        bindings = SessionBindingRepository(database)
+        binding = await bindings.create(
+            thread_id="thread-1",
+            sdk_session_id=session_id,
+            cwd_snapshot=tmp_path,
+            project_source="implicit-home",
+        )
+        bridge = FakeBridge(session_id)
+        runtime = SessionRuntime(
+            database=database,
+            bridge=bridge,
+            bindings=bindings,
+            owner_leases=OwnerLeaseStore(database),
+            owner_id="process-1",
+            binding=binding,
+            queue_poll_seconds=3_600,
+        )
+        await runtime.attach_create()
+        bridge.processing = True
+        bridge.has_active_work = True
+
+        message_id = await runtime.send(
+            "steer active turn",
+            idempotency_key="active-steering",
+            mode="immediate",
+        )
+        queued_id = await runtime.send(
+            "wait for quiet",
+            idempotency_key="quiet-queue",
+            mode="enqueue",
+        )
+        queued = await database.fetchone(
+            "SELECT state FROM message_queue WHERE id = ?",
+            (queued_id,),
+        )
+        await runtime.shutdown()
+
+    assert message_id == bridge.handle.message_id
+    assert [item[0] for item in bridge.handle.sent] == ["steer active turn"]
+    assert queued["state"] == "local_queued"
+
+
+@pytest.mark.asyncio
 async def test_restart_drain_losing_queue_claim_stays_durable_and_retries(
     tmp_path: Path,
 ) -> None:
@@ -474,25 +523,36 @@ async def test_deferred_immediate_send_retries_with_new_dispatch_operation(
             WHERE key = 'restart_draining'
             """
         )
+        with pytest.raises(ValueError, match="different immutable submission"):
+            await runtime.send(
+                "different prompt",
+                idempotency_key="immediate-retry",
+                mode="immediate",
+            )
 
-        message_id = await runtime.send(
-            "immediate retry",
-            idempotency_key="immediate-retry",
-            mode="immediate",
+        pump_task = asyncio.create_task(runtime.dispatch_queued_once())
+        retry_task = asyncio.create_task(
+            runtime.send(
+                "immediate retry",
+                idempotency_key="immediate-retry",
+                mode="immediate",
+            )
         )
+        _pump_result, message_id = await asyncio.gather(pump_task, retry_task)
         operations = await database.fetchall(
             """
             SELECT idempotency_key, state FROM session_operations
-            WHERE idempotency_key LIKE 'send:immediate-retry%'
+            WHERE kind = 'send'
             ORDER BY idempotency_key
             """
         )
 
         assert message_id == bridge.handle.message_id
-        assert [dict(row) for row in operations] == [
-            {"idempotency_key": "send:immediate-retry", "state": "rejected"},
-            {"idempotency_key": "send:immediate-retry:1", "state": "confirmed"},
-        ]
+        operation_states = {
+            str(row["idempotency_key"]): str(row["state"]) for row in operations
+        }
+        assert operation_states["send:immediate-retry"] == "rejected"
+        assert list(operation_states.values()).count("confirmed") == 1
         assert len(bridge.handle.sent) == 1
         await runtime.shutdown()
 
@@ -576,6 +636,213 @@ async def test_post_claim_configuration_drift_defers_before_sdk_send(
         assert message_id == bridge.handle.message_id
         assert len(bridge.handle.sent) == 1
         await runtime.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_owner_expiry_during_final_readiness_requeues_before_sdk_send(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    session_id = str(uuid4())
+    async with Database(tmp_path / "final-owner-expiry.sqlite3") as database:
+        bindings = SessionBindingRepository(database)
+        binding = await bindings.create(
+            thread_id="thread-1",
+            sdk_session_id=session_id,
+            cwd_snapshot=tmp_path,
+            project_source="implicit-home",
+        )
+        bridge = FakeBridge(session_id)
+        runtime = SessionRuntime(
+            database=database,
+            bridge=bridge,
+            bindings=bindings,
+            owner_leases=OwnerLeaseStore(database),
+            owner_id="process-1",
+            binding=binding,
+            queue_poll_seconds=3_600,
+        )
+        await runtime.attach_create()
+        original_readiness = bridge.get_readiness
+        readiness_started = asyncio.Event()
+        continue_readiness = asyncio.Event()
+
+        async def delayed_readiness(session: FakeHandle) -> dict[str, Any]:
+            readiness_started.set()
+            await continue_readiness.wait()
+            return await original_readiness(session)
+
+        monkeypatch.setattr(bridge, "get_readiness", delayed_readiness)
+        send = asyncio.create_task(
+            runtime.send(
+                "owner expires",
+                idempotency_key="owner-expires",
+                mode="immediate",
+            )
+        )
+        await readiness_started.wait()
+        await database.execute(
+            """
+            UPDATE session_owner_leases SET expires_at = 0
+            WHERE sdk_session_id = ?
+            """,
+            (session_id,),
+        )
+        continue_readiness.set()
+
+        with pytest.raises(SubmissionClaimDeferred):
+            await asyncio.wait_for(send, timeout=2)
+        queue = await database.fetchone(
+            """
+            SELECT state, dispatch_attempt FROM message_queue
+            WHERE thread_id = 'thread-1'
+            """
+        )
+        unknown = await database.fetchone(
+            """
+            SELECT COUNT(*) FROM event_journal
+            WHERE raw_type = 'copilotd.submission.acceptance_unknown'
+            """
+        )
+        await asyncio.wait_for(runtime.shutdown(), timeout=2)
+
+    assert runtime.state == RuntimeState.FENCED
+    assert dict(queue) == {"state": "local_queued", "dispatch_attempt": 1}
+    assert unknown[0] == 0
+    assert bridge.handle.sent == []
+
+
+@pytest.mark.asyncio
+async def test_mailbox_fence_failure_before_claim_requeues_without_unknown(
+    tmp_path: Path,
+) -> None:
+    session_id = str(uuid4())
+    async with Database(tmp_path / "mailbox-fence-requeue.sqlite3") as database:
+        bindings = SessionBindingRepository(database)
+        binding = await bindings.create(
+            thread_id="thread-1",
+            sdk_session_id=session_id,
+            cwd_snapshot=tmp_path,
+            project_source="implicit-home",
+        )
+        bridge = FakeBridge(session_id)
+        runtime = SessionRuntime(
+            database=database,
+            bridge=bridge,
+            bindings=bindings,
+            owner_leases=OwnerLeaseStore(database),
+            owner_id="process-1",
+            binding=binding,
+            owner_renew_seconds=3_600,
+            queue_poll_seconds=3_600,
+        )
+        await runtime.attach_create()
+        await database.execute(
+            """
+            UPDATE session_owner_leases SET expires_at = ?
+            WHERE sdk_session_id = ?
+            """,
+            (time.time() + 10, session_id),
+        )
+
+        with pytest.raises(SubmissionClaimDeferred):
+            await runtime.send(
+                "fenced before claim",
+                idempotency_key="pre-claim-fence",
+                mode="immediate",
+            )
+        queue = await database.fetchone(
+            "SELECT state, dispatch_attempt FROM message_queue"
+        )
+        operation = await database.fetchone(
+            """
+            SELECT state, error_code FROM session_operations
+            WHERE idempotency_key = 'send:pre-claim-fence'
+            """
+        )
+        unknown = await database.fetchone(
+            """
+            SELECT COUNT(*) FROM event_journal
+            WHERE raw_type = 'copilotd.submission.acceptance_unknown'
+            """
+        )
+        await runtime.shutdown()
+
+    assert dict(queue) == {"state": "local_queued", "dispatch_attempt": 1}
+    assert dict(operation) == {
+        "state": "rejected",
+        "error_code": "owner_fence_lost_before_start",
+    }
+    assert unknown[0] == 0
+    assert bridge.handle.sent == []
+
+
+@pytest.mark.asyncio
+async def test_non_manifest_attachments_are_rejected_before_admission(
+    tmp_path: Path,
+) -> None:
+    session_id = str(uuid4())
+    async with Database(tmp_path / "attachment-admission.sqlite3") as database:
+        bindings = SessionBindingRepository(database)
+        binding = await bindings.create(
+            thread_id="thread-1",
+            sdk_session_id=session_id,
+            cwd_snapshot=tmp_path,
+            project_source="implicit-home",
+        )
+        bridge = FakeBridge(session_id)
+        runtime = SessionRuntime(
+            database=database,
+            bridge=bridge,
+            bindings=bindings,
+            owner_leases=OwnerLeaseStore(database),
+            owner_id="process-1",
+            binding=binding,
+        )
+        await runtime.attach_create()
+
+        with pytest.raises(SessionNotReady, match="durable manifest"):
+            await runtime.send(
+                "attachment",
+                idempotency_key="attachment-without-manifest",
+                attachments=[object()],
+            )
+        queue = await database.fetchone("SELECT COUNT(*) FROM message_queue")
+        await runtime.shutdown()
+
+    assert queue[0] == 0
+
+
+@pytest.mark.asyncio
+async def test_emergency_shutdown_does_not_wait_on_dead_reducer(tmp_path: Path) -> None:
+    session_id = str(uuid4())
+    async with Database(tmp_path / "dead-reducer-shutdown.sqlite3") as database:
+        bindings = SessionBindingRepository(database)
+        binding = await bindings.create(
+            thread_id="thread-1",
+            sdk_session_id=session_id,
+            cwd_snapshot=tmp_path,
+            project_source="implicit-home",
+        )
+        runtime = SessionRuntime(
+            database=database,
+            bridge=FakeBridge(session_id),
+            bindings=bindings,
+            owner_leases=OwnerLeaseStore(database),
+            owner_id="process-1",
+            binding=binding,
+            shutdown_timeout_seconds=0.05,
+        )
+        await runtime.attach_create()
+        assert runtime._reducer is not None
+        await runtime._reducer.stop()
+
+        await asyncio.wait_for(runtime.shutdown(emergency=True), timeout=1)
+        recovered = await bindings.by_thread("thread-1")
+
+    assert runtime.state == RuntimeState.RECOVERY_UNKNOWN
+    assert recovered is not None
+    assert recovered.attachment_state == AttachmentState.RECOVERY_UNKNOWN
 
 
 @pytest.mark.asyncio
@@ -1518,17 +1785,18 @@ async def test_forced_close_cancels_submission_before_atomic_dispatch_claim(
         close_task = asyncio.create_task(
             runtime.close(idempotency_key="force-close-race", force=True)
         )
-        for _ in range(50):
-            queue_row = await database.fetchone(
-                "SELECT state FROM message_queue WHERE thread_id = ?",
-                ("thread-force-close-claim",),
-            )
-            if queue_row is not None and queue_row["state"] == "cancelled":
-                break
-            await asyncio.sleep(0.005)
-        assert queue_row is not None and queue_row["state"] == "cancelled"
-
-        allow_claim.set()
+        try:
+            for _ in range(50):
+                queue_row = await database.fetchone(
+                    "SELECT state FROM message_queue WHERE thread_id = ?",
+                    ("thread-force-close-claim",),
+                )
+                if queue_row is not None and queue_row["state"] == "cancelled":
+                    break
+                await asyncio.sleep(0.005)
+            assert queue_row is not None and queue_row["state"] == "cancelled"
+        finally:
+            allow_claim.set()
         with pytest.raises(OperationRejected, match="cancelled before dispatch"):
             await send_task
         await close_task

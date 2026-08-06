@@ -137,14 +137,25 @@ def test_sparse_cron_jumps_directly_to_local_candidate(
 ) -> None:
     real_croniter = schedule_time.croniter
     calls = 0
+    candidates = 0
 
     class CountingCroniter:
         is_valid = staticmethod(real_croniter.is_valid)
 
-        def __new__(cls, *args: object, **kwargs: object) -> object:
+        def __init__(self, *args: object, **kwargs: object) -> None:
             nonlocal calls
             calls += 1
-            return real_croniter(*args, **kwargs)
+            self.inner = real_croniter(*args, **kwargs)
+
+        def get_next(self, result_type: type[datetime]) -> datetime:
+            nonlocal candidates
+            candidates += 1
+            return self.inner.get_next(result_type)
+
+        def get_prev(self, result_type: type[datetime]) -> datetime:
+            nonlocal candidates
+            candidates += 1
+            return self.inner.get_prev(result_type)
 
     monkeypatch.setattr(schedule_time, "croniter", CountingCroniter)
     parsed = parse_schedule(
@@ -157,6 +168,29 @@ def test_sparse_cron_jumps_directly_to_local_candidate(
         "2027-01-01T00:00:00Z"
     )
     assert calls <= 2
+    before_dense = calls
+    before_candidates = candidates
+    dense = parse_schedule(
+        "cron:* * * * *",
+        "UTC",
+        anchor_utc=_timestamp("2026-01-02T00:00:00Z"),
+    )
+    assert dense.next_after(_timestamp("2026-01-02T00:00:00Z")) == _timestamp(
+        "2026-01-02T00:01:00Z"
+    )
+    assert calls - before_dense == 1
+    assert candidates - before_candidates == 1
+
+    before_spring = candidates
+    spring_dense = parse_schedule(
+        "cron:* * * * *",
+        "America/New_York",
+        anchor_utc=_timestamp("2026-03-08T07:00:00Z"),
+    )
+    assert spring_dense.next_after(
+        _timestamp("2026-03-08T07:00:00Z")
+    ) == _timestamp("2026-03-08T07:01:00Z")
+    assert candidates - before_spring == 1
 
 
 def test_shift_forward_handles_date_line_sized_gap() -> None:

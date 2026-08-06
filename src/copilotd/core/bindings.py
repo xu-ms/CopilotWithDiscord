@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
 
-from aiosqlite import Row
+from aiosqlite import Connection, Row
 
 from copilotd.storage.database import Database
 from copilotd.storage.leases import OwnerLease
@@ -91,20 +91,7 @@ class SessionBindingRepository:
         timestamp = time.time() if now is None else now
         resolved_cwd = await asyncio.to_thread(_resolve_path, cwd_snapshot)
         async with self._database.transaction() as connection:
-            if project_id is not None:
-                cursor = await connection.execute(
-                    "SELECT state, project_kind FROM projects WHERE id = ?",
-                    (project_id,),
-                )
-                project = await cursor.fetchone()
-                await cursor.close()
-                if project is None:
-                    raise BindingConflict("session project does not exist")
-                if project["state"] == "closing" or (
-                    project["project_kind"] == "worktree"
-                    and project["state"] == "retired"
-                ):
-                    raise BindingConflict("session project is closing or closed")
+            await _require_project_admission(connection, project_id)
             await connection.execute(
                 """
                 INSERT INTO session_bindings(
@@ -222,6 +209,7 @@ class SessionBindingRepository:
             binding = _row_to_binding(row)
             if binding.sdk_session_id != lease.sdk_session_id:
                 raise BindingConflict("owner lease does not match session binding")
+            await _require_project_admission(connection, binding.project_id)
             if binding.binding_intent not in {BindingIntent.ACTIVE, BindingIntent.CLOSED}:
                 raise BindingConflict(
                     f"cannot attach binding with intent {binding.binding_intent}"
@@ -484,13 +472,23 @@ class SessionBindingRepository:
     ) -> SessionBinding:
         timestamp = time.time() if now is None else now
         async with self._database.transaction() as connection:
+            current = await connection.execute(
+                "SELECT * FROM session_bindings WHERE thread_id = ?",
+                (binding.thread_id,),
+            )
+            row = await current.fetchone()
+            await current.close()
+            if row is None:
+                raise BindingConflict("session binding does not exist")
+            observed = _row_to_binding(row)
+            await _require_project_admission(connection, observed.project_id)
             cursor = await connection.execute(
                 """
                 UPDATE session_bindings
                 SET binding_intent = 'active', updated_at = ?, row_version = row_version + 1
-                WHERE thread_id = ? AND binding_intent = 'closed'
+                WHERE thread_id = ? AND binding_intent = 'closed' AND row_version = ?
                 """,
-                (timestamp, binding.thread_id),
+                (timestamp, binding.thread_id, observed.row_version),
             )
             if cursor.rowcount != 1:
                 await cursor.close()
@@ -576,3 +574,23 @@ def _row_to_binding(row: Row) -> SessionBinding:
 
 def _resolve_path(path: Path) -> Path:
     return path.expanduser().resolve()
+
+
+async def _require_project_admission(
+    connection: Connection,
+    project_id: str | None,
+) -> None:
+    if project_id is None:
+        return
+    cursor = await connection.execute(
+        "SELECT state, project_kind FROM projects WHERE id = ?",
+        (project_id,),
+    )
+    project = await cursor.fetchone()
+    await cursor.close()
+    if project is None:
+        raise BindingConflict("session project does not exist")
+    if project["state"] == "closing" or (
+        project["project_kind"] == "worktree" and project["state"] == "retired"
+    ):
+        raise BindingConflict("session project is closing or closed")

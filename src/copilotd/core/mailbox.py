@@ -32,6 +32,10 @@ class OperationRejected(RuntimeError):
     pass
 
 
+class OperationDeferred(OperationRejected):
+    pass
+
+
 class OperationAmbiguous(RuntimeError):
     pass
 
@@ -55,6 +59,8 @@ class _MailboxItem:
     record: OperationRecord
     operation: OperationCallable
     future: asyncio.Future[Any]
+    defer_on_fence_loss: bool
+    on_fence_deferred: OperationCallable | None
 
 
 class OperationStore:
@@ -183,6 +189,38 @@ class OperationStore:
             ),
         )
 
+    async def settle_deferred(
+        self,
+        record: OperationRecord,
+        *,
+        error_code: str,
+        now: float | None = None,
+    ) -> OperationRecord:
+        timestamp = time.time() if now is None else now
+        changed = await self._database.execute_count(
+            """
+            UPDATE session_operations
+            SET state = 'rejected', error_code = ?, settled_at = ?
+            WHERE operation_id = ?
+              AND (
+                  state IN ('pending', 'started')
+                  OR (state = 'unknown' AND error_code = 'owner_fence_takeover')
+              )
+            """,
+            (error_code, timestamp, record.operation_id),
+        )
+        if changed != 1:
+            raise OperationAmbiguous(
+                f"deferred operation changed concurrently: {record.operation_id}"
+            )
+        row = await self._database.fetchone(
+            "SELECT * FROM session_operations WHERE operation_id = ?",
+            (record.operation_id,),
+        )
+        if row is None:
+            raise RuntimeError(f"operation disappeared: {record.operation_id}")
+        return _row_to_record(row)
+
 
 class CommandMailbox:
     """Serializes every app-owned mutating or exclusive SDK operation."""
@@ -268,6 +306,37 @@ class CommandMailbox:
         self._futures.clear()
         self._worker = None
 
+    async def emergency_stop(self, *, timeout_seconds: float = 5) -> None:
+        async with self._submission_lock:
+            self._accepting = False
+        worker = self._worker
+        if worker is not None:
+            worker.cancel()
+            try:
+                async with asyncio.timeout(timeout_seconds):
+                    await asyncio.gather(worker, return_exceptions=True)
+            except TimeoutError:
+                worker.add_done_callback(_consume_task_result)
+        while True:
+            try:
+                item = self._queue.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+            if item is not None and not item.future.done():
+                item.future.set_exception(
+                    OperationAmbiguous(
+                        f"operation {item.record.operation_id} was emergency-stopped"
+                    )
+                )
+            self._queue.task_done()
+        for future in self._futures.values():
+            if not future.done():
+                future.set_exception(
+                    OperationAmbiguous("operation was interrupted by emergency shutdown")
+                )
+        self._futures.clear()
+        self._worker = None
+
     async def submit(
         self,
         *,
@@ -275,6 +344,8 @@ class CommandMailbox:
         idempotency_key: str,
         input_payload: Any,
         operation: OperationCallable,
+        defer_on_fence_loss: bool = False,
+        on_fence_deferred: OperationCallable | None = None,
     ) -> Any:
         if not self._accepting:
             raise RuntimeError("command mailbox is not accepting operations")
@@ -296,7 +367,15 @@ class CommandMailbox:
 
                 future = asyncio.get_running_loop().create_future()
                 self._futures[idempotency_key] = future
-                await self._queue.put(_MailboxItem(record, operation, future))
+                await self._queue.put(
+                    _MailboxItem(
+                        record,
+                        operation,
+                        future,
+                        defer_on_fence_loss,
+                        on_fence_deferred,
+                    )
+                )
         try:
             return await asyncio.shield(future)
         finally:
@@ -314,6 +393,13 @@ class CommandMailbox:
     async def _execute(self, item: _MailboxItem) -> None:
         record = item.record
         if not await self._fence_validator():
+            if item.defer_on_fence_loss:
+                await self._defer_for_fence_loss(
+                    item,
+                    record,
+                    error_code="owner_fence_lost_before_start",
+                )
+                return
             record = await self._store.transition(
                 record,
                 state=OperationState.UNKNOWN,
@@ -326,6 +412,13 @@ class CommandMailbox:
 
         record = await self._store.transition(record, state=OperationState.STARTED)
         if not await self._fence_validator():
+            if item.defer_on_fence_loss:
+                await self._defer_for_fence_loss(
+                    item,
+                    record,
+                    error_code="owner_fence_lost_before_dispatch",
+                )
+                return
             record = await self._store.transition(
                 record,
                 state=OperationState.UNKNOWN,
@@ -347,6 +440,16 @@ class CommandMailbox:
                 OperationAmbiguous(f"operation {record.operation_id} was interrupted")
             )
             raise
+        except OperationDeferred as error:
+            try:
+                await self._store.settle_deferred(
+                    record,
+                    error_code=type(error).__name__,
+                )
+            except OperationAmbiguous as settle_error:
+                item.future.set_exception(settle_error)
+            else:
+                item.future.set_exception(error)
         except OperationRejected as error:
             await self._store.transition(
                 record,
@@ -385,6 +488,36 @@ class CommandMailbox:
                 )
             else:
                 item.future.set_result(result)
+
+    async def _defer_for_fence_loss(
+        self,
+        item: _MailboxItem,
+        record: OperationRecord,
+        *,
+        error_code: str,
+    ) -> None:
+        callback_error: Exception | None = None
+        if item.on_fence_deferred is not None:
+            try:
+                await item.on_fence_deferred()
+            except Exception as error:
+                callback_error = error
+        try:
+            await self._store.settle_deferred(record, error_code=error_code)
+        except OperationAmbiguous as error:
+            item.future.set_exception(error)
+        else:
+            detail = (
+                ""
+                if callback_error is None
+                else f"; durable requeue initially failed: {callback_error}"
+            )
+            item.future.set_exception(
+                OperationDeferred(
+                    f"owner fence prevented operation {record.operation_id} "
+                    f"from dispatch{detail}"
+                )
+            )
 
 
 def _settled_result(record: OperationRecord) -> Any:
