@@ -3667,6 +3667,34 @@ class JournalReducer:
         data: dict[str, Any],
         now: float,
     ) -> None:
+        aborted = bool(data.get("aborted"))
+        await connection.execute(
+            """
+            INSERT INTO agent_loop_projections(
+                sdk_session_id, runtime_generation, owner_fence_token,
+                state, stop_reason, source_hook_audit_id, source_event_id,
+                observed_at, stale
+            ) VALUES (?, ?, ?, ?, ?, NULL, ?, ?, 0)
+            ON CONFLICT(sdk_session_id) DO UPDATE SET
+                runtime_generation = excluded.runtime_generation,
+                owner_fence_token = excluded.owner_fence_token,
+                state = excluded.state,
+                stop_reason = excluded.stop_reason,
+                source_hook_audit_id = NULL,
+                source_event_id = excluded.source_event_id,
+                observed_at = excluded.observed_at,
+                stale = 0
+            """,
+            (
+                event.sdk_session_id,
+                event.generation,
+                event.fence_token,
+                "aborted" if aborted else "idle",
+                "session_idle_aborted" if aborted else "session_idle",
+                event.event_id,
+                event.received_at,
+            ),
+        )
         cursor = await connection.execute(
             """
             SELECT submission_id, requested_mode, task_completion_outcome,
@@ -3682,7 +3710,6 @@ class JournalReducer:
         await cursor.close()
         if not candidates:
             return
-        aborted = bool(data.get("aborted"))
         for candidate in candidates:
             submission_id = str(candidate["submission_id"])
             mode = candidate["requested_mode"]

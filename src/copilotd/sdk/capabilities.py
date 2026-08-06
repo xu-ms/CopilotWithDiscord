@@ -24,7 +24,7 @@ MAIN_BRANCH_ONLY_EVENTS = (
     "session.context_cleared",
 )
 CHECKED_CAPABILITY_FIXTURE_SHA256 = (
-    "83c95eda60f87d90388cadd64254a3922b99cbab90ccb04947913e0d9e534e6a"
+    "19d1e08091c55b0fc06ee22172f5ebf2f5c79407c780d6f191613db76df72b12"
 )
 
 _REQUIRED_CAPABILITIES = frozenset(
@@ -35,6 +35,8 @@ _REQUIRED_CAPABILITIES = frozenset(
         "context_info",
         "detached_continuation",
         "event_log",
+        "hook_agent_stop",
+        "hook_user_prompt_transformed",
         "config_reattach",
         "managed_permission_handler",
         "mcp_http",

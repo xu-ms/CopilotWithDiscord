@@ -960,6 +960,38 @@ async def test_managed_settings_events_drive_durable_permission_block_state(
 
 
 @pytest.mark.asyncio
+async def test_session_idle_is_the_supported_agent_loop_observation(
+    tmp_path: Path,
+) -> None:
+    async with Database(tmp_path / "agent-loop-idle.sqlite3") as database:
+        await _insert_projection_binding(database, "session-agent-loop")
+        await JournalReducer(database).persist(
+            [
+                _adapted(
+                    "session.idle",
+                    {"aborted": False},
+                    1,
+                    session_id="session-agent-loop",
+                )
+            ]
+        )
+        row = await database.fetchone(
+            """
+            SELECT state, stop_reason, source_hook_audit_id,
+                   source_event_id, stale
+            FROM agent_loop_projections
+            WHERE sdk_session_id = 'session-agent-loop'
+            """
+        )
+
+    assert row["state"] == "idle"
+    assert row["stop_reason"] == "session_idle"
+    assert row["source_hook_audit_id"] is None
+    assert row["source_event_id"] is not None
+    assert row["stale"] == 0
+
+
+@pytest.mark.asyncio
 async def test_subagent_output_stays_in_one_collapsed_taskdeck(tmp_path: Path) -> None:
     started = SessionEvent(
         data=SubagentStartedData(

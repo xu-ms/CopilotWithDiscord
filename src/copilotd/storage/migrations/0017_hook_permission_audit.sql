@@ -46,6 +46,7 @@ CREATE TABLE agent_loop_projections (
     state TEXT NOT NULL,
     stop_reason TEXT,
     source_hook_audit_id TEXT REFERENCES hook_audit_events(audit_id),
+    source_event_id TEXT,
     observed_at REAL NOT NULL,
     stale INTEGER NOT NULL DEFAULT 0
 );

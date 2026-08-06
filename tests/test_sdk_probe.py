@@ -42,6 +42,11 @@ def test_checked_fixture_hash_and_identity_are_valid(tmp_path: Path) -> None:
     assert manifest.generated_event_count == 114
     assert manifest.supports("event_log")
     assert not manifest.supports("detached_continuation")
+    assert not manifest.supports("hook_agent_stop")
+    assert not manifest.supports("hook_user_prompt_transformed")
+    assert not manifest.supports("protocol_sampling_response")
+    assert not manifest.supports("protocol_session_limits_response")
+    assert not manifest.supports("protocol_mcp_headers_response")
 
 
 def test_checked_fixture_rejects_tampering(tmp_path: Path) -> None:
@@ -182,9 +187,7 @@ def test_unprobed_live_capabilities_merge_checked_facts_without_erasing_support(
     assert merged.supports("native_schedule")
     assert merged.supports("model_config")
     assert merged.supports("remote")
-    assert merged.capabilities["native_schedule"].evidence_kind.startswith(
-        "checked-fallback:"
-    )
+    assert merged.capabilities["native_schedule"].evidence_kind.startswith("checked-fallback:")
 
     live["native_schedule_direct"] = CapabilityResult(
         False,
@@ -193,10 +196,7 @@ def test_unprobed_live_capabilities_merge_checked_facts_without_erasing_support(
     probe._write_matrix(probe._live_matrix(live, fixture, fixture_hash))
     explicit_negative = CapabilityRegistry(settings).resolve(live["runtime"])
     assert not explicit_negative.supports("native_schedule")
-    assert (
-        explicit_negative.capabilities["native_schedule"].evidence_kind
-        == "live-command-probe"
-    )
+    assert explicit_negative.capabilities["native_schedule"].evidence_kind == "live-command-probe"
 
     live.pop("native_schedule_direct")
     unknown_error = probe._live_matrix(live, fixture, fixture_hash)
@@ -208,7 +208,4 @@ def test_unprobed_live_capabilities_merge_checked_facts_without_erasing_support(
     probe._write_matrix(unknown_error)
     preserved_unknown = CapabilityRegistry(settings).resolve(live["runtime"])
     assert not preserved_unknown.supports("remote")
-    assert (
-        preserved_unknown.capabilities["remote"].evidence_kind
-        == "live-rpc-error"
-    )
+    assert preserved_unknown.capabilities["remote"].evidence_kind == "live-rpc-error"

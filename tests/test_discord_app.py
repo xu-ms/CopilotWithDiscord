@@ -29,6 +29,7 @@ def test_discord_command_manifest_has_core_modes_and_no_deleted_roots(tmp_path: 
     bot = CopilotDiscordBot(Settings(data_dir=tmp_path))
     bot._register_application_commands()
     roots = {command.name for command in bot.tree.get_commands()}
+    project = bot.tree.get_command("project")
 
     assert {
         "session",
@@ -58,6 +59,8 @@ def test_discord_command_manifest_has_core_modes_and_no_deleted_roots(tmp_path: 
         }
         & roots
     )
+    assert project is not None
+    assert "config-reload" in {command.name for command in project.commands}
 
 
 def test_discord_registration_omits_commands_without_capability_evidence(

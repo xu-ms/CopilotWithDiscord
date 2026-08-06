@@ -52,6 +52,16 @@
       "evidence_kind": "live-rpc-fixture",
       "detail": "eventLog.tail/read returned opaque cursors, cursor status, and event batches"
     },
+    "hook_agent_stop": {
+      "supported": false,
+      "evidence_kind": "live-negative-fixture",
+      "detail": "SDK 1.0.8 accepted the callback key but never invoked it; session.idle drives the observable agent-loop projection instead"
+    },
+    "hook_user_prompt_transformed": {
+      "supported": false,
+      "evidence_kind": "live-negative-fixture",
+      "detail": "SDK 1.0.8 accepted the callback key but never invoked it; copilotD does not advertise or register the silent hook"
+    },
     "managed_permission_handler": {
       "supported": true,
       "evidence_kind": "live-extension-acceptance",
@@ -113,9 +123,9 @@
       "detail": "registered external tool handler ran exactly once and emitted requested/completed"
     },
     "protocol_mcp_headers_response": {
-      "supported": true,
-      "evidence_kind": "live-rpc-negative-id",
-      "detail": "generated headers response RPC was accepted by runtime and returned false for a missing request ID"
+      "supported": null,
+      "evidence_kind": "unprobed",
+      "detail": "generated RPC exists, but no real headers-refresh request was triggered, settled, and completed"
     },
     "protocol_mcp_oauth": {
       "supported": true,
@@ -123,14 +133,14 @@
       "detail": "loopback OAuth challenge invoked host token handler, connected, listed tools, and emitted required/completed"
     },
     "protocol_sampling_response": {
-      "supported": true,
-      "evidence_kind": "live-rpc-negative-id",
-      "detail": "generated sampling response RPC returned false for a missing request ID; a real MCP sampling attempt did not emit a request on this runtime"
+      "supported": null,
+      "evidence_kind": "unprobed",
+      "detail": "a real MCP sampling attempt did not emit a request; missing-ID RPC behavior is not support evidence"
     },
     "protocol_session_limits_response": {
-      "supported": true,
-      "evidence_kind": "live-rpc-negative-id",
-      "detail": "generated session-limit response RPC returned false for a missing request ID; no editable limit was created"
+      "supported": null,
+      "evidence_kind": "unprobed",
+      "detail": "no real session-limit request was triggered, settled, and completed; no editable limit was created"
     },
     "reasoning_summary_readback": {
       "supported": false,

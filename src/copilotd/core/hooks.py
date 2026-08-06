@@ -58,11 +58,9 @@ class SessionHookAudit:
             "on_post_tool_use": self.on_post_tool_use,
             "on_post_tool_use_failure": self.on_post_tool_use_failure,
             "on_user_prompt_submitted": self.on_user_prompt_submitted,
-            "on_user_prompt_transformed": self.on_user_prompt_transformed,
             "on_session_start": self.on_session_start,
             "on_session_end": self.on_session_end,
             "on_error_occurred": self.on_error_occurred,
-            "on_agent_stop": self.on_agent_stop,
         }
 
     async def on_pre_tool_use(

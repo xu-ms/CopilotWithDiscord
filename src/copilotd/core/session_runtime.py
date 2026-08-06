@@ -18,6 +18,11 @@ from copilotd.core.bindings import (
     SessionBindingRepository,
 )
 from copilotd.core.extensions import (
+    ConfigReloadClaim,
+    ConfigReloadClaimStore,
+    ConfigReloadState,
+    ExtensionConfigConflict,
+    ExtensionConfigError,
     ExtensionConfigRepository,
     ExtensionConfigSnapshot,
     ProjectExtensionConfig,
@@ -84,6 +89,8 @@ class SessionHandle(Protocol):
 
 
 class RuntimeBridge(Protocol):
+    def managed_settings_available(self) -> bool: ...
+
     async def create_session(
         self,
         *,
@@ -207,6 +214,10 @@ class RuntimeState(StrEnum):
 
 
 class SessionAttachUnknown(RuntimeError):
+    pass
+
+
+class SessionAttachRejected(RuntimeError):
     pass
 
 
@@ -730,22 +741,79 @@ class SessionRuntime:
             cwd=self.binding.cwd_snapshot,
             config_version=1,
         )
-        snapshot = (
-            await repository.latest(project)
-            if config is None
-            else await repository.publish(
-                project,
-                config,
-                expected_current_version=expected_project_config_version,
-            )
+        existing_snapshot = await repository.latest(project) if config is None else None
+        normalized_config = (
+            existing_snapshot.config
+            if existing_snapshot is not None
+            else config.normalized(project.cwd)
+            if config is not None
+            else ProjectExtensionConfig()
         )
-        snapshot.sdk_session_options()
+        config_hash = normalized_config.digest()
+        claim_store = ConfigReloadClaimStore(self._database)
+        claim, created = await claim_store.claim(
+            sdk_session_id=self.binding.sdk_session_id,
+            idempotency_key=idempotency_key,
+            config_hash=config_hash,
+            runtime_generation=self.binding.runtime_generation,
+            owner_fence_token=self._require_fence_token(),
+        )
+        if not created:
+            return await self._replay_config_reload_claim(
+                claim,
+                repository,
+                claim_store,
+            )
+        try:
+            preflight = ExtensionConfigSnapshot(
+                scope_key=extension_scope_key(
+                    self.binding.project_source,
+                    self.binding.project_id,
+                ),
+                version=0,
+                project_id=self.binding.project_id,
+                project_source=self.binding.project_source,
+                cwd_snapshot=self.binding.cwd_snapshot,
+                config_hash=config_hash,
+                config=normalized_config,
+            )
+            preflight.sdk_session_options()
+            snapshot = (
+                existing_snapshot
+                if existing_snapshot is not None
+                else await repository.publish(
+                    project,
+                    normalized_config,
+                    expected_current_version=expected_project_config_version,
+                )
+            )
+            if snapshot.config_hash != config_hash:
+                raise ExtensionConfigConflict(
+                    "published extension config hash changed during reload"
+                )
+            claim = await claim_store.transition(
+                claim,
+                ConfigReloadState.STARTED,
+                config_version=snapshot.version,
+            )
+        except (ExtensionConfigError, ValueError) as error:
+            await claim_store.transition(
+                claim,
+                ConfigReloadState.REJECTED,
+                error_code=type(error).__name__,
+            )
+            raise
         if (
             snapshot.version == self.binding.desired_session_config_version
             and snapshot.config_hash == self.binding.desired_session_config_hash
             and snapshot.version == self.binding.runtime_session_config_version
             and snapshot.config_hash == self.binding.runtime_session_config_hash
         ):
+            await claim_store.transition(
+                claim,
+                ConfigReloadState.CONFIRMED,
+                config_version=snapshot.version,
+            )
             return snapshot
         transition_id = str(
             uuid.uuid5(
@@ -778,6 +846,12 @@ class SessionRuntime:
             try:
                 await self._sdk_call(self._require_handle().disconnect())
             except Exception as error:
+                await claim_store.transition(
+                    claim,
+                    ConfigReloadState.UNKNOWN,
+                    config_version=snapshot.version,
+                    error_code=type(error).__name__,
+                )
                 await inbox.commit_internal(
                     {
                         "type": "copilotd.config.unknown",
@@ -807,6 +881,12 @@ class SessionRuntime:
                 target_config_version=snapshot.version,
             )
         except BaseException as error:
+            await claim_store.transition(
+                claim,
+                ConfigReloadState.UNKNOWN,
+                config_version=snapshot.version,
+                error_code=type(error).__name__,
+            )
             await self._cleanup_failed_attach(error)
             raise
         current = await self._bindings.by_thread(self.binding.thread_id)
@@ -819,8 +899,77 @@ class SessionRuntime:
             or current.session_config_state != "synced"
         ):
             self.state = RuntimeState.DEGRADED
+            await claim_store.transition(
+                claim,
+                ConfigReloadState.UNKNOWN,
+                config_version=snapshot.version,
+                error_code="ConfigReadbackMismatch",
+            )
             raise SessionAttachUnknown("config reattach could not be durably confirmed")
+        await claim_store.transition(
+            claim,
+            ConfigReloadState.CONFIRMED,
+            config_version=snapshot.version,
+        )
         return snapshot
+
+    async def _replay_config_reload_claim(
+        self,
+        claim: ConfigReloadClaim,
+        repository: ExtensionConfigRepository,
+        claim_store: ConfigReloadClaimStore,
+    ) -> ExtensionConfigSnapshot:
+        if claim.state == ConfigReloadState.CONFIRMED and claim.config_version is not None:
+            snapshot = await repository.for_session(
+                project_source=self.binding.project_source,
+                project_id=self.binding.project_id,
+                cwd_snapshot=self.binding.cwd_snapshot,
+                version=claim.config_version,
+            )
+            if snapshot.config_hash != claim.config_hash:
+                raise ExtensionConfigConflict(
+                    "confirmed config reload claim no longer matches its generation"
+                )
+            return snapshot
+        if claim.state in {
+            ConfigReloadState.CLAIMED,
+            ConfigReloadState.STARTED,
+            ConfigReloadState.UNKNOWN,
+        }:
+            current = await self._bindings.by_thread(self.binding.thread_id)
+            if current is not None:
+                config_version = (
+                    claim.config_version
+                    if claim.config_version is not None
+                    else current.desired_session_config_version
+                )
+                durable_match = (
+                    current.session_config_state == "synced"
+                    and current.desired_session_config_version == config_version
+                    and current.runtime_session_config_version == config_version
+                    and current.desired_session_config_hash == claim.config_hash
+                    and current.runtime_session_config_hash == claim.config_hash
+                )
+                if durable_match:
+                    snapshot = await repository.for_session(
+                        project_source=current.project_source,
+                        project_id=current.project_id,
+                        cwd_snapshot=current.cwd_snapshot,
+                        version=config_version,
+                    )
+                    if snapshot.config_hash != claim.config_hash:
+                        raise ExtensionConfigConflict(
+                            "durable config readback does not match reload claim"
+                        )
+                    await claim_store.transition(
+                        claim,
+                        ConfigReloadState.CONFIRMED,
+                        config_version=config_version,
+                    )
+                    return snapshot
+        if claim.state == ConfigReloadState.REJECTED:
+            raise OperationRejected(f"config reload was rejected: {claim.error_code or 'unknown'}")
+        raise OperationAmbiguous(f"config reload outcome is {claim.state}: {claim.idempotency_key}")
 
     async def _request_snapshot(self, topic: str) -> int:
         request_id = str(uuid.uuid4())
@@ -2188,6 +2337,10 @@ class SessionRuntime:
         reuse_owner: bool = False,
         target_config_version: int | None = None,
     ) -> None:
+        if not self._bridge.managed_settings_available():
+            raise SessionAttachRejected(
+                "managed settings cannot be resolved without explicit session credentials"
+            )
         config_version = (
             target_config_version
             or self.binding.pending_session_config_version
@@ -2510,7 +2663,10 @@ class SessionRuntime:
                 config_hash=snapshot.config_hash,
             ),
         )
-        self._permission_handler = ManagedAwarePermissionHandler(self._audit_permission)
+        self._permission_handler = ManagedAwarePermissionHandler(
+            self._audit_permission,
+            self._is_mutation_safe_owner,
+        )
         self._permission_handler.set_managed_permissions_blocked(
             self.binding.managed_permissions_blocked
         )

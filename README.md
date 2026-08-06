@@ -11,8 +11,8 @@ The implementation follows [`docs/copilotD-detailed-design.md`](docs/copilotD-de
 
 - Exact SDK/runtime/protocol startup assertion (`1.0.8` / `1.0.73` / `3`) backed
   by persisted, hash-checked capability evidence rather than generated method presence.
-- Bundled Copilot runtime launched with `--yolo`, with allow-all verified on every
-  create/resume and reconciled again after runtime permission-change events.
+- Bundled Copilot runtime launched with `--yolo`, with managed policy resolved from an
+  explicit session credential before allow-all is verified on every create/resume.
 - One long-lived SDK session per Discord thread, eager resume, owner fencing, and
   conservative unknown outcomes across crash windows.
 - Explicit channel project bindings with immutable cwd snapshots; unbound channels
@@ -32,9 +32,10 @@ The implementation follows [`docs/copilotD-detailed-design.md`](docs/copilotD-de
 - Immutable, versioned create/resume configuration for custom agents, skill/plugin
   directories, disabled skills, stdio/HTTP MCP servers, and environment references,
   including same-owner-fence config reattach and restart recovery.
-- Typed callback hooks with redacted audit projections; managed-aware permission
-  handling; JSON-Schema elicitation; MCP OAuth; and exactly-once protocol response
-  planes for external tools, limits, sampling, and dynamic MCP headers.
+- Supported 1.0.8 callback hooks with redacted audit projections; managed-aware,
+  owner-fenced permission handling; JSON-Schema elicitation; MCP OAuth; and exactly-once
+  protocol response implementations. Sampling, limits, and dynamic-header responses stay
+  capability-gated until a real request/response/completion fixture succeeds.
 - Durable mode/model per-field reconciliation (including gated reasoning-summary
   readback), MCP/extension health, and stale-aware usage/context projections.
 - Background task `refresh/list` reconciliation, disappearance-to-unknown handling,
@@ -53,12 +54,15 @@ disconnect, so the current topology is bundled-runtime rather than detached exec
 
 ## Setup
 
-Python 3.11 or newer and an authenticated GitHub Copilot CLI identity are required.
+Python 3.11 or newer, an explicit GitHub token, and a Discord token are required. A
+logged-in CLI identity alone is intentionally insufficient because managed organization
+policy cannot be resolved for each session without a session credential.
 
 ```bash
 python3.11 -m venv .venv
 .venv/bin/pip install -e '.[dev]'
 export COPILOTD_DISCORD_TOKEN='...'
+export COPILOTD_GITHUB_TOKEN='...'
 .venv/bin/copilotd setup
 ```
 
@@ -77,6 +81,17 @@ Useful operations:
 .venv/bin/copilotd service restart
 .venv/bin/copilotd doctor
 ```
+
+Project extension configuration is loaded from the immutable project snapshot at
+`.copilotd/extensions.json`. The JSON accepts the typed custom-agent, skill directory,
+disabled-skill, plugin directory, MCP server, and environment-reference fields documented
+by the SDK adapter; store environment variable names, never secret values. New sessions
+ingest the file automatically. Inside an idle session thread, `/project config-reload`
+publishes a new generation and performs a fenced same-session reattach.
+
+SDK 1.0.8 does not invoke `on_user_prompt_transformed` or `on_agent_stop`; copilotD does
+not register those silent callbacks. Durable `session.idle` events provide the supported
+agent-loop observation instead.
 
 ## Development
 
@@ -97,9 +112,9 @@ disposable persistent session:
 .venv/bin/copilotd sdk-probe --live
 ```
 
-The full protocol/extension acceptance uses disposable local stdio and HTTP MCP
-servers, requires the selected runtime to be authenticated, sanitizes its evidence,
-and removes every temporary session:
+The full protocol/extension acceptance uses an explicit token with auto-login disabled,
+disposable local stdio and HTTP MCP servers, sanitizes its evidence, and removes every
+temporary session:
 
 ```bash
 .venv/bin/copilotd sdk-probe --live-extensions

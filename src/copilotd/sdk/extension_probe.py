@@ -36,6 +36,7 @@ from copilotd.core.extensions import (
 )
 from copilotd.core.projects import ProjectRegistry
 from copilotd.core.session_runtime import SessionRuntime
+from copilotd.core.task_registry import TaskRegistry
 from copilotd.sdk.bridge import CopilotBridge, ManagedAwarePermissionHandler
 from copilotd.storage.database import Database
 from copilotd.storage.leases import OwnerLeaseStore
@@ -145,6 +146,25 @@ class ExtensionAcceptanceProbe:
         permission_audits: list[dict[str, Any]] = []
         elicitation_calls: list[dict[str, Any]] = []
         external_calls: list[Any] = []
+        permission_database = Database(workspace / "permission-fence.sqlite3")
+        await permission_database.open()
+        permission_leases = OwnerLeaseStore(
+            permission_database,
+            ttl_seconds=max(wait_seconds * 4, 600),
+        )
+        permission_lease = await permission_leases.acquire(
+            session_id,
+            "extension-acceptance",
+        )
+        response_tasks = TaskRegistry()
+        response_results: dict[str, list[bool]] = {
+            "sampling": [],
+            "session_limits": [],
+            "mcp_headers": [],
+        }
+        session_holder: dict[str, Any] = {}
+        deferred_responses: list[tuple[str, str]] = []
+        loop = asyncio.get_running_loop()
         local_server = _fixture_path("disposable_mcp_server.py")
         skill_directory, plugin_directory = await asyncio.to_thread(
             _create_extension_fixtures,
@@ -214,7 +234,98 @@ class ExtensionAcceptanceProbe:
         ]
 
         async def permission_audit(payload: dict[str, Any]) -> None:
+            await permission_database.execute(
+                """
+                INSERT INTO permission_audit_events(
+                    audit_id, sdk_session_id, runtime_generation,
+                    owner_fence_token, request_id, permission_kind,
+                    managed_settings, managed_approval_required,
+                    decision, request_hash, observed_at
+                ) VALUES (?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    str(uuid.uuid4()),
+                    session_id,
+                    permission_lease.fence_token,
+                    payload.get("request_id"),
+                    str(payload["permission_kind"]),
+                    int(bool(payload.get("managed_settings"))),
+                    int(bool(payload.get("managed_approval_required"))),
+                    str(payload["decision"]),
+                    str(payload["request_hash"]),
+                    time.time(),
+                ),
+            )
             permission_audits.append(payload)
+
+        async def approval_fence_valid() -> bool:
+            return await permission_leases.has_mutation_headroom(permission_lease)
+
+        permission_handler = ManagedAwarePermissionHandler(
+            permission_audit,
+            approval_fence_valid,
+        )
+
+        async def respond_to_protocol_request(kind: str, request_id: str) -> None:
+            active_session = session_holder["session"]
+            if kind == "sampling":
+                accepted = await bridge.respond_sampling(
+                    active_session,
+                    request_id,
+                    None,
+                )
+            elif kind == "session_limits":
+                accepted = await bridge.respond_session_limits(
+                    active_session,
+                    request_id,
+                )
+            else:
+                accepted = await bridge.respond_mcp_headers(
+                    active_session,
+                    request_id,
+                    None,
+                )
+            response_results[kind].append(accepted)
+
+        def schedule_protocol_response(kind: str, request_id: str) -> None:
+            if "session" not in session_holder:
+                deferred_responses.append((kind, request_id))
+                return
+            response_tasks.create(
+                respond_to_protocol_request(kind, request_id),
+                name=f"acceptance-{kind}-{request_id}",
+                source="extension-acceptance",
+                session_id=session_id,
+            )
+
+        def on_event(event: Any) -> None:
+            raw_type = event.type.value
+            events.append(raw_type)
+            data = event.to_dict().get("data", {})
+            if raw_type in {
+                "session.managed_settings_resolved",
+                "session.managed_settings_enforced",
+            } and isinstance(data, dict):
+                permission_handler.set_managed_permissions_blocked(
+                    raw_type.endswith("_enforced")
+                    or bool(data.get("bypassPermissionsDisabled"))
+                    or bool(data.get("failClosed"))
+                )
+            response_kind = {
+                "sampling.requested": "sampling",
+                "session_limits_exhausted.requested": "session_limits",
+                "mcp.headers_refresh_required": "mcp_headers",
+            }.get(raw_type)
+            if (
+                response_kind is not None
+                and isinstance(data, dict)
+                and data.get("requestId") is not None
+            ):
+                loop.call_soon_threadsafe(
+                    schedule_protocol_response,
+                    response_kind,
+                    str(data["requestId"]),
+                )
 
         async def elicitation_handler(context: dict[str, Any]) -> dict[str, Any]:
             elicitation_calls.append(context)
@@ -229,12 +340,16 @@ class ExtensionAcceptanceProbe:
             session = await bridge.create_session(
                 session_id=session_id,
                 working_directory=str(workspace),
-                on_event=lambda event: events.append(event.type.value),
-                permission_handler=ManagedAwarePermissionHandler(permission_audit),
+                on_event=on_event,
+                permission_handler=permission_handler,
                 hooks=hooks,
                 on_elicitation_request=elicitation_handler,
                 session_options=session_options,
             )
+            session_holder["session"] = session
+            for kind, request_id in deferred_responses:
+                schedule_protocol_response(kind, request_id)
+            deferred_responses.clear()
             await _wait_for_mcp_status(
                 session,
                 "local",
@@ -302,6 +417,14 @@ class ExtensionAcceptanceProbe:
                 ),
                 timeout=wait_seconds,
             )
+            await asyncio.sleep(0)
+            await response_tasks.wait_empty(wait_seconds=30)
+            if "sampling.requested" in events:
+                await _wait_for_event_type(
+                    events,
+                    "sampling.completed",
+                    wait_seconds=30,
+                )
             sampling_events = events[before_sampling:]
 
             missing_limit = await bridge.respond_session_limits(
@@ -318,18 +441,41 @@ class ExtensionAcceptanceProbe:
                 "missing-headers-request",
                 None,
             )
+            sampling_evidence = _protocol_response_evidence(
+                requested_type="sampling.requested",
+                completed_type="sampling.completed",
+                events=sampling_events,
+                accepted=response_results["sampling"],
+                missing_request_result=missing_sampling,
+                trigger_attempted=True,
+                turn_completed=("SAMPLING_GATE_DONE" in str(sampling_message.data.content)),
+            )
+            limits_evidence = _protocol_response_evidence(
+                requested_type="session_limits_exhausted.requested",
+                completed_type="session_limits_exhausted.completed",
+                events=events,
+                accepted=response_results["session_limits"],
+                missing_request_result=missing_limit,
+                trigger_attempted=False,
+            )
+            headers_evidence = _protocol_response_evidence(
+                requested_type="mcp.headers_refresh_required",
+                completed_type="mcp.headers_refresh_completed",
+                events=events,
+                accepted=response_results["mcp_headers"],
+                missing_request_result=missing_headers,
+                trigger_attempted=False,
+            )
             permission_kinds = sorted({str(item["permission_kind"]) for item in permission_audits})
             hook_set = sorted(set(hooks_seen))
             registered_hooks = sorted(
                 {
-                    "agent_stop",
                     "error",
                     "post_failure",
                     "post_tool",
                     "pre_mcp",
                     "pre_tool",
                     "prompt_submitted",
-                    "prompt_transformed",
                     "session_end",
                     "session_start",
                 }
@@ -434,33 +580,21 @@ class ExtensionAcceptanceProbe:
                         "ELICITATION_ACCEPTANCE_DONE" in str(elicitation_message.data.content)
                     ),
                 ),
-                "sampling": {
-                    "status": (
-                        "passed"
-                        if "sampling.requested" in sampling_events
-                        else "supported_untriggered"
-                    ),
-                    "request_observed": "sampling.requested" in sampling_events,
-                    "completion_observed": "sampling.completed" in sampling_events,
-                    "missing_request_rpc_returned_false": missing_sampling is False,
-                    "tool_turn_completed": (
-                        "SAMPLING_GATE_DONE" in str(sampling_message.data.content)
-                    ),
-                },
-                "session_limits_response": {
-                    "status": "supported_untriggered",
-                    "missing_request_rpc_returned_false": missing_limit is False,
-                },
-                "mcp_headers_response": {
-                    "status": "supported_untriggered",
-                    "missing_request_rpc_returned_false": missing_headers is False,
-                },
+                "sampling": sampling_evidence,
+                "session_limits_response": limits_evidence,
+                "mcp_headers_response": headers_evidence,
             }
             return primary
         finally:
+            await response_tasks.cancel_all(wait_seconds=5)
             if session is not None:
                 await session.disconnect()
             await _delete_session(bridge, session_id)
+            try:
+                await permission_leases.release(permission_lease)
+            except Exception:
+                pass
+            await permission_database.close()
 
     async def _run_oauth(
         self,
@@ -646,6 +780,48 @@ class ExtensionAcceptanceProbe:
             )
             mcp = await bridge.get_mcp_servers(runtime.handle)
             agents = await bridge.get_agents(runtime.handle)
+            mcp_names = sorted(
+                str(item.get("name")) for item in mcp.get("servers", []) if isinstance(item, dict)
+            )
+            agent_names = {
+                str(item.get("name")) for item in agents.get("agents", []) if isinstance(item, dict)
+            }
+            tools = await runtime.handle.rpc.mcp.list_tools(
+                MCPListToolsRequest(server_name="second"),
+                timeout=10,
+            )
+            tool_names = sorted(tool.name for tool in tools.tools)
+            if runtime.inbox is not None:
+                await runtime.inbox.join()
+            await runtime._refresh_all_snapshots()
+            idle_before = await database.fetchone(
+                """
+                SELECT COUNT(*) AS count FROM event_journal
+                WHERE sdk_session_id = ? AND raw_type = 'session.idle'
+                """,
+                (session_id,),
+            )
+            await runtime.send(
+                "Call second/echo exactly once with text REATTACH_TOOL_OK, "
+                "then reply exactly REATTACH_TOOL_OK.",
+                idempotency_key="acceptance-reattach-tool",
+                agent_mode="interactive",
+            )
+            await _wait_runtime_idle(
+                database,
+                session_id,
+                wait_seconds=wait_seconds,
+                minimum_idle_count=int(idle_before["count"]) + 1,
+            )
+            tool_completion = await database.fetchone(
+                """
+                SELECT COUNT(*) AS count FROM event_journal
+                WHERE sdk_session_id = ?
+                  AND generation = ?
+                  AND raw_type = 'tool.execution_complete'
+                """,
+                (session_id, runtime.binding.runtime_generation),
+            )
             result = {
                 "config_reattach": _passed(
                     verified=(
@@ -653,6 +829,10 @@ class ExtensionAcceptanceProbe:
                         and runtime.binding.runtime_generation == generation + 1
                         and runtime.binding.runtime_session_config_hash == second.config_hash
                         and runtime.binding.session_config_state == "synced"
+                        and mcp_names == ["second"]
+                        and "reattach_agent" in agent_names
+                        and "echo" in tool_names
+                        and int(tool_completion["count"]) > 0
                     ),
                     same_owner_fence=runtime.binding.owner_fence_token == fence,
                     generation_incremented=(runtime.binding.runtime_generation == generation + 1),
@@ -660,19 +840,11 @@ class ExtensionAcceptanceProbe:
                         runtime.binding.runtime_session_config_hash == second.config_hash
                         and runtime.binding.session_config_state == "synced"
                     ),
-                    mcp_servers=sorted(
-                        str(item.get("name"))
-                        for item in mcp.get("servers", [])
-                        if isinstance(item, dict)
-                    ),
-                    custom_agent_loaded=(
-                        "reattach_agent"
-                        in {
-                            str(item.get("name"))
-                            for item in agents.get("agents", [])
-                            if isinstance(item, dict)
-                        }
-                    ),
+                    mcp_servers=mcp_names,
+                    removed_server_absent="first" not in mcp_names,
+                    custom_agent_loaded="reattach_agent" in agent_names,
+                    mcp_tools=tool_names,
+                    tool_call_completed=int(tool_completion["count"]) > 0,
                 )
             }
             await runtime.close(idempotency_key="acceptance-close")
@@ -755,14 +927,12 @@ def _acceptance_hooks(seen: list[str]) -> dict[str, Callable[..., Awaitable[Any]
         "on_post_tool_use": handler("post_tool"),
         "on_post_tool_use_failure": handler("post_failure"),
         "on_user_prompt_submitted": handler("prompt_submitted"),
-        "on_user_prompt_transformed": handler("prompt_transformed"),
         "on_session_start": handler(
             "session_start",
             {"additionalContext": "disposable acceptance"},
         ),
         "on_session_end": handler("session_end"),
         "on_error_occurred": handler("error"),
-        "on_agent_stop": handler("agent_stop"),
     }
 
 
@@ -786,11 +956,67 @@ async def _wait_for_mcp_status(
     raise TimeoutError(f"MCP server did not reach expected state: {expected}")
 
 
+async def _wait_for_event_type(
+    events: list[str],
+    event_type: str,
+    *,
+    wait_seconds: float,
+) -> None:
+    deadline = asyncio.get_running_loop().time() + wait_seconds
+    while asyncio.get_running_loop().time() < deadline:
+        if event_type in events:
+            return
+        await asyncio.sleep(0.05)
+    raise TimeoutError(f"protocol completion event was not observed: {event_type}")
+
+
+def _protocol_response_evidence(
+    *,
+    requested_type: str,
+    completed_type: str,
+    events: list[str],
+    accepted: list[bool],
+    missing_request_result: bool,
+    trigger_attempted: bool,
+    turn_completed: bool | None = None,
+) -> dict[str, Any]:
+    if missing_request_result is not False:
+        raise RuntimeError("missing protocol request ID was unexpectedly accepted")
+    requested_count = events.count(requested_type)
+    completed_count = events.count(completed_type)
+    if requested_count:
+        if (
+            completed_count < requested_count
+            or len(accepted) < requested_count
+            or not all(accepted)
+        ):
+            raise RuntimeError(
+                f"observed {requested_type} without successful settlement and completion"
+            )
+        return {
+            "status": "passed",
+            "request_count": requested_count,
+            "completion_count": completed_count,
+            "responses_accepted": list(accepted),
+            "trigger_attempted": trigger_attempted,
+            **({} if turn_completed is None else {"tool_turn_completed": turn_completed}),
+        }
+    return {
+        "status": "unprobed",
+        "request_count": 0,
+        "completion_count": 0,
+        "trigger_attempted": trigger_attempted,
+        "missing_request_rpc_returned_false": True,
+        **({} if turn_completed is None else {"tool_turn_completed": turn_completed}),
+    }
+
+
 async def _wait_runtime_idle(
     database: Database,
     session_id: str,
     *,
     wait_seconds: float,
+    minimum_idle_count: int = 1,
 ) -> None:
     deadline = asyncio.get_running_loop().time() + wait_seconds
     while asyncio.get_running_loop().time() < deadline:
@@ -808,7 +1034,7 @@ async def _wait_runtime_idle(
             """,
             (session_id,),
         )
-        if int(idle["count"]) > 0 and int(active["count"]) == 0:
+        if int(idle["count"]) >= minimum_idle_count and int(active["count"]) == 0:
             return
         await asyncio.sleep(0.2)
     raise TimeoutError("disposable session did not become reattach-safe")

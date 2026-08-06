@@ -9,6 +9,7 @@ from copilotd.sdk import extension_probe
 from copilotd.sdk.extension_probe import (
     ExtensionAcceptanceProbe,
     LiveAcceptanceAuthError,
+    _protocol_response_evidence,
 )
 
 
@@ -58,3 +59,41 @@ def test_cli_exposes_explicit_live_extension_acceptance_selector() -> None:
 
     assert args.command == "sdk-probe"
     assert args.live_extensions is True
+
+
+def test_protocol_response_evidence_is_unprobed_without_real_request() -> None:
+    evidence = _protocol_response_evidence(
+        requested_type="sampling.requested",
+        completed_type="sampling.completed",
+        events=[],
+        accepted=[],
+        missing_request_result=False,
+        trigger_attempted=True,
+    )
+
+    assert evidence["status"] == "unprobed"
+
+
+def test_protocol_response_evidence_fails_partial_real_flow() -> None:
+    with pytest.raises(RuntimeError, match="without successful settlement"):
+        _protocol_response_evidence(
+            requested_type="sampling.requested",
+            completed_type="sampling.completed",
+            events=["sampling.requested"],
+            accepted=[False],
+            missing_request_result=False,
+            trigger_attempted=True,
+        )
+
+
+def test_protocol_response_evidence_passes_only_settled_completion() -> None:
+    evidence = _protocol_response_evidence(
+        requested_type="sampling.requested",
+        completed_type="sampling.completed",
+        events=["sampling.requested", "sampling.completed"],
+        accepted=[True],
+        missing_request_result=False,
+        trigger_attempted=True,
+    )
+
+    assert evidence["status"] == "passed"

@@ -22,6 +22,7 @@ class RecoveryInventoryReport:
     unknown_runtime_schedules: int
     unknown_creation_intents: int
     unknown_protocol_responses: int
+    unknown_config_reloads: int
     stale_runtime_projections: int
     dispatch_unknown_runs: int
     target_unknown_runs: int
@@ -85,6 +86,24 @@ class StartupRecoveryInventory:
                             protocol_response_attempts.sdk_session_id
                         AND owner.fence_token =
                             protocol_response_attempts.owner_fence_token
+                        AND owner.expires_at > ?
+                  )
+                """,
+                (timestamp, timestamp),
+            )
+            counts["unknown_config_reloads"] = await _update_count(
+                connection,
+                """
+                UPDATE config_reload_claims
+                SET state = 'unknown', error_code = 'startup_recovery',
+                    settled_at = COALESCE(settled_at, ?)
+                WHERE state IN ('claimed', 'started')
+                  AND NOT EXISTS (
+                      SELECT 1 FROM session_owner_leases AS owner
+                      WHERE owner.sdk_session_id =
+                            config_reload_claims.sdk_session_id
+                        AND owner.fence_token =
+                            config_reload_claims.owner_fence_token
                         AND owner.expires_at > ?
                   )
                 """,

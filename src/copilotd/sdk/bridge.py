@@ -57,13 +57,19 @@ class EventLogBatch:
 
 
 PermissionAuditCallback = Callable[[dict[str, Any]], Awaitable[None]]
+ApprovalValidator = Callable[[], Awaitable[bool]]
 
 
 class ManagedAwarePermissionHandler:
     """Approve ordinary yolo requests once and deterministically block managed ones."""
 
-    def __init__(self, audit: PermissionAuditCallback | None = None) -> None:
+    def __init__(
+        self,
+        audit: PermissionAuditCallback | None = None,
+        approval_validator: ApprovalValidator | None = None,
+    ) -> None:
         self._audit = audit
+        self._approval_validator = approval_validator
         self._managed_permissions_blocked = False
         self._managed_lock = threading.Lock()
 
@@ -90,12 +96,9 @@ class ManagedAwarePermissionHandler:
             runtime_managed_block = self._managed_permissions_blocked
         managed_settings = bool(invocation.get("managed_settings_enabled")) or runtime_managed_block
         managed_request = getattr(request, "managed_approval_required", False) is True
-        if managed_settings or managed_request:
-            decision = PermissionDecisionUserNotAvailable()
-            decision_name = "user-not-available"
-        else:
-            decision = PermissionDecisionApproveOnce()
-            decision_name = "approve-once"
+        decision_name = (
+            "user-not-available" if managed_settings or managed_request else "approve-once"
+        )
         if self._audit is not None:
             encoded = json.dumps(
                 request_payload,
@@ -115,7 +118,28 @@ class ManagedAwarePermissionHandler:
                     "request_hash": hashlib.sha256(encoded.encode()).hexdigest(),
                 }
             )
-        return decision
+        if managed_settings or managed_request:
+            return PermissionDecisionUserNotAvailable()
+        validator = self._approval_validator
+        owner_valid = validator is not None and await validator()
+        with self._managed_lock:
+            runtime_managed_block = self._managed_permissions_blocked
+        if runtime_managed_block or not owner_valid:
+            if self._audit is not None:
+                await self._audit(
+                    {
+                        "request_id": invocation.get("request_id"),
+                        "permission_kind": str(
+                            request_payload.get("kind") or getattr(request, "kind", "unknown")
+                        ),
+                        "managed_settings": runtime_managed_block,
+                        "managed_approval_required": managed_request,
+                        "decision": "user-not-available-after-fence-check",
+                        "request_hash": hashlib.sha256(encoded.encode()).hexdigest(),
+                    }
+                )
+            return PermissionDecisionUserNotAvailable()
+        return PermissionDecisionApproveOnce()
 
 
 class CopilotBridge:
@@ -214,6 +238,8 @@ class CopilotBridge:
     ) -> CopilotSession:
         options = _validated_session_options(session_options)
         managed = self._managed_session_options()
+        if permission_handler is None:
+            raise PermissionPostureError("explicit fence-validating permission handler is required")
         return await self.client.create_session(
             **options,
             **managed,
@@ -223,7 +249,7 @@ class CopilotBridge:
             include_sub_agent_streaming_events=True,
             manage_schedule_enabled=False,
             on_event=on_event,
-            on_permission_request=permission_handler or ManagedAwarePermissionHandler(),
+            on_permission_request=permission_handler,
             on_user_input_request=on_user_input_request,
             on_exit_plan_mode_request=on_exit_plan_mode_request,
             on_auto_mode_switch_request=on_auto_mode_switch_request,
@@ -250,6 +276,8 @@ class CopilotBridge:
     ) -> CopilotSession:
         options = _validated_session_options(session_options)
         managed = self._managed_session_options()
+        if permission_handler is None:
+            raise PermissionPostureError("explicit fence-validating permission handler is required")
         return await self.client.resume_session(
             session_id,
             **options,
@@ -528,16 +556,22 @@ class CopilotBridge:
         }
 
     def _managed_session_options(self) -> dict[str, Any]:
+        self.require_managed_settings_available()
         token = self._settings.github_token
-        if token is None:
-            return {
-                "enable_managed_settings": False,
-                "github_token": None,
-            }
+        assert token is not None
         return {
             "enable_managed_settings": True,
             "github_token": token.get_secret_value(),
         }
+
+    def managed_settings_available(self) -> bool:
+        return self._settings.github_token is not None
+
+    def require_managed_settings_available(self) -> None:
+        if not self.managed_settings_available():
+            raise PermissionPostureError(
+                "explicit GitHub token is required to resolve managed settings"
+            )
 
 
 _FORCED_SESSION_OPTIONS = {

@@ -47,6 +47,8 @@ async def test_all_registered_hooks_create_typed_redacted_audit_projections(
             ),
         )
         handlers = audit.handlers()
+        assert "on_user_prompt_transformed" not in handlers
+        assert "on_agent_stop" not in handlers
         timestamp = datetime.now(UTC)
         base = {
             "sessionId": "session-hooks",
@@ -97,14 +99,6 @@ async def test_all_registered_hooks_create_typed_redacted_audit_projections(
             {**base, "prompt": "SECRET_USER_PROMPT"},
             {"hookInvocationId": "prompt-submitted"},
         )
-        await handlers["on_user_prompt_transformed"](
-            {
-                **base,
-                "prompt": "SECRET_USER_PROMPT",
-                "transformedPrompt": "SECRET_TRANSFORMED_PROMPT",
-            },
-            {"hookInvocationId": "prompt-transformed"},
-        )
         start_result = await handlers["on_session_start"](
             {**base, "source": "resume"},
             {"hookInvocationId": "session-start"},
@@ -129,24 +123,12 @@ async def test_all_registered_hooks_create_typed_redacted_audit_projections(
                 "correlationId": "correlation-1",
             },
         )
-        await handlers["on_agent_stop"](
-            {
-                **base,
-                "stopReason": "completed",
-                "transcriptPath": "/secret/transcript",
-                "stopHookActive": False,
-            },
-            {"hookInvocationId": "agent-stop"},
-        )
         await inbox.join()
         rows = await database.fetchall(
             """
             SELECT hook_name, phase, payload_json
             FROM hook_audit_events ORDER BY observed_at, hook_name
             """
-        )
-        agent = await database.fetchone(
-            "SELECT state, stop_reason, stale FROM agent_loop_projections"
         )
         error = await database.fetchone(
             """
@@ -156,7 +138,7 @@ async def test_all_registered_hooks_create_typed_redacted_audit_projections(
         )
         await worker.stop()
 
-    assert len(rows) == 10
+    assert len(rows) == 8
     encoded = "\n".join(str(row["payload_json"]) for row in rows)
     for secret in (
         "SECRET_COMMAND",
@@ -164,18 +146,11 @@ async def test_all_registered_hooks_create_typed_redacted_audit_projections(
         "SECRET_DIFF_CONTENT",
         "SECRET_PERMISSION_DENIED",
         "SECRET_USER_PROMPT",
-        "SECRET_TRANSFORMED_PROMPT",
         "SECRET_SESSION_ERROR",
         "SECRET_MODEL_ERROR",
-        "/secret/transcript",
     ):
         assert secret not in encoded
     assert start_result["additionalContext"].startswith("copilotD session context:")
-    assert dict(agent) == {
-        "state": "stopped",
-        "stop_reason": "completed",
-        "stale": 0,
-    }
     assert dict(error) == {
         "classification": "model_call",
         "recoverable": 1,

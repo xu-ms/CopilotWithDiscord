@@ -545,11 +545,15 @@ class InteractionGateway:
         kind = "interaction"
         if row is not None:
             kind = str(row["kind"])
-            if not claimed and row["response"] is not None:
-                settled_response = cast(
+        if not claimed:
+            settled_response = (
+                cast(
                     InteractionResponse,
                     json.loads(str(row["response"])),
                 )
+                if row is not None and row["response"] is not None
+                else _unclaimed_interaction_fallback(kind)
+            )
         if claimed:
             await self._inbox.commit_internal(
                 {
@@ -598,6 +602,21 @@ def interaction_fallback(kind: str) -> InteractionResponse:
     if kind == "mcp_oauth":
         return {"kind": "cancelled"}
     raise ValueError(f"unsupported interaction kind: {kind}")
+
+
+def _unclaimed_interaction_fallback(kind: str) -> InteractionResponse:
+    if kind in {
+        "user_input",
+        "exit_plan_mode",
+        "auto_mode_switch",
+        "elicitation",
+        "mcp_oauth",
+    }:
+        return interaction_fallback(kind)
+    return {
+        "answer": "No committed response was available.",
+        "wasFreeform": True,
+    }
 
 
 def parse_elicitation_schema(value: Any) -> ElicitationForm:

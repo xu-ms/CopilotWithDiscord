@@ -32,7 +32,7 @@ from pydantic import SecretStr
 
 from copilotd.config import Settings
 from copilotd.core.task_registry import TaskRegistry
-from copilotd.sdk.bridge import CopilotBridge
+from copilotd.sdk.bridge import CopilotBridge, ManagedAwarePermissionHandler
 from copilotd.sdk.capabilities import (
     MAIN_BRANCH_ONLY_EVENTS,
     PINNED_GENERATED_EVENT_COUNT,
@@ -147,6 +147,7 @@ class SdkProbe:
                     session_id=session_id,
                     working_directory=workspace,
                     on_event=recorder.callback,
+                    permission_handler=ManagedAwarePermissionHandler(),
                 )
                 live["actual_session_id"] = session.session_id
                 live["session_id_matches"] = session.session_id == session_id
@@ -287,6 +288,7 @@ class SdkProbe:
                     working_directory=workspace,
                     on_event=resume_recorder.callback,
                     continue_pending_work=True,
+                    permission_handler=ManagedAwarePermissionHandler(),
                 )
                 live["resume_session_id_matches"] = resumed.session_id == session_id
                 await bridge.ensure_allow_all(resumed)
@@ -387,6 +389,16 @@ class SdkProbe:
                 _supported(event_log_read) and _supported(event_log_tail),
                 "live-rpc-probe",
                 {"read": event_log_read, "tail": event_log_tail},
+            ),
+            "hook_agent_stop": _evidence(
+                None,
+                "unprobed",
+                "SDK 1.0.8 does not expose a verified AgentStop callback",
+            ),
+            "hook_user_prompt_transformed": _evidence(
+                None,
+                "unprobed",
+                "SDK 1.0.8 does not expose a verified transformed-prompt callback",
             ),
             "config_reattach": _evidence(
                 None,
@@ -727,6 +739,7 @@ class SdkProbe:
                     session_id=session_id,
                     working_directory=workspace,
                     on_event=recorder.callback,
+                    permission_handler=ManagedAwarePermissionHandler(),
                 )
                 detail["actual_session_id"] = session.session_id
                 detail["sessions_before_disconnect"] = [
@@ -778,6 +791,7 @@ class SdkProbe:
                     working_directory=workspace,
                     on_event=resume_recorder.callback,
                     continue_pending_work=True,
+                    permission_handler=ManagedAwarePermissionHandler(),
                 )
                 history = await resumed.get_events()
                 detail["history_event_count"] = len(history)

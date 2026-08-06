@@ -1,3 +1,4 @@
+import json
 from pathlib import Path
 
 import pytest
@@ -8,6 +9,7 @@ from copilotd.core.extensions import (
     EnvironmentReference,
     ExtensionConfigConflict,
     ExtensionConfigError,
+    ExtensionConfigFileSource,
     ExtensionConfigRepository,
     HeaderBinding,
     McpHttpServer,
@@ -196,6 +198,77 @@ def test_extension_config_rejects_secret_bearing_or_ambiguous_shapes() -> None:
             name="remote",
             url="https://user:secret@mcp.example.test",
         )
+
+
+@pytest.mark.asyncio
+async def test_extension_file_source_ingests_strict_project_config(
+    tmp_path: Path,
+) -> None:
+    home = tmp_path / "home"
+    home.mkdir()
+    config_dir = home / ".copilotd"
+    config_dir.mkdir()
+    config_path = config_dir / "extensions.json"
+    config_path.write_text(
+        json.dumps(
+            {
+                "environment_references": [{"name": "token", "source_env": "PRODUCTION_TOKEN"}],
+                "disabled_skills": ["disabled-production-skill"],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    async with Database(tmp_path / "file-source.sqlite3") as database:
+        projects = ProjectRegistry(database, resolved_home=home)
+        await projects.initialize()
+        project = await projects.resolve("channel-file-source")
+        repository = ExtensionConfigRepository(database)
+        snapshot = await repository.ingest(
+            project,
+            ExtensionConfigFileSource(),
+        )
+
+    assert snapshot.version == 1
+    assert snapshot.config.disabled_skills == ("disabled-production-skill",)
+    assert snapshot.config.environment_references[0].source_env == "PRODUCTION_TOKEN"
+    assert "PRODUCTION_TOKEN" in snapshot.config.canonical_json()
+
+
+@pytest.mark.asyncio
+async def test_extension_file_source_rejects_symlink_and_oversize(
+    tmp_path: Path,
+) -> None:
+    home = tmp_path / "home"
+    home.mkdir()
+    projects_database = Database(tmp_path / "file-source-errors.sqlite3")
+    await projects_database.open()
+    try:
+        projects = ProjectRegistry(projects_database, resolved_home=home)
+        await projects.initialize()
+        project = await projects.resolve("channel-file-source-errors")
+        config_dir = home / ".copilotd"
+        config_dir.mkdir()
+        outside = tmp_path / "outside.json"
+        outside.write_text("{}", encoding="utf-8")
+        config_path = config_dir / "extensions.json"
+        config_path.symlink_to(outside)
+
+        with pytest.raises(ExtensionConfigError, match=r"outside|symlink"):
+            await ExtensionConfigFileSource().load(project)
+
+        config_path.unlink()
+        outside.unlink()
+        config_path.symlink_to(config_dir / "missing.json")
+        with pytest.raises(ExtensionConfigError, match="symlink"):
+            await ExtensionConfigFileSource().load(project)
+
+        config_path.unlink()
+        config_path.write_text('{"disabled_skills":["too-large"]}', encoding="utf-8")
+        with pytest.raises(ExtensionConfigError, match="exceeds"):
+            await ExtensionConfigFileSource(max_bytes=4).load(project)
+    finally:
+        await projects_database.close()
     with pytest.raises(ExtensionConfigError, match="unknown environment"):
         ProjectExtensionConfig(
             mcp_servers=(

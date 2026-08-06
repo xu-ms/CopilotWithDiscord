@@ -13,6 +13,10 @@ from copilotd.sdk.bridge import (
 )
 
 
+async def _approval_allowed() -> bool:
+    return True
+
+
 @dataclass
 class FakePermissionState:
     enabled: bool
@@ -125,7 +129,7 @@ async def test_managed_aware_permission_handler_approves_ordinary_once(
         managed_approval_required=False,
         to_dict=lambda: {"kind": permission_kind},
     )
-    result = await ManagedAwarePermissionHandler(audit)(
+    result = await ManagedAwarePermissionHandler(audit, _approval_allowed)(
         request,
         {"managed_settings_enabled": False},
     )
@@ -163,7 +167,7 @@ async def test_managed_aware_permission_handler_returns_user_not_available(
 
 @pytest.mark.asyncio
 async def test_managed_permission_state_from_runtime_events_blocks_without_sdk_flags() -> None:
-    handler = ManagedAwarePermissionHandler()
+    handler = ManagedAwarePermissionHandler(approval_validator=_approval_allowed)
     request = SimpleNamespace(
         kind="mcp",
         to_dict=lambda: {"kind": "mcp"},
@@ -176,6 +180,36 @@ async def test_managed_permission_state_from_runtime_events_blocks_without_sdk_f
 
     assert blocked.kind == "user-not-available"
     assert ordinary.kind == "approve-once"
+
+
+@pytest.mark.asyncio
+async def test_permission_handler_rechecks_fence_after_audit_before_approval() -> None:
+    order: list[str] = []
+    decisions: list[str] = []
+
+    async def audit(payload: dict[str, object]) -> None:
+        order.append("audit")
+        decisions.append(str(payload["decision"]))
+
+    async def lost_fence() -> bool:
+        order.append("fence")
+        return False
+
+    request = SimpleNamespace(
+        kind="write",
+        to_dict=lambda: {"kind": "write"},
+    )
+    result = await ManagedAwarePermissionHandler(audit, lost_fence)(
+        request,
+        {"session_id": "session-1"},
+    )
+
+    assert result.kind == "user-not-available"
+    assert order[:2] == ["audit", "fence"]
+    assert decisions == [
+        "approve-once",
+        "user-not-available-after-fence-check",
+    ]
 
 
 class FakeClient:
@@ -212,26 +246,29 @@ async def test_bridge_preregisters_event_handler_and_forces_runtime_options() ->
     client = FakeClient()
     bridge = object.__new__(CopilotBridge)
     bridge._client = client
-    bridge._settings = SimpleNamespace(github_token=None)
+    bridge._settings = SimpleNamespace(github_token=SecretStr("session-token"))
 
     def callback(_event: object) -> None:
         return None
 
+    permission_handler = ManagedAwarePermissionHandler(approval_validator=_approval_allowed)
     await bridge.create_session(
         session_id="session-1",
         working_directory="/tmp/project",
         on_event=callback,
+        permission_handler=permission_handler,
     )
     await bridge.resume_session(
         session_id="session-1",
         working_directory="/tmp/project",
         on_event=callback,
         continue_pending_work=False,
+        permission_handler=permission_handler,
     )
 
     assert client.create_kwargs["on_event"] is callback
-    assert client.create_kwargs["enable_managed_settings"] is False
-    assert client.create_kwargs["github_token"] is None
+    assert client.create_kwargs["enable_managed_settings"] is True
+    assert client.create_kwargs["github_token"] == "session-token"
     assert client.create_kwargs["manage_schedule_enabled"] is False
     assert client.create_kwargs["streaming"] is True
     assert client.resume_id == "session-1"
@@ -250,10 +287,43 @@ async def test_bridge_enables_managed_settings_only_with_session_token() -> None
         session_id="session-managed",
         working_directory="/tmp/project",
         on_event=lambda _event: None,
+        permission_handler=ManagedAwarePermissionHandler(approval_validator=_approval_allowed),
     )
 
     assert client.create_kwargs["enable_managed_settings"] is True
     assert client.create_kwargs["github_token"] == "managed-token"
+
+
+@pytest.mark.asyncio
+async def test_bridge_rejects_implicit_unfenced_permission_handler() -> None:
+    bridge = object.__new__(CopilotBridge)
+    bridge._client = FakeClient()
+    bridge._settings = SimpleNamespace(github_token=SecretStr("managed-token"))
+
+    with pytest.raises(PermissionPostureError, match="fence-validating"):
+        await bridge.create_session(
+            session_id="session-unfenced",
+            working_directory="/tmp/project",
+            on_event=lambda _event: None,
+        )
+
+    assert bridge._client.create_kwargs == {}
+
+
+@pytest.mark.asyncio
+async def test_bridge_fails_closed_when_managed_settings_cannot_resolve() -> None:
+    bridge = object.__new__(CopilotBridge)
+    bridge._client = FakeClient()
+    bridge._settings = SimpleNamespace(github_token=None)
+
+    with pytest.raises(PermissionPostureError, match="explicit GitHub token"):
+        await bridge.create_session(
+            session_id="session-no-managed-auth",
+            working_directory="/tmp/project",
+            on_event=lambda _event: None,
+        )
+
+    assert bridge._client.create_kwargs == {}
 
 
 @pytest.mark.asyncio

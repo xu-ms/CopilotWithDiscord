@@ -19,6 +19,7 @@ async def test_initial_migration_creates_full_schema(tmp_path: Path) -> None:
         "background_observations",
         "capabilities",
         "channel_settings",
+        "config_reload_claims",
         "custom_agents",
         "event_journal",
         "execution_health",

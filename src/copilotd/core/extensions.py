@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import os
@@ -7,6 +8,7 @@ import re
 import time
 from collections.abc import Mapping
 from dataclasses import dataclass, replace
+from enum import StrEnum
 from pathlib import Path
 from typing import Any, Literal, TypeAlias
 from urllib.parse import urlparse
@@ -16,6 +18,8 @@ from copilotd.storage.database import Database
 
 _CONFIG_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_.-]{0,127}$")
 _REASONING_EFFORTS = {"low", "medium", "high", "xhigh", "max"}
+DEFAULT_EXTENSION_CONFIG_PATH = Path(".copilotd/extensions.json")
+MAX_EXTENSION_CONFIG_BYTES = 1024 * 1024
 
 
 class ExtensionConfigError(ValueError):
@@ -28,6 +32,26 @@ class ExtensionConfigConflict(ExtensionConfigError):
 
 class MissingEnvironmentReference(ExtensionConfigError):
     pass
+
+
+class ConfigReloadState(StrEnum):
+    CLAIMED = "claimed"
+    STARTED = "started"
+    CONFIRMED = "confirmed"
+    REJECTED = "rejected"
+    UNKNOWN = "unknown"
+
+
+@dataclass(frozen=True, slots=True)
+class ConfigReloadClaim:
+    sdk_session_id: str
+    idempotency_key: str
+    config_hash: str
+    claimed_generation: int
+    owner_fence_token: int
+    state: ConfigReloadState
+    config_version: int | None
+    error_code: str | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -342,6 +366,52 @@ class ExtensionConfigSnapshot:
         return {item.name: references[item.reference] for item in server.headers}
 
 
+class ExtensionConfigFileSource:
+    """Loads one strict, secret-free project config from the project snapshot."""
+
+    def __init__(
+        self,
+        relative_path: Path = DEFAULT_EXTENSION_CONFIG_PATH,
+        *,
+        max_bytes: int = MAX_EXTENSION_CONFIG_BYTES,
+    ) -> None:
+        if relative_path.is_absolute() or ".." in relative_path.parts:
+            raise ExtensionConfigError("extension config path must stay within the project")
+        if max_bytes < 1:
+            raise ExtensionConfigError("extension config size limit must be positive")
+        self.relative_path = relative_path
+        self.max_bytes = max_bytes
+
+    def path_for(self, project: ProjectSnapshot) -> Path:
+        return (project.cwd / self.relative_path).resolve()
+
+    async def load(self, project: ProjectSnapshot) -> ProjectExtensionConfig:
+        return await asyncio.to_thread(self._load_sync, project)
+
+    def _load_sync(self, project: ProjectSnapshot) -> ProjectExtensionConfig:
+        path = project.cwd / self.relative_path
+        if path.is_symlink():
+            raise ExtensionConfigError("extension config file cannot be a symlink")
+        project_root = project.cwd.resolve()
+        resolved = path.resolve()
+        if not resolved.is_relative_to(project_root):
+            raise ExtensionConfigError("extension config resolves outside the project")
+        if not path.exists():
+            return ProjectExtensionConfig()
+        stat = path.stat()
+        if not path.is_file():
+            raise ExtensionConfigError(f"extension config is not a file: {path}")
+        if stat.st_size > self.max_bytes:
+            raise ExtensionConfigError(f"extension config exceeds {self.max_bytes} bytes")
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError) as error:
+            raise ExtensionConfigError(f"extension config could not be read: {path}") from error
+        if not isinstance(payload, Mapping):
+            raise ExtensionConfigError("extension config root must be an object")
+        return ProjectExtensionConfig.from_dict(payload)
+
+
 class ExtensionConfigRepository:
     """Publishes immutable project extension generations and resolves session pins."""
 
@@ -431,6 +501,20 @@ class ExtensionConfigRepository:
             return await self.publish(project, ProjectExtensionConfig())
         return _snapshot_from_row(row)
 
+    async def ingest(
+        self,
+        project: ProjectSnapshot,
+        source: ExtensionConfigFileSource,
+        *,
+        expected_current_version: int | None = None,
+    ) -> ExtensionConfigSnapshot:
+        config = await source.load(project)
+        return await self.publish(
+            project,
+            config,
+            expected_current_version=expected_current_version,
+        )
+
     async def for_session(
         self,
         *,
@@ -472,6 +556,165 @@ class ExtensionConfigRepository:
                 "session cwd does not match its immutable extension config generation"
             )
         return snapshot
+
+
+class ConfigReloadClaimStore:
+    def __init__(self, database: Database) -> None:
+        self._database = database
+
+    async def claim(
+        self,
+        *,
+        sdk_session_id: str,
+        idempotency_key: str,
+        config_hash: str,
+        runtime_generation: int,
+        owner_fence_token: int,
+        now: float | None = None,
+    ) -> tuple[ConfigReloadClaim, bool]:
+        timestamp = time.time() if now is None else now
+        async with self._database.transaction() as connection:
+            cursor = await connection.execute(
+                """
+                SELECT * FROM config_reload_claims
+                WHERE sdk_session_id = ? AND idempotency_key = ?
+                """,
+                (sdk_session_id, idempotency_key),
+            )
+            row = await cursor.fetchone()
+            await cursor.close()
+            if row is None:
+                await connection.execute(
+                    """
+                    INSERT INTO config_reload_claims(
+                        sdk_session_id, idempotency_key, config_hash,
+                        claimed_generation, owner_fence_token, state, created_at
+                    ) VALUES (?, ?, ?, ?, ?, 'claimed', ?)
+                    """,
+                    (
+                        sdk_session_id,
+                        idempotency_key,
+                        config_hash,
+                        runtime_generation,
+                        owner_fence_token,
+                        timestamp,
+                    ),
+                )
+                row = await _fetch_reload_claim(
+                    connection,
+                    sdk_session_id,
+                    idempotency_key,
+                )
+                return _row_to_reload_claim(row), True
+        claim = _row_to_reload_claim(row)
+        if claim.config_hash != config_hash:
+            raise ExtensionConfigConflict(
+                "config reload idempotency key was reused with a different config hash"
+            )
+        return claim, False
+
+    async def transition(
+        self,
+        claim: ConfigReloadClaim,
+        state: ConfigReloadState,
+        *,
+        config_version: int | None = None,
+        error_code: str | None = None,
+        now: float | None = None,
+    ) -> ConfigReloadClaim:
+        allowed = {
+            ConfigReloadState.CLAIMED: {
+                ConfigReloadState.STARTED,
+                ConfigReloadState.CONFIRMED,
+                ConfigReloadState.REJECTED,
+                ConfigReloadState.UNKNOWN,
+            },
+            ConfigReloadState.STARTED: {
+                ConfigReloadState.CONFIRMED,
+                ConfigReloadState.REJECTED,
+                ConfigReloadState.UNKNOWN,
+            },
+            ConfigReloadState.UNKNOWN: {
+                ConfigReloadState.CONFIRMED,
+            },
+        }
+        if state not in allowed.get(claim.state, set()):
+            raise ExtensionConfigConflict(
+                f"invalid config reload transition {claim.state} -> {state}"
+            )
+        timestamp = time.time() if now is None else now
+        settled_at = (
+            timestamp
+            if state
+            in {
+                ConfigReloadState.CONFIRMED,
+                ConfigReloadState.REJECTED,
+                ConfigReloadState.UNKNOWN,
+            }
+            else None
+        )
+        async with self._database.transaction() as connection:
+            cursor = await connection.execute(
+                """
+                UPDATE config_reload_claims
+                SET state = ?, config_version = COALESCE(?, config_version),
+                    error_code = ?, settled_at = ?
+                WHERE sdk_session_id = ? AND idempotency_key = ?
+                  AND config_hash = ? AND state = ?
+                """,
+                (
+                    state.value,
+                    config_version,
+                    error_code,
+                    settled_at,
+                    claim.sdk_session_id,
+                    claim.idempotency_key,
+                    claim.config_hash,
+                    claim.state.value,
+                ),
+            )
+            if cursor.rowcount != 1:
+                await cursor.close()
+                raise ExtensionConfigConflict("config reload claim changed concurrently")
+            await cursor.close()
+            row = await _fetch_reload_claim(
+                connection,
+                claim.sdk_session_id,
+                claim.idempotency_key,
+            )
+        return _row_to_reload_claim(row)
+
+
+async def _fetch_reload_claim(
+    connection: Any,
+    sdk_session_id: str,
+    idempotency_key: str,
+) -> Any:
+    cursor = await connection.execute(
+        """
+        SELECT * FROM config_reload_claims
+        WHERE sdk_session_id = ? AND idempotency_key = ?
+        """,
+        (sdk_session_id, idempotency_key),
+    )
+    row = await cursor.fetchone()
+    await cursor.close()
+    if row is None:
+        raise ExtensionConfigConflict("config reload claim disappeared")
+    return row
+
+
+def _row_to_reload_claim(row: Any) -> ConfigReloadClaim:
+    return ConfigReloadClaim(
+        sdk_session_id=str(row["sdk_session_id"]),
+        idempotency_key=str(row["idempotency_key"]),
+        config_hash=str(row["config_hash"]),
+        claimed_generation=int(row["claimed_generation"]),
+        owner_fence_token=int(row["owner_fence_token"]),
+        state=ConfigReloadState(str(row["state"])),
+        config_version=(None if row["config_version"] is None else int(row["config_version"])),
+        error_code=(None if row["error_code"] is None else str(row["error_code"])),
+    )
 
 
 def extension_scope_key(project_source: str, project_id: str | None) -> str:

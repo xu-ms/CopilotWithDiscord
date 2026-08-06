@@ -215,6 +215,17 @@ async def test_startup_recovery_preserves_pending_config_and_marks_runtime_unkno
             )
             """
         )
+        await database.execute(
+            """
+            INSERT INTO config_reload_claims(
+                sdk_session_id, idempotency_key, config_hash,
+                claimed_generation, owner_fence_token, state, created_at
+            ) VALUES (
+                'session-config', 'reload-1', 'config-hash',
+                1, 1, 'started', 101
+            )
+            """
+        )
 
         report = await StartupRecoveryInventory(database).run(now=200)
         binding = await database.fetchone(
@@ -232,6 +243,7 @@ async def test_startup_recovery_preserves_pending_config_and_marks_runtime_unkno
         attempt = await database.fetchone(
             "SELECT state, error_code FROM protocol_response_attempts"
         )
+        reload_claim = await database.fetchone("SELECT state, error_code FROM config_reload_claims")
         stale = await database.fetchall(
             """
             SELECT stale FROM context_projections
@@ -241,6 +253,7 @@ async def test_startup_recovery_preserves_pending_config_and_marks_runtime_unkno
         )
 
     assert report.unknown_protocol_responses == 1
+    assert report.unknown_config_reloads == 1
     assert report.stale_runtime_projections == 2
     assert dict(binding) == {
         "attachment_state": "recovery_unknown",
@@ -258,6 +271,10 @@ async def test_startup_recovery_preserves_pending_config_and_marks_runtime_unkno
     }
     assert request["response_state"] == "unknown"
     assert dict(attempt) == {
+        "state": "unknown",
+        "error_code": "startup_recovery",
+    }
+    assert dict(reload_claim) == {
         "state": "unknown",
         "error_code": "startup_recovery",
     }

@@ -38,6 +38,7 @@ from copilotd.core.bindings import (
 from copilotd.core.extensions import (
     EnvironmentBinding,
     EnvironmentReference,
+    ExtensionConfigConflict,
     ExtensionConfigRepository,
     McpStdioServer,
     ProjectExtensionConfig,
@@ -47,6 +48,7 @@ from copilotd.core.projects import ProjectRegistry
 from copilotd.core.session_runtime import (
     DetachBlocked,
     RuntimeState,
+    SessionAttachRejected,
     SessionAttachUnknown,
     SessionNotReady,
     SessionOwnerConflict,
@@ -112,6 +114,10 @@ class FakeBridge:
         self.protocol_response_calls: list[tuple[str, str, Any]] = []
         self.context_error: Exception | None = None
         self.usage_error: Exception | None = None
+        self.managed_settings_enabled = True
+
+    def managed_settings_available(self) -> bool:
+        return self.managed_settings_enabled
 
     async def create_session(self, **kwargs: Any) -> FakeHandle:
         self.create_calls += 1
@@ -392,6 +398,40 @@ async def test_runtime_preregisters_ingress_stays_alive_after_idle_and_closes_cl
     assert closed.attachment_state == AttachmentState.ABSENT
     assert owner is not None
     assert owner.expires_at <= datetime.now(UTC).timestamp()
+
+
+@pytest.mark.asyncio
+async def test_runtime_fails_closed_before_attach_without_managed_credentials(
+    tmp_path: Path,
+) -> None:
+    session_id = str(uuid4())
+    async with Database(tmp_path / "managed-auth-required.sqlite3") as database:
+        bindings = SessionBindingRepository(database)
+        binding = await bindings.create(
+            thread_id="thread-managed-auth-required",
+            sdk_session_id=session_id,
+            cwd_snapshot=tmp_path,
+            project_source="implicit-home",
+        )
+        bridge = FakeBridge(session_id)
+        bridge.managed_settings_enabled = False
+        runtime = SessionRuntime(
+            database=database,
+            bridge=bridge,
+            bindings=bindings,
+            owner_leases=OwnerLeaseStore(database),
+            owner_id="process-managed-auth-required",
+            binding=binding,
+        )
+
+        with pytest.raises(SessionAttachRejected, match="managed settings"):
+            await runtime.attach_create()
+        unchanged = await bindings.by_thread("thread-managed-auth-required")
+
+    assert bridge.create_calls == 0
+    assert runtime.state == RuntimeState.DETACHED
+    assert unchanged is not None
+    assert unchanged.attachment_state == AttachmentState.ABSENT
 
 
 @pytest.mark.asyncio
@@ -2326,12 +2366,12 @@ async def test_extension_config_hooks_and_same_fence_reattach(
             "on_post_tool_use",
             "on_post_tool_use_failure",
             "on_user_prompt_submitted",
-            "on_user_prompt_transformed",
             "on_session_start",
             "on_session_end",
             "on_error_occurred",
-            "on_agent_stop",
         } <= set(hooks)
+        assert "on_user_prompt_transformed" not in hooks
+        assert "on_agent_stop" not in hooks
         await hooks["on_pre_tool_use"](
             {
                 "sessionId": session_id,
@@ -2353,11 +2393,35 @@ async def test_extension_config_hooks_and_same_fence_reattach(
         )
         assert decision.kind == "approve-once"
 
+        second_config = ProjectExtensionConfig(disabled_skills=("disabled-test",))
         second = await runtime.reload_extension_config(
             idempotency_key="reload-1",
-            config=ProjectExtensionConfig(disabled_skills=("disabled-test",)),
+            config=second_config,
             expected_project_config_version=1,
         )
+        replayed = await runtime.reload_extension_config(
+            idempotency_key="reload-1",
+            config=second_config,
+        )
+        with pytest.raises(ExtensionConfigConflict, match="different config hash"):
+            await runtime.reload_extension_config(
+                idempotency_key="reload-1",
+                config=ProjectExtensionConfig(disabled_skills=("conflicting-test",)),
+            )
+        for crash_state in ("started", "unknown"):
+            await database.execute(
+                """
+                UPDATE config_reload_claims
+                SET state = ?, settled_at = NULL
+                WHERE sdk_session_id = ? AND idempotency_key = 'reload-1'
+                """,
+                (crash_state, session_id),
+            )
+            reconciled_replay = await runtime.reload_extension_config(
+                idempotency_key="reload-1",
+                config=second_config,
+            )
+            assert reconciled_replay == second
         hook_rows = await database.fetchall(
             "SELECT hook_name, phase FROM hook_audit_events ORDER BY observed_at"
         )
@@ -2365,8 +2429,20 @@ async def test_extension_config_hooks_and_same_fence_reattach(
             "SELECT permission_kind, decision FROM permission_audit_events"
         )
         updated = await bindings.by_thread("thread-extension")
+        generations = await database.fetchone(
+            "SELECT COUNT(*) AS count FROM project_extension_config_generations"
+        )
+        reload_claim = await database.fetchone(
+            """
+            SELECT config_hash, state, config_version
+            FROM config_reload_claims
+            WHERE sdk_session_id = ? AND idempotency_key = 'reload-1'
+            """,
+            (session_id,),
+        )
 
         assert second.version == 2
+        assert replayed == second
         assert updated is not None
         assert updated.runtime_generation == first_generation + 1
         assert updated.owner_fence_token == first_fence
@@ -2374,6 +2450,13 @@ async def test_extension_config_hooks_and_same_fence_reattach(
         assert updated.desired_session_config_hash == second.config_hash
         assert updated.runtime_session_config_hash == second.config_hash
         assert bridge.resume_calls == 1
+        assert runtime.state == RuntimeState.READY
+        assert generations["count"] == 2
+        assert dict(reload_claim) == {
+            "config_hash": second.config_hash,
+            "state": "confirmed",
+            "config_version": second.version,
+        }
         assert bridge.resume_kwargs["session_options"]["disabled_skills"] == ["disabled-test"]
         assert [dict(row) for row in hook_rows] == [{"hook_name": "pre_tool_use", "phase": "pre"}]
         assert [dict(row) for row in permission_rows] == [
@@ -2486,6 +2569,71 @@ async def test_elicitation_and_oauth_handlers_are_exactly_once_and_redacted(
         assert "must-not-persist" not in oauth_row["payload"]
         assert "[redacted]" in oauth_row["payload"]
         await runtime.close(idempotency_key="close-elicitation")
+
+
+@pytest.mark.asyncio
+async def test_lost_oauth_settlement_never_returns_uncommitted_token(
+    tmp_path: Path,
+) -> None:
+    session_id = str(uuid4())
+    async with Database(tmp_path / "oauth-lost-claim.sqlite3") as database:
+        bindings = SessionBindingRepository(database)
+        binding = await bindings.create(
+            thread_id="thread-oauth-lost-claim",
+            sdk_session_id=session_id,
+            cwd_snapshot=tmp_path,
+            project_source="implicit-home",
+        )
+        bridge = FakeBridge(session_id)
+        runtime = SessionRuntime(
+            database=database,
+            bridge=bridge,
+            bindings=bindings,
+            owner_leases=OwnerLeaseStore(database),
+            owner_id="process-oauth-lost-claim",
+            binding=binding,
+            interaction_timeout_seconds=5,
+        )
+        await runtime.attach_create()
+        handler_task = asyncio.create_task(
+            bridge.create_kwargs["on_mcp_auth_request"](
+                {
+                    "requestId": "oauth-lost-claim",
+                    "serverName": "oauth",
+                    "serverUrl": "http://127.0.0.1/mcp",
+                    "reason": "initial",
+                },
+                {"sessionId": session_id},
+            )
+        )
+        interaction_id = await _wait_for_pending_interaction(
+            database,
+            kind="mcp_oauth",
+        )
+        await database.execute(
+            """
+            UPDATE pending_interactions
+            SET state = 'resolved', response = NULL
+            WHERE interaction_id = ?
+            """,
+            (interaction_id,),
+        )
+        gateway = runtime._require_interaction_gateway()
+        claimed, settled = await gateway._settle(
+            interaction_id,
+            response={"kind": "token", "accessToken": "uncommitted-token"},
+            persisted_response={"kind": "token", "accessToken": "[redacted]"},
+            display_response="stale response",
+            state="resolved",
+        )
+
+        assert claimed is False
+        assert settled == {"kind": "cancelled"}
+        assert await handler_task == {"kind": "cancelled"}
+        await runtime.close(
+            idempotency_key="close-oauth-lost-claim",
+            force=True,
+        )
 
 
 @pytest.mark.asyncio

@@ -17,13 +17,16 @@ from discord.ext import commands
 from copilotd.config import Settings
 from copilotd.core.attachments import AttachmentError, AttachmentService
 from copilotd.core.bindings import SessionBinding, SessionBindingRepository
-from copilotd.core.extensions import ExtensionConfigRepository
+from copilotd.core.extensions import (
+    ExtensionConfigFileSource,
+    ExtensionConfigRepository,
+)
 from copilotd.core.interactions import (
     DiscordInteractionAdapter,
     ElicitationField,
     ElicitationForm,
 )
-from copilotd.core.projects import ProjectRegistry
+from copilotd.core.projects import ProjectRegistry, ProjectSnapshot, ProjectSource
 from copilotd.core.recovery import RecoveryInventoryReport, StartupRecoveryInventory
 from copilotd.core.session_runtime import SessionRuntime
 from copilotd.core.sessions import (
@@ -76,6 +79,7 @@ class CopilotDiscordBot(commands.Bot):
         self.projects: ProjectRegistry | None = None
         self.bindings: SessionBindingRepository | None = None
         self.extension_configs: ExtensionConfigRepository | None = None
+        self.extension_config_source = ExtensionConfigFileSource()
         self.sessions: SessionRegistry | None = None
         self.creation: SessionCreationService | None = None
         self.dispatcher: RenderOutboxDispatcher | None = None
@@ -139,6 +143,8 @@ class CopilotDiscordBot(commands.Bot):
             sessions=self.sessions,
             threads=DiscordThreadGateway(self),
             extension_configs=self.extension_configs,
+            extension_config_source=self.extension_config_source,
+            attachment_preflight=self.bridge.require_managed_settings_available,
         )
         self._tasks.create(
             self._task_failure_loop(),
@@ -751,6 +757,39 @@ class CopilotDiscordBot(commands.Bot):
             snapshot = await self._require_projects().resolve(_parent_channel_id(interaction))
             await interaction.followup.send(
                 f"source: `{snapshot.source}`\ncwd: `{snapshot.cwd}`",
+                ephemeral=True,
+            )
+
+        @project.command(
+            name="config-reload",
+            description="Publish .copilotd/extensions.json and reattach this session",
+        )
+        async def project_config_reload(interaction: discord.Interaction) -> None:
+            await interaction.response.defer(ephemeral=True)
+            runtime = await self._interaction_runtime(interaction)
+            binding = runtime.binding
+            project_snapshot = ProjectSnapshot(
+                project_id=binding.project_id,
+                channel_id=f"session:{binding.thread_id}",
+                source=(
+                    ProjectSource.EXPLICIT
+                    if binding.project_id is not None
+                    else ProjectSource.IMPLICIT_HOME
+                ),
+                root_path=binding.cwd_snapshot,
+                cwd=binding.cwd_snapshot,
+                config_version=binding.desired_session_config_version,
+            )
+            config = await self.extension_config_source.load(project_snapshot)
+            snapshot = await runtime.reload_extension_config(
+                idempotency_key=f"interaction:{interaction.id}",
+                config=config,
+            )
+            await interaction.followup.send(
+                (
+                    f"Extension config `{snapshot.version}` reattached "
+                    f"(`{snapshot.config_hash[:12]}`)."
+                ),
                 ephemeral=True,
             )
 

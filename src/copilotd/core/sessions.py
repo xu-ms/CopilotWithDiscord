@@ -13,11 +13,17 @@ from aiosqlite import Row
 
 from copilotd.core.bindings import SessionBinding, SessionBindingRepository
 from copilotd.core.extensions import (
+    ExtensionConfigFileSource,
     ExtensionConfigRepository,
     ExtensionConfigSnapshot,
 )
 from copilotd.core.projects import ProjectRegistry, ProjectSnapshot
-from copilotd.core.session_runtime import RuntimeState, SessionAttachUnknown, SessionRuntime
+from copilotd.core.session_runtime import (
+    RuntimeState,
+    SessionAttachRejected,
+    SessionAttachUnknown,
+    SessionRuntime,
+)
 from copilotd.storage.database import Database
 
 RuntimeFactory = Callable[[SessionBinding], SessionRuntime]
@@ -276,6 +282,8 @@ class SessionCreationService:
         sessions: SessionRegistry,
         threads: ThreadGateway,
         extension_configs: ExtensionConfigRepository | None = None,
+        extension_config_source: ExtensionConfigFileSource | None = None,
+        attachment_preflight: Callable[[], None] | None = None,
     ) -> None:
         self._projects = projects
         self._intents = intents
@@ -283,6 +291,8 @@ class SessionCreationService:
         self._sessions = sessions
         self._threads = threads
         self._extension_configs = extension_configs
+        self._extension_config_source = extension_config_source
+        self._attachment_preflight = attachment_preflight
         self._source_locks: dict[tuple[str, str], _SourceCreationLock] = {}
         self._source_locks_guard = asyncio.Lock()
 
@@ -296,6 +306,8 @@ class SessionCreationService:
         thread_name: str,
         send_initial_prompt: bool = True,
     ) -> SessionRuntime:
+        if self._attachment_preflight is not None:
+            self._attachment_preflight()
         source_key = (source_kind, source_id)
         entry = await self._acquire_source_lock(source_key)
         try:
@@ -321,11 +333,16 @@ class SessionCreationService:
         send_initial_prompt: bool,
     ) -> SessionRuntime:
         project = await self._projects.resolve(channel_id)
-        extension_config = (
-            None
-            if self._extension_configs is None
-            else await self._extension_configs.latest(project)
-        )
+        extension_config = None
+        if self._extension_configs is not None:
+            extension_config = (
+                await self._extension_configs.latest(project)
+                if self._extension_config_source is None
+                else await self._extension_configs.ingest(
+                    project,
+                    self._extension_config_source,
+                )
+            )
         intent, _ = await self._intents.reserve(
             source_kind=source_kind,
             source_id=source_id,
@@ -381,6 +398,9 @@ class SessionCreationService:
                     await runtime.attach_resume()
                 else:
                     await runtime.attach_create()
+            except SessionAttachRejected:
+                await self._intents.mark(intent, CreationState.FAILED)
+                raise
             except SessionAttachUnknown as error:
                 await self._intents.mark(intent, CreationState.UNKNOWN)
                 raise SessionCreationUnknown("SDK session creation is unknown") from error
