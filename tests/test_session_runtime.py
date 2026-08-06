@@ -26,6 +26,7 @@ from copilotd.core.bindings import (
 )
 from copilotd.core.mailbox import OperationAmbiguous, OperationRejected
 from copilotd.core.session_runtime import (
+    ClosedSessionRequiresReactivation,
     DetachBlocked,
     RuntimeState,
     SessionAttachUnknown,
@@ -329,15 +330,9 @@ async def test_runtime_routes_user_input_through_durable_interaction(
         assert pending is not None
         interaction_id = str(pending["interaction_id"])
 
-        assert (
-            await runtime.respond_interaction(interaction_id, selection=1)
-            == "resolved"
-        )
+        assert await runtime.respond_interaction(interaction_id, selection=1) == "resolved"
         assert await response_task == {"answer": "second", "wasFreeform": False}
-        assert (
-            await runtime.respond_interaction(interaction_id, selection=0)
-            == "expired"
-        )
+        assert await runtime.respond_interaction(interaction_id, selection=0) == "expired"
 
         settled = await database.fetchone(
             "SELECT state, response FROM pending_interactions WHERE interaction_id = ?",
@@ -358,10 +353,7 @@ async def test_runtime_routes_user_input_through_durable_interaction(
         assert '"answer": "second"' in str(settled["response"])
         assert lease is not None and lease["state"] == "released"
         assert [row["lane"] for row in render_rows] == ["interaction", "interaction"]
-        assert all(
-            row["coalesce_key"] == f"interaction:{interaction_id}"
-            for row in render_rows
-        )
+        assert all(row["coalesce_key"] == f"interaction:{interaction_id}" for row in render_rows)
 
         assert await runtime.set_mode("plan", idempotency_key="enter-plan") == "plan"
         plan_task = asyncio.create_task(
@@ -483,9 +475,7 @@ async def test_runtime_times_out_plan_interaction_with_typed_decline(
             {},
         )
         assert result == {"approved": False}
-        interaction = await database.fetchone(
-            "SELECT state FROM pending_interactions"
-        )
+        interaction = await database.fetchone("SELECT state FROM pending_interactions")
         lease = await database.fetchone(
             "SELECT state FROM liveness_leases WHERE kind = 'interaction'"
         )
@@ -741,13 +731,9 @@ async def test_close_freezes_send_admission_before_checking_detach_blockers(
             )
 
         monkeypatch.setattr(runtime.inbox, "commit_internal", delayed_commit)
-        send_task = asyncio.create_task(
-            runtime.send("racing send", idempotency_key="racing-send")
-        )
+        send_task = asyncio.create_task(runtime.send("racing send", idempotency_key="racing-send"))
         await admission_started.wait()
-        close_task = asyncio.create_task(
-            runtime.close(idempotency_key="racing-close")
-        )
+        close_task = asyncio.create_task(runtime.close(idempotency_key="racing-close"))
         await asyncio.sleep(0)
         assert not close_task.done()
 
@@ -1021,8 +1007,7 @@ async def test_permission_change_event_reconciles_allow_all_before_next_send(
             if (
                 bridge.allow_all_calls >= 2
                 and reconciled is not None
-                and reconciled.permission_posture
-                == PermissionPosture.VERIFIED_ALLOW_ALL
+                and reconciled.permission_posture == PermissionPosture.VERIFIED_ALLOW_ALL
             ):
                 break
             await asyncio.sleep(0.005)
@@ -1457,6 +1442,64 @@ async def test_attach_cancellation_during_owner_acquire_resets_state(
 
 
 @pytest.mark.asyncio
+async def test_attach_cancellation_after_begin_uses_acquired_owner_fence(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    session_id = str(uuid4())
+    async with Database(tmp_path / "attach-cancel-begin.sqlite3") as database:
+        bindings = SessionBindingRepository(database)
+        binding = await bindings.create(
+            thread_id="thread-attach-cancel-begin",
+            sdk_session_id=session_id,
+            cwd_snapshot=tmp_path,
+            project_source="implicit-home",
+        )
+        original_begin = bindings.begin_attachment
+        committed = asyncio.Event()
+        never = asyncio.Event()
+
+        async def committed_then_blocked(**kwargs: Any):
+            result = await original_begin(**kwargs)
+            committed.set()
+            await never.wait()
+            return result
+
+        monkeypatch.setattr(
+            bindings,
+            "begin_attachment",
+            committed_then_blocked,
+        )
+        store = OwnerLeaseStore(database)
+        runtime = SessionRuntime(
+            database=database,
+            bridge=FakeBridge(session_id),
+            bindings=bindings,
+            owner_leases=store,
+            owner_id="cancelled-begin-owner",
+            binding=binding,
+        )
+
+        attach = asyncio.create_task(runtime.attach_resume())
+        await committed.wait()
+        attach.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await attach
+
+        recovered = await bindings.by_thread(binding.thread_id)
+        owner = await store.current(session_id)
+        assert recovered is not None
+        assert recovered.runtime_generation == 1
+        assert recovered.owner_fence_token is not None
+        assert recovered.attachment_state == AttachmentState.RECOVERY_UNKNOWN
+        assert recovered.permission_posture == PermissionPosture.UNKNOWN
+        assert runtime.state == RuntimeState.RECOVERY_UNKNOWN
+        assert runtime.handle is None
+        assert runtime.inbox is None
+        assert owner is not None and owner.expires_at <= time.time()
+
+
+@pytest.mark.asyncio
 async def test_attach_cancellation_during_resume_releases_owner_and_recovers(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1501,6 +1544,114 @@ async def test_attach_cancellation_during_resume_releases_owner_and_recovers(
         assert recovered.attachment_state == AttachmentState.RECOVERY_UNKNOWN
         assert owner is not None and owner.expires_at <= time.time()
         assert runtime.inbox is None
+
+
+@pytest.mark.asyncio
+async def test_attach_cancellation_after_handle_disconnects_and_resets_binding(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    session_id = str(uuid4())
+    async with Database(tmp_path / "attach-cancel-handle.sqlite3") as database:
+        bindings = SessionBindingRepository(database)
+        binding = await bindings.create(
+            thread_id="thread-attach-cancel-handle",
+            sdk_session_id=session_id,
+            cwd_snapshot=tmp_path,
+            project_source="implicit-home",
+        )
+        bridge = FakeBridge(session_id)
+        entered = asyncio.Event()
+        never = asyncio.Event()
+
+        async def blocked_allow_all(_handle: FakeHandle) -> object:
+            entered.set()
+            await never.wait()
+            return object()
+
+        monkeypatch.setattr(bridge, "ensure_allow_all", blocked_allow_all)
+        store = OwnerLeaseStore(database)
+        runtime = SessionRuntime(
+            database=database,
+            bridge=bridge,
+            bindings=bindings,
+            owner_leases=store,
+            owner_id="cancelled-handle-owner",
+            binding=binding,
+        )
+        attach = asyncio.create_task(runtime.attach_resume())
+        await entered.wait()
+        attach.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await attach
+
+        recovered = await bindings.by_thread(binding.thread_id)
+        owner = await store.current(session_id)
+        assert bridge.handle.disconnect_calls == 1
+        assert recovered is not None
+        assert recovered.binding_intent == BindingIntent.ACTIVE
+        assert recovered.attachment_state == AttachmentState.ABSENT
+        assert runtime.state == RuntimeState.DETACHED
+        assert runtime.handle is None
+        assert runtime.inbox is None
+        assert owner is not None and owner.expires_at <= time.time()
+
+
+@pytest.mark.asyncio
+async def test_attach_cancellation_cleanup_failure_still_releases_owner(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    session_id = str(uuid4())
+    async with Database(tmp_path / "attach-cancel-cleanup.sqlite3") as database:
+        bindings = SessionBindingRepository(database)
+        binding = await bindings.create(
+            thread_id="thread-attach-cancel-cleanup",
+            sdk_session_id=session_id,
+            cwd_snapshot=tmp_path,
+            project_source="implicit-home",
+        )
+        bridge = FakeBridge(session_id)
+        entered = asyncio.Event()
+        never = asyncio.Event()
+
+        async def blocked_allow_all(_handle: FakeHandle) -> object:
+            entered.set()
+            await never.wait()
+            return object()
+
+        monkeypatch.setattr(bridge, "ensure_allow_all", blocked_allow_all)
+        store = OwnerLeaseStore(database)
+        runtime = SessionRuntime(
+            database=database,
+            bridge=bridge,
+            bindings=bindings,
+            owner_leases=store,
+            owner_id="cancelled-cleanup-owner",
+            binding=binding,
+        )
+        original_by_thread = bindings.by_thread
+        attach = asyncio.create_task(runtime.attach_resume())
+        await entered.wait()
+
+        async def failed_read(_thread_id: str):
+            raise RuntimeError("simulated cleanup read failure")
+
+        monkeypatch.setattr(bindings, "by_thread", failed_read)
+        attach.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await attach
+
+        recovered = await original_by_thread(binding.thread_id)
+        owner = await store.current(session_id)
+        assert bridge.handle.disconnect_calls == 1
+        assert recovered is not None
+        assert recovered.attachment_state == AttachmentState.RECOVERY_UNKNOWN
+        assert recovered.permission_posture == PermissionPosture.UNKNOWN
+        assert runtime.state == RuntimeState.RECOVERY_UNKNOWN
+        assert runtime.handle is None
+        assert runtime.inbox is None
+        assert owner is not None and owner.expires_at <= time.time()
 
 
 @pytest.mark.asyncio
@@ -1555,6 +1706,124 @@ async def test_runtime_reactivation_is_single_flight_for_concurrent_messages(
         assert first_runtime.state == RuntimeState.READY
         assert resume_calls == 1
         await first_runtime.close(idempotency_key="close-single-flight")
+
+
+@pytest.mark.asyncio
+async def test_closed_session_requires_explicit_resume(
+    tmp_path: Path,
+) -> None:
+    session_id = str(uuid4())
+    async with Database(tmp_path / "closed-explicit-resume.sqlite3") as database:
+        bindings = SessionBindingRepository(database)
+        binding = await bindings.create(
+            thread_id="thread-closed-explicit-resume",
+            sdk_session_id=session_id,
+            cwd_snapshot=tmp_path,
+            project_source="implicit-home",
+        )
+        bridge = FakeBridge(session_id)
+
+        def runtime_factory(current_binding):
+            return SessionRuntime(
+                database=database,
+                bridge=bridge,
+                bindings=bindings,
+                owner_leases=OwnerLeaseStore(database),
+                owner_id="closed-explicit-owner",
+                binding=current_binding,
+            )
+
+        registry = SessionRegistry(bindings, runtime_factory)
+        runtime = await registry.ensure_attached(binding)
+        await runtime.close(idempotency_key="close-explicit-resume")
+        closed = await bindings.by_thread(binding.thread_id)
+        assert closed is not None
+
+        with pytest.raises(
+            ClosedSessionRequiresReactivation,
+            match="explicit resume",
+        ):
+            await registry.ensure_attached(binding, reactivate=False)
+
+        resumed = await registry.ensure_attached(closed, reactivate=True)
+        assert resumed.state == RuntimeState.READY
+        assert bridge.resume_calls == 2
+        await resumed.close(idempotency_key="close-explicit-resume-again")
+
+
+@pytest.mark.asyncio
+async def test_single_flight_escalates_concurrent_explicit_reactivation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    session_id = str(uuid4())
+    async with Database(tmp_path / "reactivation-escalation.sqlite3") as database:
+        bindings = SessionBindingRepository(database)
+        binding = await bindings.create(
+            thread_id="thread-reactivation-escalation",
+            sdk_session_id=session_id,
+            cwd_snapshot=tmp_path,
+            project_source="implicit-home",
+        )
+        bridge = FakeBridge(session_id)
+
+        def runtime_factory(current_binding):
+            return SessionRuntime(
+                database=database,
+                bridge=bridge,
+                bindings=bindings,
+                owner_leases=OwnerLeaseStore(database),
+                owner_id="reactivation-escalation-owner",
+                binding=current_binding,
+            )
+
+        registry = SessionRegistry(bindings, runtime_factory)
+        original_by_thread = bindings.by_thread
+        transition_entered = asyncio.Event()
+        release_transition = asyncio.Event()
+        calls = 0
+
+        async def controlled_by_thread(thread_id: str):
+            nonlocal calls
+            calls += 1
+            if calls == 2:
+                transition_entered.set()
+                await release_transition.wait()
+            return await original_by_thread(thread_id)
+
+        monkeypatch.setattr(bindings, "by_thread", controlled_by_thread)
+        ordinary = asyncio.create_task(registry.ensure_attached(binding, reactivate=False))
+        await transition_entered.wait()
+        await database.execute(
+            """
+            UPDATE session_bindings
+            SET binding_intent = 'closed', row_version = row_version + 1
+            WHERE thread_id = ?
+            """,
+            (binding.thread_id,),
+        )
+        closed = await original_by_thread(binding.thread_id)
+        assert closed is not None
+        explicit = asyncio.create_task(registry.ensure_attached(closed, reactivate=True))
+        for _ in range(100):
+            transition = registry._transitions.get(binding.thread_id)
+            if transition is not None and transition.reactivate_requested:
+                break
+            await asyncio.sleep(0.001)
+        assert transition is not None and transition.reactivate_requested
+        release_transition.set()
+
+        ordinary_runtime, explicit_runtime = await asyncio.gather(
+            ordinary,
+            explicit,
+        )
+        assert ordinary_runtime is explicit_runtime
+        assert ordinary_runtime.state == RuntimeState.READY
+        assert bridge.resume_calls == 1
+        current = await original_by_thread(binding.thread_id)
+        assert current is not None
+        assert current.binding_intent == BindingIntent.ACTIVE
+        await ordinary_runtime.close(idempotency_key="close-reactivation-escalation")
 
 
 @pytest.mark.asyncio

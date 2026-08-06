@@ -6,6 +6,7 @@ import json
 import os
 import sqlite3
 import time
+import uuid
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any, Protocol
@@ -18,13 +19,18 @@ def fence_marker_paths(
     database_path: Path,
     fence_id: str,
 ) -> tuple[Path, Path]:
-    prefix = database_path.with_name(
-        f".{database_path.name}.{fence_id}"
-    )
+    prefix = database_path.with_name(f".{database_path.name}.{fence_id}")
     return (
         prefix.with_name(prefix.name + ".loss"),
         prefix.with_name(prefix.name + ".accounting-failure"),
     )
+
+
+def fence_pending_marker_directory(
+    database_path: Path,
+    fence_id: str,
+) -> Path:
+    return database_path.with_name(f".{database_path.name}.{fence_id}.pending")
 
 
 class QuiesceSessions(Protocol):
@@ -62,9 +68,7 @@ class ServiceControlWorker:
         self._pid = os.getpid()
         self._process_generation = process_generation
         self._process_started_at = process_started_at
-        self._handoff_token_hash = hashlib.sha256(
-            handoff_token.encode()
-        ).hexdigest()
+        self._handoff_token_hash = hashlib.sha256(handoff_token.encode()).hexdigest()
         self._poll_seconds = poll_seconds
         self._quiesce_timeout_seconds = quiesce_timeout_seconds
         self._rollback_timeout_seconds = rollback_timeout_seconds
@@ -80,9 +84,7 @@ class ServiceControlWorker:
             if self._active_fence_id is not None:
                 state = await self._fence_state(self._active_fence_id)
                 if state not in {"prepared", "committed"}:
-                    await self._rollback_quiesce(
-                        self._active_fence_id
-                    )
+                    await self._rollback_quiesce(self._active_fence_id)
 
     async def _poll_once(self) -> None:
         if self._active_fence_id is None:
@@ -100,13 +102,8 @@ class ServiceControlWorker:
             if (
                 int(row["expected_pid"]) != self._pid
                 or str(row["expected_generation"]) != self._process_generation
-                or abs(
-                    float(row["expected_process_started_at"])
-                    - self._process_started_at
-                )
-                > 5
-                or str(row["handoff_token_hash"])
-                != self._handoff_token_hash
+                or abs(float(row["expected_process_started_at"]) - self._process_started_at) > 5
+                or str(row["handoff_token_hash"]) != self._handoff_token_hash
             ):
                 await self._release_mismatched_fence(row)
                 return
@@ -118,7 +115,7 @@ class ServiceControlWorker:
         if state in {"prepared", "committed"}:
             self._terminate_process(75)
             return
-        if state is None or state == "released":
+        if state is None or state in {"released", "violated"}:
             await self._rollback_quiesce(self._active_fence_id)
             return
         if state == "acknowledged":
@@ -139,25 +136,46 @@ class ServiceControlWorker:
         if not await self._await_or_abort(begin, fence_id, deadline):
             return
         while True:
-            drain = asyncio.create_task(
-                self._sessions.drain_service_quiesce(),
-                name=f"service-drain:{fence_id}",
-            )
-            if not await self._await_or_abort(drain, fence_id, deadline):
-                return
-            depth, _ = self._sessions.service_quiesce_metrics()
-            if depth:
-                self._record_producer_sync("drain_depth")
-                continue
-            if self._has_failure_marker(fence_id):
+            producer_before = await self._producer_count(fence_id)
+            depth_before, violations_before = self._sessions.service_quiesce_metrics()
+            journal_before = await self._journal_id()
+            markers_before = self._failure_marker_epoch(fence_id)
+            if markers_before:
                 await self._mark_quiesce_failed(
                     fence_id,
                     "durable_loss_or_accounting_failure",
                 )
                 await self._rollback_quiesce(fence_id)
                 return
-            producer_count = await self._producer_count(fence_id)
-            journal_id = await self._journal_id()
+            drain = asyncio.create_task(
+                self._sessions.drain_service_quiesce(),
+                name=f"service-final-drain:{fence_id}",
+            )
+            if not await self._await_or_abort(drain, fence_id, deadline):
+                return
+            producer_after = await self._producer_count(fence_id)
+            depth_after, violations_after = self._sessions.service_quiesce_metrics()
+            if depth_after:
+                self._record_producer_sync("drain_depth")
+                continue
+            journal_after = await self._journal_id()
+            markers_after = self._failure_marker_epoch(fence_id)
+            if markers_after:
+                await self._mark_quiesce_failed(
+                    fence_id,
+                    "durable_loss_or_accounting_failure",
+                )
+                await self._rollback_quiesce(fence_id)
+                return
+            if (
+                depth_before != 0
+                or violations_before != 0
+                or violations_after != 0
+                or producer_before != producer_after
+                or journal_before != journal_after
+                or markers_before != markers_after
+            ):
+                continue
             async with self._database.transaction() as connection:
                 cursor = await connection.execute(
                     """
@@ -173,13 +191,14 @@ class ServiceControlWorker:
                       AND protocol_version = ?
                       AND handoff_token_hash = ?
                       AND producer_count = ?
+                      AND violation_count = 0
                       AND (SELECT COALESCE(MAX(journal_id), 0)
                            FROM event_journal) = ?
                     """,
                     (
                         time.time(),
-                        producer_count,
-                        journal_id,
+                        producer_before,
+                        journal_before,
                         json.dumps(
                             {"drained": True},
                             sort_keys=True,
@@ -191,8 +210,8 @@ class ServiceControlWorker:
                         self._process_started_at,
                         SERVICE_CONTROL_PROTOCOL_VERSION,
                         self._handoff_token_hash,
-                        producer_count,
-                        journal_id,
+                        producer_before,
+                        journal_before,
                     ),
                 )
                 changed = cursor.rowcount == 1
@@ -254,6 +273,23 @@ class ServiceControlWorker:
             task.add_done_callback(_consume_task_result)
 
     async def _rollback_quiesce(self, fence_id: str) -> None:
+        await self._database.execute(
+            """
+            UPDATE service_admission_fences
+            SET state = 'released', released_at = ?,
+                rollback_state = 'pending', detail = ?
+            WHERE fence_id = ? AND state = 'violated'
+            """,
+            (
+                time.time(),
+                json.dumps(
+                    {"reason": "violated_fence_rollback"},
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ),
+                fence_id,
+            ),
+        )
         rollback = asyncio.create_task(
             self._sessions.end_service_quiesce(),
             name=f"service-quiesce-rollback:{fence_id}",
@@ -262,11 +298,7 @@ class ServiceControlWorker:
             {rollback},
             timeout=self._rollback_timeout_seconds,
         )
-        completed = (
-            rollback in done
-            and not rollback.cancelled()
-            and rollback.exception() is None
-        )
+        completed = rollback in done and not rollback.cancelled() and rollback.exception() is None
         if not completed:
             if rollback in done and not rollback.cancelled():
                 rollback.exception()
@@ -282,13 +314,7 @@ class ServiceControlWorker:
             (
                 "complete" if completed else "pending",
                 json.dumps(
-                    {
-                        "reason": (
-                            "rollback_complete"
-                            if completed
-                            else "rollback_timeout_retrying"
-                        )
-                    },
+                    {"reason": ("rollback_complete" if completed else "rollback_timeout_retrying")},
                     sort_keys=True,
                     separators=(",", ":"),
                 ),
@@ -303,7 +329,7 @@ class ServiceControlWorker:
             """
             UPDATE service_admission_fences
             SET state = 'violated', violation_count = violation_count + 1,
-                detail = ?
+                rollback_state = 'pending', detail = ?
             WHERE fence_id = ? AND state = 'requested'
             """,
             (
@@ -367,6 +393,12 @@ class ServiceControlWorker:
     def _record_producer_sync(self, source: str) -> None:
         if self._active_fence_id is None:
             return
+        fence_id = self._active_fence_id
+        pending = self._create_pending_marker(
+            fence_id=fence_id,
+            source=source,
+        )
+        accounted = False
         try:
             connection = sqlite3.connect(str(self._database.path), timeout=0)
             try:
@@ -394,7 +426,7 @@ class ServiceControlWorker:
                             sort_keys=True,
                             separators=(",", ":"),
                         ),
-                        self._active_fence_id,
+                        fence_id,
                     ),
                 )
                 connection.commit()
@@ -404,24 +436,29 @@ class ServiceControlWorker:
                         SELECT state FROM service_admission_fences
                         WHERE fence_id = ?
                         """,
-                        (self._active_fence_id,),
+                        (fence_id,),
                     ).fetchone()
                     if row is None or row["state"] == "released":
+                        accounted = True
                         return
-                    raise RuntimeError(
-                        "active service admission fence disappeared"
-                    )
+                    raise RuntimeError("active service admission fence disappeared")
+                accounted = True
             finally:
                 connection.close()
         except sqlite3.Error as error:
             self._write_marker(
-                fence_id=self._active_fence_id,
+                fence_id=fence_id,
                 kind="accounting-failure",
                 source=source,
             )
-            raise RuntimeError(
-                "could not durably record post-quiesce producer"
-            ) from error
+            raise RuntimeError("could not durably record post-quiesce producer") from error
+        finally:
+            if accounted:
+                pending.unlink(missing_ok=True)
+                try:
+                    pending.parent.rmdir()
+                except OSError:
+                    pass
 
     def _record_loss_sync(self, source: str) -> None:
         if self._active_fence_id is None:
@@ -433,10 +470,58 @@ class ServiceControlWorker:
         )
 
     def _has_failure_marker(self, fence_id: str) -> bool:
-        return any(
-            path.exists() and path.stat().st_size > 0
-            for path in fence_marker_paths(self._database.path, fence_id)
+        return bool(self._failure_marker_epoch(fence_id))
+
+    def _failure_marker_epoch(
+        self,
+        fence_id: str,
+    ) -> tuple[tuple[str, int, int], ...]:
+        paths = list(fence_marker_paths(self._database.path, fence_id))
+        pending = fence_pending_marker_directory(
+            self._database.path,
+            fence_id,
         )
+        if pending.is_dir():
+            paths.extend(pending.iterdir())
+        epoch: list[tuple[str, int, int]] = []
+        for path in paths:
+            try:
+                stat_result = path.stat()
+            except FileNotFoundError:
+                continue
+            if stat_result.st_size > 0:
+                epoch.append(
+                    (
+                        path.name,
+                        stat_result.st_size,
+                        stat_result.st_mtime_ns,
+                    )
+                )
+        return tuple(sorted(epoch))
+
+    def _create_pending_marker(
+        self,
+        *,
+        fence_id: str,
+        source: str,
+    ) -> Path:
+        directory = fence_pending_marker_directory(
+            self._database.path,
+            fence_id,
+        )
+        directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+        path = directory / uuid.uuid4().hex
+        descriptor = os.open(
+            path,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+            0o600,
+        )
+        try:
+            os.write(descriptor, f"{source}\n".encode())
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+        return path
 
     def _write_marker(
         self,

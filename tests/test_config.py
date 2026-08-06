@@ -1,16 +1,15 @@
 import json
 import os
+import shutil
 import sqlite3
 import stat
 from pathlib import Path
-from types import SimpleNamespace
 
 import pytest
 from pydantic import SecretStr, ValidationError
 
 from copilotd.config import (
     Settings,
-    _quiesce_windows_legacy_services,
     load_settings,
     platform_default_paths,
 )
@@ -34,6 +33,61 @@ def _sqlite_marker(path: Path) -> str:
         return str(row[0])
     finally:
         connection.close()
+
+
+class _TestMigrationGuard:
+    def __init__(self, connections: dict[Path, sqlite3.Connection]) -> None:
+        self.connections = connections
+        self.finalized: list[Path] = []
+        self.swap_prepared = False
+        self.released = False
+
+    def stage_database(self, source: Path, target: Path) -> None:
+        if target.exists():
+            assert source.read_bytes() == target.read_bytes()
+            return
+        shutil.copy2(source, target)
+
+    def finalize_database(self, database: Path) -> None:
+        self.finalized.append(database)
+
+    def prepare_swap(self) -> None:
+        if self.swap_prepared:
+            return
+        self.swap_prepared = True
+        for connection in self.connections.values():
+            connection.rollback()
+            connection.close()
+        self.connections.clear()
+
+    def release(self) -> None:
+        if self.released:
+            return
+        self.prepare_swap()
+        self.released = True
+
+
+def _test_migration_guard(
+    databases: tuple[Path, ...],
+) -> _TestMigrationGuard:
+    connections: dict[Path, sqlite3.Connection] = {}
+    try:
+        for database in databases:
+            connection = sqlite3.connect(database, timeout=0)
+            connection.execute("BEGIN EXCLUSIVE")
+            connections[database.resolve()] = connection
+    except BaseException as error:
+        for connection in connections.values():
+            connection.rollback()
+            connection.close()
+        raise RuntimeError("legacy SQLite database still has an active writer") from error
+    return _TestMigrationGuard(connections)
+
+
+def _complete_adoption(adoption: object) -> bool:
+    assert adoption is not None
+    adoption.complete()  # type: ignore[union-attr]
+    return True
 
 
 def test_settings_resolve_paths_and_create_layout(tmp_path: Path) -> None:
@@ -125,19 +179,101 @@ def test_windows_legacy_state_is_atomically_adopted(
 
     monkeypatch.setattr("copilotd.config.os.replace", recording_replace)
 
-    assert settings.adopt_legacy_windows_layout(
+    assert _complete_adoption(
+        settings.adopt_legacy_windows_layout(
+            platform_name="win32",
+            environ={"LOCALAPPDATA": str(local_app_data)},
+            home=tmp_path / "home",
+            service_quiescer=_test_migration_guard,
+        )
+    )
+
+    assert _sqlite_marker(settings.database_path) == "legacy-db"
+    assert (settings.data_dir / "sessions" / "session.json").read_text() == "durable"
+    assert (
+        local_app_data / ".copilotd-legacy-state-migration",
+        settings.data_dir,
+    ) in replacements
+    assert not (local_app_data / ".copilotd-layout-migration.json").exists()
+
+
+def test_windows_migration_journal_persists_until_install_verification(
+    tmp_path: Path,
+) -> None:
+    local_app_data = tmp_path / "Local"
+    legacy_db = local_app_data / "copilotD" / "copilotd.sqlite3"
+    _create_sqlite(legacy_db, "legacy")
+    data_dir, cache_dir, log_dir = platform_default_paths(
+        "win32",
+        environ={"LOCALAPPDATA": str(local_app_data)},
+        home=tmp_path / "home",
+    )
+    settings = Settings(
+        _env_file=None,
+        data_dir=data_dir,
+        cache_dir=cache_dir,
+        log_dir=log_dir,
+        resolved_home=tmp_path / "home",
+    )
+
+    adoption = settings.adopt_legacy_windows_layout(
+        platform_name="win32",
+        environ={"LOCALAPPDATA": str(local_app_data)},
+        home=tmp_path / "home",
+        service_quiescer=_test_migration_guard,
+    )
+
+    assert adoption is not None
+    journal = local_app_data / ".copilotd-layout-migration.json"
+    assert json.loads(journal.read_text())["phase"] == ("swapped_pending_install")
+    assert settings.windows_legacy_layout_pending(
+        platform_name="win32",
+        environ={"LOCALAPPDATA": str(local_app_data)},
+        home=tmp_path / "home",
+    )
+    adoption.abandon()
+    assert journal.exists()
+    resumed = settings.adopt_legacy_windows_layout(
+        platform_name="win32",
+        environ={"LOCALAPPDATA": str(local_app_data)},
+        home=tmp_path / "home",
+        service_quiescer=_test_migration_guard,
+    )
+    assert resumed is not None
+    resumed.complete()
+    assert not journal.exists()
+    assert not settings.windows_legacy_layout_pending(
         platform_name="win32",
         environ={"LOCALAPPDATA": str(local_app_data)},
         home=tmp_path / "home",
     )
 
-    assert _sqlite_marker(settings.database_path) == "legacy-db"
-    assert (settings.data_dir / "sessions" / "session.json").read_text() == "durable"
-    assert replacements[-1] == (
-        local_app_data / ".copilotd-legacy-state-migration",
-        settings.data_dir,
+
+def test_completed_split_layout_is_not_legacy_on_case_insensitive_path(
+    tmp_path: Path,
+) -> None:
+    local_app_data = tmp_path / "Local"
+    target_root = local_app_data / "copilotd"
+    for name in ("state", "cache", "logs"):
+        (target_root / name).mkdir(parents=True, exist_ok=True)
+    data_dir, cache_dir, log_dir = platform_default_paths(
+        "win32",
+        environ={"LOCALAPPDATA": str(local_app_data)},
+        home=tmp_path / "home",
     )
-    assert not (local_app_data / ".copilotd-layout-migration.json").exists()
+    settings = Settings(
+        _env_file=None,
+        data_dir=data_dir,
+        cache_dir=cache_dir,
+        log_dir=log_dir,
+        resolved_home=tmp_path / "home",
+    )
+
+    assert not settings.windows_legacy_layout_pending(
+        platform_name="win32",
+        environ={"LOCALAPPDATA": str(local_app_data)},
+        home=tmp_path / "home",
+    )
 
 
 def test_windows_legacy_adoption_recovers_staged_tree(tmp_path: Path) -> None:
@@ -168,10 +304,13 @@ def test_windows_legacy_adoption_recovers_staged_tree(tmp_path: Path) -> None:
         resolved_home=tmp_path / "home",
     )
 
-    assert settings.adopt_legacy_windows_layout(
-        platform_name="win32",
-        environ={"LOCALAPPDATA": str(local_app_data)},
-        home=tmp_path / "home",
+    assert _complete_adoption(
+        settings.adopt_legacy_windows_layout(
+            platform_name="win32",
+            environ={"LOCALAPPDATA": str(local_app_data)},
+            home=tmp_path / "home",
+            service_quiescer=_test_migration_guard,
+        )
     )
     assert _sqlite_marker(settings.database_path) == "staged-db"
 
@@ -205,10 +344,13 @@ def test_windows_split_layout_merges_legacy_and_new_state(tmp_path: Path) -> Non
         resolved_home=tmp_path / "home",
     )
 
-    assert settings.adopt_legacy_windows_layout(
-        platform_name="win32",
-        environ={"LOCALAPPDATA": str(local_app_data)},
-        home=tmp_path / "home",
+    assert _complete_adoption(
+        settings.adopt_legacy_windows_layout(
+            platform_name="win32",
+            environ={"LOCALAPPDATA": str(local_app_data)},
+            home=tmp_path / "home",
+            service_quiescer=_test_migration_guard,
+        )
     )
 
     assert _sqlite_marker(settings.database_path) == "legacy-db"
@@ -251,9 +393,7 @@ def test_windows_split_layout_fails_closed_on_conflicting_databases(
 
     assert _sqlite_marker(legacy_db) == "legacy-db"
     assert _sqlite_marker(target_db) == "different-db"
-    assert not (
-        local_app_data / ".copilotd-legacy-state-migration"
-    ).exists()
+    assert not (local_app_data / ".copilotd-legacy-state-migration").exists()
 
 
 def test_windows_migration_quiesces_service_before_first_move(
@@ -278,24 +418,28 @@ def test_windows_migration_quiesces_service_before_first_move(
         resolved_home=tmp_path / "home",
     )
     events: list[str] = []
-    replace = os.replace
 
-    def quiesce(databases: tuple[Path, ...]) -> None:
+    def quiesce(databases: tuple[Path, ...]) -> _TestMigrationGuard:
         assert legacy_db in databases
         assert legacy_db.exists()
         events.append("quiesced")
+        guard = _test_migration_guard(databases)
+        stage_database = guard.stage_database
 
-    def observed_replace(source: str | Path, target: str | Path) -> None:
-        if Path(source).name == "copilotd.sqlite3":
+        def observed_stage(source: Path, target: Path) -> None:
             events.append("moved")
-        replace(source, target)
+            stage_database(source, target)
 
-    monkeypatch.setattr("copilotd.config.os.replace", observed_replace)
-    settings.adopt_legacy_windows_layout(
-        platform_name="win32",
-        environ={"LOCALAPPDATA": str(local_app_data)},
-        home=tmp_path / "home",
-        service_quiescer=quiesce,
+        monkeypatch.setattr(guard, "stage_database", observed_stage)
+        return guard
+
+    _complete_adoption(
+        settings.adopt_legacy_windows_layout(
+            platform_name="win32",
+            environ={"LOCALAPPDATA": str(local_app_data)},
+            home=tmp_path / "home",
+            service_quiescer=quiesce,
+        )
     )
 
     assert events.index("quiesced") < events.index("moved")
@@ -320,7 +464,9 @@ def test_windows_migration_quiesce_failure_moves_nothing(tmp_path: Path) -> None
         resolved_home=tmp_path / "home",
     )
 
-    def fail_quiesce(_databases: tuple[Path, ...]) -> None:
+    def fail_quiesce(
+        _databases: tuple[Path, ...],
+    ) -> _TestMigrationGuard:
         raise RuntimeError("legacy process still writing")
 
     with pytest.raises(RuntimeError, match="still writing"):
@@ -333,9 +479,7 @@ def test_windows_migration_quiesce_failure_moves_nothing(tmp_path: Path) -> None
 
     assert _sqlite_marker(legacy_db) == "legacy-db"
     assert not data_dir.exists()
-    assert not (
-        local_app_data / ".copilotd-legacy-state-migration"
-    ).exists()
+    assert not (local_app_data / ".copilotd-legacy-state-migration").exists()
 
 
 def test_windows_migration_rejects_active_sqlite_writer(tmp_path: Path) -> None:
@@ -365,7 +509,7 @@ def test_windows_migration_rejects_active_sqlite_writer(tmp_path: Path) -> None:
                 platform_name="win32",
                 environ={"LOCALAPPDATA": str(local_app_data)},
                 home=tmp_path / "home",
-                service_quiescer=lambda _databases: None,
+                service_quiescer=_test_migration_guard,
             )
     finally:
         connection.rollback()
@@ -398,27 +542,36 @@ def test_managed_service_never_runs_layout_migration_in_process(
     settings.ensure_directories()
 
     assert _sqlite_marker(legacy_db) == "legacy"
-    assert not (
-        local_app_data / ".copilotd-legacy-state-migration"
-    ).exists()
+    assert not (local_app_data / ".copilotd-legacy-state-migration").exists()
 
 
-def test_windows_quiescer_excludes_helper_and_parent_processes(
-    monkeypatch: pytest.MonkeyPatch,
+def test_unmanaged_directory_creation_never_runs_layout_migration(
+    tmp_path: Path,
 ) -> None:
-    commands: list[list[str]] = []
+    local_app_data = tmp_path / "Local"
+    legacy = local_app_data / "copilotD"
+    _create_sqlite(legacy / "copilotd.sqlite3", "legacy")
+    data_dir, cache_dir, log_dir = platform_default_paths(
+        "win32",
+        environ={"LOCALAPPDATA": str(local_app_data)},
+        home=tmp_path / "home",
+    )
+    settings = Settings(
+        _env_file=None,
+        data_dir=data_dir,
+        cache_dir=cache_dir,
+        log_dir=log_dir,
+        resolved_home=tmp_path / "home",
+    )
 
-    def run(command: list[str], **_kwargs: object) -> SimpleNamespace:
-        commands.append(command)
-        return SimpleNamespace(returncode=0, stdout="", stderr="")
+    settings.ensure_directories()
 
-    monkeypatch.setattr("copilotd.config.subprocess.run", run)
-
-    _quiesce_windows_legacy_services(())
-
-    script = commands[0][-1]
-    assert "$upgraderProcessIds = @($PID," in script
-    assert "$upgraderProcessIds -notcontains $_.ProcessId" in script
+    assert _sqlite_marker(legacy / "copilotd.sqlite3") == "legacy"
+    assert settings.windows_legacy_layout_pending(
+        platform_name="win32",
+        environ={"LOCALAPPDATA": str(local_app_data)},
+        home=tmp_path / "home",
+    )
 
 
 def test_windows_split_layout_recovers_after_staging_crash(
@@ -461,21 +614,192 @@ def test_windows_split_layout_recovers_after_staging_crash(
             platform_name="win32",
             environ={"LOCALAPPDATA": str(local_app_data)},
             home=tmp_path / "home",
+            service_quiescer=_test_migration_guard,
         )
     staging = local_app_data / ".copilotd-legacy-state-migration"
     journal = local_app_data / ".copilotd-layout-migration.json"
     assert staging.exists() and journal.exists()
-    assert not data_dir.exists()
+    assert data_dir.exists()
 
     monkeypatch.setattr("copilotd.config.os.replace", replace)
-    assert settings.adopt_legacy_windows_layout(
-        platform_name="win32",
-        environ={"LOCALAPPDATA": str(local_app_data)},
-        home=tmp_path / "home",
+    assert _complete_adoption(
+        settings.adopt_legacy_windows_layout(
+            platform_name="win32",
+            environ={"LOCALAPPDATA": str(local_app_data)},
+            home=tmp_path / "home",
+            service_quiescer=_test_migration_guard,
+        )
     )
     assert _sqlite_marker(data_dir / "copilotd.sqlite3") == "target-db"
     assert (data_dir / "sessions" / "legacy.json").read_text() == "legacy"
     assert not staging.exists() and not journal.exists()
+
+
+def test_windows_migration_recovers_authoritative_handoff_stage(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    local_app_data = tmp_path / "Local"
+    legacy = local_app_data / "copilotD"
+    legacy_db = legacy / "copilotd.sqlite3"
+    _create_sqlite(legacy_db, "legacy")
+    data_dir, cache_dir, log_dir = platform_default_paths(
+        "win32",
+        environ={"LOCALAPPDATA": str(local_app_data)},
+        home=tmp_path / "home",
+    )
+    settings = Settings(
+        _env_file=None,
+        data_dir=data_dir,
+        cache_dir=cache_dir,
+        log_dir=log_dir,
+        resolved_home=tmp_path / "home",
+    )
+
+    def quiesce(databases: tuple[Path, ...]) -> _TestMigrationGuard:
+        guard = _test_migration_guard(databases)
+
+        def finalize(database: Path) -> None:
+            connection = sqlite3.connect(database)
+            try:
+                connection.execute("UPDATE marker SET value = 'handoff-staged'")
+                connection.commit()
+            finally:
+                connection.close()
+
+        guard.finalize_database = finalize  # type: ignore[method-assign]
+        return guard
+
+    replace = os.replace
+    staging = local_app_data / ".copilotd-legacy-state-migration"
+    crashed = False
+
+    def crash_before_authoritative_swap(
+        source: str | Path,
+        target: str | Path,
+    ) -> None:
+        nonlocal crashed
+        if Path(source) == staging and Path(target) == data_dir and not crashed:
+            crashed = True
+            raise OSError("simulated crash before authoritative swap")
+        replace(source, target)
+
+    monkeypatch.setattr(
+        "copilotd.config.os.replace",
+        crash_before_authoritative_swap,
+    )
+    with pytest.raises(OSError, match="authoritative swap"):
+        settings.adopt_legacy_windows_layout(
+            platform_name="win32",
+            environ={"LOCALAPPDATA": str(local_app_data)},
+            home=tmp_path / "home",
+            service_quiescer=quiesce,
+        )
+    journal = local_app_data / ".copilotd-layout-migration.json"
+    assert json.loads(journal.read_text())["phase"] == "swap_started"
+    assert _sqlite_marker(staging / "copilotd.sqlite3") == "handoff-staged"
+
+    monkeypatch.setattr("copilotd.config.os.replace", replace)
+    assert _complete_adoption(
+        settings.adopt_legacy_windows_layout(
+            platform_name="win32",
+            environ={"LOCALAPPDATA": str(local_app_data)},
+            home=tmp_path / "home",
+            service_quiescer=_test_migration_guard,
+        )
+    )
+    assert _sqlite_marker(data_dir / "copilotd.sqlite3") == "handoff-staged"
+    assert not staging.exists()
+    assert not journal.exists()
+
+
+def test_windows_migration_recovers_crash_after_atomic_tree_swap(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    local_app_data = tmp_path / "Local"
+    legacy_db = local_app_data / "copilotD" / "copilotd.sqlite3"
+    _create_sqlite(legacy_db, "legacy")
+    data_dir, cache_dir, log_dir = platform_default_paths(
+        "win32",
+        environ={"LOCALAPPDATA": str(local_app_data)},
+        home=tmp_path / "home",
+    )
+    settings = Settings(
+        _env_file=None,
+        data_dir=data_dir,
+        cache_dir=cache_dir,
+        log_dir=log_dir,
+        resolved_home=tmp_path / "home",
+    )
+    staging = local_app_data / ".copilotd-legacy-state-migration"
+    journal = local_app_data / ".copilotd-layout-migration.json"
+    replace = os.replace
+    crashed = False
+
+    def crash_after_swap(source: str | Path, target: str | Path) -> None:
+        nonlocal crashed
+        source_path = Path(source)
+        target_path = Path(target)
+        if source_path == staging and target_path == data_dir and not crashed:
+            crashed = True
+            replace(source, target)
+            raise OSError("simulated crash after atomic tree swap")
+        replace(source, target)
+
+    monkeypatch.setattr("copilotd.config.os.replace", crash_after_swap)
+    with pytest.raises(OSError, match="after atomic tree swap"):
+        settings.adopt_legacy_windows_layout(
+            platform_name="win32",
+            environ={"LOCALAPPDATA": str(local_app_data)},
+            home=tmp_path / "home",
+            service_quiescer=_test_migration_guard,
+        )
+
+    assert not staging.exists()
+    assert _sqlite_marker(data_dir / "copilotd.sqlite3") == "legacy"
+    assert json.loads(journal.read_text())["phase"] == "swap_started"
+
+    monkeypatch.setattr("copilotd.config.os.replace", replace)
+    adoption = settings.adopt_legacy_windows_layout(
+        platform_name="win32",
+        environ={"LOCALAPPDATA": str(local_app_data)},
+        home=tmp_path / "home",
+        service_quiescer=_test_migration_guard,
+    )
+    assert adoption is not None
+    assert json.loads(journal.read_text())["phase"] == ("swapped_pending_install")
+    adoption.complete()
+    assert not journal.exists()
+
+
+def test_windows_migration_without_setup_guard_fails_before_move(
+    tmp_path: Path,
+) -> None:
+    local_app_data = tmp_path / "Local"
+    legacy_db = local_app_data / "copilotD" / "copilotd.sqlite3"
+    _create_sqlite(legacy_db, "legacy")
+    data_dir, cache_dir, log_dir = platform_default_paths(
+        "win32",
+        environ={"LOCALAPPDATA": str(local_app_data)},
+        home=tmp_path / "home",
+    )
+    settings = Settings(
+        _env_file=None,
+        data_dir=data_dir,
+        cache_dir=cache_dir,
+        log_dir=log_dir,
+        resolved_home=tmp_path / "home",
+    )
+
+    with pytest.raises(RuntimeError, match=r"restricted to.*setup"):
+        settings.adopt_legacy_windows_layout(
+            platform_name="win32",
+            environ={"LOCALAPPDATA": str(local_app_data)},
+            home=tmp_path / "home",
+        )
+    assert _sqlite_marker(legacy_db) == "legacy"
+    assert not data_dir.exists()
 
 
 def test_service_secret_is_private_and_loadable_without_plaintext_artifacts(
@@ -527,18 +851,13 @@ def test_managed_worker_backfills_shared_handoff_token_for_future_manager(
     worker_settings = settings.ensure_service_handoff_token()
 
     assert worker_settings.service_handoff_token is not None
-    worker_token = (
-        worker_settings.service_handoff_token.get_secret_value()
-    )
+    worker_token = worker_settings.service_handoff_token.get_secret_value()
     monkeypatch.setenv("COPILOTD_DATA_DIR", str(settings.data_dir))
     monkeypatch.setenv("COPILOTD_CACHE_DIR", str(settings.cache_dir))
     monkeypatch.setenv("COPILOTD_LOG_DIR", str(settings.log_dir))
     manager_settings = load_settings()
     assert manager_settings.service_handoff_token is not None
-    assert (
-        manager_settings.service_handoff_token.get_secret_value()
-        == worker_token
-    )
+    assert manager_settings.service_handoff_token.get_secret_value() == worker_token
 
 
 def test_insecure_service_secret_is_rejected(

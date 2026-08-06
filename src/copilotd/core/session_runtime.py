@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import logging
 import time
 import uuid
 from collections.abc import Awaitable, Callable
@@ -40,6 +41,7 @@ AgentMode = Literal["interactive", "plan", "autopilot", "shell"]
 DeliveryMode = Literal["enqueue", "immediate"]
 AttachmentResolver = Callable[[str], Awaitable[list[Any]]]
 T = TypeVar("T")
+_LOGGER = logging.getLogger(__name__)
 
 
 class SessionHandle(Protocol):
@@ -130,6 +132,10 @@ class SessionNotReady(RuntimeError):
     pass
 
 
+class ClosedSessionRequiresReactivation(SessionNotReady):
+    pass
+
+
 class DetachBlocked(RuntimeError):
     def __init__(self, blockers: list[str]) -> None:
         self.blockers = blockers
@@ -214,7 +220,10 @@ class SessionRuntime:
         return self._inbox
 
     async def attach_create(self) -> None:
-        await self._attach(create=True, continue_pending_work=False)
+        await self._attach_guarded(
+            create=True,
+            continue_pending_work=False,
+        )
 
     async def attach_resume(
         self,
@@ -222,9 +231,17 @@ class SessionRuntime:
         reactivate: bool = False,
         continue_pending_work: bool = False,
     ) -> None:
-        if reactivate and self.binding.binding_intent == BindingIntent.CLOSED:
+        current = await self._bindings.by_thread(self.binding.thread_id)
+        if current is None:
+            raise SessionNotReady("session binding disappeared before attach")
+        self.binding = current
+        if self.binding.binding_intent == BindingIntent.CLOSED:
+            if not reactivate:
+                raise ClosedSessionRequiresReactivation(
+                    "closed session requires an explicit resume"
+                )
             self.binding = await self._bindings.activate(self.binding)
-        await self._attach(
+        await self._attach_guarded(
             create=False,
             continue_pending_work=continue_pending_work,
         )
@@ -274,9 +291,7 @@ class SessionRuntime:
                         "prompt_hash": prompt_hash,
                         "attachment_manifest_id": attachment_manifest_id,
                         "requested_mode": effective_agent_mode,
-                        "requested_model_config": json.loads(
-                            model_row["desired_model_config"]
-                        ),
+                        "requested_model_config": json.loads(model_row["desired_model_config"]),
                         "requested_agent": model_row["desired_agent"],
                         "requested_session_config_version": model_row[
                             "desired_session_config_version"
@@ -385,9 +400,7 @@ class SessionRuntime:
                 idempotency_key=f"queue:{row['id']}",
                 prompt=str(row["prompt"]),
                 prompt_hash=str(row["prompt_hash"]),
-                attachment_manifest_id=(
-                    None if manifest_id is None else str(manifest_id)
-                ),
+                attachment_manifest_id=(None if manifest_id is None else str(manifest_id)),
                 attachments=attachments,
                 mode=cast(DeliveryMode, str(row["requested_delivery"])),
                 agent_mode=cast(AgentMode, str(row["requested_mode_snapshot"])),
@@ -414,9 +427,7 @@ class SessionRuntime:
                 operation_idempotency_key=f"send:{idempotency_key}",
             )
             if not claimed:
-                raise OperationRejected(
-                    f"submission {submission_id} was cancelled before dispatch"
-                )
+                raise OperationRejected(f"submission {submission_id} was cancelled before dispatch")
             await inbox.commit_internal(
                 {
                     "type": "copilotd.submission.submitting",
@@ -576,13 +587,10 @@ class SessionRuntime:
                     ),
                 )
             elif (
-                int(active_lease["runtime_generation"])
-                != self.binding.runtime_generation
+                int(active_lease["runtime_generation"]) != self.binding.runtime_generation
                 or int(active_lease["owner_fence_token"]) != fence_token
             ):
-                raise RuntimeError(
-                    "queued submission has a stale active liveness lease"
-                )
+                raise RuntimeError("queued submission has a stale active liveness lease")
             else:
                 await connection.execute(
                     """
@@ -710,10 +718,7 @@ class SessionRuntime:
             except asyncio.CancelledError:
                 raise
             except Exception as error:
-                if (
-                    self.state != RuntimeState.READY
-                    or not await self._is_current_owner()
-                ):
+                if self.state != RuntimeState.READY or not await self._is_current_owner():
                     self.state = RuntimeState.FENCED
                     if self._mailbox is not None:
                         self._mailbox.freeze()
@@ -727,9 +732,7 @@ class SessionRuntime:
                         },
                     },
                     source="snapshot",
-                    internal_event_id=(
-                        f"tasks:{self.binding.runtime_generation}:{epoch}:failed"
-                    ),
+                    internal_event_id=(f"tasks:{self.binding.runtime_generation}:{epoch}:failed"),
                 )
                 continue
             if self.state != RuntimeState.READY or not await self._is_current_owner():
@@ -752,9 +755,7 @@ class SessionRuntime:
 
     async def _permission_reconcile_loop(self) -> None:
         while not self._permission_reconcile_stop.is_set():
-            requested = asyncio.create_task(
-                self._permission_reconcile_requested.wait()
-            )
+            requested = asyncio.create_task(self._permission_reconcile_requested.wait())
             stopped = asyncio.create_task(self._permission_reconcile_stop.wait())
             done, pending = await asyncio.wait(
                 {requested, stopped},
@@ -777,9 +778,7 @@ class SessionRuntime:
             error_type: str | None = None
             try:
                 await self._assert_owned_handle()
-                await self._sdk_call(
-                    self._bridge.ensure_allow_all(self._require_handle())
-                )
+                await self._sdk_call(self._bridge.ensure_allow_all(self._require_handle()))
             except asyncio.CancelledError:
                 raise
             except PermissionPostureError as error:
@@ -818,9 +817,7 @@ class SessionRuntime:
                     },
                 },
                 source="snapshot",
-                internal_event_id=(
-                    f"permissions:{self.binding.runtime_generation}:{epoch}"
-                ),
+                internal_event_id=(f"permissions:{self.binding.runtime_generation}:{epoch}"),
             )
 
     def _on_sdk_event_accepted(self, event: Any) -> None:
@@ -849,9 +846,7 @@ class SessionRuntime:
                 )
                 overflow = self._inbox.overflow
                 if overflow is not None and overflow.lost_count:
-                    on_loss(
-                        "pre_quiesce_inbox_overflow"
-                    )
+                    on_loss("pre_quiesce_inbox_overflow")
         if self._mailbox is not None:
             await self._mailbox.pause_admission()
             await self._mailbox.wait_idle()
@@ -962,9 +957,7 @@ class SessionRuntime:
             await self._bridge.set_mode(handle, mode)
             observed = await self._bridge.get_mode(handle)
             if observed != mode:
-                raise RuntimeError(
-                    f"mode reconciliation returned {observed}; expected {mode}"
-                )
+                raise RuntimeError(f"mode reconciliation returned {observed}; expected {mode}")
             return observed
 
         try:
@@ -1069,17 +1062,12 @@ class SessionRuntime:
                     context_tier=context_tier,
                 )
             )
-            observed = await self._sdk_call(
-                self._bridge.get_current_model(handle)
-            )
+            observed = await self._sdk_call(self._bridge.get_current_model(handle))
             if observed.get("modelId") != model:
                 raise RuntimeError(
                     f"model reconciliation returned {observed.get('modelId')}; expected {model}"
                 )
-            if (
-                reasoning_effort is not None
-                and observed.get("reasoningEffort") != reasoning_effort
-            ):
+            if reasoning_effort is not None and observed.get("reasoningEffort") != reasoning_effort:
                 raise RuntimeError("model reasoning effort could not be confirmed")
             observed_tier = observed.get("contextTier")
             if context_tier is not None and observed_tier != context_tier:
@@ -1181,12 +1169,9 @@ class SessionRuntime:
             retry_after = request.get("retryAfterSeconds")
             suffix = "" if retry_after is None else f" Retry after {retry_after} seconds."
             payload["question"] = (
-                "Copilot reached an eligible rate limit. Switch to Auto mode?"
-                f"{suffix}"
+                f"Copilot reached an eligible rate limit. Switch to Auto mode?{suffix}"
             )
-        future: asyncio.Future[dict[str, Any] | str] = (
-            asyncio.get_running_loop().create_future()
-        )
+        future: asyncio.Future[dict[str, Any] | str] = asyncio.get_running_loop().create_future()
         self._interaction_futures[interaction_id] = future
         await self._require_inbox().commit_internal(
             {"type": "copilotd.interaction.requested", "data": payload},
@@ -1628,9 +1613,7 @@ class SessionRuntime:
                     raise DetachBlocked(blockers)
             if force and blockers:
                 await self.clear_queue()
-                await self.cancel_pending_interactions(
-                    reason="Cancelled by forced session close."
-                )
+                await self.cancel_pending_interactions(reason="Cancelled by forced session close.")
                 await self._force_active_unknown()
                 try:
                     await self.abort(idempotency_key=f"{idempotency_key}:force")
@@ -1772,11 +1755,7 @@ class SessionRuntime:
                 self.binding = await self._bindings.begin_attachment(
                     thread_id=self.binding.thread_id,
                     lease=self._lease,
-                    state=(
-                        AttachmentState.CREATING
-                        if create
-                        else AttachmentState.RESUMING
-                    ),
+                    state=(AttachmentState.CREATING if create else AttachmentState.RESUMING),
                 )
                 self._start_components()
             except BaseException:
@@ -1879,8 +1858,7 @@ class SessionRuntime:
                             "data": {"observed": observed_model},
                         },
                         internal_event_id=(
-                            f"model:{self.binding.runtime_generation}:"
-                            f"initial:{observed_hash}"
+                            f"model:{self.binding.runtime_generation}:initial:{observed_hash}"
                         ),
                     )
             elif desired_model:
@@ -1903,6 +1881,138 @@ class SessionRuntime:
                 self._accepting_sends = True
             self._start_runtime_producers()
 
+    async def _attach_guarded(
+        self,
+        *,
+        create: bool,
+        continue_pending_work: bool,
+    ) -> None:
+        try:
+            await self._attach(
+                create=create,
+                continue_pending_work=continue_pending_work,
+            )
+        except asyncio.CancelledError:
+            if (
+                self._handle is not None or self._lease is not None or self._inbox is not None
+            ) and self.state not in {
+                RuntimeState.DETACHED,
+                RuntimeState.RECOVERY_UNKNOWN,
+            }:
+                await self._shield_cancelled_attachment_cleanup()
+            raise
+
+    async def _shield_cancelled_attachment_cleanup(self) -> None:
+        cleanup = asyncio.create_task(
+            self._cleanup_cancelled_attachment(),
+            name=f"attach-cancel-cleanup:{self.binding.sdk_session_id}",
+        )
+        try:
+            await asyncio.shield(cleanup)
+        except asyncio.CancelledError:
+            await cleanup
+        except BaseException:
+            self.state = RuntimeState.RECOVERY_UNKNOWN
+            _LOGGER.exception(
+                "cancelled attachment cleanup failed for %s",
+                self.binding.sdk_session_id,
+            )
+
+    async def _cleanup_cancelled_attachment(self) -> None:
+        disconnected = False
+        durable_state_set = False
+        lease = self._lease
+        fence_token = lease.fence_token if lease is not None else self.binding.owner_fence_token
+        try:
+            if self._handle is not None:
+                try:
+                    await self._sdk_call(self._handle.disconnect())
+                except BaseException:
+                    disconnected = False
+                else:
+                    disconnected = True
+            current = await self._bindings.by_thread(self.binding.thread_id)
+            if (
+                current is not None
+                and current.sdk_session_id == self.binding.sdk_session_id
+                and fence_token is not None
+                and current.owner_fence_token == fence_token
+            ):
+                if disconnected and current.attachment_state in {
+                    AttachmentState.CREATING,
+                    AttachmentState.RESUMING,
+                    AttachmentState.ATTACHED,
+                }:
+                    self.binding = await self._bindings.reset_cancelled_attachment(current)
+                    self.state = RuntimeState.DETACHED
+                    durable_state_set = True
+                elif current.attachment_state in {
+                    AttachmentState.CREATING,
+                    AttachmentState.RESUMING,
+                    AttachmentState.ATTACHED,
+                    AttachmentState.DISCONNECTING,
+                }:
+                    self.binding = await self._bindings.mark_recovery_unknown(current)
+                    self.state = RuntimeState.RECOVERY_UNKNOWN
+                    durable_state_set = True
+        except BaseException:
+            self.state = RuntimeState.RECOVERY_UNKNOWN
+            try:
+                async with self._database.transaction() as connection:
+                    cursor = await connection.execute(
+                        """
+                        UPDATE session_bindings
+                        SET attachment_state = 'recovery_unknown',
+                            attachment_reason = 'attach_cancel_cleanup_failed',
+                            permission_posture = 'unknown',
+                            permission_verified_at = NULL,
+                            updated_at = ?, row_version = row_version + 1
+                        WHERE thread_id = ? AND sdk_session_id = ?
+                          AND owner_fence_token = ?
+                          AND attachment_state IN (
+                            'creating', 'resuming', 'attached', 'disconnecting'
+                          )
+                        """,
+                        (
+                            time.time(),
+                            self.binding.thread_id,
+                            self.binding.sdk_session_id,
+                            fence_token,
+                        ),
+                    )
+                    durable_state_set = cursor.rowcount == 1
+                    await cursor.close()
+            except BaseException:
+                _LOGGER.exception(
+                    "could not mark cancelled attachment unknown for %s",
+                    self.binding.sdk_session_id,
+                )
+            _LOGGER.exception(
+                "attachment cancellation reconciliation failed for %s",
+                self.binding.sdk_session_id,
+            )
+        finally:
+            if not durable_state_set:
+                self.state = RuntimeState.RECOVERY_UNKNOWN
+            try:
+                await self._stop_components(release_owner=True)
+            except BaseException:
+                self.state = RuntimeState.RECOVERY_UNKNOWN
+                _LOGGER.exception(
+                    "attachment cancellation component release failed for %s",
+                    self.binding.sdk_session_id,
+                )
+                if lease is not None:
+                    try:
+                        await self._owner_leases.release(lease)
+                    except BaseException:
+                        _LOGGER.exception(
+                            "attachment cancellation owner release failed for %s",
+                            self.binding.sdk_session_id,
+                        )
+        if disconnected and durable_state_set and (self.state != RuntimeState.RECOVERY_UNKNOWN):
+            self.state = RuntimeState.DETACHED
+
     async def _shield_attachment_cleanup(self, *, mark_unknown: bool) -> None:
         cleanup = asyncio.create_task(
             self._cleanup_attachment_failure(mark_unknown=mark_unknown),
@@ -1915,13 +2025,15 @@ class SessionRuntime:
 
     async def _cleanup_attachment_failure(self, *, mark_unknown: bool) -> None:
         if mark_unknown:
+            lease = self._lease
+            fence_token = lease.fence_token if lease is not None else self.binding.owner_fence_token
             current = await self._bindings.by_thread(self.binding.thread_id)
             if (
                 current is not None
-                and current.runtime_generation == self.binding.runtime_generation
-                and current.owner_fence_token == self.binding.owner_fence_token
-                and current.attachment_state
-                in {AttachmentState.CREATING, AttachmentState.RESUMING}
+                and current.sdk_session_id == self.binding.sdk_session_id
+                and fence_token is not None
+                and current.owner_fence_token == fence_token
+                and current.attachment_state in {AttachmentState.CREATING, AttachmentState.RESUMING}
             ):
                 self.binding = await self._bindings.mark_attach_unknown(current)
             self.state = RuntimeState.RECOVERY_UNKNOWN
@@ -1930,11 +2042,7 @@ class SessionRuntime:
             if not mark_unknown:
                 self.state = RuntimeState.DETACHED
         else:
-            self.state = (
-                RuntimeState.RECOVERY_UNKNOWN
-                if mark_unknown
-                else RuntimeState.DETACHED
-            )
+            self.state = RuntimeState.RECOVERY_UNKNOWN if mark_unknown else RuntimeState.DETACHED
 
     async def _acquire_owner_for_attachment(self) -> OwnerLease:
         error: OwnerConflict | None = None
@@ -1953,9 +2061,7 @@ class SessionRuntime:
         raise error
 
     async def _release_unassigned_owner_lease(self) -> None:
-        current = await self._owner_leases.current(
-            self.binding.sdk_session_id
-        )
+        current = await self._owner_leases.current(self.binding.sdk_session_id)
         if current is None or current.owner_id != self._owner_id:
             return
         try:
@@ -2197,9 +2303,7 @@ class SessionRuntime:
             self._permission_reconcile_task = None
         if self._mailbox is not None:
             try:
-                await self._mailbox.stop(
-                    timeout_seconds=self._shutdown_timeout_seconds
-                )
+                await self._mailbox.stop(timeout_seconds=self._shutdown_timeout_seconds)
             except Exception as error:
                 errors.append(error)
             self._mailbox = None
@@ -2209,9 +2313,7 @@ class SessionRuntime:
             self._renewal_task = None
         if self._reducer is not None:
             try:
-                await self._reducer.stop(
-                    timeout_seconds=self._shutdown_timeout_seconds
-                )
+                await self._reducer.stop(timeout_seconds=self._shutdown_timeout_seconds)
             except Exception as error:
                 if self.state != RuntimeState.FENCED:
                     errors.append(error)
@@ -2226,10 +2328,7 @@ class SessionRuntime:
             try:
                 await self._owner_leases.release(lease)
             except Exception as error:
-                if not (
-                    self.state == RuntimeState.FENCED
-                    and isinstance(error, FenceLost)
-                ):
+                if not (self.state == RuntimeState.FENCED and isinstance(error, FenceLost)):
                     errors.append(error)
         if errors:
             raise ExceptionGroup("session component shutdown failed", errors)

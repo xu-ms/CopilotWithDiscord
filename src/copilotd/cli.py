@@ -13,7 +13,7 @@ from typing import Any
 from pydantic import ValidationError
 
 from copilotd import __version__
-from copilotd.config import Settings, load_settings
+from copilotd.config import LegacyLayoutAdoption, Settings, load_settings
 from copilotd.discord_app import run_discord_bot
 from copilotd.logging import configure_logging
 from copilotd.ops.contracts import (
@@ -103,6 +103,14 @@ async def run_command(
     manager: ServiceManager | None = None,
 ) -> int:
     settings = load_settings() if settings is None else settings
+    install_request = args.command == "setup" or (
+        args.command == "service" and args.service_command == "install"
+    )
+    if not install_request and settings.windows_legacy_layout_pending():
+        raise ValueError(
+            "legacy Windows state requires `copilotd setup` or "
+            "`copilotd service install` before this command"
+        )
     settings.ensure_directories()
     configure_logging(
         settings.log_level,
@@ -154,17 +162,28 @@ async def run_command(
         return 0
 
     if args.command == "setup":
-        async with Database(settings.database_path):
-            pass
         selected_preflight = preflight or SetupPreflight(settings)
         report = await selected_preflight.run()
         report.require_success()
         selected_manager = manager or ServiceManager(settings)
-        receipt = await asyncio.to_thread(selected_manager.install)
-        status = await asyncio.to_thread(
-            selected_manager.verify_post_install,
-            receipt,
+        adoption = await _adopt_windows_legacy_layout(
+            settings,
+            selected_manager,
         )
+        try:
+            async with Database(settings.database_path):
+                pass
+            receipt = await asyncio.to_thread(selected_manager.install)
+            status = await asyncio.to_thread(
+                selected_manager.verify_post_install,
+                receipt,
+            )
+        except BaseException:
+            if adoption is not None:
+                adoption.abandon()
+            raise
+        if adoption is not None:
+            adoption.complete()
         _print_success(
             "setup",
             {
@@ -177,18 +196,28 @@ async def run_command(
 
     if args.command == "service":
         selected_manager = manager or ServiceManager(settings)
-        if args.service_command in {"install", "status", "restart", "watchdog"}:
-            async with Database(settings.database_path):
-                pass
         if args.service_command == "install":
             selected_preflight = preflight or SetupPreflight(settings)
             report = await selected_preflight.run()
             report.require_success()
-            receipt = await asyncio.to_thread(selected_manager.install)
-            status = await asyncio.to_thread(
-                selected_manager.verify_post_install,
-                receipt,
+            adoption = await _adopt_windows_legacy_layout(
+                settings,
+                selected_manager,
             )
+            try:
+                async with Database(settings.database_path):
+                    pass
+                receipt = await asyncio.to_thread(selected_manager.install)
+                status = await asyncio.to_thread(
+                    selected_manager.verify_post_install,
+                    receipt,
+                )
+            except BaseException:
+                if adoption is not None:
+                    adoption.abandon()
+                raise
+            if adoption is not None:
+                adoption.complete()
             _print_success(
                 "service.install",
                 {
@@ -198,11 +227,15 @@ async def run_command(
                 },
             )
         elif args.service_command == "status":
+            async with Database(settings.database_path):
+                pass
             _print_success(
                 "service.status",
                 status_dict(await asyncio.to_thread(selected_manager.status)),
             )
         elif args.service_command == "restart":
+            async with Database(settings.database_path):
+                pass
             receipt = await asyncio.to_thread(
                 selected_manager.restart,
                 force=args.force,
@@ -231,6 +264,8 @@ async def run_command(
                 },
             )
         elif args.service_command == "watchdog":
+            async with Database(settings.database_path):
+                pass
             outcome = await asyncio.to_thread(selected_manager.watchdog)
             _print_success("service.watchdog", {"watchdog": outcome})
         elif args.service_command == "logs":
@@ -261,6 +296,21 @@ async def run_command(
         return 0
 
     raise AssertionError(f"unhandled command: {args.command}")
+
+
+async def _adopt_windows_legacy_layout(
+    settings: Settings,
+    manager: ServiceManager,
+) -> LegacyLayoutAdoption | None:
+    if manager.platform != "win32":
+        return None
+    adoption = await asyncio.to_thread(
+        settings.adopt_legacy_windows_layout,
+        platform_name="win32",
+        service_quiescer=manager.quiesce_windows_legacy_layout,
+    )
+    settings.ensure_directories()
+    return adoption
 
 
 def main(argv: list[str] | None = None) -> None:

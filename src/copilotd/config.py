@@ -3,18 +3,54 @@ from __future__ import annotations
 import hashlib
 import json
 import os
-import sqlite3
 import stat
-import subprocess
 import sys
 import time
 import uuid
 from collections.abc import Callable, Mapping
+from dataclasses import dataclass
 from pathlib import Path
+from typing import Protocol
 
 from platformdirs import user_cache_path, user_data_path, user_log_path
 from pydantic import Field, SecretStr, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+
+class LegacyLayoutMigrationGuard(Protocol):
+    def stage_database(self, source: Path, target: Path) -> None: ...
+
+    def finalize_database(self, database: Path) -> None: ...
+
+    def prepare_swap(self) -> None: ...
+
+    def release(self) -> None: ...
+
+
+@dataclass(slots=True)
+class LegacyLayoutAdoption:
+    journal_path: Path
+    guard: LegacyLayoutMigrationGuard
+    _closed: bool = False
+
+    def complete(self) -> None:
+        if self._closed:
+            return
+        try:
+            self.journal_path.unlink(missing_ok=True)
+        finally:
+            try:
+                self.guard.release()
+            finally:
+                self._closed = True
+
+    def abandon(self) -> None:
+        if self._closed:
+            return
+        try:
+            self.guard.release()
+        finally:
+            self._closed = True
 
 
 def platform_default_paths(
@@ -164,9 +200,42 @@ class Settings(BaseSettings):
     def capability_path(self) -> Path:
         return self.data_dir / "cache" / "event-fixtures" / "capabilities.json"
 
+    def windows_legacy_layout_pending(
+        self,
+        *,
+        platform_name: str | None = None,
+        environ: Mapping[str, str] | None = None,
+        home: Path | None = None,
+    ) -> bool:
+        effective_platform = sys.platform if platform_name is None else platform_name
+        if effective_platform != "win32":
+            return False
+        effective_environ = os.environ if environ is None else environ
+        effective_home = self.resolved_home if home is None else home
+        expected_data, _, _ = platform_default_paths(
+            "win32",
+            environ=effective_environ,
+            home=effective_home,
+        )
+        if self.data_dir != expected_data.expanduser().resolve():
+            return False
+        local_app_data = expected_data.parent.parent
+        legacy_root = local_app_data / "copilotD"
+        excluded = {
+            expected_data,
+            self.cache_dir,
+            self.log_dir,
+            local_app_data / ".copilotd-legacy-state-migration",
+            local_app_data / ".copilotd-layout-migration.json",
+            local_app_data / ".copilotd-layout-migration.lock",
+        }
+        return (
+            bool(_legacy_state_entries(legacy_root, excluded=excluded))
+            or (local_app_data / ".copilotd-legacy-state-migration").exists()
+            or (local_app_data / ".copilotd-layout-migration.json").exists()
+        )
+
     def ensure_directories(self) -> None:
-        if os.environ.get("COPILOTD_MANAGED_SERVICE") != "1":
-            self.adopt_legacy_windows_layout()
         directories = [
             self.data_dir,
             self.cache_dir,
@@ -193,11 +262,11 @@ class Settings(BaseSettings):
         platform_name: str | None = None,
         environ: Mapping[str, str] | None = None,
         home: Path | None = None,
-        service_quiescer: Callable[[tuple[Path, ...]], None] | None = None,
-    ) -> bool:
+        service_quiescer: (Callable[[tuple[Path, ...]], LegacyLayoutMigrationGuard] | None) = None,
+    ) -> LegacyLayoutAdoption | None:
         effective_platform = sys.platform if platform_name is None else platform_name
         if effective_platform != "win32":
-            return False
+            return None
         effective_environ = os.environ if environ is None else environ
         effective_home = self.resolved_home if home is None else home
         expected_data, _, _ = platform_default_paths(
@@ -206,7 +275,7 @@ class Settings(BaseSettings):
             home=effective_home,
         )
         if self.data_dir != expected_data.expanduser().resolve():
-            return False
+            return None
         local_app_data = expected_data.parent.parent
         legacy_root = local_app_data / "copilotD"
         target_root = expected_data.parent
@@ -215,12 +284,9 @@ class Settings(BaseSettings):
         lock = local_app_data / ".copilotd-layout-migration.lock"
         local_app_data.mkdir(parents=True, exist_ok=True)
         descriptor = _acquire_private_lock(lock)
+        guard: LegacyLayoutMigrationGuard | None = None
         try:
-            legacy_source = (
-                legacy_root
-                if legacy_root.exists()
-                else target_root
-            )
+            legacy_source = legacy_root if legacy_root.exists() else target_root
             excluded = {
                 expected_data,
                 self.cache_dir,
@@ -234,41 +300,97 @@ class Settings(BaseSettings):
                 excluded=excluded,
             )
             migration = _read_private_json(journal)
-            if staging.exists() and expected_data.exists():
-                raise RuntimeError(
-                    "Windows state migration has both staged and target trees"
+            migration_phase = None if migration is None else str(migration.get("phase"))
+            if (
+                migration_phase
+                in {
+                    "swap_started",
+                    "swapped_pending_install",
+                }
+                and expected_data.is_dir()
+                and not staging.exists()
+            ):
+                if service_quiescer is None:
+                    raise RuntimeError(
+                        "Windows legacy state migration is restricted to "
+                        "`copilotd setup` or `copilotd service install`"
+                    )
+                databases = (
+                    (expected_data / "copilotd.sqlite3",)
+                    if (expected_data / "copilotd.sqlite3").exists()
+                    else ()
                 )
-            if staging.exists():
-                if migration is None or migration.get("phase") not in {
+                guard = service_quiescer(databases)
+                guard.prepare_swap()
+                if migration_phase == "swap_started":
+                    _atomic_private_json(
+                        journal,
+                        {
+                            "schema_version": 1,
+                            "phase": "swapped_pending_install",
+                            "target": str(expected_data),
+                            "service_quiesced": True,
+                            "durable_handoff": True,
+                            "swap_recovered": True,
+                        },
+                    )
+                adoption = LegacyLayoutAdoption(journal, guard)
+                guard = None
+                return adoption
+            if staging.exists() and expected_data.exists():
+                if migration_phase not in {
                     "prepared",
                     "staged",
+                    "database_staging",
+                    "handoff_staged",
+                    "swap_started",
+                }:
+                    raise RuntimeError("Windows state migration has both staged and target trees")
+            if staging.exists():
+                if migration is None or migration_phase not in {
+                    "prepared",
+                    "staged",
+                    "database_staging",
+                    "handoff_staged",
+                    "swap_started",
                 }:
                     raise RuntimeError(
-                        "Windows state migration staging exists without "
-                        "a recoverable journal"
+                        "Windows state migration staging exists without a recoverable journal"
                     )
-                _assert_merge_compatible(legacy_entries, staging)
+                _assert_merge_compatible(
+                    legacy_entries,
+                    staging,
+                    ignore_database=migration_phase
+                    in {
+                        "database_staging",
+                        "handoff_staged",
+                        "swap_started",
+                    },
+                )
             elif not legacy_entries:
-                journal.unlink(missing_ok=True)
-                return False
+                if migration is not None:
+                    raise RuntimeError("Windows migration journal has no recoverable state")
+                return None
             else:
                 if expected_data.exists():
                     _assert_merge_compatible(legacy_entries, expected_data)
+            if service_quiescer is None:
+                raise RuntimeError(
+                    "Windows legacy state migration is restricted to "
+                    "`copilotd setup` or `copilotd service install`"
+                )
+            if staging.exists() and migration_phase == "database_staging":
+                for path in _sqlite_family(staging / "copilotd.sqlite3"):
+                    path.unlink(missing_ok=True)
             databases = tuple(
                 path
                 for path in {
                     legacy_source / "copilotd.sqlite3",
                     expected_data / "copilotd.sqlite3",
-                    staging / "copilotd.sqlite3",
                 }
                 if path.exists()
             )
-            if service_quiescer is not None:
-                service_quiescer(databases)
-            elif sys.platform == "win32":
-                _quiesce_windows_legacy_services(databases)
-            if databases:
-                _verify_exclusive_sqlite_writers(databases)
+            guard = service_quiescer(databases)
             if not staging.exists():
                 _atomic_private_json(
                     journal,
@@ -281,10 +403,7 @@ class Settings(BaseSettings):
                         "service_quiesced": True,
                     },
                 )
-                if expected_data.exists():
-                    os.replace(expected_data, staging)
-                else:
-                    staging.mkdir(parents=True, exist_ok=False)
+                staging.mkdir(parents=True, exist_ok=False)
             _atomic_private_json(
                 journal,
                 {
@@ -296,24 +415,101 @@ class Settings(BaseSettings):
                     "service_quiesced": True,
                 },
             )
+            authoritative_staged = migration_phase in {
+                "handoff_staged",
+                "swap_started",
+            }
+            deferred: list[Path] = []
+            if expected_data.exists():
+                for entry in sorted(
+                    list(expected_data.iterdir()),
+                    key=lambda path: path.name.casefold(),
+                ):
+                    _merge_state_entry(
+                        entry,
+                        staging / entry.name,
+                        guard=guard,
+                        deferred=deferred,
+                        authoritative_staged=authoritative_staged,
+                    )
             legacy_entries = _legacy_state_entries(
                 legacy_source,
                 excluded=excluded,
             )
-            _assert_merge_compatible(legacy_entries, staging)
+            _assert_merge_compatible(
+                legacy_entries,
+                staging,
+                ignore_database=authoritative_staged,
+            )
             for entry in legacy_entries:
-                _merge_state_entry(entry, staging / entry.name)
-            if (
-                legacy_source != target_root
-                and legacy_source.exists()
-                and not any(legacy_source.iterdir())
-            ):
-                legacy_source.rmdir()
+                _merge_state_entry(
+                    entry,
+                    staging / entry.name,
+                    guard=guard,
+                    deferred=deferred,
+                    authoritative_staged=authoritative_staged,
+                )
+            staged_database = staging / "copilotd.sqlite3"
+            if not authoritative_staged and staged_database.exists():
+                _atomic_private_json(
+                    journal,
+                    {
+                        "schema_version": 1,
+                        "phase": "database_staging",
+                        "legacy": str(legacy_source),
+                        "staging": str(staging),
+                        "target": str(expected_data),
+                        "service_quiesced": True,
+                    },
+                )
+                guard.finalize_database(staged_database)
+                _atomic_private_json(
+                    journal,
+                    {
+                        "schema_version": 1,
+                        "phase": "handoff_staged",
+                        "legacy": str(legacy_source),
+                        "staging": str(staging),
+                        "target": str(expected_data),
+                        "service_quiesced": True,
+                    },
+                )
+            guard.prepare_swap()
+            for path in deferred:
+                path.unlink(missing_ok=True)
+            _prune_empty_directories(expected_data)
+            if legacy_source != target_root:
+                _prune_empty_directories(legacy_source)
             target_root.mkdir(parents=True, exist_ok=True)
+            _atomic_private_json(
+                journal,
+                {
+                    "schema_version": 1,
+                    "phase": "swap_started",
+                    "legacy": str(legacy_source),
+                    "staging": str(staging),
+                    "target": str(expected_data),
+                    "service_quiesced": True,
+                    "durable_handoff": True,
+                },
+            )
             os.replace(staging, expected_data)
-            journal.unlink(missing_ok=True)
-            return True
+            _atomic_private_json(
+                journal,
+                {
+                    "schema_version": 1,
+                    "phase": "swapped_pending_install",
+                    "target": str(expected_data),
+                    "service_quiesced": True,
+                    "durable_handoff": True,
+                },
+            )
+            adoption = LegacyLayoutAdoption(journal, guard)
+            guard = None
+            return adoption
         finally:
+            if guard is not None:
+                guard.release()
             os.close(descriptor)
             lock.unlink(missing_ok=True)
 
@@ -353,12 +549,8 @@ class Settings(BaseSettings):
             ),
             "service_handoff_token": (
                 None
-                if service_handoff_token is None
-                and self.service_handoff_token is None
-                else (
-                    service_handoff_token
-                    or self.service_handoff_token
-                ).get_secret_value()
+                if service_handoff_token is None and self.service_handoff_token is None
+                else (service_handoff_token or self.service_handoff_token).get_secret_value()
             ),
         }
         _atomic_private_json(self.service_secrets_path, payload)
@@ -367,12 +559,8 @@ class Settings(BaseSettings):
     def ensure_service_handoff_token(self) -> Settings:
         if self.service_handoff_token is not None:
             return self
-        updated = self.model_copy(
-            update={"service_handoff_token": SecretStr(uuid.uuid4().hex)}
-        )
-        updated.write_service_secrets(
-            service_handoff_token=updated.service_handoff_token
-        )
+        updated = self.model_copy(update={"service_handoff_token": SecretStr(uuid.uuid4().hex)})
+        updated.write_service_secrets(service_handoff_token=updated.service_handoff_token)
         return updated
 
     @property
@@ -422,8 +610,6 @@ def load_settings() -> Settings:
     """Load environment settings plus the private service-only secret file."""
 
     settings = Settings()
-    if os.environ.get("COPILOTD_MANAGED_SERVICE") != "1":
-        settings.adopt_legacy_windows_layout()
     settings = _apply_persisted_service_settings(settings)
     secret_path_text = os.environ.get("COPILOTD_SERVICE_SECRETS")
     if secret_path_text is None and not settings.service_secrets_path.exists():
@@ -448,9 +634,7 @@ def load_settings() -> Settings:
     if settings.runtime_connection_token is None and payload.get("runtime_connection_token"):
         updates["runtime_connection_token"] = SecretStr(str(payload["runtime_connection_token"]))
     if settings.service_handoff_token is None and payload.get("service_handoff_token"):
-        updates["service_handoff_token"] = SecretStr(
-            str(payload["service_handoff_token"])
-        )
+        updates["service_handoff_token"] = SecretStr(str(payload["service_handoff_token"]))
     return settings.model_copy(update=updates)
 
 
@@ -501,15 +685,12 @@ def _legacy_state_entries(
 ) -> list[Path]:
     if not root.is_dir():
         return []
-    excluded_keys = {
-        str(path).replace("/", "\\").casefold() for path in excluded
-    }
+    excluded_keys = {str(path).replace("/", "\\").casefold() for path in excluded}
     return sorted(
         (
             entry
             for entry in root.iterdir()
-            if str(entry).replace("/", "\\").casefold()
-            not in excluded_keys
+            if str(entry).replace("/", "\\").casefold() not in excluded_keys
             and entry.name
             not in {
                 ".copilotd-layout-migration.json",
@@ -521,54 +702,110 @@ def _legacy_state_entries(
     )
 
 
-def _assert_merge_compatible(entries: list[Path], target: Path) -> None:
+def _assert_merge_compatible(
+    entries: list[Path],
+    target: Path,
+    *,
+    ignore_database: bool = False,
+) -> None:
     conflicts: list[str] = []
     for source in entries:
-        _collect_merge_conflicts(source, target / source.name, conflicts)
-    if conflicts:
-        raise RuntimeError(
-            "Windows legacy and target state conflict: "
-            + ", ".join(conflicts)
+        _collect_merge_conflicts(
+            source,
+            target / source.name,
+            conflicts,
+            ignore_database=ignore_database,
         )
+    if conflicts:
+        raise RuntimeError("Windows legacy and target state conflict: " + ", ".join(conflicts))
 
 
 def _collect_merge_conflicts(
     source: Path,
     target: Path,
     conflicts: list[str],
+    *,
+    ignore_database: bool,
 ) -> None:
+    if ignore_database and _is_sqlite_family(source):
+        return
     if not target.exists():
         return
     if source.is_dir() and target.is_dir():
         for child in source.iterdir():
-            _collect_merge_conflicts(child, target / child.name, conflicts)
+            _collect_merge_conflicts(
+                child,
+                target / child.name,
+                conflicts,
+                ignore_database=ignore_database,
+            )
         return
     if source.is_file() and target.is_file():
         if _file_digest(source) != _file_digest(target):
-            conflicts.append(
-                f"{source.name} differs at {source} and {target}"
-            )
+            conflicts.append(f"{source.name} differs at {source} and {target}")
         return
     conflicts.append(f"type mismatch at {source} and {target}")
 
 
-def _merge_state_entry(source: Path, target: Path) -> None:
+def _merge_state_entry(
+    source: Path,
+    target: Path,
+    *,
+    guard: LegacyLayoutMigrationGuard,
+    deferred: list[Path],
+    authoritative_staged: bool,
+) -> None:
+    if _is_sqlite_family(source):
+        deferred.append(source)
+        if source.name == "copilotd.sqlite3" and not authoritative_staged:
+            guard.stage_database(source, target)
+        return
     if not target.exists():
         os.replace(source, target)
         return
     if source.is_dir() and target.is_dir():
         for child in list(source.iterdir()):
-            _merge_state_entry(child, target / child.name)
-        source.rmdir()
+            _merge_state_entry(
+                child,
+                target / child.name,
+                guard=guard,
+                deferred=deferred,
+                authoritative_staged=authoritative_staged,
+            )
+        if not any(source.iterdir()):
+            source.rmdir()
         return
     if source.is_file() and target.is_file():
         if _file_digest(source) != _file_digest(target):
-            raise RuntimeError(
-                f"Windows state changed during migration: {source}"
-            )
+            raise RuntimeError(f"Windows state changed during migration: {source}")
         source.unlink()
         return
     raise RuntimeError(f"Windows state type changed during migration: {source}")
+
+
+def _is_sqlite_family(path: Path) -> bool:
+    return path.name in {
+        "copilotd.sqlite3",
+        "copilotd.sqlite3-wal",
+        "copilotd.sqlite3-shm",
+    }
+
+
+def _sqlite_family(database: Path) -> tuple[Path, Path, Path]:
+    return (
+        database,
+        database.with_name(database.name + "-wal"),
+        database.with_name(database.name + "-shm"),
+    )
+
+
+def _prune_empty_directories(root: Path) -> None:
+    if not root.is_dir():
+        return
+    for directory, _, _ in os.walk(root, topdown=False):
+        path = Path(directory)
+        if not any(path.iterdir()):
+            path.rmdir()
 
 
 def _file_digest(path: Path) -> str:
@@ -585,73 +822,6 @@ def _read_private_json(path: Path) -> dict[str, object] | None:
     except (OSError, ValueError, json.JSONDecodeError):
         return None
     return payload if isinstance(payload, dict) else None
-
-
-def _quiesce_windows_legacy_services(
-    databases: tuple[Path, ...],
-) -> None:
-    del databases
-    script = r"""
-$ErrorActionPreference = 'Stop'
-$upgraderProcessIds = @($PID, __PARENT_PID__)
-$tasks = @('copilotD Runtime', 'copilotD Bot', 'copilotD Watchdog')
-foreach ($taskName in $tasks) {
-  Stop-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue
-}
-$pattern = '(?i)(copilotd-service\.ps1|(?:^|\s)copilotd(?:\.exe)?\s+run\s+--foreground)'
-$deadline = [DateTime]::UtcNow.AddSeconds(15)
-do {
-  $processes = @(Get-CimInstance Win32_Process | Where-Object {
-    $upgraderProcessIds -notcontains $_.ProcessId -and
-    [regex]::IsMatch([string]$_.CommandLine, $pattern)
-  })
-  foreach ($process in $processes) {
-    & taskkill.exe /PID $process.ProcessId /T /F | Out-Null
-  }
-  if ($processes.Count -eq 0) { break }
-  Start-Sleep -Milliseconds 200
-} while ([DateTime]::UtcNow -lt $deadline)
-$remaining = @(Get-CimInstance Win32_Process | Where-Object {
-  $upgraderProcessIds -notcontains $_.ProcessId -and
-  [regex]::IsMatch([string]$_.CommandLine, $pattern)
-})
-if ($remaining.Count -ne 0) {
-  throw 'legacy copilotD process tree did not stop'
-}
-""".replace("__PARENT_PID__", str(os.getpid()))
-    completed = subprocess.run(
-        [
-            "powershell.exe",
-            "-NoProfile",
-            "-NonInteractive",
-            "-Command",
-            script,
-        ],
-        check=False,
-        capture_output=True,
-        text=True,
-    )
-    if completed.returncode != 0:
-        detail = completed.stderr.strip() or completed.stdout.strip()
-        raise RuntimeError(
-            f"could not quiesce legacy Windows service: {detail}"
-        )
-
-
-def _verify_exclusive_sqlite_writers(
-    databases: tuple[Path, ...],
-) -> None:
-    for database in databases:
-        connection = sqlite3.connect(str(database), timeout=0)
-        try:
-            connection.execute("BEGIN EXCLUSIVE")
-            connection.rollback()
-        except sqlite3.Error as error:
-            raise RuntimeError(
-                f"legacy SQLite database still has an active writer: {database}"
-            ) from error
-        finally:
-            connection.close()
 
 
 def _acquire_private_lock(path: Path) -> int:

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import getpass
 import hashlib
 import json
@@ -7,6 +8,7 @@ import os
 import plistlib
 import queue
 import re
+import shutil
 import sqlite3
 import subprocess
 import sys
@@ -22,7 +24,7 @@ from typing import Any, Literal, Protocol
 
 from pydantic import SecretStr
 
-from copilotd.config import Settings
+from copilotd.config import LegacyLayoutMigrationGuard, Settings
 from copilotd.ops.contracts import (
     FORCE_RESTART_DRAIN_SECONDS,
     RESTART_STORM_LIMIT,
@@ -32,9 +34,13 @@ from copilotd.ops.contracts import (
     SERVICE_STATUS_SCHEMA_VERSION,
     WATCHDOG_INTERVAL_SECONDS,
 )
-from copilotd.ops.control import fence_marker_paths
+from copilotd.ops.control import (
+    fence_marker_paths,
+    fence_pending_marker_directory,
+)
 from copilotd.ops.heartbeat import HeartbeatSnapshot, heartbeat_age_seconds, read_heartbeat
 from copilotd.ops.wake import ResumeTimestampProvider, resume_timestamp_provider
+from copilotd.storage.database import Database
 
 Topology = Literal["bundled-runtime", "sidecar"]
 EffectiveState = Literal["running", "loaded", "stopped", "missing", "unknown"]
@@ -218,7 +224,7 @@ class QuiesceFence:
     fence_id: str
     expected_pid: int
     expected_generation: str
-    expected_process_started_at: float
+    expected_process_started_at: float | None
     protocol_version: int
     handoff_token_hash: str
     requested_at: float
@@ -461,20 +467,12 @@ class SqliteRestartCoordinator:
         if row is None:
             return "none"
         if not replacement_is_managed:
-            raise ServiceError(
-                "replacement process is not the effective OS-managed bot"
-            )
+            raise ServiceError("replacement process is not the effective OS-managed bot")
         if old_process_identity_alive:
-            raise ServiceError(
-                "refusing replacement adoption while old process is alive"
-            )
-        if (
-            int(row["protocol_version"]) >= SERVICE_CONTROL_PROTOCOL_VERSION
-            and (
-                manager_handoff_token is None
-                or _token_hash(manager_handoff_token)
-                != str(row["handoff_token_hash"])
-            )
+            raise ServiceError("refusing replacement adoption while old process is alive")
+        if int(row["protocol_version"]) >= SERVICE_CONTROL_PROTOCOL_VERSION and (
+            manager_handoff_token is None
+            or _token_hash(manager_handoff_token) != str(row["handoff_token_hash"])
         ):
             raise ServiceError("replacement manager handoff token is invalid")
         same_process = (
@@ -486,9 +484,7 @@ class SqliteRestartCoordinator:
             )
         )
         if same_process:
-            raise ServiceError(
-                f"service fence still belongs to this process: {row['fence_id']}"
-            )
+            raise ServiceError(f"service fence still belongs to this process: {row['fence_id']}")
         state = str(row["state"])
         if state == "prepared":
             fence = self._row_to_fence(row)
@@ -514,22 +510,14 @@ class SqliteRestartCoordinator:
                     (row["fence_id"],),
                 ).fetchone()
                 if committed is None:
-                    raise ServiceError(
-                        "committed service fence disappeared during adoption"
-                    )
-                acknowledged_producer_count = committed[
-                    "acknowledged_producer_count"
-                ]
-                acknowledged_journal_id = committed[
-                    "acknowledged_journal_id"
-                ]
+                    raise ServiceError("committed service fence disappeared during adoption")
+                acknowledged_producer_count = committed["acknowledged_producer_count"]
+                acknowledged_journal_id = committed["acknowledged_journal_id"]
                 if (
                     acknowledged_producer_count is None
                     or acknowledged_journal_id is None
-                    or int(committed["producer_count"])
-                    != int(acknowledged_producer_count)
-                    or int(committed["current_journal_id"])
-                    != int(acknowledged_journal_id)
+                    or int(committed["producer_count"]) != int(acknowledged_producer_count)
+                    or int(committed["current_journal_id"]) != int(acknowledged_journal_id)
                     or int(committed["violation_count"]) > 0
                     or self._has_fence_failure_marker(str(row["fence_id"]))
                 ):
@@ -554,10 +542,8 @@ class SqliteRestartCoordinator:
                             {
                                 "reason": "replacement_generation_adopted",
                                 "replacement_pid": replacement_pid,
-                                "replacement_generation":
-                                    replacement_generation,
-                                "replacement_process_started_at":
-                                    replacement_process_started_at,
+                                "replacement_generation": replacement_generation,
+                                "replacement_process_started_at": replacement_process_started_at,
                             },
                             sort_keys=True,
                             separators=(",", ":"),
@@ -594,8 +580,7 @@ class SqliteRestartCoordinator:
                             {
                                 "reason": "replacement_aborted_reversible_fence",
                                 "replacement_pid": replacement_pid,
-                                "replacement_generation":
-                                    replacement_generation,
+                                "replacement_generation": replacement_generation,
                             },
                             sort_keys=True,
                             separators=(",", ":"),
@@ -604,9 +589,7 @@ class SqliteRestartCoordinator:
                     ),
                 )
             if cursor.rowcount != 1:
-                raise ServiceError(
-                    "replacement could not adopt the service restart fence"
-                )
+                raise ServiceError("replacement could not adopt the service restart fence")
             connection.commit()
         finally:
             connection.close()
@@ -925,9 +908,7 @@ class SqliteRestartCoordinator:
             return snapshot
         except sqlite3.Error as error:
             connection.rollback()
-            raise ServiceError(
-                f"could not capture fenced restart snapshot: {error}"
-            ) from error
+            raise ServiceError(f"could not capture fenced restart snapshot: {error}") from error
         finally:
             connection.close()
 
@@ -1015,9 +996,7 @@ class SqliteRestartCoordinator:
                     ),
                 ).fetchone()
                 if row is None:
-                    raise RestartBlocked(
-                        ["irreversible_admission_fence_missing"]
-                    )
+                    raise RestartBlocked(["irreversible_admission_fence_missing"])
             else:
                 self._require_fence_state(
                     connection,
@@ -1066,9 +1045,7 @@ class SqliteRestartCoordinator:
             connection.commit()
         except sqlite3.Error as error:
             connection.rollback()
-            raise ServiceError(
-                f"could not commit restart owner handoff: {error}"
-            ) from error
+            raise ServiceError(f"could not commit restart owner handoff: {error}") from error
         finally:
             connection.close()
 
@@ -1165,9 +1142,7 @@ class SqliteRestartCoordinator:
                 ],
             )
             counts["intents"] = len(intent_targets)
-            inflight_placeholders = ",".join(
-                "?" for _ in _INFLIGHT_SUBMISSION_STATES
-            )
+            inflight_placeholders = ",".join("?" for _ in _INFLIGHT_SUBMISSION_STATES)
             connection.execute(
                 f"""
                 UPDATE message_queue
@@ -1446,9 +1421,7 @@ class SqliteRestartCoordinator:
             WHERE state IN ('active', 'unknown')
             """,
         )
-        terminal_placeholders = ",".join(
-            "?" for _ in _TERMINAL_SCHEDULE_RUN_STATES
-        )
+        terminal_placeholders = ",".join("?" for _ in _TERMINAL_SCHEDULE_RUN_STATES)
         native_trigger_windows = self._count(
             connection,
             f"""
@@ -1515,22 +1488,18 @@ class SqliteRestartCoordinator:
             fence_id=str(row["fence_id"]),
             expected_pid=int(row["expected_pid"]),
             expected_generation=str(row["expected_generation"]),
-            expected_process_started_at=float(
-                row["expected_process_started_at"] or 0
+            expected_process_started_at=(
+                None
+                if row["expected_process_started_at"] is None
+                else float(row["expected_process_started_at"])
             ),
             protocol_version=int(row["protocol_version"]),
             handoff_token_hash=str(row["handoff_token_hash"] or ""),
             requested_at=float(row["requested_at"]),
             acknowledged_at=(
-                None
-                if row["acknowledged_at"] is None
-                else float(row["acknowledged_at"])
+                None if row["acknowledged_at"] is None else float(row["acknowledged_at"])
             ),
-            ingress_depth=(
-                None
-                if row["ingress_depth"] is None
-                else int(row["ingress_depth"])
-            ),
+            ingress_depth=(None if row["ingress_depth"] is None else int(row["ingress_depth"])),
             violation_count=int(row["violation_count"]),
         )
 
@@ -1578,9 +1547,7 @@ class SqliteRestartCoordinator:
             connection,
             fence,
         ):
-            raise RestartBlocked(
-                ["admission_fence_loss_or_accounting_failure"]
-            )
+            raise RestartBlocked(["admission_fence_loss_or_accounting_failure"])
         journal = connection.execute(
             "SELECT COALESCE(MAX(journal_id), 0) FROM event_journal"
         ).fetchone()
@@ -1597,26 +1564,36 @@ class SqliteRestartCoordinator:
         connection: sqlite3.Connection,
         fence: QuiesceFence,
     ) -> bool:
-        database_path_row = connection.execute(
-            "PRAGMA database_list"
-        ).fetchone()
+        database_path_row = connection.execute("PRAGMA database_list").fetchone()
         if database_path_row is None:
             return True
         database_path = Path(str(database_path_row[2]))
-        return any(
-            marker.exists() and marker.stat().st_size > 0
-            for marker in fence_marker_paths(database_path, fence.fence_id)
+        return _fence_failure_markers_exist(
+            database_path,
+            fence.fence_id,
         )
 
     def _has_fence_failure_marker(self, fence_id: str) -> bool:
-        return any(
-            marker.exists() and marker.stat().st_size > 0
-            for marker in fence_marker_paths(self._database_path, fence_id)
+        return _fence_failure_markers_exist(
+            self._database_path,
+            fence_id,
         )
 
     def _cleanup_fence_markers(self, fence_id: str) -> None:
         for marker in fence_marker_paths(self._database_path, fence_id):
             marker.unlink(missing_ok=True)
+        pending = fence_pending_marker_directory(
+            self._database_path,
+            fence_id,
+        )
+        if pending.is_dir():
+            for marker in pending.iterdir():
+                if marker.is_file():
+                    marker.unlink(missing_ok=True)
+            try:
+                pending.rmdir()
+            except OSError:
+                pass
 
     def _connect(self) -> sqlite3.Connection:
         if not self._database_path.is_file():
@@ -1843,6 +1820,71 @@ class RestartStormStore:
                 time.sleep(0.02)
 
 
+class _WindowsLegacyMigrationGuard(LegacyLayoutMigrationGuard):
+    def __init__(
+        self,
+        connections: dict[Path, sqlite3.Connection],
+    ) -> None:
+        self._connections = connections
+        self._swap_prepared = False
+        self._released = False
+
+    def stage_database(self, source: Path, target: Path) -> None:
+        if self._released or self._swap_prepared:
+            raise ServiceError("Windows migration guard is already released")
+        source = source.resolve()
+        if source not in self._connections:
+            raise ServiceError(f"Windows migration database is not exclusively locked: {source}")
+        target.parent.mkdir(parents=True, exist_ok=True)
+        if target.exists():
+            if _file_digest(source) != _file_digest(target):
+                raise ServiceError("Windows state changed after migration conflict validation")
+            return
+        shutil.copy2(source, target)
+        with target.open("rb") as stream:
+            os.fsync(stream.fileno())
+        if _file_digest(source) != _file_digest(target):
+            raise ServiceError("Windows database staging copy was not exact")
+
+    def finalize_database(self, database: Path) -> None:
+        if self._released or self._swap_prepared:
+            raise ServiceError("Windows migration guard is already released")
+
+        async def migrate() -> None:
+            async with Database(database):
+                pass
+
+        asyncio.run(migrate())
+        SqliteRestartCoordinator(database).handoff_stopped_legacy_worker(
+            force=True,
+            now=time.time(),
+        )
+        connection = sqlite3.connect(database, timeout=0)
+        try:
+            result = connection.execute("PRAGMA quick_check").fetchone()
+        finally:
+            connection.close()
+        if result is None or str(result[0]).lower() != "ok":
+            raise ServiceError("staged Windows database failed integrity validation")
+
+    def prepare_swap(self) -> None:
+        if self._swap_prepared:
+            return
+        self._swap_prepared = True
+        for connection in self._connections.values():
+            try:
+                connection.rollback()
+            finally:
+                connection.close()
+        self._connections.clear()
+
+    def release(self) -> None:
+        if self._released:
+            return
+        self.prepare_swap()
+        self._released = True
+
+
 class ServiceManager:
     def __init__(
         self,
@@ -1870,11 +1912,7 @@ class ServiceManager:
         persisted_working_directory = persisted.get("working_directory") if persisted else None
         persisted_runtime_argv = persisted.get("runtime_argv") if persisted else None
         self.entrypoint = (
-            (
-                Path(entrypoint)
-                if entrypoint is not None
-                else Path(sys.argv[0])
-            )
+            (Path(entrypoint) if entrypoint is not None else Path(sys.argv[0]))
             .expanduser()
             .resolve()
         )
@@ -2064,7 +2102,7 @@ class ServiceManager:
             [
                 "param([Parameter(Mandatory=$true)]"
                 "[ValidateSet('Install','Status','Restart','RestartRuntime',"
-                "'StopBot','StartBot','Uninstall')]"
+                "'DisableBot','StopBot','EnableBot','StartBot','Uninstall')]"
                 "[string]$Action)",
                 "$ErrorActionPreference = 'Stop'",
                 "$identity = [Security.Principal.WindowsIdentity]::GetCurrent()",
@@ -2073,18 +2111,15 @@ class ServiceManager:
                 "$taskFiles = [ordered]@{",
                 task_map,
                 "}",
-                "$knownTaskNames = @("
-                "'copilotD Runtime','copilotD Bot','copilotD Watchdog')",
+                "$knownTaskNames = @('copilotD Runtime','copilotD Bot','copilotD Watchdog')",
                 f"$secretPath = '{secret_path}'",
                 f"$runnerPath = '{runner_path}'",
-                "function Test-CopilotDAction("
-                "[string]$Line, [string]$ActionName) {",
+                "function Test-CopilotDAction([string]$Line, [string]$ActionName) {",
                 "  $runnerIndex = $Line.IndexOf($runnerPath, "
                 "[StringComparison]::OrdinalIgnoreCase)",
                 "  if ($runnerIndex -lt 0) { return $false }",
                 "  $tail = $Line.Substring($runnerIndex + $runnerPath.Length)",
-                "  $pattern = '(?i)(?:^|\\s)' + "
-                "[regex]::Escape($ActionName) + '(?:\\s|$)'",
+                "  $pattern = '(?i)(?:^|\\s)' + [regex]::Escape($ActionName) + '(?:\\s|$)'",
                 "  return [regex]::IsMatch($tail, $pattern)",
                 "}",
                 "function Get-CopilotDHostProcesses([string[]]$TaskNames) {",
@@ -2097,8 +2132,7 @@ class ServiceManager:
                 "    $line = [string]$_.CommandLine",
                 "    $matches = $false",
                 "    foreach ($actionName in $actions) {",
-                "      if (Test-CopilotDAction $line $actionName) { "
-                "$matches = $true; break }",
+                "      if (Test-CopilotDAction $line $actionName) { $matches = $true; break }",
                 "    }",
                 "    $matches",
                 "  })",
@@ -2107,13 +2141,11 @@ class ServiceManager:
                 "  $all = @(Get-CimInstance Win32_Process)",
                 "  $pending = [Collections.Generic.Queue[int]]::new()",
                 "  $ids = [Collections.Generic.HashSet[int]]::new()",
-                "  foreach ($root in $Roots) { "
-                "$pending.Enqueue([int]$root.ProcessId) }",
+                "  foreach ($root in $Roots) { $pending.Enqueue([int]$root.ProcessId) }",
                 "  while ($pending.Count -gt 0) {",
                 "    $id = $pending.Dequeue()",
                 "    if (-not $ids.Add($id)) { continue }",
-                "    foreach ($child in $all | Where-Object { "
-                "$_.ParentProcessId -eq $id }) {",
+                "    foreach ($child in $all | Where-Object { $_.ParentProcessId -eq $id }) {",
                 "      $pending.Enqueue([int]$child.ProcessId)",
                 "    }",
                 "  }",
@@ -2121,8 +2153,7 @@ class ServiceManager:
                 "}",
                 "function Stop-CopilotDTasks([string[]]$TaskNames) {",
                 "  foreach ($taskName in $TaskNames) {",
-                "    Stop-ScheduledTask -TaskName $taskName "
-                "-ErrorAction SilentlyContinue",
+                "    Stop-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue",
                 "  }",
                 "  $hosts = @(Get-CopilotDHostProcesses $TaskNames)",
                 "  $tracked = @(Get-CopilotDProcessTreeIds $hosts)",
@@ -2131,8 +2162,7 @@ class ServiceManager:
                 "    if ($LASTEXITCODE -ne 0 -and "
                 "$null -ne (Get-Process -Id $hostProcess.ProcessId "
                 "-ErrorAction SilentlyContinue)) {",
-                "      throw \"Could not stop copilotD process tree "
-                "$($hostProcess.ProcessId)\"",
+                '      throw "Could not stop copilotD process tree $($hostProcess.ProcessId)"',
                 "    }",
                 "  }",
                 "  $deadline = [DateTime]::UtcNow.AddSeconds(15)",
@@ -2140,8 +2170,7 @@ class ServiceManager:
                 "    $remaining = @($tracked | Where-Object { "
                 "$null -ne (Get-Process -Id $_ -ErrorAction SilentlyContinue) })",
                 "    $remainingHosts = @(Get-CopilotDHostProcesses $TaskNames)",
-                "    if ($remaining.Count -eq 0 -and "
-                "$remainingHosts.Count -eq 0) { return }",
+                "    if ($remaining.Count -eq 0 -and $remainingHosts.Count -eq 0) { return }",
                 "    Start-Sleep -Milliseconds 200",
                 "  } while ([DateTime]::UtcNow -lt $deadline)",
                 "  throw 'copilotD process tree did not exit before task unregister'",
@@ -2213,10 +2242,18 @@ class ServiceManager:
                 "  Start-ScheduledTask -TaskName 'copilotD Bot' -ErrorAction Stop",
                 "} elseif ($Action -eq 'RestartRuntime') {",
                 "  Stop-CopilotDTasks @('copilotD Runtime')",
-                "  Start-ScheduledTask -TaskName 'copilotD Runtime' "
-                "-ErrorAction Stop",
+                "  Start-ScheduledTask -TaskName 'copilotD Runtime' -ErrorAction Stop",
+                "} elseif ($Action -eq 'DisableBot') {",
+                "  Disable-ScheduledTask -TaskName 'copilotD Bot' -ErrorAction Stop | Out-Null",
                 "} elseif ($Action -eq 'StopBot') {",
+                "  $botTask = Get-ScheduledTask -TaskName 'copilotD Bot' "
+                "-ErrorAction SilentlyContinue",
+                "  if ($null -ne $botTask) {",
+                "    Disable-ScheduledTask -TaskName 'copilotD Bot' -ErrorAction Stop | Out-Null",
+                "  }",
                 "  Stop-CopilotDTasks @('copilotD Bot')",
+                "} elseif ($Action -eq 'EnableBot') {",
+                "  Enable-ScheduledTask -TaskName 'copilotD Bot' -ErrorAction Stop | Out-Null",
                 "} elseif ($Action -eq 'StartBot') {",
                 "  Start-ScheduledTask -TaskName 'copilotD Bot' -ErrorAction Stop",
                 "} elseif ($Action -eq 'Uninstall') {",
@@ -2264,6 +2301,95 @@ class ServiceManager:
             for task, xml in self.windows_task_xml().items()
         }
 
+    def quiesce_windows_legacy_layout(
+        self,
+        databases: tuple[Path, ...],
+    ) -> LegacyLayoutMigrationGuard:
+        if self.platform != "win32":
+            raise ServiceError("legacy Windows layout migration requires a Windows manager")
+        script = r"""
+$ErrorActionPreference = 'Stop'
+$upgraderProcessIds = @($PID, __PARENT_PID__)
+$tasks = @('copilotD Runtime', 'copilotD Bot', 'copilotD Watchdog')
+foreach ($taskName in $tasks) {
+  $task = Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue
+  if ($null -ne $task) {
+    Disable-ScheduledTask -TaskName $taskName -ErrorAction Stop | Out-Null
+    Stop-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue
+  }
+}
+$pattern = '(?i)(copilotd-service\.ps1|(?:^|\s)copilotd(?:\.exe)?\s+run\s+--foreground)'
+$trackedProcessIds = [Collections.Generic.HashSet[int]]::new()
+function Add-CopilotDProcessTree([object[]]$Roots) {
+  $all = @(Get-CimInstance Win32_Process)
+  $pending = [Collections.Generic.Queue[int]]::new()
+  foreach ($root in $Roots) { $pending.Enqueue([int]$root.ProcessId) }
+  while ($pending.Count -gt 0) {
+    $id = $pending.Dequeue()
+    if (-not $trackedProcessIds.Add($id)) { continue }
+    foreach ($child in $all | Where-Object { $_.ParentProcessId -eq $id }) {
+      $pending.Enqueue([int]$child.ProcessId)
+    }
+  }
+}
+$deadline = [DateTime]::UtcNow.AddSeconds(15)
+do {
+  $processes = @(Get-CimInstance Win32_Process | Where-Object {
+    $upgraderProcessIds -notcontains $_.ProcessId -and
+    [regex]::IsMatch([string]$_.CommandLine, $pattern)
+  })
+  Add-CopilotDProcessTree $processes
+  foreach ($process in $processes) {
+    & taskkill.exe /PID $process.ProcessId /T /F | Out-Null
+  }
+  $remainingTracked = @($trackedProcessIds | Where-Object {
+    $null -ne (Get-Process -Id $_ -ErrorAction SilentlyContinue)
+  })
+  if ($processes.Count -eq 0 -and $remainingTracked.Count -eq 0) { break }
+  Start-Sleep -Milliseconds 200
+} while ([DateTime]::UtcNow -lt $deadline)
+$remaining = @(Get-CimInstance Win32_Process | Where-Object {
+  $upgraderProcessIds -notcontains $_.ProcessId -and
+  [regex]::IsMatch([string]$_.CommandLine, $pattern)
+})
+$remainingTracked = @($trackedProcessIds | Where-Object {
+  $null -ne (Get-Process -Id $_ -ErrorAction SilentlyContinue)
+})
+if ($remaining.Count -ne 0 -or $remainingTracked.Count -ne 0) {
+  throw 'legacy copilotD process tree did not stop'
+}
+""".replace("__PARENT_PID__", str(os.getpid()))
+        self._runner.run(
+            [
+                "powershell.exe",
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                script,
+            ],
+            check=True,
+        )
+        connections: dict[Path, sqlite3.Connection] = {}
+        try:
+            for database in databases:
+                resolved = database.resolve()
+                connection = sqlite3.connect(str(resolved), timeout=0)
+                connections[resolved] = connection
+                checkpoint = connection.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
+                if checkpoint is not None and int(checkpoint[0]) != 0:
+                    raise ServiceError(f"legacy SQLite checkpoint is busy: {resolved}")
+                connection.execute("BEGIN EXCLUSIVE")
+        except (sqlite3.Error, OSError, ServiceError) as error:
+            for connection in connections.values():
+                try:
+                    connection.rollback()
+                finally:
+                    connection.close()
+            if isinstance(error, ServiceError):
+                raise
+            raise ServiceError("legacy SQLite database still has an active writer") from error
+        return _WindowsLegacyMigrationGuard(connections)
+
     def install(self) -> InstallReceipt:
         if self.platform not in {"darwin", "win32"}:
             raise ServiceError(f"service installation is unsupported on {self.platform}")
@@ -2278,14 +2404,10 @@ class ServiceManager:
             if self.settings.runtime_connection_token is None:
                 missing.append("COPILOTD_RUNTIME_CONNECTION_TOKEN")
             if missing:
-                raise ServiceError(
-                    "sidecar topology is missing: " + ", ".join(missing)
-                )
+                raise ServiceError("sidecar topology is missing: " + ", ".join(missing))
         self.settings.ensure_directories()
         self._assert_runtime_argv_has_no_secrets()
-        self.settings.write_service_secrets(
-            service_handoff_token=SecretStr(self._handoff_token)
-        )
+        self.settings.write_service_secrets(service_handoff_token=SecretStr(self._handoff_token))
         previous = _read_heartbeat_optional(self.settings.heartbeat_path)
         installed_at = self._now()
         if self.platform == "darwin":
@@ -2298,9 +2420,7 @@ class ServiceManager:
             topology=self.topology,
             previous_pid=None if previous is None else previous.pid,
             previous_generation=(None if previous is None else previous.process_generation),
-            previous_process_started_at=(
-                None if previous is None else previous.process_started_at
-            ),
+            previous_process_started_at=(None if previous is None else previous.process_started_at),
             expected_units=self.expected_unit_names,
             definition_hashes=hashes,
         )
@@ -2321,12 +2441,8 @@ class ServiceManager:
         while True:
             status = self.status()
             last_status = status
-            current_process_started_at = _optional_timestamp(
-                status.process_started_at
-            )
-            previous_process_started_at = _optional_timestamp(
-                receipt.previous_process_started_at
-            )
+            current_process_started_at = _optional_timestamp(status.process_started_at)
+            previous_process_started_at = _optional_timestamp(receipt.previous_process_started_at)
             fresh_process = (
                 status.pid is not None
                 and status.process_generation is not None
@@ -2334,12 +2450,10 @@ class ServiceManager:
                 and (
                     receipt.previous_generation is None
                     or (
-                        status.process_generation
-                        != receipt.previous_generation
+                        status.process_generation != receipt.previous_generation
                         and (
                             previous_process_started_at is None
-                            or current_process_started_at
-                            > previous_process_started_at
+                            or current_process_started_at > previous_process_started_at
                         )
                     )
                 )
@@ -2373,9 +2487,7 @@ class ServiceManager:
         elif self.platform == "win32":
             installer = self.settings.data_dir / "runtime" / "install-service.ps1"
             if not installer.exists():
-                raise ServiceError(
-                    "refusing unsafe Windows uninstall without install-service.ps1"
-                )
+                raise ServiceError("refusing unsafe Windows uninstall without install-service.ps1")
             self._runner.run(
                 [
                     "powershell.exe",
@@ -2430,9 +2542,7 @@ class ServiceManager:
         )
         process_identity_matches: bool | None
         heartbeat_process_started_at = (
-            None
-            if heartbeat is None
-            else _optional_timestamp(heartbeat.process_started_at)
+            None if heartbeat is None else _optional_timestamp(heartbeat.process_started_at)
         )
         if (
             heartbeat is None
@@ -2443,12 +2553,9 @@ class ServiceManager:
         ):
             process_identity_matches = None
         else:
-            process_identity_matches = (
-                heartbeat.pid == bot.pid
-                and _timestamps_match(
-                    heartbeat_process_started_at,
-                    bot.process_started_at,
-                )
+            process_identity_matches = heartbeat.pid == bot.pid and _timestamps_match(
+                heartbeat_process_started_at,
+                bot.process_started_at,
             )
         units_effective = all(
             unit is not None
@@ -2489,17 +2596,11 @@ class ServiceManager:
             ),
             pid=None if heartbeat is None else heartbeat.pid,
             process_generation=(None if heartbeat is None else heartbeat.process_generation),
-            process_started_at=(
-                None if heartbeat is None else heartbeat.process_started_at
-            ),
-            manager_process_started_at=(
-                None if bot is None else bot.process_started_at
-            ),
+            process_started_at=(None if heartbeat is None else heartbeat.process_started_at),
+            manager_process_started_at=(None if bot is None else bot.process_started_at),
             process_identity_matches=process_identity_matches,
             service_control_protocol=(
-                None
-                if heartbeat is None
-                else heartbeat.service_control_protocol
+                None if heartbeat is None else heartbeat.service_control_protocol
             ),
             heartbeat_age_seconds=age,
             heartbeat_written_at=(None if heartbeat is None else heartbeat.written_at),
@@ -2536,17 +2637,14 @@ class ServiceManager:
             raise RestartBlocked([f"heartbeat_unavailable:{status.heartbeat_error or 'missing'}"])
         if status.process_generation is None:
             raise RestartBlocked(["process_generation_missing"])
-        expected_process_started_at = _optional_timestamp(
-            status.process_started_at
-        )
+        expected_process_started_at = _optional_timestamp(status.process_started_at)
         if expected_process_started_at is None:
             raise RestartBlocked(["process_start_identity_missing"])
         if status.process_identity_matches is not True:
             raise RestartBlocked(["os_pid_heartbeat_mismatch"])
         if (
             status.service_control_protocol is None
-            or status.service_control_protocol
-            < SERVICE_CONTROL_PROTOCOL_VERSION
+            or status.service_control_protocol < SERVICE_CONTROL_PROTOCOL_VERSION
         ):
             return self._replace_legacy_worker(
                 status,
@@ -2596,9 +2694,7 @@ class ServiceManager:
             committed = True
             if restart_runtime:
                 if self.topology != "sidecar":
-                    raise ServiceError(
-                        "runtime restart requires sidecar topology"
-                    )
+                    raise ServiceError("runtime restart requires sidecar topology")
                 self._restart_runtime()
             self._restart_bot()
             return RestartReceipt(
@@ -2618,10 +2714,7 @@ class ServiceManager:
             ):
                 self._terminate_bot_fail_closed()
                 raise
-            irreversible = (
-                irreversible
-                or self._coordinator.is_irreversible(fence)
-            )
+            irreversible = irreversible or self._coordinator.is_irreversible(fence)
             if irreversible:
                 try:
                     if not committed:
@@ -2651,17 +2744,15 @@ class ServiceManager:
         assert status.process_generation is not None
         assert status.process_started_at is not None
         requested_at = self._now()
-        snapshot = self._coordinator.snapshot(now=requested_at)
+        initial_snapshot = self._coordinator.snapshot(now=requested_at)
         if not force and (
             not status.heartbeat_fresh
             or status.protected_work is not False
             or status.queue.ingress_queue_depth != 0
         ):
-            raise RestartBlocked(
-                ["legacy_worker_heartbeat_not_detach_safe"]
-            )
-        if snapshot.blockers and not force:
-            raise RestartBlocked(snapshot.blockers)
+            raise RestartBlocked(["legacy_worker_heartbeat_not_detach_safe"])
+        if initial_snapshot.blockers and not force:
+            raise RestartBlocked(initial_snapshot.blockers)
         process_started_at = _parse_rfc3339(status.process_started_at)
         self._stop_bot_for_legacy_upgrade()
         deadline = time.monotonic() + self.settings.restart_drain_timeout_seconds
@@ -2670,22 +2761,17 @@ class ServiceManager:
             process_started_at=process_started_at,
         ):
             if time.monotonic() >= deadline:
-                raise ServiceError(
-                    "legacy service worker did not exit before handoff"
-                )
+                raise ServiceError("legacy service worker did not exit before handoff")
             self._sleep(0.05)
+        snapshot = self._coordinator.snapshot(now=self._now())
         force_outcome = self._coordinator.handoff_stopped_legacy_worker(
-            force=force,
+            force=True,
             now=self._now(),
         )
-        self.settings.write_service_secrets(
-            service_handoff_token=SecretStr(self._handoff_token)
-        )
+        self.settings.write_service_secrets(service_handoff_token=SecretStr(self._handoff_token))
         if restart_runtime:
             if self.topology != "sidecar":
-                raise ServiceError(
-                    "legacy runtime restart requires sidecar topology"
-                )
+                raise ServiceError("legacy runtime restart requires sidecar topology")
             self._restart_runtime()
         self._start_bot_after_legacy_upgrade()
         return RestartReceipt(
@@ -2776,8 +2862,7 @@ class ServiceManager:
             raise result
         if time.time() > deadline or not result.bounded:
             raise ForcePreparationUncertain(
-                "force preparation exceeded its deadline; "
-                "process terminated fail-closed"
+                "force preparation exceeded its deadline; process terminated fail-closed"
             )
         return result
 
@@ -2852,9 +2937,7 @@ class ServiceManager:
                 process_generation=snapshot.process_generation,
             )
             return "replacement-starting"
-        heartbeat_process_started_at = _optional_timestamp(
-            snapshot.process_started_at
-        )
+        heartbeat_process_started_at = _optional_timestamp(snapshot.process_started_at)
         if (
             heartbeat_process_started_at is None
             or managed_bot.process_started_at is None
@@ -2903,9 +2986,7 @@ class ServiceManager:
                 "watchdog_runtime_loss",
                 "runtime sidecar loss fenced and restarted the bot",
                 force_outcome=(
-                    None
-                    if receipt.force_outcome is None
-                    else asdict(receipt.force_outcome)
+                    None if receipt.force_outcome is None else asdict(receipt.force_outcome)
                 ),
             )
             return "runtime-loss-restarted"
@@ -2958,8 +3039,7 @@ class ServiceManager:
             return "replacement-starting"
         if (
             initial.service_control_protocol is None
-            or initial.service_control_protocol
-            < SERVICE_CONTROL_PROTOCOL_VERSION
+            or initial.service_control_protocol < SERVICE_CONTROL_PROTOCOL_VERSION
         ):
             if (
                 not initial.heartbeat_fresh
@@ -2989,9 +3069,7 @@ class ServiceManager:
         fence: QuiesceFence | None = None
         committed = False
         try:
-            expected_process_started_at = _optional_timestamp(
-                initial.process_started_at
-            )
+            expected_process_started_at = _optional_timestamp(initial.process_started_at)
             if expected_process_started_at is None:
                 return "replacement-starting"
             fence = self._coordinator.request_quiesce(
@@ -3043,11 +3121,7 @@ class ServiceManager:
                 "watchdog restart failed closed during admission quiesce",
                 error=str(error),
             )
-            return (
-                "restart-failed-closed"
-                if committed
-                else "quiesce-failed"
-            )
+            return "restart-failed-closed" if committed else "quiesce-failed"
         finally:
             if not committed and fence is not None:
                 self._coordinator.release_quiesce(
@@ -3089,9 +3163,7 @@ class ServiceManager:
                 check=False,
             )
             if label not in self._mac_labels:
-                (self.launch_agents_dir / f"{label}.plist").unlink(
-                    missing_ok=True
-                )
+                (self.launch_agents_dir / f"{label}.plist").unlink(missing_ok=True)
         for label in self._mac_labels:
             path = self.launch_agents_dir / f"{label}.plist"
             self._runner.run(
@@ -3119,9 +3191,7 @@ class ServiceManager:
         task_validation = self.validate_windows_task_xml()
         failures = [f"{name}: {', '.join(errors)}" for name, errors in validation.items() if errors]
         failures.extend(
-            f"{name}: {', '.join(errors)}"
-            for name, errors in task_validation.items()
-            if errors
+            f"{name}: {', '.join(errors)}" for name, errors in task_validation.items() if errors
         )
         if failures:
             raise ServiceVerificationError(
@@ -3215,11 +3285,7 @@ class ServiceManager:
             else:
                 state = _parse_launchctl_state(result.stdout)
                 pid = _parse_launchctl_pid(result.stdout)
-                process_started_at = (
-                    None
-                    if pid is None
-                    else self._process_started_at(pid)
-                )
+                process_started_at = None if pid is None else self._process_started_at(pid)
                 expected_plist = plistlib.loads(expected)
                 effective_matches = _launchctl_definition_matches(
                     result.stdout,
@@ -3307,9 +3373,7 @@ class ServiceManager:
                 state = _normalize_windows_task_state(str(row.get("state", "")))
                 pid_value = row.get("pid")
                 pid = None if pid_value is None else int(pid_value)
-                process_started_at = _optional_timestamp(
-                    row.get("process_started_at")
-                )
+                process_started_at = _optional_timestamp(row.get("process_started_at"))
                 try:
                     effective_matches = isinstance(
                         exported,
@@ -3486,9 +3550,7 @@ class ServiceManager:
                 check=True,
             )
             return
-        raise ServiceError(
-            f"runtime restart is unsupported on {self.platform}"
-        )
+        raise ServiceError(f"runtime restart is unsupported on {self.platform}")
 
     def _terminate_bot_fail_closed(self) -> None:
         if self.platform == "darwin":
@@ -3501,6 +3563,11 @@ class ServiceManager:
                 ],
                 check=False,
             )
+            return
+        if self.platform == "win32":
+            self._disable_and_stop_windows_bot()
+            return
+        raise ServiceError(f"fail-closed bot termination is unsupported on {self.platform}")
 
     def _stop_bot_for_legacy_upgrade(self) -> None:
         if self.platform == "darwin":
@@ -3514,11 +3581,9 @@ class ServiceManager:
             )
             return
         if self.platform == "win32":
-            self._run_windows_installer_action("StopBot", check=True)
+            self._disable_and_stop_windows_bot()
             return
-        raise ServiceError(
-            f"legacy worker stop is unsupported on {self.platform}"
-        )
+        raise ServiceError(f"legacy worker stop is unsupported on {self.platform}")
 
     def _start_bot_after_legacy_upgrade(self) -> None:
         if self.platform == "darwin":
@@ -3545,6 +3610,7 @@ class ServiceManager:
             )
             return
         if self.platform == "win32":
+            self._run_windows_installer_action("EnableBot", check=True)
             self._runner.run(
                 [
                     "schtasks.exe",
@@ -3555,9 +3621,7 @@ class ServiceManager:
                 check=True,
             )
             return
-        raise ServiceError(
-            f"legacy worker start is unsupported on {self.platform}"
-        )
+        raise ServiceError(f"legacy worker start is unsupported on {self.platform}")
 
     def _run_windows_installer_action(
         self,
@@ -3580,6 +3644,12 @@ class ServiceManager:
             ],
             check=check,
         )
+
+    def _disable_and_stop_windows_bot(self) -> None:
+        try:
+            self._run_windows_installer_action("DisableBot", check=True)
+        finally:
+            self._run_windows_installer_action("StopBot", check=True)
 
     def _service_environment(self) -> dict[str, str]:
         environment = {
@@ -3608,10 +3678,12 @@ class ServiceManager:
         if self.platform == "win32":
             script = (
                 "$process = Get-CimInstance Win32_Process "
-                f"-Filter \"ProcessId = {pid}\" "
+                f'-Filter "ProcessId = {pid}" '
                 "-ErrorAction Stop; "
-                "if ($null -ne $process) { "
-                "$process.CreationDate.ToUniversalTime().ToString('o') }"
+                "if ($null -eq $process) { '__COPILOTD_PROCESS_ABSENT__' } "
+                "elseif ($null -eq $process.CreationDate) { "
+                "throw 'process creation time is unavailable' } "
+                "else { $process.CreationDate.ToUniversalTime().ToString('o') }"
             )
             result = self._runner.run(
                 [
@@ -3624,27 +3696,41 @@ class ServiceManager:
                 check=False,
             )
             if result.returncode != 0:
-                raise ServiceError(
-                    "could not query Windows process start identity"
-                )
-            return _optional_timestamp(result.stdout.strip())
+                raise ServiceError("could not query Windows process start identity")
+            output = result.stdout.strip()
+            if output == "__COPILOTD_PROCESS_ABSENT__":
+                return None
+            if not output:
+                raise ServiceError("Windows process probe succeeded without a start identity")
+            try:
+                started_at = _optional_timestamp(output)
+            except (TypeError, ValueError) as error:
+                raise ServiceError("Windows process start identity was malformed") from error
+            if started_at is None:
+                raise ServiceError("Windows process start identity was malformed")
+            return started_at
         if self.platform != "darwin":
-            raise ServiceError(
-                f"process start identity is unsupported on {self.platform}"
-            )
+            raise ServiceError(f"process start identity is unsupported on {self.platform}")
         result = self._runner.run(
             ["ps", "-p", str(pid), "-o", "lstart="],
             check=False,
         )
-        if result.returncode != 0 or not result.stdout.strip():
+        if result.returncode == 1 and not result.stdout.strip() and not result.stderr.strip():
             return None
+        if result.returncode != 0:
+            detail = result.stderr.strip() or result.stdout.strip()
+            raise ServiceError(
+                "could not query macOS process start identity" + (f": {detail}" if detail else "")
+            )
+        if not result.stdout.strip():
+            raise ServiceError("macOS process probe succeeded without a start identity")
         try:
             parsed = datetime.strptime(
                 " ".join(result.stdout.split()),
                 "%a %b %d %H:%M:%S %Y",
             )
-        except ValueError:
-            return None
+        except ValueError as error:
+            raise ServiceError("macOS process start identity was malformed") from error
         return parsed.astimezone().timestamp()
 
     def _assert_runtime_argv_has_no_secrets(self) -> None:
@@ -3765,9 +3851,11 @@ class ServiceManager:
         self,
         *,
         pid: int,
-        process_started_at: float,
+        process_started_at: float | None,
     ) -> bool:
         current = self._process_started_at(pid)
+        if process_started_at is None:
+            return current is not None
         return _timestamps_match(current, process_started_at)
 
     def _startup_grace_active(self, now: float) -> bool:
@@ -3791,9 +3879,7 @@ class ServiceManager:
         state = _read_json_optional(self.settings.service_state_path) or {}
         verified_pid = state.get("last_verified_pid")
         verified_generation = state.get("last_verified_generation")
-        verified_started_at = _optional_timestamp(
-            state.get("last_verified_process_started_at")
-        )
+        verified_started_at = _optional_timestamp(state.get("last_verified_process_started_at"))
         heartbeat_started_at = _optional_timestamp(snapshot.process_started_at)
         exact = (
             verified_pid is not None
@@ -3818,10 +3904,7 @@ class ServiceManager:
                 heartbeat_started_at,
                 managed_bot.process_started_at,
             )
-            and (
-                verified_started_at is None
-                or heartbeat_started_at > verified_started_at
-            )
+            and (verified_started_at is None or heartbeat_started_at > verified_started_at)
         )
         if not replacement_is_ready:
             return False
@@ -4113,10 +4196,8 @@ def _windows_xml_contract(xml: str) -> dict[str, str | None]:
         "logon_enabled": text(".//t:LogonTrigger/t:Enabled"),
         "logon_user": text(".//t:LogonTrigger/t:UserId"),
         "repetition_interval": text(".//t:LogonTrigger/t:Repetition/t:Interval"),
-        "repetition_stop": text(        ".//t:LogonTrigger/t:Repetition/t:StopAtDurationEnd"
-        ),
-        "registration_interval": text(
-        ".//t:RegistrationTrigger/t:Repetition/t:Interval"),
+        "repetition_stop": text(".//t:LogonTrigger/t:Repetition/t:StopAtDurationEnd"),
+        "registration_interval": text(".//t:RegistrationTrigger/t:Repetition/t:Interval"),
         "multiple_instances": text(".//t:Settings/t:MultipleInstancesPolicy"),
         "disallow_battery": text(".//t:Settings/t:DisallowStartIfOnBatteries"),
         "stop_on_battery": text(".//t:Settings/t:StopIfGoingOnBatteries"),
@@ -4349,6 +4430,31 @@ def _atomic_write_bytes(path: Path, content: bytes, *, private: bool) -> None:
 
 def _sha256_bytes(content: bytes) -> str:
     return hashlib.sha256(content).hexdigest()
+
+
+def _file_digest(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        while block := stream.read(1024 * 1024):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def _fence_failure_markers_exist(
+    database_path: Path,
+    fence_id: str,
+) -> bool:
+    paths = list(fence_marker_paths(database_path, fence_id))
+    pending = fence_pending_marker_directory(database_path, fence_id)
+    if pending.is_dir():
+        paths.extend(pending.iterdir())
+    for marker in paths:
+        try:
+            if marker.is_file() and marker.stat().st_size > 0:
+                return True
+        except FileNotFoundError:
+            continue
+    return False
 
 
 def _sha256_text(content: str) -> str:

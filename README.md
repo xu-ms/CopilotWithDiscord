@@ -108,9 +108,11 @@ Runtime paths are fixed by platform:
 | macOS | `~/Library/Application Support/copilotd/` | `~/Library/Caches/copilotd/heartbeat.json` | `~/Library/Logs/copilotd/` |
 | Windows | `%LOCALAPPDATA%\copilotd\state\` | `%LOCALAPPDATA%\copilotd\cache\heartbeat.json` | `%LOCALAPPDATA%\copilotd\logs\` |
 
-On first Windows upgrade, a legacy `%LOCALAPPDATA%\copilotD\` state tree is adopted
-through a lock-protected two-rename migration before any new directories are created, so
-the existing database and session state remain visible.
+On first Windows upgrade, only `setup` or `service install` may adopt a legacy
+`%LOCALAPPDATA%\copilotD\` state tree. The installer disables service triggers, proves the
+old process trees exited, holds SQLite exclusion while staging a durable unknown-outcome
+handoff, atomically swaps the tree, and verifies the reinstalled tasks. Other commands
+refuse to create split state until that migration completes.
 
 `copilotd.log` is rotating JSON (10 MiB with seven backups); `boot.log`,
 `watchdog.log`, and `alerts.log` have distinct destinations. Override paths with

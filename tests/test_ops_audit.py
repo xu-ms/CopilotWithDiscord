@@ -44,25 +44,15 @@ def test_operations_scripts_are_wheel_package_resources() -> None:
 
 def test_selected_hardware_lanes_require_real_resume_and_recheck_health() -> None:
     repository = Path(__file__).resolve().parents[1]
-    macos = (
-        repository
-        / "src"
-        / "copilotd"
-        / "ops"
-        / "scripts"
-        / "acceptance-macos.sh"
-    ).read_text(encoding="utf-8")
+    macos = (repository / "src" / "copilotd" / "ops" / "scripts" / "acceptance-macos.sh").read_text(
+        encoding="utf-8"
+    )
     windows = (
-        repository
-        / "src"
-        / "copilotd"
-        / "ops"
-        / "scripts"
-        / "acceptance-windows.ps1"
+        repository / "src" / "copilotd" / "ops" / "scripts" / "acceptance-windows.ps1"
     ).read_text(encoding="utf-8")
-    workflow = (
-        repository / ".github" / "workflows" / "ops-acceptance.yml"
-    ).read_text(encoding="utf-8")
+    workflow = (repository / ".github" / "workflows" / "ops-acceptance.yml").read_text(
+        encoding="utf-8"
+    )
 
     assert "COPILOTD_ACCEPTANCE_ALLOW_SLEEP" in macos
     assert "pmset relative wake" in macos
@@ -73,7 +63,12 @@ def test_selected_hardware_lanes_require_real_resume_and_recheck_health() -> Non
     assert "bot generation changed during soak" in macos
     assert "if ! log show" in macos
     assert "existing LaunchAgent would be replaced" in macos
-    assert "copilotd service uninstall" in macos
+    assert macos.count("copilotd service uninstall") == 2
+    assert "setup_attempted=1" in macos
+    assert "trap cleanup EXIT HUP INT TERM" in macos
+    assert 'launchctl bootout "gui/$(id -u)/$label"' in macos
+    assert 'rm -rf "$service_root"' in macos
+    assert "service-secrets.json" in macos
     assert "COPILOTD_ACCEPTANCE_EVIDENCE_DIR" in macos
     assert "credential leaked into acceptance artifact" in macos
     assert '"cleanup_verified": True' in macos
@@ -86,6 +81,15 @@ def test_selected_hardware_lanes_require_real_resume_and_recheck_health() -> Non
     assert "wake marker is outside the intended wake interval" in windows
     assert "'recent-wake'" in windows
     assert "service is not ready after resume" in windows
+    assert "$uninstall = copilotd service uninstall" in windows
+    assert "} finally {" in windows
+    assert "$serviceAttempted = $true" in windows
+    assert "existing scheduled task would be replaced" in windows
+    assert "scheduled task remains after cleanup" in windows
+    assert "Get-AcceptanceProcessTreeIds" in windows
+    assert "acceptance service process tree remains after cleanup" in windows
+    assert "Remove-Item -LiteralPath $acceptanceRoot -Recurse -Force" in windows
+    assert "credential leaked into acceptance artifact" in windows
     assert "runs-on: [self-hosted, macOS, copilotd-acceptance]" in workflow
     assert "runs-on: [self-hosted, Windows, copilotd-acceptance]" in workflow
     assert "sdk-probe --live" in workflow

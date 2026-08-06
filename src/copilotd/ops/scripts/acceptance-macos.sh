@@ -27,19 +27,58 @@ for label in \
 done
 
 work="$(mktemp -d "${TMPDIR:-/tmp}/copilotd-macos-acceptance.XXXXXX")"
-installed=0
+service_root="$work/service"
+export COPILOTD_DATA_DIR="$service_root/state"
+export COPILOTD_CACHE_DIR="$service_root/cache"
+export COPILOTD_LOG_DIR="$service_root/logs"
+setup_attempted=0
 cleanup() {
-  if [ "$installed" = 1 ]; then
+  status=$?
+  trap - EXIT HUP INT TERM
+  set +e
+  if [ "$setup_attempted" = 1 ]; then
     copilotd service uninstall >"$work/uninstall-fallback.json" 2>&1 || true
   fi
+  for label in \
+    com.github.copilotd.runtime \
+    com.github.copilotd.bot \
+    com.github.copilotd.watchdog; do
+    launchctl bootout "gui/$(id -u)/$label" >/dev/null 2>&1 || true
+    rm -f "$HOME/Library/LaunchAgents/$label.plist"
+    if [ -e "$HOME/Library/LaunchAgents/$label.plist" ] ||
+      launchctl print "gui/$(id -u)/$label" >/dev/null 2>&1; then
+      status=1
+    fi
+  done
+  python3 - "$work" "$service_root" <<'PY' || status=1
+import os
+import sys
+from pathlib import Path
+
+token = os.environ["COPILOTD_DISCORD_TOKEN"].encode()
+for root_text in sys.argv[1:]:
+    root = Path(root_text)
+    for path in root.rglob("*"):
+        if not path.is_file() or path.name == "service-secrets.json":
+            continue
+        if token in path.read_bytes():
+            raise SystemExit(f"credential leaked into acceptance artifact: {path.name}")
+PY
+  if [ -f "$COPILOTD_DATA_DIR/config/service-secrets.json" ]; then
+    size="$(wc -c <"$COPILOTD_DATA_DIR/config/service-secrets.json")"
+    dd if=/dev/zero of="$COPILOTD_DATA_DIR/config/service-secrets.json" \
+      bs=1 count="$size" conv=notrunc >/dev/null 2>&1 || status=1
+  fi
+  rm -rf "$service_root"
   rm -rf "$work"
+  exit "$status"
 }
 trap cleanup EXIT HUP INT TERM
 test_started_at="$(date +%s)"
 log_started_at="$(date -r "$test_started_at" '+%Y-%m-%d %H:%M:%S')"
 
+setup_attempted=1
 copilotd setup >"$work/setup.json"
-installed=1
 copilotd service status >"$work/status-before.json"
 copilotd service logs >"$work/logs.json"
 python3 - "$work/status-before.json" "$work/identity.json" <<'PY'
@@ -155,9 +194,7 @@ fi
 if grep -q "because inefficient" "$work/launchd.log"; then
   fail "launchd reported because inefficient"
 fi
-
 copilotd service uninstall >"$work/uninstall.json"
-installed=0
 for label in \
   com.github.copilotd.runtime \
   com.github.copilotd.bot \
@@ -168,6 +205,28 @@ for label in \
     fail "effective LaunchAgent remains after cleanup: $label"
   fi
 done
+setup_attempted=0
+
+python3 - "$work" "$service_root" <<'PY'
+import os
+import sys
+from pathlib import Path
+
+token = os.environ["COPILOTD_DISCORD_TOKEN"].encode()
+for root_text in sys.argv[1:]:
+    root = Path(root_text)
+    for path in root.rglob("*"):
+        if not path.is_file() or path.name == "service-secrets.json":
+            continue
+        if token in path.read_bytes():
+            raise SystemExit(f"credential leaked into acceptance artifact: {path.name}")
+PY
+if [ -f "$COPILOTD_DATA_DIR/config/service-secrets.json" ]; then
+  size="$(wc -c <"$COPILOTD_DATA_DIR/config/service-secrets.json")"
+  dd if=/dev/zero of="$COPILOTD_DATA_DIR/config/service-secrets.json" \
+    bs=1 count="$size" conv=notrunc >/dev/null 2>&1
+fi
+rm -rf "$service_root"
 
 python3 - "$work" "${COPILOTD_ACCEPTANCE_EVIDENCE_DIR:-}" <<'PY'
 import hashlib
@@ -179,7 +238,7 @@ from pathlib import Path
 work = Path(sys.argv[1])
 evidence_dir = Path(sys.argv[2]) if sys.argv[2] else None
 token = os.environ["COPILOTD_DISCORD_TOKEN"].encode()
-for path in work.iterdir():
+for path in work.rglob("*"):
     if path.is_file() and token in path.read_bytes():
         raise SystemExit(f"credential leaked into acceptance artifact: {path.name}")
 

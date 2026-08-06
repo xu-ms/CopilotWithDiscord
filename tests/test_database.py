@@ -74,7 +74,7 @@ async def test_migrations_are_idempotent(tmp_path: Path) -> None:
     async with Database(database_path) as database:
         rows = await database.fetchall("SELECT version FROM schema_migrations")
 
-    assert [row["version"] for row in rows] == list(range(1, 12))
+    assert [row["version"] for row in rows] == list(range(1, 13))
 
 
 @pytest.mark.asyncio

@@ -9,7 +9,11 @@ from types import SimpleNamespace
 import pytest
 
 from copilotd.core.sessions import SessionRegistry
-from copilotd.ops.control import ServiceControlWorker, fence_marker_paths
+from copilotd.ops.control import (
+    ServiceControlWorker,
+    fence_marker_paths,
+    fence_pending_marker_directory,
+)
 from copilotd.ops.service import (
     RestartBlocked,
     ServiceError,
@@ -26,6 +30,10 @@ class FakeSessions:
         self.violations = 0
         self.on_violation: Callable[[str], None] | None = None
         self.produce_during_begin = False
+        self.produce_during_first_drain = False
+        self.produce_during_first_metrics = False
+        self.drain_calls = 0
+        self.metrics_calls = 0
         self.begin_gate: asyncio.Event | None = None
         self.end_gate: asyncio.Event | None = None
         self.ignore_end_cancellation = False
@@ -57,10 +65,24 @@ class FakeSessions:
                 await self.end_gate.wait()
 
     async def drain_service_quiesce(self) -> None:
+        self.drain_calls += 1
+        if (
+            self.produce_during_first_drain
+            and self.drain_calls == 1
+            and self.on_violation is not None
+        ):
+            self.on_violation("producer_between_epoch_and_drain")
         if self.depth:
             await asyncio.Event().wait()
 
     def service_quiesce_metrics(self) -> tuple[int, int]:
+        self.metrics_calls += 1
+        if (
+            self.produce_during_first_metrics
+            and self.metrics_calls == 1
+            and self.on_violation is not None
+        ):
+            self.on_violation("producer_during_depth_snapshot")
         return self.depth, self.violations
 
 
@@ -148,10 +170,7 @@ async def test_durable_loss_marker_blocks_acknowledged_fence(
             now=now + 1,
             reason="test_complete",
         )
-        assert not any(
-            path.exists()
-            for path in fence_marker_paths(database_path, fence.fence_id)
-        )
+        assert not any(path.exists() for path in fence_marker_paths(database_path, fence.fence_id))
 
 
 @pytest.mark.asyncio
@@ -190,6 +209,57 @@ async def test_sqlite_accounting_lock_fails_fast_and_persists_marker(
             fence.fence_id,
         )
         assert accounting_marker.is_file()
+        pending = fence_pending_marker_directory(
+            database_path,
+            fence.fence_id,
+        )
+        assert any(pending.iterdir())
+        coordinator.release_quiesce(
+            fence,
+            now=time.time(),
+            reason="test_complete",
+        )
+        assert not pending.exists()
+
+
+@pytest.mark.asyncio
+async def test_pending_producer_marker_blocks_commit_after_ack_race(
+    tmp_path: Path,
+) -> None:
+    database_path = tmp_path / "pending-producer.sqlite3"
+    async with Database(database_path) as database:
+        coordinator = SqliteRestartCoordinator(database_path)
+        now = time.time()
+        fence = coordinator.request_quiesce(
+            expected_pid=os.getpid(),
+            expected_generation="generation-1",
+            expected_process_started_at=now - 1,
+            now=now,
+        )
+        coordinator.acknowledge_quiesce(fence, now=now)
+        worker = ServiceControlWorker(
+            database,
+            FakeSessions(),
+            process_generation="generation-1",
+            process_started_at=now - 1,
+        )
+        worker._active_fence_id = fence.fence_id
+        worker._create_pending_marker(
+            fence_id=fence.fence_id,
+            source="producer_pre_accounting",
+        )
+
+        with pytest.raises(
+            RestartBlocked,
+            match="loss_or_accounting_failure",
+        ):
+            coordinator.commit_quiesce(fence, now=now + 1)
+
+        coordinator.release_quiesce(
+            fence,
+            now=now + 1,
+            reason="test_complete",
+        )
 
 
 @pytest.mark.asyncio
@@ -278,15 +348,21 @@ async def test_service_control_acknowledges_drain_and_detects_late_ingress(
             for _ in range(100):
                 row = await database.fetchone(
                     """
-                    SELECT state FROM service_admission_fences
+                    SELECT state, violation_count
+                    FROM service_admission_fences
                     WHERE fence_id = ?
                     """,
                     (fence.fence_id,),
                 )
-                if row is not None and row["state"] == "violated":
+                if row is not None and row["state"] in {
+                    "violated",
+                    "released",
+                }:
                     break
                 await asyncio.sleep(0.005)
-            assert row is not None and row["state"] == "violated"
+            assert row is not None
+            assert row["state"] in {"violated", "released"}
+            assert row["violation_count"] == 1
 
             coordinator.release_quiesce(
                 fence,
@@ -496,6 +572,124 @@ async def test_atomic_ack_retries_callback_in_final_ack_window(
 
 
 @pytest.mark.asyncio
+async def test_ack_retries_producer_accounted_before_reservation_finishes(
+    tmp_path: Path,
+) -> None:
+    database_path = tmp_path / "ack-reservation-race.sqlite3"
+    sessions = FakeSessions()
+    sessions.produce_during_first_drain = True
+    generation = "generation-1"
+    started_at = time.time() - 1
+    async with Database(database_path) as database:
+        coordinator = SqliteRestartCoordinator(database_path)
+        fence = coordinator.request_quiesce(
+            expected_pid=os.getpid(),
+            expected_generation=generation,
+            expected_process_started_at=started_at,
+            now=time.time(),
+        )
+        worker = asyncio.create_task(
+            ServiceControlWorker(
+                database,
+                sessions,
+                process_generation=generation,
+                process_started_at=started_at,
+                poll_seconds=0.005,
+            ).run()
+        )
+        try:
+            await asyncio.to_thread(
+                coordinator.wait_for_quiesce,
+                fence,
+                timeout_seconds=1,
+            )
+            row = await database.fetchone(
+                """
+                SELECT state, producer_count, acknowledged_producer_count
+                FROM service_admission_fences WHERE fence_id = ?
+                """,
+                (fence.fence_id,),
+            )
+            assert sessions.drain_calls >= 2
+            assert tuple(row) == ("acknowledged", 1, 1)
+        finally:
+            coordinator.release_quiesce(
+                fence,
+                now=time.time(),
+                reason="test_complete",
+            )
+            worker.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await worker
+
+
+@pytest.mark.asyncio
+async def test_ack_snapshots_producer_count_before_depth_and_drain(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database_path = tmp_path / "ack-count-before-depth.sqlite3"
+    sessions = FakeSessions()
+    sessions.produce_during_first_metrics = True
+    generation = "generation-1"
+    started_at = time.time() - 1
+    async with Database(database_path) as database:
+        coordinator = SqliteRestartCoordinator(database_path)
+        fence = coordinator.request_quiesce(
+            expected_pid=os.getpid(),
+            expected_generation=generation,
+            expected_process_started_at=started_at,
+            now=time.time(),
+        )
+        control = ServiceControlWorker(
+            database,
+            sessions,
+            process_generation=generation,
+            process_started_at=started_at,
+            poll_seconds=0.005,
+        )
+        producer_snapshots = 0
+        original_producer_count = control._producer_count
+
+        async def counted_producer_snapshot(fence_id: str) -> int:
+            nonlocal producer_snapshots
+            producer_snapshots += 1
+            return await original_producer_count(fence_id)
+
+        monkeypatch.setattr(
+            control,
+            "_producer_count",
+            counted_producer_snapshot,
+        )
+        worker = asyncio.create_task(control.run())
+        try:
+            await asyncio.to_thread(
+                coordinator.wait_for_quiesce,
+                fence,
+                timeout_seconds=1,
+            )
+            row = await database.fetchone(
+                """
+                SELECT state, producer_count, acknowledged_producer_count
+                FROM service_admission_fences WHERE fence_id = ?
+                """,
+                (fence.fence_id,),
+            )
+            assert producer_snapshots >= 4
+            assert sessions.drain_calls >= 2
+            assert tuple(row) == ("acknowledged", 1, 1)
+        finally:
+            coordinator.release_quiesce(
+                fence,
+                now=time.time(),
+                reason="test_complete",
+            )
+            worker.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await worker
+
+
+@pytest.mark.asyncio
 async def test_released_fence_cancels_hung_quiesce_and_rolls_back(
     tmp_path: Path,
 ) -> None:
@@ -645,6 +839,66 @@ async def test_rollback_exception_remains_pending_for_retry(
         )
         assert tuple(row) == ("pending", 1)
         assert worker._active_fence_id == fence.fence_id
+
+
+@pytest.mark.asyncio
+async def test_violated_fence_rollback_timeout_is_released_and_retried(
+    tmp_path: Path,
+) -> None:
+    database_path = tmp_path / "violated-rollback-retry.sqlite3"
+    sessions = FakeSessions()
+    sessions.end_gate = asyncio.Event()
+    sessions.ignore_end_cancellation = True
+    generation = "generation-1"
+    started_at = time.time() - 1
+    async with Database(database_path) as database:
+        coordinator = SqliteRestartCoordinator(database_path)
+        fence = coordinator.request_quiesce(
+            expected_pid=os.getpid(),
+            expected_generation=generation,
+            expected_process_started_at=started_at,
+            now=time.time(),
+        )
+        await database.execute(
+            """
+            UPDATE service_admission_fences
+            SET state = 'violated', rollback_state = 'pending',
+                violation_count = 1
+            WHERE fence_id = ?
+            """,
+            (fence.fence_id,),
+        )
+        worker = ServiceControlWorker(
+            database,
+            sessions,
+            process_generation=generation,
+            process_started_at=started_at,
+            rollback_timeout_seconds=0.01,
+        )
+        worker._active_fence_id = fence.fence_id
+
+        await worker._poll_once()
+        row = await database.fetchone(
+            """
+            SELECT state, rollback_state, rollback_attempts
+            FROM service_admission_fences WHERE fence_id = ?
+            """,
+            (fence.fence_id,),
+        )
+        assert tuple(row) == ("released", "pending", 1)
+        assert worker._active_fence_id == fence.fence_id
+
+        sessions.end_gate.set()
+        await worker._poll_once()
+        row = await database.fetchone(
+            """
+            SELECT state, rollback_state, rollback_attempts
+            FROM service_admission_fences WHERE fence_id = ?
+            """,
+            (fence.fence_id,),
+        )
+        assert tuple(row) == ("released", "complete", 2)
+        assert worker._active_fence_id is None
 
 
 @pytest.mark.asyncio

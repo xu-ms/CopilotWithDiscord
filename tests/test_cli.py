@@ -84,9 +84,7 @@ async def test_schema_dependent_service_command_upgrades_schema_seven(
     async with Database(settings.database_path) as database:
         await database.execute("DROP TABLE service_admission_fences")
         await database.execute("DROP TABLE service_restart_intents")
-        await database.execute(
-            "DELETE FROM schema_migrations WHERE version IN (8, 9, 10, 11)"
-        )
+        await database.execute("DELETE FROM schema_migrations WHERE version >= 8")
     manager = ServiceManager(settings, platform="unsupported")
     args = argparse.Namespace(command="service", service_command="status")
 
@@ -94,9 +92,7 @@ async def test_schema_dependent_service_command_upgrades_schema_seven(
     capsys.readouterr()
 
     async with Database(settings.database_path) as database:
-        versions = await database.fetchall(
-            "SELECT version FROM schema_migrations ORDER BY version"
-        )
+        versions = await database.fetchall("SELECT version FROM schema_migrations ORDER BY version")
         tables = await database.fetchall(
             """
             SELECT name FROM sqlite_master
@@ -105,7 +101,7 @@ async def test_schema_dependent_service_command_upgrades_schema_seven(
             ORDER BY name
             """
         )
-    assert [row["version"] for row in versions] == list(range(1, 12))
+    assert [row["version"] for row in versions] == list(range(1, 13))
     assert [row["name"] for row in tables] == [
         "service_admission_fences",
         "service_restart_intents",
@@ -121,9 +117,7 @@ async def test_force_restart_applies_operations_migrations_before_coordination(
     async with Database(settings.database_path) as database:
         await database.execute("DROP TABLE service_admission_fences")
         await database.execute("DROP TABLE service_restart_intents")
-        await database.execute(
-            "DELETE FROM schema_migrations WHERE version IN (8, 9, 10, 11)"
-        )
+        await database.execute("DELETE FROM schema_migrations WHERE version >= 8")
     manager = ServiceManager(settings, platform="unsupported")
     observed = False
 
@@ -165,6 +159,68 @@ async def test_force_restart_applies_operations_migrations_before_coordination(
 
 
 @pytest.mark.asyncio
+async def test_unmanaged_command_refuses_pending_windows_layout(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    settings = _settings(tmp_path)
+    manager = ServiceManager(settings, platform="win32")
+    monkeypatch.setattr(
+        Settings,
+        "windows_legacy_layout_pending",
+        lambda _self: True,
+    )
+    args = argparse.Namespace(command="service", service_command="status")
+
+    with pytest.raises(ValueError, match=r"setup.*service install"):
+        await run_command(args, settings=settings, manager=manager)
+    assert not settings.database_path.exists()
+
+
+@pytest.mark.asyncio
+async def test_install_command_is_only_cli_path_that_adopts_legacy_layout(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    settings = _settings(tmp_path)
+
+    class AdoptionReached(Exception):
+        pass
+
+    class SuccessfulReport:
+        def require_success(self) -> None:
+            return
+
+        def as_dict(self) -> dict[str, object]:
+            return {}
+
+    class SuccessfulPreflight:
+        async def run(self) -> SuccessfulReport:
+            return SuccessfulReport()
+
+    manager = ServiceManager(settings, platform="win32")
+
+    def adopt(_self: Settings, **kwargs: object) -> bool:
+        assert kwargs["platform_name"] == "win32"
+        assert kwargs["service_quiescer"] == (manager.quiesce_windows_legacy_layout)
+        raise AdoptionReached
+
+    monkeypatch.setattr(Settings, "adopt_legacy_windows_layout", adopt)
+    args = argparse.Namespace(
+        command="service",
+        service_command="install",
+    )
+
+    with pytest.raises(AdoptionReached):
+        await run_command(
+            args,
+            settings=settings,
+            manager=manager,
+            preflight=SuccessfulPreflight(),  # type: ignore[arg-type]
+        )
+
+
+@pytest.mark.asyncio
 async def test_managed_service_logging_disables_stderr_duplication(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -176,9 +232,7 @@ async def test_managed_service_logging_disables_stderr_duplication(
     monkeypatch.setenv("COPILOTD_MANAGED_SERVICE", "1")
     monkeypatch.setattr(
         "copilotd.cli.configure_logging",
-        lambda level, log_dir, *, stderr: calls.append(
-            (level, log_dir, stderr)
-        ),
+        lambda level, log_dir, *, stderr: calls.append((level, log_dir, stderr)),
     )
     args = argparse.Namespace(command="service", service_command="status")
 

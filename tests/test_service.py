@@ -99,13 +99,10 @@ class FakeRunner:
         del check
         call = tuple(str(value) for value in command)
         self.calls.append(call)
-        if call[:2] == ("launchctl", "bootout") and call[-1].endswith(
-            "com.github.copilotd.bot"
-        ):
+        if call[:2] == ("launchctl", "bootout") and call[-1].endswith("com.github.copilotd.bot"):
             self.process_running = False
-        if (
-            call[:2] == ("launchctl", "bootstrap")
-            and call[-1].endswith("com.github.copilotd.bot.plist")
+        if call[:2] == ("launchctl", "bootstrap") and call[-1].endswith(
+            "com.github.copilotd.bot.plist"
         ):
             self.process_running = True
         if call[0] == "plutil" and "-extract" in call:
@@ -122,11 +119,7 @@ class FakeRunner:
             action = call[call.index("-Action") + 1]
             if action in {"Install", "Status"}:
                 return self._result(call, stdout=self._windows_status())
-        if (
-            call[0] == "powershell.exe"
-            and "-Command" in call
-            and "ProcessId =" in call[-1]
-        ):
+        if call[0] == "powershell.exe" and "-Command" in call and "ProcessId =" in call[-1]:
             return self._result(
                 call,
                 stdout=(
@@ -136,7 +129,7 @@ class FakeRunner:
                     ).isoformat()
                     + "\n"
                     if self.process_running
-                    else ""
+                    else "__COPILOTD_PROCESS_ABSENT__\n"
                 ),
             )
         return self._result(call)
@@ -175,14 +168,12 @@ class FakeRunner:
                     ),
                     "pid": (
                         None
-                        if task in self.missing_tasks
-                        or task.endswith("Watchdog")
+                        if task in self.missing_tasks or task.endswith("Watchdog")
                         else self.mac_pid
                     ),
                     "process_started_at": (
                         None
-                        if task in self.missing_tasks
-                        or task.endswith("Watchdog")
+                        if task in self.missing_tasks or task.endswith("Watchdog")
                         else datetime.fromtimestamp(
                             self.process_started_at,
                             UTC,
@@ -223,6 +214,7 @@ class AutoAckRestartCoordinator(SqliteRestartCoordinator):
         )
         self.acknowledge_quiesce(fence, now=now)
         return fence
+
 
 class ViolatingRestartCoordinator(AutoAckRestartCoordinator):
     def snapshot_under_fence(
@@ -276,6 +268,50 @@ class LateProducerAfterPrepareCoordinator(AutoAckRestartCoordinator):
         finally:
             connection.close()
         return outcome
+
+
+class LegacyAdmissionRaceCoordinator(AutoAckRestartCoordinator):
+    def __init__(self, database_path: Path) -> None:
+        super().__init__(database_path)
+        self.snapshot_calls = 0
+
+    def snapshot(self, *, now: float) -> RestartSafetySnapshot:
+        snapshot = super().snapshot(now=now)
+        self.snapshot_calls += 1
+        if self.snapshot_calls == 1:
+            connection = self._connect()
+            try:
+                connection.execute(
+                    """
+                    INSERT INTO session_bindings(
+                        thread_id, project_source, cwd_snapshot,
+                        sdk_session_id, attachment_state,
+                        runtime_generation, owner_fence_token,
+                        created_at, updated_at
+                    ) VALUES (
+                        'legacy-race-thread', 'home', '/tmp',
+                        'legacy-race-session', 'attached', 1, 3, ?, ?
+                    )
+                    """,
+                    (now, now),
+                )
+                connection.execute(
+                    """
+                    INSERT INTO session_operations(
+                        operation_id, sdk_session_id, runtime_generation,
+                        owner_fence_token, kind, idempotency_key,
+                        input_hash, state, created_at
+                    ) VALUES (
+                        'legacy-race-operation', 'legacy-race-session', 1, 3,
+                        'send', 'legacy-race-send', 'hash', 'started', ?
+                    )
+                    """,
+                    (now,),
+                )
+                connection.commit()
+            finally:
+                connection.close()
+        return snapshot
 
 
 def _manager(
@@ -364,9 +400,7 @@ def test_macos_install_boots_out_every_definition_before_bootstrap(
     runner = FakeRunner()
     manager = _manager(settings, runner)
     manager.launch_agents_dir.mkdir(parents=True)
-    stale_runtime = (
-        manager.launch_agents_dir / "com.github.copilotd.runtime.plist"
-    )
+    stale_runtime = manager.launch_agents_dir / "com.github.copilotd.runtime.plist"
     stale_runtime.write_text("stale", encoding="utf-8")
 
     manager.install()
@@ -383,8 +417,7 @@ def test_macos_install_boots_out_every_definition_before_bootstrap(
     assert max(bootout_indexes) < min(bootstrap_indexes)
     assert not stale_runtime.exists()
     assert any(
-        call[:2] == ("launchctl", "bootout")
-        and call[-1].endswith("com.github.copilotd.runtime")
+        call[:2] == ("launchctl", "bootout") and call[-1].endswith("com.github.copilotd.runtime")
         for call in calls
     )
     for label in ("com.github.copilotd.bot", "com.github.copilotd.watchdog"):
@@ -435,8 +468,7 @@ def test_reinstall_uses_current_entrypoint_instead_of_stale_persisted_path(
     assert new_manager.status().definition_drift == ("bot", "watchdog")
     new_manager.install()
     definitions = {
-        name: plistlib.loads(content)
-        for name, content in new_manager.macos_plists().items()
+        name: plistlib.loads(content) for name, content in new_manager.macos_plists().items()
     }
     assert definitions["com.github.copilotd.bot.plist"]["ProgramArguments"][0] == str(
         new_entrypoint.resolve()
@@ -486,7 +518,9 @@ def test_post_install_accepts_new_identity_after_legacy_heartbeat(
             process_started_at=datetime.fromtimestamp(
                 replacement_started_at,
                 UTC,
-            ).isoformat().replace("+00:00", "Z"),
+            )
+            .isoformat()
+            .replace("+00:00", "Z"),
         ),
     )
 
@@ -525,10 +559,13 @@ def test_windows_tasks_and_powershell_cover_full_current_user_contract(
         == "PT5M"
     )
     assert watchdog.findtext(".//t:StartWhenAvailable", namespaces=namespace) == "true"
-    logon_children = [child.tag.rsplit("}", 1)[-1] for child in watchdog.find(
-        ".//t:LogonTrigger",
-        namespace,
-    )]
+    logon_children = [
+        child.tag.rsplit("}", 1)[-1]
+        for child in watchdog.find(
+            ".//t:LogonTrigger",
+            namespace,
+        )
+    ]
     registration_children = [
         child.tag.rsplit("}", 1)[-1]
         for child in watchdog.find(".//t:RegistrationTrigger", namespace)
@@ -539,9 +576,13 @@ def test_windows_tasks_and_powershell_cover_full_current_user_contract(
         "copilotD Bot": (),
         "copilotD Watchdog": (),
     }
-    invalid = tasks["copilotD Bot"].replace("PT1M", "PT30S").replace(
-        ">255<",
-        ">999<",
+    invalid = (
+        tasks["copilotD Bot"]
+        .replace("PT1M", "PT30S")
+        .replace(
+            ">255<",
+            ">999<",
+        )
     )
     assert _windows_task_contract_errors(invalid) == (
         "RestartOnFailure Interval must be at least PT1M",
@@ -554,9 +595,9 @@ def test_windows_tasks_and_powershell_cover_full_current_user_contract(
     assert invalid_repetition is not None
     invalid_logon.remove(invalid_repetition)
     invalid_logon.append(invalid_repetition)
-    assert _windows_task_contract_errors(
-        ET.tostring(invalid_order, encoding="unicode")
-    )[0].startswith("LogonTrigger child order is schema-invalid")
+    assert _windows_task_contract_errors(ET.tostring(invalid_order, encoding="unicode"))[
+        0
+    ].startswith("LogonTrigger child order is schema-invalid")
     installer = manager.windows_installer()
     assert "Unregister-ScheduledTask" in installer
     assert "Register-ScheduledTask" in manager.windows_installer()
@@ -611,11 +652,15 @@ def test_windows_install_is_idempotent_and_verifies_exported_xml(tmp_path: Path)
     ]
     assert len(install_calls) == 2
     assert (
-        settings.data_dir / "runtime" / "copilotd-service.ps1"
-    ).read_bytes().startswith(b"\xef\xbb\xbf")
+        (settings.data_dir / "runtime" / "copilotd-service.ps1")
+        .read_bytes()
+        .startswith(b"\xef\xbb\xbf")
+    )
     assert (
-        settings.data_dir / "runtime" / "install-service.ps1"
-    ).read_bytes().startswith(b"\xef\xbb\xbf")
+        (settings.data_dir / "runtime" / "install-service.ps1")
+        .read_bytes()
+        .startswith(b"\xef\xbb\xbf")
+    )
     status = manager.status()
     assert status.installed is True
     assert status.definition_drift == ()
@@ -663,6 +708,207 @@ def test_windows_process_identity_probe_distinguishes_alive_and_dead(
         pid=runner.mac_pid,
         process_started_at=runner.process_started_at,
     )
+
+    runner.process_running = True
+    assert manager.process_identity_alive(
+        pid=runner.mac_pid,
+        process_started_at=None,
+    )
+    runner.process_running = False
+    assert not manager.process_identity_alive(
+        pid=runner.mac_pid,
+        process_started_at=None,
+    )
+
+
+def test_windows_process_identity_probe_fails_closed_on_probe_ambiguity(
+    tmp_path: Path,
+) -> None:
+    settings = _settings(tmp_path)
+    runner = FakeRunner()
+    manager = ServiceManager(
+        settings,
+        entrypoint=settings.resolved_home / "copilotd.exe",
+        platform="win32",
+        command_runner=runner,
+        windows_user_id="DOMAIN\\test",
+    )
+
+    runner.run = lambda command, check=False: CommandResult(  # type: ignore[method-assign]
+        tuple(command),
+        1,
+        "",
+        "access denied",
+    )
+    with pytest.raises(ServiceError, match="could not query Windows"):
+        manager.process_identity_alive(
+            pid=12345,
+            process_started_at=None,
+        )
+
+    runner.run = lambda command, check=False: CommandResult(  # type: ignore[method-assign]
+        tuple(command),
+        0,
+        "",
+        "",
+    )
+    with pytest.raises(ServiceError, match="without a start identity"):
+        manager.process_identity_alive(
+            pid=12345,
+            process_started_at=None,
+        )
+
+
+def test_windows_fail_closed_termination_runs_verified_stop_bot(
+    tmp_path: Path,
+) -> None:
+    settings = _settings(tmp_path)
+    runner = FakeRunner()
+    manager = _manager(settings, runner, platform_name="win32")
+
+    manager._terminate_bot_fail_closed()
+
+    actions = [
+        call[call.index("-Action") + 1]
+        for call in runner.calls
+        if call[0] == "powershell.exe" and "-Action" in call
+    ]
+    assert actions[-2:] == ["DisableBot", "StopBot"]
+    installer = manager.windows_installer()
+    stop_bot = installer.split(
+        "} elseif ($Action -eq 'StopBot') {",
+        maxsplit=1,
+    )[1].split("} elseif", maxsplit=1)[0]
+    assert "Disable-ScheduledTask -TaskName 'copilotD Bot'" in stop_bot
+    assert "Stop-CopilotDTasks @('copilotD Bot')" in stop_bot
+    assert "Get-CopilotDProcessTreeIds" in installer
+    assert "copilotD process tree did not exit before task unregister" in installer
+
+    manager._start_bot_after_legacy_upgrade()
+    enable = next(
+        index
+        for index, call in enumerate(runner.calls)
+        if "-Action" in call and call[call.index("-Action") + 1] == "EnableBot"
+    )
+    start = next(
+        index for index, call in enumerate(runner.calls) if call[:2] == ("schtasks.exe", "/Run")
+    )
+    assert enable < start
+
+
+def test_windows_fail_closed_attempts_verified_stop_when_disable_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    settings = _settings(tmp_path)
+    manager = _manager(settings, FakeRunner(), platform_name="win32")
+    actions: list[str] = []
+
+    def action(name: str, *, check: bool) -> None:
+        assert check is True
+        actions.append(name)
+        if name == "DisableBot":
+            raise ServiceError("disable failed")
+
+    monkeypatch.setattr(manager, "_run_windows_installer_action", action)
+
+    with pytest.raises(ServiceError, match="disable failed"):
+        manager._terminate_bot_fail_closed()
+    assert actions == ["DisableBot", "StopBot"]
+
+
+def test_macos_process_probe_only_treats_clean_esrch_as_absent(
+    tmp_path: Path,
+) -> None:
+    settings = _settings(tmp_path)
+    runner = FakeRunner()
+    manager = ServiceManager(
+        settings,
+        platform="darwin",
+        command_runner=runner,
+    )
+
+    runner.run = lambda command, check=False: CommandResult(  # type: ignore[method-assign]
+        tuple(command),
+        1,
+        "",
+        "",
+    )
+    assert not manager.process_identity_alive(
+        pid=12345,
+        process_started_at=None,
+    )
+
+    runner.run = lambda command, check=False: CommandResult(  # type: ignore[method-assign]
+        tuple(command),
+        1,
+        "",
+        "operation not permitted",
+    )
+    with pytest.raises(ServiceError, match="could not query macOS"):
+        manager.process_identity_alive(
+            pid=12345,
+            process_started_at=None,
+        )
+
+
+def test_windows_legacy_migration_guard_holds_lock_and_records_handoff(
+    tmp_path: Path,
+) -> None:
+    settings = _settings(tmp_path)
+
+    async def initialize() -> None:
+        async with Database(settings.database_path):
+            pass
+
+    asyncio.run(initialize())
+    runner = FakeRunner()
+    manager = _manager(settings, runner, platform_name="win32")
+
+    guard = manager.quiesce_windows_legacy_layout((settings.database_path,))
+    competing = sqlite3.connect(settings.database_path, timeout=0)
+    try:
+        with pytest.raises(sqlite3.OperationalError, match="locked"):
+            competing.execute("BEGIN IMMEDIATE")
+    finally:
+        competing.close()
+    staged = tmp_path / "staged" / "copilotd.sqlite3"
+    guard.stage_database(settings.database_path, staged)
+    guard.finalize_database(staged)
+    guard.release()
+
+    connection = sqlite3.connect(staged)
+    try:
+        versions = {
+            int(row[0]) for row in connection.execute("SELECT version FROM schema_migrations")
+        }
+        handoffs = int(
+            connection.execute(
+                """
+                SELECT COUNT(*) FROM service_restart_intents
+                WHERE kind = 'legacy_worker_replacement'
+                """
+            ).fetchone()[0]
+        )
+    finally:
+        connection.close()
+    assert max(versions) == 12
+    assert handoffs == 1
+    script = next(
+        call[-1]
+        for call in runner.calls
+        if call[:4]
+        == (
+            "powershell.exe",
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+        )
+    )
+    assert script.index("Disable-ScheduledTask") < script.index("taskkill.exe")
+    assert "HashSet[int]" in script
+    assert "Add-CopilotDProcessTree $processes" in script
+    assert "$remainingTracked.Count -eq 0" in script
 
 
 def test_windows_partial_install_reports_missing_task_without_crashing(
@@ -890,14 +1136,9 @@ class RecordingServiceManager(ServiceManager):
         return True
 
     def _test_process_started_at(self, _pid: int) -> float:
-        if (
-            self.use_heartbeat_process_start
-            and self._provider_settings.heartbeat_path.exists()
-        ):
+        if self.use_heartbeat_process_start and self._provider_settings.heartbeat_path.exists():
             try:
-                snapshot = read_heartbeat(
-                    self._provider_settings.heartbeat_path
-                )
+                snapshot = read_heartbeat(self._provider_settings.heartbeat_path)
             except (ValueError, json.JSONDecodeError):
                 pass
             else:
@@ -1032,10 +1273,7 @@ async def test_watchdog_restart_failure_after_commit_terminates_fail_closed(
     manager = FailingWatchdogRestartManager(settings)
 
     assert manager.watchdog(now=now) == "restart-failed-closed"
-    assert any(
-        call[:3] == ("launchctl", "kill", "SIGTERM")
-        for call in manager.runner.calls
-    )
+    assert any(call[:3] == ("launchctl", "kill", "SIGTERM") for call in manager.runner.calls)
     connection = sqlite3.connect(settings.database_path)
     try:
         state = connection.execute(
@@ -1174,9 +1412,7 @@ async def test_sidecar_runtime_loss_marks_inflight_outcome_unknown_without_bot_k
             ORDER BY submission_id
             """
         )
-        queue_rows = await database.fetchall(
-            "SELECT id, state FROM message_queue ORDER BY id"
-        )
+        queue_rows = await database.fetchall("SELECT id, state FROM message_queue ORDER BY id")
     assert [tuple(row) for row in submissions] == [
         ("ambiguous-1", "outcome_unknown"),
         ("cancelled-1", "cancelled"),
@@ -1196,9 +1432,7 @@ async def test_sidecar_runtime_loss_marks_inflight_outcome_unknown_without_bot_k
             WHERE id = 'queued-1'
             """
         )
-    snapshot = SqliteRestartCoordinator(settings.database_path).snapshot(
-        now=time.time()
-    )
+    snapshot = SqliteRestartCoordinator(settings.database_path).snapshot(now=time.time())
     assert snapshot.local_pending == 0
 
 
@@ -1333,15 +1567,18 @@ async def test_committed_restart_hands_off_owner_and_recovers_attachment(
     assert closing_owner["expires_at"] == pytest.approx(now + 1)
     assert replacement.fence_token == 8
 
-    assert coordinator.recover_for_replacement(
-        replacement_pid=5000,
-        replacement_generation="new-generation",
-        replacement_process_started_at=now + 2,
-        manager_handoff_token="",
-        replacement_is_managed=True,
-        old_process_identity_alive=False,
-        now=now + 2,
-    ) == "committed"
+    assert (
+        coordinator.recover_for_replacement(
+            replacement_pid=5000,
+            replacement_generation="new-generation",
+            replacement_process_started_at=now + 2,
+            manager_handoff_token="",
+            replacement_is_managed=True,
+            old_process_identity_alive=False,
+            now=now + 2,
+        )
+        == "committed"
+    )
     row = coordinator._fence_row(fence.fence_id)
     assert row is not None and row["state"] == "released"
 
@@ -1394,15 +1631,18 @@ async def test_replacement_completes_crashed_irreversible_prepare(
     coordinator.prepare_force(fence, snapshot, deadline=now + 10)
     assert coordinator._fence_row(fence.fence_id)["state"] == "prepared"
 
-    assert coordinator.recover_for_replacement(
-        replacement_pid=5000,
-        replacement_generation="replacement-generation",
-        replacement_process_started_at=now + 1,
-        manager_handoff_token="",
-        replacement_is_managed=True,
-        old_process_identity_alive=False,
-        now=now + 1,
-    ) == "committed"
+    assert (
+        coordinator.recover_for_replacement(
+            replacement_pid=5000,
+            replacement_generation="replacement-generation",
+            replacement_process_started_at=now + 1,
+            manager_handoff_token="",
+            replacement_is_managed=True,
+            old_process_identity_alive=False,
+            now=now + 1,
+        )
+        == "committed"
+    )
 
     connection = coordinator._connect()
     try:
@@ -1461,15 +1701,18 @@ async def test_replacement_adopts_reversible_crash_owner_without_ttl_wait(
         now=now,
     )
 
-    assert coordinator.recover_for_replacement(
-        replacement_pid=5000,
-        replacement_generation="replacement-generation",
-        replacement_process_started_at=now + 1,
-        manager_handoff_token="",
-        replacement_is_managed=True,
-        old_process_identity_alive=False,
-        now=now + 1,
-    ) == "requested"
+    assert (
+        coordinator.recover_for_replacement(
+            replacement_pid=5000,
+            replacement_generation="replacement-generation",
+            replacement_process_started_at=now + 1,
+            manager_handoff_token="",
+            replacement_is_managed=True,
+            old_process_identity_alive=False,
+            now=now + 1,
+        )
+        == "requested"
+    )
 
     async with Database(settings.database_path) as database:
         binding = await database.fetchone(
@@ -1561,15 +1804,18 @@ async def test_replacement_recovers_legacy_committed_fence_with_null_epochs(
         )
     coordinator = SqliteRestartCoordinator(settings.database_path)
 
-    assert coordinator.recover_for_replacement(
-        replacement_pid=5000,
-        replacement_generation="replacement-generation",
-        replacement_process_started_at=now,
-        manager_handoff_token=None,
-        replacement_is_managed=True,
-        old_process_identity_alive=False,
-        now=now,
-    ) == "committed"
+    assert (
+        coordinator.recover_for_replacement(
+            replacement_pid=5000,
+            replacement_generation="replacement-generation",
+            replacement_process_started_at=now,
+            manager_handoff_token=None,
+            replacement_is_managed=True,
+            old_process_identity_alive=False,
+            now=now,
+        )
+        == "committed"
+    )
 
     row = coordinator._fence_row("legacy-fence")
     assert row is not None and row["state"] == "released"
@@ -1611,20 +1857,56 @@ async def test_replacement_recovers_legacy_prepared_fence_with_null_identity(
         )
     coordinator = SqliteRestartCoordinator(settings.database_path)
 
-    assert coordinator.recover_for_replacement(
-        replacement_pid=5000,
-        replacement_generation="replacement-generation",
-        replacement_process_started_at=now,
-        manager_handoff_token=None,
-        replacement_is_managed=True,
-        old_process_identity_alive=False,
-        now=now,
-    ) == "committed"
+    assert (
+        coordinator.recover_for_replacement(
+            replacement_pid=5000,
+            replacement_generation="replacement-generation",
+            replacement_process_started_at=now,
+            manager_handoff_token=None,
+            replacement_is_managed=True,
+            old_process_identity_alive=False,
+            now=now,
+        )
+        == "committed"
+    )
 
     row = coordinator._fence_row("legacy-prepared")
     assert row is not None
     assert row["state"] == "released"
     assert row["owner_handoff_at"] is not None
+
+
+@pytest.mark.asyncio
+async def test_schema12_restores_unknown_legacy_process_identity_to_null(
+    tmp_path: Path,
+) -> None:
+    settings = _settings(tmp_path)
+    now = time.time()
+    async with Database(settings.database_path) as database:
+        await database.execute(
+            """
+            INSERT INTO service_admission_fences(
+                fence_id, expected_pid, expected_generation,
+                expected_process_started_at, state, requested_at,
+                protocol_version, handoff_token_hash, detail
+            ) VALUES (
+                'legacy-unknown-start', 4321, 'legacy-generation',
+                0, 'released', ?, 1, '', '{}'
+            )
+            """,
+            (now,),
+        )
+        await database.execute("DELETE FROM schema_migrations WHERE version = 12")
+
+    async with Database(settings.database_path) as database:
+        row = await database.fetchone(
+            """
+            SELECT expected_process_started_at
+            FROM service_admission_fences
+            WHERE fence_id = 'legacy-unknown-start'
+            """
+        )
+    assert row is not None and row[0] is None
 
 
 @pytest.mark.asyncio
@@ -1654,7 +1936,9 @@ async def test_watchdog_never_kills_replacement_or_process_in_startup_grace(
             process_started_at=datetime.fromtimestamp(
                 now - 190,
                 UTC,
-            ).isoformat().replace("+00:00", "Z"),
+            )
+            .isoformat()
+            .replace("+00:00", "Z"),
         ),
     )
     assert replacement.watchdog(now=now) == "replacement-starting"
@@ -1694,9 +1978,7 @@ async def test_watchdog_explicitly_adopts_ready_replacement_generation(
                 "last_verified_pid": 4321,
                 "last_verified_generation": "old-generation",
                 "last_verified_process_started_at": (
-                    datetime.fromtimestamp(now - 100, UTC)
-                    .isoformat()
-                    .replace("+00:00", "Z")
+                    datetime.fromtimestamp(now - 100, UTC).isoformat().replace("+00:00", "Z")
                 ),
                 "last_verified_at": now - 90,
             }
@@ -1709,9 +1991,7 @@ async def test_watchdog_explicitly_adopts_ready_replacement_generation(
             now,
             process_generation="replacement-generation",
             process_started_at=(
-                datetime.fromtimestamp(now - 10, UTC)
-                .isoformat()
-                .replace("+00:00", "Z")
+                datetime.fromtimestamp(now - 10, UTC).isoformat().replace("+00:00", "Z")
             ),
         ),
     )
@@ -1916,10 +2196,7 @@ async def test_force_restart_coordinator_is_bounded_with_durable_fallback(
     elapsed = time.monotonic() - started
 
     assert elapsed < 1.2
-    assert any(
-        call[:3] == ("launchctl", "kill", "SIGTERM")
-        for call in runner.calls
-    )
+    assert any(call[:3] == ("launchctl", "kill", "SIGTERM") for call in runner.calls)
 
 
 def test_restart_missing_or_malformed_heartbeat_fails_closed(tmp_path: Path) -> None:
@@ -1954,8 +2231,7 @@ async def test_schema11_manager_replaces_legacy_protocol_worker_before_fence(
 
     assert receipt.admission_fence_id == "legacy-worker-protocol-upgrade"
     assert any(
-        call[:2] == ("launchctl", "bootout")
-        and call[-1].endswith("com.github.copilotd.bot")
+        call[:2] == ("launchctl", "bootout") and call[-1].endswith("com.github.copilotd.bot")
         for call in runner.calls
     )
     assert any(
@@ -1963,18 +2239,56 @@ async def test_schema11_manager_replaces_legacy_protocol_worker_before_fence(
         and call[-1].endswith("com.github.copilotd.bot.plist")
         for call in runner.calls
     )
-    secrets = json.loads(
-        settings.service_secrets_path.read_text(encoding="utf-8")
-    )
+    secrets = json.loads(settings.service_secrets_path.read_text(encoding="utf-8"))
     assert secrets["service_handoff_token"] == manager._handoff_token
     connection = sqlite3.connect(settings.database_path)
     try:
-        count = connection.execute(
-            "SELECT COUNT(*) FROM service_admission_fences"
-        ).fetchone()[0]
+        count = connection.execute("SELECT COUNT(*) FROM service_admission_fences").fetchone()[0]
     finally:
         connection.close()
     assert count == 0
+
+
+@pytest.mark.asyncio
+async def test_legacy_protocol_replacement_snapshots_after_death_and_recovers_race(
+    tmp_path: Path,
+) -> None:
+    settings = _settings(tmp_path)
+    async with Database(settings.database_path):
+        pass
+    runner = FakeRunner()
+    manager = _manager(settings, runner)
+    manager._coordinator = LegacyAdmissionRaceCoordinator(settings.database_path)
+    manager.install()
+    _write_heartbeat(
+        settings,
+        _heartbeat(time.time(), service_control_protocol=1),
+    )
+
+    receipt = manager.restart(force=False)
+
+    assert receipt.safety_snapshot.pending_operations == 1
+    assert receipt.force_outcome is not None
+    assert "conservative ambiguity recovery" in receipt.force_outcome.detail
+    assert manager._coordinator.snapshot_calls == 2
+    connection = sqlite3.connect(settings.database_path)
+    try:
+        state = connection.execute(
+            """
+            SELECT state FROM session_operations
+            WHERE operation_id = 'legacy-race-operation'
+            """
+        ).fetchone()[0]
+        incident = connection.execute(
+            """
+            SELECT kind FROM service_restart_intents
+            WHERE kind = 'legacy_worker_replacement'
+            """
+        ).fetchone()[0]
+    finally:
+        connection.close()
+    assert state == "unknown"
+    assert incident == "legacy_worker_replacement"
 
 
 @pytest.mark.asyncio
@@ -2011,22 +2325,19 @@ async def test_legacy_protocol_replacement_requires_fresh_unprotected_heartbeat(
                 datetime.fromtimestamp(
                     runner.process_started_at,
                     UTC,
-                ).isoformat().replace("+00:00", "Z")
+                )
+                .isoformat()
+                .replace("+00:00", "Z")
             ),
         ),
     )
-    service_state = json.loads(
-        settings.service_state_path.read_text(encoding="utf-8")
-    )
+    service_state = json.loads(settings.service_state_path.read_text(encoding="utf-8"))
     service_state["installed_at"] = now - 300
     settings.service_state_path.write_text(
         json.dumps(service_state),
         encoding="utf-8",
     )
-    assert (
-        manager._watchdog_restart(now)
-        == "legacy-worker-manual-upgrade-required"
-    )
+    assert manager._watchdog_restart(now) == "legacy-worker-manual-upgrade-required"
 
     receipt = manager.restart(force=True)
     assert receipt.admission_fence_id == "legacy-worker-protocol-upgrade"
@@ -2141,9 +2452,7 @@ async def test_force_prepare_failure_stays_irreversible_and_terminates_bot(
             (now,),
         )
     runner = FakeRunner()
-    coordinator = LateProducerAfterPrepareCoordinator(
-        settings.database_path
-    )
+    coordinator = LateProducerAfterPrepareCoordinator(settings.database_path)
     manager = ServiceManager(
         settings,
         entrypoint=settings.resolved_home / "copilotd",
@@ -2187,19 +2496,19 @@ async def test_force_prepare_failure_stays_irreversible_and_terminates_bot(
     assert fence["owner_handoff_at"] is not None
     assert fence["violation_count"] == 1
     assert owner["expires_at"] <= time.time()
-    assert any(
-        call[:3] == ("launchctl", "kill", "SIGTERM")
-        for call in runner.calls
+    assert any(call[:3] == ("launchctl", "kill", "SIGTERM") for call in runner.calls)
+    assert (
+        coordinator.recover_for_replacement(
+            replacement_pid=5000,
+            replacement_generation="replacement-generation",
+            replacement_process_started_at=now + 2,
+            manager_handoff_token=manager._handoff_token,
+            replacement_is_managed=True,
+            old_process_identity_alive=False,
+            now=now + 2,
+        )
+        == "committed"
     )
-    assert coordinator.recover_for_replacement(
-        replacement_pid=5000,
-        replacement_generation="replacement-generation",
-        replacement_process_started_at=now + 2,
-        manager_handoff_token=manager._handoff_token,
-        replacement_is_managed=True,
-        old_process_identity_alive=False,
-        now=now + 2,
-    ) == "committed"
     connection = coordinator._connect()
     try:
         incident = connection.execute(

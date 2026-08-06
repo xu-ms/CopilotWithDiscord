@@ -166,10 +166,8 @@ class SessionBindingRepository:
             binding = _row_to_binding(row)
             if binding.sdk_session_id != lease.sdk_session_id:
                 raise BindingConflict("owner lease does not match session binding")
-            if binding.binding_intent not in {BindingIntent.ACTIVE, BindingIntent.CLOSED}:
-                raise BindingConflict(
-                    f"cannot attach binding with intent {binding.binding_intent}"
-                )
+            if binding.binding_intent != BindingIntent.ACTIVE:
+                raise BindingConflict(f"cannot attach binding with intent {binding.binding_intent}")
             attachable_states = {
                 AttachmentState.ABSENT,
                 AttachmentState.RECOVERY_UNKNOWN,
@@ -179,9 +177,7 @@ class SessionBindingRepository:
                 and binding.owner_fence_token != lease.fence_token
             )
             if binding.attachment_state not in attachable_states and not stale_attached:
-                raise BindingConflict(
-                    f"cannot attach binding in state {binding.attachment_state}"
-                )
+                raise BindingConflict(f"cannot attach binding in state {binding.attachment_state}")
 
             generation = binding.runtime_generation + 1
             update = await connection.execute(
@@ -289,6 +285,26 @@ class SessionBindingRepository:
             expected_states=(AttachmentState.CREATING, AttachmentState.RESUMING),
         )
 
+    async def reset_cancelled_attachment(
+        self,
+        binding: SessionBinding,
+        *,
+        now: float | None = None,
+    ) -> SessionBinding:
+        timestamp = time.time() if now is None else now
+        return await self._transition_attachment(
+            binding,
+            state=AttachmentState.ABSENT,
+            permission_posture=PermissionPosture.UNVERIFIED,
+            permission_verified_at=None,
+            now=timestamp,
+            expected_states=(
+                AttachmentState.CREATING,
+                AttachmentState.RESUMING,
+                AttachmentState.ATTACHED,
+            ),
+        )
+
     async def mark_recovery_unknown(
         self,
         binding: SessionBinding,
@@ -387,15 +403,9 @@ class SessionBindingRepository:
         timestamp = time.time() if now is None else now
         return await self._transition_attachment(
             binding,
-            state=(
-                AttachmentState.ABSENT
-                if succeeded
-                else AttachmentState.RECOVERY_UNKNOWN
-            ),
+            state=(AttachmentState.ABSENT if succeeded else AttachmentState.RECOVERY_UNKNOWN),
             permission_posture=(
-                PermissionPosture.UNVERIFIED
-                if succeeded
-                else PermissionPosture.UNKNOWN
+                PermissionPosture.UNVERIFIED if succeeded else PermissionPosture.UNKNOWN
             ),
             permission_verified_at=None,
             now=timestamp,

@@ -13,9 +13,18 @@ from typing import Protocol
 
 from aiosqlite import Row
 
-from copilotd.core.bindings import SessionBinding, SessionBindingRepository
+from copilotd.core.bindings import (
+    BindingIntent,
+    SessionBinding,
+    SessionBindingRepository,
+)
 from copilotd.core.projects import ProjectRegistry, ProjectSnapshot
-from copilotd.core.session_runtime import RuntimeState, SessionAttachUnknown, SessionRuntime
+from copilotd.core.session_runtime import (
+    ClosedSessionRequiresReactivation,
+    RuntimeState,
+    SessionAttachUnknown,
+    SessionRuntime,
+)
 from copilotd.storage.database import Database
 
 RuntimeFactory = Callable[[SessionBinding], SessionRuntime]
@@ -79,6 +88,12 @@ class SessionCreationUnknown(RuntimeError):
 class _SourceCreationLock:
     lock: asyncio.Lock
     users: int = 0
+
+
+@dataclass(slots=True)
+class _AttachmentTransition:
+    reactivate_requested: bool
+    task: asyncio.Task[SessionRuntime] | None = None
 
 
 class CreationIntentRepository:
@@ -214,7 +229,7 @@ class SessionRegistry:
         self._active_creations = 0
         self._admission_condition = asyncio.Condition()
         self._transition_lock = asyncio.Lock()
-        self._transitions: dict[str, asyncio.Task[SessionRuntime]] = {}
+        self._transitions: dict[str, _AttachmentTransition] = {}
 
     def for_thread(self, thread_id: str) -> SessionRuntime | None:
         return self._runtimes.get(thread_id)
@@ -240,9 +255,7 @@ class SessionRegistry:
             received_at = inbox.last_received_at
             if received_at is not None:
                 last_callback_at = (
-                    received_at
-                    if last_callback_at is None
-                    else max(last_callback_at, received_at)
+                    received_at if last_callback_at is None else max(last_callback_at, received_at)
                 )
         return depth, max_lag_ms, last_callback_at
 
@@ -261,35 +274,69 @@ class SessionRegistry:
         *,
         reactivate: bool = False,
     ) -> SessionRuntime:
+        current = await self._bindings.by_thread(binding.thread_id)
+        if current is None:
+            raise RuntimeError("session binding disappeared before attach")
+        binding = current
+        if binding.binding_intent == BindingIntent.CLOSED and not reactivate:
+            raise ClosedSessionRequiresReactivation("closed session requires an explicit resume")
         runtime = self.for_thread(binding.thread_id)
-        if runtime is not None and runtime.state == RuntimeState.READY:
+        if (
+            runtime is not None
+            and runtime.state == RuntimeState.READY
+            and binding.binding_intent == BindingIntent.ACTIVE
+        ):
             return runtime
-        async with self._transition_lock:
-            transition = self._transitions.get(binding.thread_id)
-            if transition is None:
-                transition = asyncio.create_task(
-                    self._ensure_attached_transition(
-                        binding,
-                        reactivate=reactivate,
-                    ),
-                    name=f"session-attach:{binding.thread_id}",
-                )
-                self._transitions[binding.thread_id] = transition
-        try:
-            return await asyncio.shield(transition)
-        finally:
-            if transition.done():
-                async with self._transition_lock:
-                    if self._transitions.get(binding.thread_id) is transition:
-                        self._transitions.pop(binding.thread_id, None)
+        for attempt in range(2):
+            async with self._transition_lock:
+                transition = self._transitions.get(binding.thread_id)
+                if transition is None:
+                    transition = _AttachmentTransition(
+                        reactivate_requested=reactivate,
+                    )
+                    transition.task = asyncio.create_task(
+                        self._ensure_attached_transition(
+                            binding,
+                            transition=transition,
+                        ),
+                        name=f"session-attach:{binding.thread_id}",
+                    )
+                    self._transitions[binding.thread_id] = transition
+                elif reactivate:
+                    transition.reactivate_requested = True
+                task = transition.task
+                assert task is not None
+            try:
+                return await asyncio.shield(task)
+            except ClosedSessionRequiresReactivation:
+                if not reactivate or attempt == 1:
+                    raise
+            finally:
+                if task.done():
+                    async with self._transition_lock:
+                        if self._transitions.get(binding.thread_id) is transition:
+                            self._transitions.pop(binding.thread_id, None)
+            binding = await self._bindings.by_thread(binding.thread_id) or binding
+        raise AssertionError("explicit reactivation retry did not settle")
 
     async def _ensure_attached_transition(
         self,
         binding: SessionBinding,
         *,
-        reactivate: bool,
+        transition: _AttachmentTransition,
     ) -> SessionRuntime:
         async with self.creation_admission():
+            current = await self._bindings.by_thread(binding.thread_id)
+            if current is None:
+                raise RuntimeError("session binding disappeared during attach transition")
+            binding = current
+            if (
+                binding.binding_intent == BindingIntent.CLOSED
+                and not transition.reactivate_requested
+            ):
+                raise ClosedSessionRequiresReactivation(
+                    "closed session requires an explicit resume"
+                )
             runtime = self.for_thread(binding.thread_id)
             if runtime is None or runtime.state in {
                 RuntimeState.CLOSED,
@@ -298,11 +345,9 @@ class SessionRegistry:
             }:
                 runtime = await self.replace(binding)
             if runtime.state == RuntimeState.DETACHED:
-                await runtime.attach_resume(reactivate=reactivate)
+                await runtime.attach_resume(reactivate=transition.reactivate_requested)
             if runtime.state != RuntimeState.READY:
-                raise RuntimeError(
-                    f"session attach settled in {runtime.state}"
-                )
+                raise RuntimeError(f"session attach settled in {runtime.state}")
             return runtime
 
     async def eager_resume(self) -> dict[str, str]:
@@ -367,9 +412,7 @@ class SessionRegistry:
         async with self._admission_condition:
             if self._service_quiesced:
                 self._record_registry_violation("session_creation")
-                raise RuntimeError(
-                    "session creation is quiesced for service restart"
-                )
+                raise RuntimeError("session creation is quiesced for service restart")
             self._active_creations += 1
         token = _creation_admitted.set(True)
         try:
@@ -383,9 +426,7 @@ class SessionRegistry:
     def _assert_registry_admission(self) -> None:
         if self._service_quiesced and not _creation_admitted.get():
             self._record_registry_violation("runtime_registration")
-            raise RuntimeError(
-                "session runtime admission is quiesced for service restart"
-            )
+            raise RuntimeError("session runtime admission is quiesced for service restart")
 
     def _record_registry_violation(self, source: str) -> None:
         self._service_quiesce_violations += 1
