@@ -123,21 +123,34 @@ async def test_bridge_preregisters_event_handler_and_forces_runtime_options() ->
     def callback(_event: object) -> None:
         return None
 
+    session_config = {
+        "mcp_servers": {"local": {"type": "stdio", "command": "node"}},
+        "custom_agents": [{"name": "reviewer", "prompt": "Review"}],
+        "enable_skills": True,
+        "skill_directories": ["/tmp/skills"],
+        "plugin_directories": ["/tmp/plugins"],
+    }
     await bridge.create_session(
         session_id="session-1",
         working_directory="/tmp/project",
         on_event=callback,
+        session_config=session_config,
     )
     await bridge.resume_session(
         session_id="session-1",
         working_directory="/tmp/project",
         on_event=callback,
         continue_pending_work=False,
+        session_config=session_config,
     )
 
     assert client.create_kwargs["on_event"] is callback
     assert client.create_kwargs["manage_schedule_enabled"] is False
     assert client.create_kwargs["streaming"] is True
+    assert client.create_kwargs["mcp_servers"] == session_config["mcp_servers"]
+    assert client.create_kwargs["custom_agents"] == session_config["custom_agents"]
+    assert client.create_kwargs["skill_directories"] == ["/tmp/skills"]
+    assert client.create_kwargs["plugin_directories"] == ["/tmp/plugins"]
     assert client.resume_id == "session-1"
     assert client.resume_kwargs["on_event"] is callback
     assert client.resume_kwargs["continue_pending_work"] is False

@@ -1,4 +1,5 @@
 import asyncio
+import shutil
 import sqlite3
 import time
 from importlib import resources
@@ -8,12 +9,42 @@ import pytest
 
 from copilotd.storage.database import Database
 
+EXPECTED_MIGRATION_VERSIONS = [*range(1, 10), *range(30, 38)]
+
+
+def _create_migration_fixture(path: Path, *, through_version: int) -> None:
+    connection = sqlite3.connect(path)
+    connection.execute(
+        """
+        CREATE TABLE schema_migrations (
+            version INTEGER PRIMARY KEY,
+            name TEXT NOT NULL,
+            applied_at REAL NOT NULL
+        )
+        """
+    )
+    migration_root = resources.files("copilotd.storage.migrations")
+    for migration in sorted(
+        item
+        for item in migration_root.iterdir()
+        if item.name.endswith(".sql") and int(item.name.partition("_")[0]) <= through_version
+    ):
+        connection.executescript(migration.read_text(encoding="utf-8"))
+        version = int(migration.name.partition("_")[0])
+        connection.execute(
+            "INSERT INTO schema_migrations VALUES (?, ?, ?)",
+            (version, migration.name, time.time()),
+        )
+    connection.commit()
+    connection.close()
+
 
 @pytest.mark.asyncio
 async def test_initial_migration_creates_full_schema(tmp_path: Path) -> None:
     database_path = tmp_path / "copilotd.sqlite3"
     expected_tables = {
         "attachment_items",
+        "attachment_inline_variants",
         "attachment_manifests",
         "autopilot_objectives",
         "background_observations",
@@ -37,6 +68,10 @@ async def test_initial_migration_creates_full_schema(tmp_path: Path) -> None:
         "render_messages",
         "render_outbox",
         "render_streams",
+        "render_attachment_batches",
+        "render_attachment_checkpoints",
+        "render_batch_intents",
+        "render_parent_diagnostics",
         "runtime_incidents",
         "runtime_schedules",
         "schedule_runs",
@@ -46,6 +81,8 @@ async def test_initial_migration_creates_full_schema(tmp_path: Path) -> None:
         "session_creation_intents",
         "session_operations",
         "session_owner_leases",
+        "session_projection_snapshots",
+        "session_ui_metadata",
         "skill_dirs",
         "startup_recovery_runs",
         "snapshot_observations",
@@ -54,6 +91,11 @@ async def test_initial_migration_creates_full_schema(tmp_path: Path) -> None:
         "submission_task_links",
         "task_card_projections",
         "taskdeck_panel_state",
+        "pinned_message_provenance",
+        "tool_output_streams",
+        "tool_spill_artifacts",
+        "trusted_local_artifacts",
+        "trusted_local_artifact_snapshots",
         "usage_samples",
     }
 
@@ -64,11 +106,15 @@ async def test_initial_migration_creates_full_schema(tmp_path: Path) -> None:
         migration = await database.fetchone(
             "SELECT version, name FROM schema_migrations WHERE version = 1"
         )
+        outbox_columns = await database.fetchall("PRAGMA table_info(render_outbox)")
+        spill_columns = await database.fetchall("PRAGMA table_info(tool_spill_artifacts)")
         foreign_keys = await database.fetchone("PRAGMA foreign_keys")
         journal_mode = await database.fetchone("PRAGMA journal_mode")
 
     assert {row["name"] for row in tables} == expected_tables
     assert dict(migration) == {"version": 1, "name": "0001_initial.sql"}
+    assert "payload_revision" in {row["name"] for row in outbox_columns}
+    assert {"retention_until", "delivery_confirmed_at"} <= {row["name"] for row in spill_columns}
     assert foreign_keys[0] == 1
     assert journal_mode[0] == "wal"
 
@@ -82,48 +128,23 @@ async def test_migrations_are_idempotent(tmp_path: Path) -> None:
     async with Database(database_path) as database:
         rows = await database.fetchall("SELECT version FROM schema_migrations")
 
-    assert [row["version"] for row in rows] == list(range(1, 10))
+    assert [row["version"] for row in rows] == EXPECTED_MIGRATION_VERSIONS
 
 
 @pytest.mark.asyncio
 async def test_foundation_migration_upgrades_existing_v7_database(tmp_path: Path) -> None:
+    fixture_path = tmp_path / "copilotd-v7-fixture.sqlite3"
     database_path = tmp_path / "upgrade-v7.sqlite3"
-    connection = sqlite3.connect(database_path)
-    connection.execute(
-        """
-        CREATE TABLE schema_migrations (
-            version INTEGER PRIMARY KEY,
-            name TEXT NOT NULL,
-            applied_at REAL NOT NULL
-        )
-        """
-    )
-    migration_root = resources.files("copilotd.storage.migrations")
-    for migration in sorted(
-        item
-        for item in migration_root.iterdir()
-        if item.name.endswith(".sql") and int(item.name.partition("_")[0]) <= 7
-    ):
-        connection.executescript(migration.read_text(encoding="utf-8"))
-        version = int(migration.name.partition("_")[0])
-        connection.execute(
-            "INSERT INTO schema_migrations VALUES (?, ?, ?)",
-            (version, migration.name, time.time()),
-        )
-    connection.commit()
-    connection.close()
+    _create_migration_fixture(fixture_path, through_version=7)
+    shutil.copy2(fixture_path, database_path)
 
     async with Database(database_path) as database:
-        versions = await database.fetchall(
-            "SELECT version FROM schema_migrations ORDER BY version"
-        )
+        versions = await database.fetchall("SELECT version FROM schema_migrations ORDER BY version")
         capability_columns = await database.fetchall("PRAGMA table_info(capabilities)")
         event_columns = await database.fetchall("PRAGMA table_info(event_journal)")
-        tables = await database.fetchall(
-            "SELECT name FROM sqlite_master WHERE type = 'table'"
-        )
+        tables = await database.fetchall("SELECT name FROM sqlite_master WHERE type = 'table'")
 
-    assert [row["version"] for row in versions] == list(range(1, 10))
+    assert [row["version"] for row in versions] == EXPECTED_MIGRATION_VERSIONS
     assert "protocol_version" in {row["name"] for row in capability_columns}
     assert {
         "schema_version",
@@ -138,6 +159,55 @@ async def test_foundation_migration_upgrades_existing_v7_database(tmp_path: Path
         "startup_recovery_runs",
         "submission_segments",
         "submission_task_links",
+    } <= {row["name"] for row in tables}
+
+
+@pytest.mark.asyncio
+async def test_discord_migrations_upgrade_copied_foundation_v9_database(
+    tmp_path: Path,
+) -> None:
+    fixture_path = tmp_path / "copilotd-foundation-v9-fixture.sqlite3"
+    database_path = tmp_path / "upgrade-foundation-v9.sqlite3"
+    _create_migration_fixture(fixture_path, through_version=9)
+    connection = sqlite3.connect(fixture_path)
+    connection.execute(
+        """
+        INSERT INTO render_streams(
+            session_id, message_id, content, finalized, updated_at
+        ) VALUES ('session-v9', 'message-v9', 'preserved', 1, 9)
+        """
+    )
+    connection.commit()
+    connection.close()
+    shutil.copy2(fixture_path, database_path)
+
+    async with Database(database_path) as database:
+        versions = await database.fetchall("SELECT version FROM schema_migrations ORDER BY version")
+        render_stream = await database.fetchone(
+            """
+            SELECT session_id, message_id, agent_id, content, finalized, updated_at
+            FROM render_streams
+            WHERE session_id = 'session-v9' AND message_id = 'message-v9'
+            """
+        )
+        tables = await database.fetchall("SELECT name FROM sqlite_master WHERE type = 'table'")
+
+    assert [row["version"] for row in versions] == EXPECTED_MIGRATION_VERSIONS
+    assert dict(render_stream) == {
+        "session_id": "session-v9",
+        "message_id": "message-v9",
+        "agent_id": "",
+        "content": "preserved",
+        "finalized": 1,
+        "updated_at": 9.0,
+    }
+    assert {
+        "execution_health",
+        "snapshot_observations",
+        "submission_task_links",
+        "render_attachment_batches",
+        "session_ui_metadata",
+        "trusted_local_artifact_snapshots",
     } <= {row["name"] for row in tables}
 
 

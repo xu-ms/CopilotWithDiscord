@@ -11,6 +11,8 @@ from typing import Any
 
 import aiosqlite
 
+_CORE_MIGRATION_VERSION = 37
+
 
 class Database:
     """Single-process async SQLite connection with serialized transactions."""
@@ -41,6 +43,7 @@ class Database:
             await self._connection.execute("PRAGMA journal_mode = WAL")
         await self._ensure_migration_table()
         await self.migrate()
+        await self.apply_compatibility_patches()
 
     async def close(self) -> None:
         if self._connection is None:
@@ -79,6 +82,8 @@ class Database:
         for migration in migration_files:
             version_text, _, _ = migration.name.partition("_")
             version = int(version_text)
+            if version > _CORE_MIGRATION_VERSION:
+                continue
             if version in applied:
                 continue
             sql = migration.read_text(encoding="utf-8")
@@ -89,6 +94,182 @@ class Database:
                     "INSERT INTO schema_migrations(version, name, applied_at) VALUES (?, ?, ?)",
                     (version, migration.name, time.time()),
                 )
+
+    async def apply_compatibility_patches(self) -> None:
+        await self._ensure_render_streams_agent_schema()
+        await self._ensure_render_attachment_delivery_schema()
+        await self._ensure_task_surface_columns()
+        await self._ensure_review_hardening_columns()
+
+    async def _ensure_render_streams_agent_schema(self) -> None:
+        if not await self._table_exists("render_streams"):
+            return
+        columns = await self.fetchall("PRAGMA table_info(render_streams)")
+        column_names = [str(row["name"]) for row in columns]
+        pk_columns = [
+            str(row["name"])
+            for row in sorted(columns, key=lambda row: int(row["pk"]))
+            if int(row["pk"]) > 0
+        ]
+        if "agent_id" in column_names and pk_columns == [
+            "session_id",
+            "message_id",
+            "agent_id",
+        ]:
+            return
+        migration = resources.files("copilotd.storage.migrations").joinpath(
+            "0030_render_streams_agent_id.sql"
+        )
+        sql = migration.read_text(encoding="utf-8")
+        async with self.transaction() as connection:
+            for statement in _split_sql_statements(sql):
+                await connection.execute(statement)
+
+    async def _ensure_render_attachment_delivery_schema(self) -> None:
+        tables = await self.fetchall(
+            "SELECT name FROM sqlite_master WHERE type = 'table' "
+            "AND name LIKE 'render_attachment_%'"
+        )
+        table_names = {str(row["name"]) for row in tables}
+        if {
+            "render_attachment_checkpoints",
+            "render_attachment_batches",
+        } <= table_names and await self._index_exists("render_attachment_batches_idempotency_idx"):
+            return
+        migration = resources.files("copilotd.storage.migrations").joinpath(
+            "0031_render_attachment_delivery.sql"
+        )
+        sql = migration.read_text(encoding="utf-8")
+        async with self.transaction() as connection:
+            for statement in _split_sql_statements(sql):
+                await connection.execute(statement)
+
+    async def _ensure_task_surface_columns(self) -> None:
+        if not await self._table_exists("task_card_projections"):
+            return
+        columns = await self.fetchall("PRAGMA table_info(task_card_projections)")
+        existing = {str(row["name"]) for row in columns}
+        additions = {
+            "dependencies_json": "TEXT NOT NULL DEFAULT '[]'",
+            "artifact_links_json": "TEXT NOT NULL DEFAULT '[]'",
+            "can_promote": "INTEGER NOT NULL DEFAULT 0",
+            "last_progress_at": "REAL",
+        }
+        async with self.transaction() as connection:
+            for name, declaration in additions.items():
+                if name not in existing:
+                    await connection.execute(
+                        f"ALTER TABLE task_card_projections ADD COLUMN {name} {declaration}"
+                    )
+
+    async def _ensure_review_hardening_columns(self) -> None:
+        additions = {
+            "tool_output_streams": {
+                "artifact_emitted": "INTEGER NOT NULL DEFAULT 0",
+                "finalized": "INTEGER NOT NULL DEFAULT 0",
+            },
+            "tool_spill_artifacts": {
+                "retention_until": "REAL NOT NULL DEFAULT 0",
+                "delivery_confirmed_at": "REAL",
+            },
+            "render_outbox": {
+                "payload_revision": "INTEGER NOT NULL DEFAULT 1",
+            },
+            "render_batch_intents": {
+                "delivery_family": "TEXT NOT NULL DEFAULT ''",
+            },
+            "session_creation_intents": {
+                "project_config_snapshot": "TEXT NOT NULL DEFAULT '{}'",
+                "channel_config_snapshot": "TEXT NOT NULL DEFAULT '{}'",
+                "layout": "TEXT NOT NULL DEFAULT 'text'",
+                "project_config_version": "INTEGER NOT NULL DEFAULT 1",
+                "channel_config_version": "INTEGER NOT NULL DEFAULT 1",
+                "config_snapshot_state": ("TEXT NOT NULL DEFAULT 'legacy_unverified'"),
+            },
+            "session_bindings": {
+                "session_config_snapshot": "TEXT NOT NULL DEFAULT '{}'",
+                "channel_config_snapshot": "TEXT NOT NULL DEFAULT '{}'",
+                "config_snapshot_state": ("TEXT NOT NULL DEFAULT 'legacy_unverified'"),
+            },
+        }
+        for table, columns in additions.items():
+            if not await self._table_exists(table):
+                continue
+            rows = await self.fetchall(f"PRAGMA table_info({table})")
+            existing = {str(row["name"]) for row in rows}
+            async with self.transaction() as connection:
+                for name, declaration in columns.items():
+                    if name not in existing:
+                        await connection.execute(
+                            f"ALTER TABLE {table} ADD COLUMN {name} {declaration}"
+                        )
+        if await self._table_exists("session_bindings"):
+            await self.execute(
+                """
+                UPDATE session_bindings
+                SET session_config_snapshot = '{"session_options":{}}',
+                    channel_config_snapshot =
+                        '{"channel_config_version":1,"layout":"text",'
+                        || '"mention_required":false}',
+                    config_snapshot_state = 'verified'
+                WHERE config_snapshot_state = 'legacy_unverified'
+                """
+            )
+        if await self._table_exists("tool_spill_artifacts"):
+            await self.execute(
+                """
+                UPDATE tool_spill_artifacts
+                SET retention_until = updated_at + 604800
+                WHERE retention_until = 0
+                """
+            )
+        if await self._table_exists("render_batch_intents"):
+            await self.execute(
+                """
+                UPDATE render_batch_intents
+                SET delivery_family = render_message_id
+                WHERE delivery_family = ''
+                """
+            )
+            await self.execute(
+                """
+                CREATE INDEX IF NOT EXISTS render_batch_intents_family_idx
+                ON render_batch_intents(
+                    session_id, delivery_family, agent_id, batch_index, updated_at
+                )
+                """
+            )
+        if await self._table_exists("session_creation_intents"):
+            await self.execute(
+                """
+                UPDATE session_creation_intents
+                SET project_config_snapshot =
+                        '{"project_config_version":1,"session_options":{}}',
+                    channel_config_snapshot =
+                        '{"channel_config_version":1,"layout":"text",'
+                        || '"mention_required":false}',
+                    layout = 'text',
+                    project_config_version = 1,
+                    channel_config_version = 1,
+                    config_snapshot_state = 'verified'
+                WHERE config_snapshot_state = 'legacy_unverified'
+                  AND state NOT IN ('creating', 'unknown')
+                """
+            )
+
+    async def _table_exists(self, name: str) -> bool:
+        row = await self.fetchone(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?",
+            (name,),
+        )
+        return row is not None
+
+    async def _index_exists(self, name: str) -> bool:
+        row = await self.fetchone(
+            "SELECT 1 FROM sqlite_master WHERE type = 'index' AND name = ?",
+            (name,),
+        )
+        return row is not None
 
     @asynccontextmanager
     async def transaction(self) -> AsyncIterator[aiosqlite.Connection]:

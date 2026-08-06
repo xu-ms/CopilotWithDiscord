@@ -20,6 +20,9 @@ The implementation follows [`docs/copilotD-detailed-design.md`](docs/copilotD-de
 - Durable SQLite event journal with strict UUID SDK IDs, app FIFO, reducer-owned
   operation receipts, liveness leases, epoch/watermark snapshots, render outbox,
   and attachment manifests.
+- Seventeen applied migrations use reserved namespaces: Foundation owns `0001`-`0009`
+  and Discord surface owns `0030`-`0037`; `0010`-`0019` and `0020`-`0029` remain
+  intentionally reserved for Native and Scheduler.
 - Durable event-log backfill with cursor rebase/gap diagnostics and ingress-overflow
   freeze/backfill/generation replacement; unrecoverable ephemeral gaps remain
   explicitly outcome-unknown.

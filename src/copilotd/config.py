@@ -24,9 +24,7 @@ class Settings(BaseSettings):
         extra="ignore",
     )
 
-    data_dir: Path = Field(
-        default_factory=lambda: user_data_path("copilotD", ensure_exists=False)
-    )
+    data_dir: Path = Field(default_factory=lambda: user_data_path("copilotD", ensure_exists=False))
     cache_dir: Path = Field(
         default_factory=lambda: user_cache_path("copilotD", ensure_exists=False)
     )
@@ -47,6 +45,7 @@ class Settings(BaseSettings):
     attachment_file_max_bytes: int = 25 * 1024 * 1024
     attachment_message_max_bytes: int = 100 * 1024 * 1024
     attachment_blob_max_bytes: int = 7 * 1024 * 1024
+    attachment_runtime_frame_max_bytes: int = 7 * 1024 * 1024
     discord_upload_max_bytes: int = 7 * 1024 * 1024
 
     @field_validator("data_dir", "cache_dir", "log_dir", "resolved_home", mode="before")
@@ -58,9 +57,7 @@ class Settings(BaseSettings):
     @classmethod
     def validate_lease_ttl(cls, value: int) -> int:
         if value < MUTATION_HEADROOM_SECONDS + RENEWAL_JITTER_MARGIN_SECONDS:
-            raise ValueError(
-                "owner lease TTL must exceed mutation headroom by the jitter margin"
-            )
+            raise ValueError("owner lease TTL must exceed mutation headroom by the jitter margin")
         return value
 
     @field_validator("owner_lease_renew_seconds")
@@ -94,6 +91,7 @@ class Settings(BaseSettings):
         "attachment_file_max_bytes",
         "attachment_message_max_bytes",
         "attachment_blob_max_bytes",
+        "attachment_runtime_frame_max_bytes",
         "discord_upload_max_bytes",
     )
     @classmethod

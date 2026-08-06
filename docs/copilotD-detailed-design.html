@@ -5288,11 +5288,14 @@ model、<code>/mode</code>、<code>/goal</code>、<code>/bare</code>、<code>/to
 unknown</td>
 </tr>
 <tr>
-<td>9 个 SQLite migration、project <code>$HOME</code> fallback/cwd
-snapshot、owner fence、creation saga、strict-UUID event
-journal、reducer-owned operation/submission receipts、submission-task
-links、liveness leases、startup
-recovery inventory 与 eager resume</td>
+<td>17 个 SQLite migration（Foundation
+<code>0001</code>–<code>0009</code>，Discord surface
+<code>0030</code>–<code>0037</code>；<code>0010</code>–<code>0019</code>
+与 <code>0020</code>–<code>0029</code> 分别为 Native/Scheduler 的预留
+namespace）、project <code>$HOME</code> fallback/cwd snapshot、owner
+fence、creation saga、strict-UUID event journal、reducer-owned
+operation/submission receipts、submission-task links、liveness
+leases、startup recovery inventory 与 eager resume</td>
 <td>bundled runtime 进程死亡后的 in-flight execution 仍只能标 outcome
 unknown；experimental task action RPC 继续 gated</td>
 </tr>

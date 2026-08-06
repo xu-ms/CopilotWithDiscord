@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import time
 import uuid
 from collections.abc import Callable
@@ -12,7 +13,11 @@ from typing import Protocol
 from aiosqlite import Row
 
 from copilotd.core.bindings import SessionBinding, SessionBindingRepository
-from copilotd.core.projects import ProjectRegistry, ProjectSnapshot
+from copilotd.core.projects import (
+    ProjectRegistry,
+    ProjectSessionConfigSnapshot,
+    ProjectSnapshot,
+)
 from copilotd.core.session_runtime import RuntimeState, SessionAttachUnknown, SessionRuntime
 from copilotd.storage.database import Database
 
@@ -38,6 +43,12 @@ class CreationIntent:
     cwd_snapshot: Path
     sdk_session_id: str
     thread_id: str | None
+    project_config_snapshot: dict[str, object]
+    channel_config_snapshot: dict[str, object]
+    layout: str
+    project_config_version: int
+    channel_config_version: int
+    config_snapshot_state: str
     state: CreationState
 
 
@@ -62,6 +73,7 @@ class ThreadGateway(Protocol):
         source_id: str,
         name: str,
         creation_token: str,
+        layout: str,
     ) -> ThreadReference: ...
 
 
@@ -79,12 +91,28 @@ class CreationIntentRepository:
     def __init__(self, database: Database) -> None:
         self._database = database
 
+    async def by_source(
+        self,
+        *,
+        source_kind: str,
+        source_id: str,
+    ) -> CreationIntent | None:
+        row = await self._database.fetchone(
+            """
+            SELECT * FROM session_creation_intents
+            WHERE source_kind = ? AND source_id = ?
+            """,
+            (source_kind, source_id),
+        )
+        return None if row is None else _row_to_intent(row)
+
     async def reserve(
         self,
         *,
         source_kind: str,
         source_id: str,
         project: ProjectSnapshot,
+        config: ProjectSessionConfigSnapshot,
         now: float | None = None,
     ) -> tuple[CreationIntent, bool]:
         timestamp = time.time() if now is None else now
@@ -99,14 +127,7 @@ class CreationIntentRepository:
             row = await cursor.fetchone()
             await cursor.close()
             if row is not None:
-                intent = _row_to_intent(row)
-                if (
-                    intent.project_source != project.source.value
-                    or intent.project_id != project.project_id
-                    or intent.cwd_snapshot != project.cwd
-                ):
-                    raise ValueError("creation source was reused with a different project snapshot")
-                return intent, False
+                return _row_to_intent(row), False
 
             intent = CreationIntent(
                 creation_token=uuid.uuid4().hex,
@@ -117,15 +138,25 @@ class CreationIntentRepository:
                 cwd_snapshot=project.cwd,
                 sdk_session_id=str(uuid.uuid4()),
                 thread_id=None,
+                project_config_snapshot=config.project_payload(),
+                channel_config_snapshot=config.channel_payload(),
+                layout=config.layout,
+                project_config_version=config.project_config_version,
+                channel_config_version=config.channel_config_version,
+                config_snapshot_state="verified",
                 state=CreationState.RESERVED,
             )
             await connection.execute(
                 """
                 INSERT INTO session_creation_intents(
                     creation_token, source_kind, source_id, project_source,
-                    project_id, cwd_snapshot, sdk_session_id, state,
+                    project_id, cwd_snapshot, sdk_session_id,
+                    project_config_snapshot, channel_config_snapshot, layout,
+                    project_config_version, channel_config_version,
+                    config_snapshot_state, state,
                     created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'verified',
+                          ?, ?, ?)
                 """,
                 (
                     intent.creation_token,
@@ -135,6 +166,11 @@ class CreationIntentRepository:
                     intent.project_id,
                     str(intent.cwd_snapshot),
                     intent.sdk_session_id,
+                    json.dumps(intent.project_config_snapshot, sort_keys=True),
+                    json.dumps(intent.channel_config_snapshot, sort_keys=True),
+                    intent.layout,
+                    intent.project_config_version,
+                    intent.channel_config_version,
                     intent.state.value,
                     timestamp,
                     timestamp,
@@ -234,9 +270,7 @@ class SessionRegistry:
                 try:
                     await runtime.shutdown()
                 except Exception as cleanup_error:
-                    failures[binding.thread_id] = (
-                        f"{error}; cleanup failed: {cleanup_error}"
-                    )
+                    failures[binding.thread_id] = f"{error}; cleanup failed: {cleanup_error}"
         return failures
 
     async def shutdown(self) -> None:
@@ -304,12 +338,30 @@ class SessionCreationService:
         thread_name: str,
         send_initial_prompt: bool,
     ) -> SessionRuntime:
-        project = await self._projects.resolve(channel_id)
-        intent, _ = await self._intents.reserve(
+        intent = await self._intents.by_source(
             source_kind=source_kind,
             source_id=source_id,
-            project=project,
         )
+        if intent is None:
+            config = await self._projects.session_config_snapshot(channel_id)
+            project = ProjectSnapshot(
+                project_id=config.project_id,
+                channel_id=channel_id,
+                source=config.source,
+                root_path=config.root_path,
+                cwd=config.cwd,
+                config_version=config.project_config_version,
+            )
+            intent, _ = await self._intents.reserve(
+                source_kind=source_kind,
+                source_id=source_id,
+                project=project,
+                config=config,
+            )
+        if intent.config_snapshot_state != "verified":
+            raise SessionCreationUnknown(
+                "legacy creation intent has no verified project configuration snapshot"
+            )
         if intent.thread_id is None:
             reference = await self._threads.find_thread(
                 channel_id=channel_id,
@@ -323,6 +375,7 @@ class SessionCreationService:
                         source_id=source_id,
                         name=thread_name,
                         creation_token=intent.creation_token,
+                        layout=intent.layout,
                     )
                 except Exception as error:
                     await self._intents.mark(intent, CreationState.UNKNOWN)
@@ -337,6 +390,9 @@ class SessionCreationService:
                 cwd_snapshot=intent.cwd_snapshot,
                 project_source=intent.project_source,
                 project_id=intent.project_id,
+                session_config_snapshot=intent.project_config_snapshot,
+                channel_config_snapshot=intent.channel_config_snapshot,
+                session_config_version=intent.project_config_version,
             )
 
         runtime = self._sessions.for_thread(intent.thread_id)
@@ -413,5 +469,11 @@ def _row_to_intent(row: Row) -> CreationIntent:
         cwd_snapshot=Path(row["cwd_snapshot"]),
         sdk_session_id=row["sdk_session_id"],
         thread_id=row["thread_id"],
+        project_config_snapshot=json.loads(row["project_config_snapshot"]),
+        channel_config_snapshot=json.loads(row["channel_config_snapshot"]),
+        layout=row["layout"],
+        project_config_version=int(row["project_config_version"]),
+        channel_config_version=int(row["channel_config_version"]),
+        config_snapshot_state=str(row["config_snapshot_state"]),
         state=CreationState(row["state"]),
     )

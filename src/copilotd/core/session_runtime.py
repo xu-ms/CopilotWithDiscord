@@ -2,13 +2,18 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import inspect
 import json
 import time
 import uuid
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Mapping
 from enum import StrEnum
 from typing import Any, Literal, Protocol, TypeVar, cast
 
+from copilotd.core.attachments import (
+    sdk_send_frame_size,
+    sdk_trace_context,
+)
 from copilotd.core.bindings import (
     AttachmentState,
     BindingConflict,
@@ -16,6 +21,13 @@ from copilotd.core.bindings import (
     PermissionPosture,
     SessionBinding,
     SessionBindingRepository,
+)
+from copilotd.core.commands import (
+    CDCapabilityError,
+    CDInputError,
+    CDSessionStateError,
+    ModelReasoningSummaryAdapter,
+    TaskActionAdapter,
 )
 from copilotd.core.inbox import ReducerInbox, SdkEventIngress
 from copilotd.core.interactions import interaction_target_mode
@@ -41,7 +53,7 @@ from copilotd.storage.leases import (
 
 AgentMode = Literal["interactive", "plan", "autopilot", "shell"]
 DeliveryMode = Literal["enqueue", "immediate"]
-AttachmentResolver = Callable[[str], Awaitable[list[Any]]]
+AttachmentResolver = Callable[..., Awaitable[list[Any]]]
 T = TypeVar("T")
 
 
@@ -72,6 +84,7 @@ class RuntimeBridge(Protocol):
         on_user_input_request: Any,
         on_exit_plan_mode_request: Any,
         on_auto_mode_switch_request: Any,
+        session_config: dict[str, Any] | None = None,
     ) -> SessionHandle: ...
 
     async def resume_session(
@@ -84,6 +97,7 @@ class RuntimeBridge(Protocol):
         on_user_input_request: Any,
         on_exit_plan_mode_request: Any,
         on_auto_mode_switch_request: Any,
+        session_config: dict[str, Any] | None = None,
     ) -> SessionHandle: ...
 
     async def ensure_allow_all(self, session: SessionHandle) -> Any: ...
@@ -101,6 +115,7 @@ class RuntimeBridge(Protocol):
         model: str,
         reasoning_effort: str | None,
         context_tier: str | None,
+        reasoning_summary: str | None = None,
     ) -> None: ...
 
     async def get_current_model(self, session: SessionHandle) -> dict[str, Any]: ...
@@ -188,6 +203,9 @@ class SessionRuntime:
         shutdown_timeout_seconds: float = 5,
         capabilities: CapabilityManifest | None = None,
         task_registry: TaskRegistry | None = None,
+        send_frame_max_bytes: int = 7 * 1024 * 1024,
+        model_summary_adapter: ModelReasoningSummaryAdapter | None = None,
+        task_action_adapter: TaskActionAdapter | None = None,
     ) -> None:
         self._database = database
         self._bridge = bridge
@@ -204,6 +222,9 @@ class SessionRuntime:
         self._sdk_operation_timeout_seconds = sdk_operation_timeout_seconds
         self._shutdown_timeout_seconds = shutdown_timeout_seconds
         self._capabilities = capabilities
+        self._send_frame_max_bytes = send_frame_max_bytes
+        self._model_summary_adapter = model_summary_adapter
+        self._task_action_adapter = task_action_adapter
 
         self.state = RuntimeState.DETACHED
         self._lease: OwnerLease | None = None
@@ -314,9 +335,7 @@ class SessionRuntime:
                         "attachment_manifest_id": attachment_manifest_id,
                         "attachment_count": len(attachments or []),
                         "requested_mode": effective_agent_mode,
-                        "requested_model_config": json.loads(
-                            model_row["desired_model_config"]
-                        ),
+                        "requested_model_config": json.loads(model_row["desired_model_config"]),
                         "requested_agent": model_row["desired_agent"],
                         "requested_session_config_version": model_row[
                             "desired_session_config_version"
@@ -396,7 +415,10 @@ class SessionRuntime:
                 return None
             runtime_model = await self._database.fetchone(
                 """
-                SELECT runtime_model_config FROM session_bindings WHERE thread_id = ?
+                SELECT runtime_model_config, desired_agent, runtime_agent,
+                       desired_session_config_version,
+                       runtime_session_config_version
+                FROM session_bindings WHERE thread_id = ?
                 """,
                 (self.binding.thread_id,),
             )
@@ -412,6 +434,35 @@ class SessionRuntime:
             ):
                 await self._block_queue_item(row["id"], "blocked_model_drift")
                 return None
+            requested_agent = row["requested_agent_snapshot"]
+            observed_agent = None if runtime_model is None else runtime_model["runtime_agent"]
+            if observed_agent in {None, "unknown"} and runtime_model is not None:
+                observed_agent = runtime_model["desired_agent"]
+            if requested_agent is not None and str(observed_agent or "unknown") != str(
+                requested_agent
+            ):
+                await self._block_queue_item(row["id"], "blocked_agent_drift")
+                return None
+            observed_config_version = (
+                None if runtime_model is None else runtime_model["runtime_session_config_version"]
+            )
+            if observed_config_version is None and runtime_model is not None:
+                observed_config_version = runtime_model["desired_session_config_version"]
+            requested_config_version = int(row["requested_session_config_version"])
+            desired_config_version = (
+                None if runtime_model is None else runtime_model["desired_session_config_version"]
+            )
+            if (
+                desired_config_version is None
+                or int(desired_config_version) != requested_config_version
+                or observed_config_version is None
+                or int(observed_config_version) != requested_config_version
+            ):
+                await self._block_queue_item(
+                    row["id"],
+                    "blocked_session_config_drift",
+                )
+                return None
             attachments = self._volatile_attachments.get(row["id"])
             manifest_id = row["attachment_manifest_id"]
             if manifest_id is not None:
@@ -423,7 +474,6 @@ class SessionRuntime:
                     raise SessionNotReady(
                         "attachment manifest exists but no integrity resolver is configured"
                     )
-                attachments = await self._attachment_resolver(str(manifest_id))
             elif attachments:
                 await self._block_queue_item(
                     str(row["id"]),
@@ -435,9 +485,7 @@ class SessionRuntime:
                 idempotency_key=f"queue:{row['id']}",
                 prompt=str(row["prompt"]),
                 prompt_hash=str(row["prompt_hash"]),
-                attachment_manifest_id=(
-                    None if manifest_id is None else str(manifest_id)
-                ),
+                attachment_manifest_id=(None if manifest_id is None else str(manifest_id)),
                 attachments=attachments,
                 mode=cast(DeliveryMode, str(row["requested_delivery"])),
                 agent_mode=cast(AgentMode, str(row["requested_mode_snapshot"])),
@@ -462,8 +510,13 @@ class SessionRuntime:
                 raise SessionNotReady(
                     "attachment manifest exists but no integrity resolver is configured"
                 )
-            attachments = await self._attachment_resolver(attachment_manifest_id)
-        elif attachments:
+            attachments = await self._resolve_attachments_for_send(
+                attachment_manifest_id,
+                prompt=prompt,
+                mode=mode,
+                agent_mode=agent_mode,
+            )
+        elif attachments and mode != "immediate":
             raise SessionNotReady("attachments require a durable manifest")
 
         async def dispatch() -> str:
@@ -472,10 +525,21 @@ class SessionRuntime:
                 operation_idempotency_key=f"send:{idempotency_key}",
             )
             if not claimed:
-                raise OperationRejected(
-                    f"submission {submission_id} was cancelled before dispatch"
-                )
+                raise OperationRejected(f"submission {submission_id} was cancelled before dispatch")
             await self._assert_dispatchable()
+            frame_size = await asyncio.to_thread(
+                sdk_send_frame_size,
+                session_id=self.binding.sdk_session_id,
+                prompt=prompt,
+                attachments=attachments,
+                mode=mode,
+                agent_mode=agent_mode,
+                trace_context=sdk_trace_context(),
+            )
+            if frame_size > self._send_frame_max_bytes:
+                raise OperationRejected(
+                    "complete serialized session.send frame exceeds runtime limit"
+                )
             return await self._sdk_call(
                 self._require_handle().send(
                     prompt,
@@ -498,6 +562,7 @@ class SessionRuntime:
                 operation=dispatch,
             )
         except OperationRejected:
+            self._volatile_attachments.pop(submission_id, None)
             await inbox.commit_internal(
                 {
                     "type": "copilotd.submission.rejected",
@@ -528,6 +593,36 @@ class SessionRuntime:
         )
         self._volatile_attachments.pop(submission_id, None)
         return str(message_id)
+
+    async def _resolve_attachments_for_send(
+        self,
+        manifest_id: str,
+        *,
+        prompt: str,
+        mode: DeliveryMode,
+        agent_mode: AgentMode,
+    ) -> list[Any]:
+        resolver = self._attachment_resolver
+        if resolver is None:
+            raise SessionNotReady(
+                "attachment manifest exists but no integrity resolver is configured"
+            )
+        parameters = inspect.signature(resolver).parameters.values()
+        supports_context = any(
+            parameter.kind == inspect.Parameter.VAR_KEYWORD for parameter in parameters
+        )
+        if not supports_context:
+            names = {parameter.name for parameter in parameters}
+            supports_context = {"session_id", "prompt", "mode", "agent_mode"} <= names
+        if not supports_context:
+            return await resolver(manifest_id)
+        return await resolver(
+            manifest_id,
+            session_id=self.binding.sdk_session_id,
+            prompt=prompt,
+            mode=mode,
+            agent_mode=agent_mode,
+        )
 
     async def _claim_submission(
         self,
@@ -790,9 +885,7 @@ class SessionRuntime:
                 """,
                 (self.binding.sdk_session_id, topic),
             )
-            if state is None or int(state["requested_epoch"]) <= int(
-                state["applied_epoch"]
-            ):
+            if state is None or int(state["requested_epoch"]) <= int(state["applied_epoch"]):
                 epoch = await self._request_snapshot(topic)
             else:
                 epoch = int(state["requested_epoch"])
@@ -800,14 +893,10 @@ class SessionRuntime:
             query_start = inbox.last_sdk_receive_seq
             try:
                 if topic == "tasks":
-                    payload = {
-                        "tasks": await self._bridge.get_tasks(self._require_handle())
-                    }
+                    payload = {"tasks": await self._bridge.get_tasks(self._require_handle())}
                 elif topic == "schedules":
                     payload = {
-                        "schedules": await self._bridge.get_native_schedules(
-                            self._require_handle()
-                        )
+                        "schedules": await self._bridge.get_native_schedules(self._require_handle())
                     }
                 elif topic == "remote":
                     payload = await self._bridge.get_remote_state(self._require_handle())
@@ -839,9 +928,7 @@ class SessionRuntime:
                 """,
                 (self.binding.sdk_session_id, topic),
             )
-            if latest is not None and int(latest["applied_epoch"]) < int(
-                latest["requested_epoch"]
-            ):
+            if latest is not None and int(latest["applied_epoch"]) < int(latest["requested_epoch"]):
                 self._snapshot_topics.add(topic)
                 self._task_reconcile_requested.set()
 
@@ -882,9 +969,7 @@ class SessionRuntime:
         blockers = await self._readiness_blockers(require_quiet=False)
         if blockers:
             self.state = RuntimeState.DEGRADED
-            raise SessionNotReady(
-                "session readiness reconciliation failed: " + ", ".join(blockers)
-            )
+            raise SessionNotReady("session readiness reconciliation failed: " + ", ".join(blockers))
 
     async def _readiness_blockers(self, *, require_quiet: bool) -> list[str]:
         blockers: list[str] = []
@@ -948,9 +1033,7 @@ class SessionRuntime:
                     (self.binding.sdk_session_id,),
                 )
                 if unknown_tasks is not None and int(unknown_tasks[0]) > 0:
-                    blockers.append(
-                        f"background_tasks_unknown:{int(unknown_tasks[0])}"
-                    )
+                    blockers.append(f"background_tasks_unknown:{int(unknown_tasks[0])}")
             if self._capabilities.supports("native_schedule"):
                 unknown_schedules = await self._database.fetchone(
                     """
@@ -960,9 +1043,7 @@ class SessionRuntime:
                     (self.binding.sdk_session_id,),
                 )
                 if unknown_schedules is not None and int(unknown_schedules[0]) > 0:
-                    blockers.append(
-                        f"runtime_schedules_unknown:{int(unknown_schedules[0])}"
-                    )
+                    blockers.append(f"runtime_schedules_unknown:{int(unknown_schedules[0])}")
 
         if require_quiet:
             if binding["runtime_processing"]:
@@ -972,13 +1053,8 @@ class SessionRuntime:
             if int(binding["native_queue_count"] or 0) > 0:
                 blockers.append(f"native_queue:{int(binding['native_queue_count'])}")
             if int(binding["native_steering_count"] or 0) > 0:
-                blockers.append(
-                    f"native_steering:{int(binding['native_steering_count'])}"
-                )
-            if (
-                self._capabilities is None
-                or self._capabilities.supports("task_snapshot")
-            ):
+                blockers.append(f"native_steering:{int(binding['native_steering_count'])}")
+            if self._capabilities is None or self._capabilities.supports("task_snapshot"):
                 active_tasks = await self._database.fetchone(
                     """
                     SELECT COUNT(*) FROM background_observations
@@ -988,9 +1064,7 @@ class SessionRuntime:
                     (self.binding.sdk_session_id,),
                 )
                 if active_tasks is not None and int(active_tasks[0]) > 0:
-                    blockers.append(
-                        f"background_tasks_active:{int(active_tasks[0])}"
-                    )
+                    blockers.append(f"background_tasks_active:{int(active_tasks[0])}")
             if (
                 self._capabilities is not None
                 and self._capabilities.supports("remote")
@@ -1001,8 +1075,16 @@ class SessionRuntime:
 
     async def _permission_reconcile_loop(self) -> None:
         while not self._permission_reconcile_stop.is_set():
-            await self._permission_reconcile_requested.wait()
-            if self._permission_reconcile_stop.is_set():
+            requested = asyncio.create_task(self._permission_reconcile_requested.wait())
+            stopped = asyncio.create_task(self._permission_reconcile_stop.wait())
+            done, pending = await asyncio.wait(
+                {requested, stopped},
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            for task in pending:
+                task.cancel()
+            await asyncio.gather(*pending, return_exceptions=True)
+            if stopped in done and self._permission_reconcile_stop.is_set():
                 return
             self._permission_reconcile_requested.clear()
             if self.state != RuntimeState.READY:
@@ -1016,9 +1098,7 @@ class SessionRuntime:
             error_type: str | None = None
             try:
                 await self._assert_owned_handle()
-                await self._sdk_call(
-                    self._bridge.ensure_allow_all(self._require_handle())
-                )
+                await self._sdk_call(self._bridge.ensure_allow_all(self._require_handle()))
             except asyncio.CancelledError:
                 raise
             except PermissionPostureError as error:
@@ -1057,9 +1137,7 @@ class SessionRuntime:
                     },
                 },
                 source="snapshot",
-                internal_event_id=(
-                    f"permissions:{self.binding.runtime_generation}:{epoch}"
-                ),
+                internal_event_id=(f"permissions:{self.binding.runtime_generation}:{epoch}"),
             )
 
     def _on_sdk_event_accepted(self, event: Any) -> None:
@@ -1128,9 +1206,7 @@ class SessionRuntime:
             await self._bridge.set_mode(handle, mode)
             observed = await self._bridge.get_mode(handle)
             if observed != mode:
-                raise RuntimeError(
-                    f"mode reconciliation returned {observed}; expected {mode}"
-                )
+                raise RuntimeError(f"mode reconciliation returned {observed}; expected {mode}")
             return observed
 
         try:
@@ -1178,6 +1254,7 @@ class SessionRuntime:
         *,
         reasoning_effort: str | None,
         context_tier: str | None,
+        reasoning_summary: str | None = None,
         idempotency_key: str,
     ) -> dict[str, Any]:
         await self._assert_dispatchable()
@@ -1203,12 +1280,25 @@ class SessionRuntime:
             )
         if context_tier not in {None, "default", "long_context"}:
             raise ValueError(f"unsupported context tier: {context_tier}")
+        if reasoning_summary is not None:
+            reasoning_summary = reasoning_summary.strip()
+            if not reasoning_summary:
+                raise CDInputError("reasoning summary cannot be empty")
+            if (
+                self._model_summary_adapter is None
+                or not self._model_summary_adapter.supports_reasoning_summary(model)
+            ):
+                raise CDCapabilityError(
+                    f"{model} does not expose confirmed reasoning-summary readback"
+                )
 
         target = {
             "modelId": model,
             "reasoningEffort": reasoning_effort,
             "contextTier": context_tier,
         }
+        if reasoning_summary is not None:
+            target["reasoningSummary"] = reasoning_summary
         transition_id = str(
             uuid.uuid5(
                 uuid.NAMESPACE_URL,
@@ -1227,29 +1317,46 @@ class SessionRuntime:
         async def dispatch() -> dict[str, Any]:
             await self._assert_owned_handle()
             handle = self._require_handle()
-            await self._sdk_call(
-                self._bridge.set_model(
-                    handle,
-                    model=model,
-                    reasoning_effort=reasoning_effort,
-                    context_tier=context_tier,
+            if reasoning_summary is None:
+                await self._sdk_call(
+                    self._bridge.set_model(
+                        handle,
+                        model=model,
+                        reasoning_effort=reasoning_effort,
+                        context_tier=context_tier,
+                    )
                 )
-            )
-            observed = await self._sdk_call(
-                self._bridge.get_current_model(handle)
-            )
+            else:
+                await self._sdk_call(
+                    self._bridge.set_model(
+                        handle,
+                        model=model,
+                        reasoning_effort=reasoning_effort,
+                        context_tier=context_tier,
+                        reasoning_summary=reasoning_summary,
+                    )
+                )
+            observed = await self._sdk_call(self._bridge.get_current_model(handle))
+            if reasoning_summary is not None and self._model_summary_adapter is not None:
+                readback = await self._model_summary_adapter.read_current_model(
+                    session_id=self.binding.sdk_session_id
+                )
+                if readback is not None:
+                    observed = {**observed, **dict(readback)}
             if observed.get("modelId") != model:
                 raise RuntimeError(
                     f"model reconciliation returned {observed.get('modelId')}; expected {model}"
                 )
-            if (
-                reasoning_effort is not None
-                and observed.get("reasoningEffort") != reasoning_effort
-            ):
+            if reasoning_effort is not None and observed.get("reasoningEffort") != reasoning_effort:
                 raise RuntimeError("model reasoning effort could not be confirmed")
             observed_tier = observed.get("contextTier")
             if context_tier is not None and observed_tier != context_tier:
                 raise RuntimeError("model context tier could not be confirmed")
+            if (
+                reasoning_summary is not None
+                and observed.get("reasoningSummary") != reasoning_summary
+            ):
+                raise RuntimeError("model reasoning summary could not be confirmed")
             return observed
 
         try:
@@ -1293,11 +1400,88 @@ class SessionRuntime:
 
     async def context_snapshot(self) -> dict[str, Any] | None:
         await self._assert_owned_handle()
-        return await self._bridge.get_context(self._require_handle())
+        return await self._projection_snapshot(
+            "context",
+            self._bridge.get_context(self._require_handle()),
+            allow_none=True,
+        )
 
     async def usage_snapshot(self) -> dict[str, Any]:
         await self._assert_owned_handle()
-        return await self._bridge.get_usage(self._require_handle())
+        snapshot = await self._projection_snapshot(
+            "usage",
+            self._bridge.get_usage(self._require_handle()),
+            allow_none=False,
+        )
+        return {} if snapshot is None else snapshot
+
+    async def readiness_snapshot(self) -> dict[str, Any]:
+        return await self._refresh_readiness()
+
+    async def steer(self, text: str, *, idempotency_key: str) -> str:
+        normalized = text.strip()
+        if not normalized:
+            raise CDInputError("steer text cannot be empty")
+        readiness = await self._refresh_readiness()
+        if not (readiness["processing"] or readiness["hasActiveWork"] or readiness["abortable"]):
+            raise CDSessionStateError("steering requires an observed active Copilot turn")
+        return await self.send(
+            normalized,
+            idempotency_key=idempotency_key,
+            mode="immediate",
+            origin="steer",
+        )
+
+    async def _projection_snapshot(
+        self,
+        kind: Literal["context", "usage"],
+        operation: Awaitable[dict[str, Any] | None],
+        *,
+        allow_none: bool,
+    ) -> dict[str, Any] | None:
+        observed_at = time.time()
+        error: Exception | None = None
+        try:
+            snapshot = await self._sdk_call(operation)
+        except Exception as caught:
+            error = caught
+            snapshot = None
+        if snapshot is not None:
+            value = dict(snapshot)
+            await self._database.execute(
+                """
+                INSERT INTO session_projection_snapshots(
+                    session_id, kind, payload, observed_at
+                ) VALUES (?, ?, ?, ?)
+                ON CONFLICT(session_id, kind) DO UPDATE SET
+                    payload = excluded.payload,
+                    observed_at = excluded.observed_at
+                """,
+                (
+                    self.binding.sdk_session_id,
+                    kind,
+                    json.dumps(value, ensure_ascii=False, sort_keys=True),
+                    observed_at,
+                ),
+            )
+            return value
+        row = await self._database.fetchone(
+            """
+            SELECT payload, observed_at FROM session_projection_snapshots
+            WHERE session_id = ? AND kind = ?
+            """,
+            (self.binding.sdk_session_id, kind),
+        )
+        if row is not None:
+            value = json.loads(str(row["payload"]))
+            value["_stale"] = True
+            value["_observed_at"] = float(row["observed_at"])
+            if error is not None:
+                value["_error"] = type(error).__name__
+            return value
+        if error is not None:
+            raise error
+        return None if allow_none else {}
 
     async def _handle_user_input_request(
         self,
@@ -1347,12 +1531,9 @@ class SessionRuntime:
             retry_after = request.get("retryAfterSeconds")
             suffix = "" if retry_after is None else f" Retry after {retry_after} seconds."
             payload["question"] = (
-                "Copilot reached an eligible rate limit. Switch to Auto mode?"
-                f"{suffix}"
+                f"Copilot reached an eligible rate limit. Switch to Auto mode?{suffix}"
             )
-        future: asyncio.Future[dict[str, Any] | str] = (
-            asyncio.get_running_loop().create_future()
-        )
+        future: asyncio.Future[dict[str, Any] | str] = asyncio.get_running_loop().create_future()
         self._interaction_futures[interaction_id] = future
         await self._require_inbox().commit_internal(
             {"type": "copilotd.interaction.requested", "data": payload},
@@ -1596,11 +1777,14 @@ class SessionRuntime:
     async def queue_items(self) -> list[dict[str, Any]]:
         rows = await self._database.fetchall(
             """
-            SELECT id, prompt, position, state, created_at
-            FROM message_queue
-            WHERE thread_id = ?
-              AND state NOT IN ('cancelled', 'submitted', 'failed')
-            ORDER BY position
+            SELECT q.id, q.prompt, q.position, q.state, q.created_at,
+                   q.schedule_run_id, q.replaces_id, s.origin,
+                   s.runtime_schedule_id
+            FROM message_queue AS q
+            JOIN submissions AS s ON s.submission_id = q.id
+            WHERE q.thread_id = ?
+              AND q.state NOT IN ('cancelled', 'submitted', 'failed')
+            ORDER BY q.position
             """,
             (self.binding.thread_id,),
         )
@@ -1618,6 +1802,198 @@ class SessionRuntime:
     async def clear_queue(self) -> int:
         async with self._queue_dispatch_lock:
             return await self._cancel_queued("1 = 1", ())
+
+    async def resubmit_queue_item(
+        self,
+        submission_id: str,
+        *,
+        idempotency_key: str,
+    ) -> str:
+        await self._assert_owned_handle()
+        allowed_states = {
+            "blocked_mode_drift",
+            "blocked_model_drift",
+            "blocked_agent_drift",
+            "blocked_session_config_drift",
+        }
+        now = time.time()
+        replacement_id = str(
+            uuid.uuid5(
+                uuid.NAMESPACE_URL,
+                (
+                    f"copilotd:{self.binding.sdk_session_id}:queue-resubmit:"
+                    f"{submission_id}:{idempotency_key}"
+                ),
+            )
+        )
+        async with self._queue_dispatch_lock:
+            async with self._database.transaction() as connection:
+                cursor = await connection.execute(
+                    """
+                    SELECT q.*, s.origin, s.runtime_schedule_id
+                    FROM message_queue AS q
+                    JOIN submissions AS s ON s.submission_id = q.id
+                    WHERE q.id = ? AND q.thread_id = ?
+                    """,
+                    (submission_id, self.binding.thread_id),
+                )
+                source = await cursor.fetchone()
+                await cursor.close()
+                if source is None:
+                    raise CDInputError(f"queue item not found: {submission_id}")
+                if str(source["state"]) not in allowed_states:
+                    raise CDSessionStateError(
+                        "only configuration-drift queue items can be resubmitted"
+                    )
+                cursor = await connection.execute(
+                    """
+                    SELECT desired_mode, pending_mode, runtime_mode,
+                           desired_model_config, pending_model_config,
+                           runtime_model_config, desired_agent, pending_agent,
+                           runtime_agent, desired_session_config_version,
+                           pending_session_config_version,
+                           runtime_session_config_version
+                    FROM session_bindings WHERE thread_id = ?
+                    """,
+                    (self.binding.thread_id,),
+                )
+                config = await cursor.fetchone()
+                await cursor.close()
+                if config is None:
+                    raise CDSessionStateError("session configuration is unavailable")
+                if any(
+                    config[key] is not None
+                    for key in (
+                        "pending_mode",
+                        "pending_model_config",
+                        "pending_agent",
+                        "pending_session_config_version",
+                    )
+                ):
+                    raise CDSessionStateError("session configuration is still transitioning")
+                runtime_mode = str(config["runtime_mode"])
+                if runtime_mode == "unknown":
+                    raise CDSessionStateError("runtime mode is not confirmed")
+                model_config = config["runtime_model_config"]
+                if model_config is None:
+                    model_config = config["desired_model_config"]
+                runtime_agent = str(config["runtime_agent"])
+                if runtime_agent == "unknown":
+                    runtime_agent = str(config["desired_agent"])
+                session_config_version = (
+                    config["runtime_session_config_version"]
+                    if config["runtime_session_config_version"] is not None
+                    else config["desired_session_config_version"]
+                )
+                position_cursor = await connection.execute(
+                    """
+                    SELECT COALESCE(MAX(position), 0) + 1
+                    FROM message_queue WHERE thread_id = ?
+                    """,
+                    (self.binding.thread_id,),
+                )
+                position = int((await position_cursor.fetchone())[0])
+                await position_cursor.close()
+                schedule_run_id = source["schedule_run_id"]
+                await connection.execute(
+                    """
+                    UPDATE message_queue
+                    SET state = 'cancelled', updated_at = ?
+                    WHERE id = ?
+                    """,
+                    (now, submission_id),
+                )
+                await connection.execute(
+                    """
+                    UPDATE submissions
+                    SET state = 'cancelled', schedule_run_id = NULL
+                    WHERE submission_id = ?
+                    """,
+                    (submission_id,),
+                )
+                await connection.execute(
+                    """
+                    INSERT INTO submissions(
+                        submission_id, sdk_session_id, origin, parent_submission_id,
+                        schedule_run_id, runtime_schedule_id, attachment_manifest_id,
+                        prompt_hash, requested_mode, requested_model_config,
+                        requested_agent, requested_session_config_version,
+                        requested_delivery, state, created_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'enqueue',
+                              'local_queued', ?)
+                    """,
+                    (
+                        replacement_id,
+                        self.binding.sdk_session_id,
+                        str(source["origin"]),
+                        submission_id,
+                        schedule_run_id,
+                        source["runtime_schedule_id"],
+                        source["attachment_manifest_id"],
+                        hashlib.sha256(str(source["prompt"]).encode()).hexdigest(),
+                        runtime_mode,
+                        str(model_config),
+                        runtime_agent,
+                        int(session_config_version),
+                        now,
+                    ),
+                )
+                await connection.execute(
+                    """
+                    INSERT INTO message_queue(
+                        id, thread_id, discord_message_id, schedule_run_id, prompt,
+                        attachment_manifest_id, requested_mode_snapshot,
+                        requested_model_config_snapshot, requested_agent_snapshot,
+                        requested_session_config_version, position, state,
+                        replaces_id, created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'local_queued',
+                              ?, ?, ?)
+                    """,
+                    (
+                        replacement_id,
+                        self.binding.thread_id,
+                        source["discord_message_id"],
+                        schedule_run_id,
+                        str(source["prompt"]),
+                        source["attachment_manifest_id"],
+                        runtime_mode,
+                        str(model_config),
+                        runtime_agent,
+                        int(session_config_version),
+                        position,
+                        submission_id,
+                        now,
+                        now,
+                    ),
+                )
+                await connection.execute(
+                    """
+                    UPDATE liveness_leases
+                    SET state = 'released', refreshed_at = ?, released_at = ?
+                    WHERE sdk_session_id = ? AND kind = 'submission'
+                      AND source_id = ? AND state = 'active'
+                    """,
+                    (now, now, self.binding.sdk_session_id, submission_id),
+                )
+                await connection.execute(
+                    """
+                    INSERT INTO liveness_leases(
+                        sdk_session_id, lease_id, kind, source_id,
+                        runtime_generation, owner_fence_token, state,
+                        acquired_at, refreshed_at
+                    ) VALUES (?, ?, 'submission', ?, ?, ?, 'active', ?, ?)
+                    """,
+                    (
+                        self.binding.sdk_session_id,
+                        f"submission:{replacement_id}",
+                        replacement_id,
+                        self.binding.runtime_generation,
+                        self.binding.owner_fence_token,
+                        now,
+                        now,
+                    ),
+                )
+        return replacement_id
 
     async def update_taskdeck_view(
         self,
@@ -1698,6 +2074,164 @@ class SessionRuntime:
             internal_event_id=f"taskdeck-view:{interaction_id}",
         )
         return "updated"
+
+    async def perform_taskdeck_action(
+        self,
+        *,
+        panel_id: str,
+        card_token: str,
+        expected_revision: int,
+        action: Literal["cancel", "promote", "message", "remove", "download"],
+        message_id: str,
+        interaction_id: str,
+        message: str | None = None,
+    ) -> dict[str, Any]:
+        mapping = await self._database.fetchone(
+            """
+            SELECT discord_message_id FROM render_messages
+            WHERE session_id = ? AND logical_key = 'taskdeck'
+            """,
+            (self.binding.sdk_session_id,),
+        )
+        if mapping is None or str(mapping["discord_message_id"]) != message_id:
+            return {"status": "invalid"}
+        cards = await self._database.fetchall(
+            """
+            SELECT card_token, task_id, agent_id, kind, state, can_promote,
+                   detail_artifact, revision
+            FROM task_card_projections
+            WHERE sdk_session_id = ? AND panel_id = ?
+            ORDER BY first_seen_at, card_key
+            """,
+            (self.binding.sdk_session_id, panel_id),
+        )
+        if not cards:
+            return {"status": "invalid"}
+        revision = sum(int(card["revision"]) for card in cards)
+        if revision != expected_revision:
+            await self.refresh_taskdeck(interaction_id=f"{interaction_id}:stale")
+            return {"status": "stale"}
+        card = next(
+            (candidate for candidate in cards if str(candidate["card_token"]) == card_token),
+            None,
+        )
+        if card is None:
+            return {"status": "invalid"}
+        state = str(card["state"])
+        task_id = None if card["task_id"] is None else str(card["task_id"])
+        if action == "download":
+            artifact = card["detail_artifact"]
+            if artifact is None:
+                return {"status": "invalid"}
+            return {
+                "status": "download",
+                "filename": f"task-{card_token}-detail.md",
+                "content": str(artifact),
+            }
+        if self._task_action_adapter is None:
+            raise CDCapabilityError("native task actions are not available")
+        if task_id is None:
+            raise CDCapabilityError("this TaskDeck card has no addressable task ID")
+        operation_key = f"task-action:{interaction_id}:{action}:{task_id}"
+
+        async def dispatch() -> Mapping[str, Any]:
+            await self._assert_owned_handle()
+            if action == "cancel":
+                return await self._task_action_adapter.cancel_task(
+                    session_id=self.binding.sdk_session_id,
+                    task_id=task_id,
+                )
+            if action == "promote":
+                return await self._task_action_adapter.promote_task(
+                    session_id=self.binding.sdk_session_id,
+                    task_id=task_id,
+                )
+            if action == "message":
+                return await self._task_action_adapter.message_task(
+                    session_id=self.binding.sdk_session_id,
+                    task_id=task_id,
+                    message=normalized_message,
+                )
+            return await self._task_action_adapter.remove_task(
+                session_id=self.binding.sdk_session_id,
+                task_id=task_id,
+            )
+
+        normalized_message = ""
+        if action == "cancel":
+            if state not in {"running", "idle"}:
+                raise CDSessionStateError("only running or idle tasks can be cancelled")
+        elif action == "promote":
+            if state not in {"running", "idle"} or not bool(card["can_promote"]):
+                raise CDSessionStateError("this task cannot be promoted")
+        elif action == "message":
+            if str(card["kind"]) != "agent" or state not in {"running", "idle"}:
+                raise CDSessionStateError("only active agent tasks accept messages")
+            normalized_message = "" if message is None else message.strip()
+            if not normalized_message:
+                raise CDInputError("task message cannot be empty")
+        else:
+            if state not in {"completed", "failed", "cancelled"}:
+                raise CDSessionStateError("only terminal tasks can be removed")
+        if not await self._is_current_owner():
+            raise OperationAmbiguous(f"owner fence lost before task action {operation_key}")
+        result = await self._require_mailbox().submit(
+            kind=f"task_{action}",
+            idempotency_key=operation_key,
+            input_payload={
+                "action": action,
+                "task_id": task_id,
+                "message": normalized_message or None,
+            },
+            operation=dispatch,
+        )
+        if action == "remove":
+            await self._database.execute(
+                """
+                DELETE FROM task_card_projections
+                WHERE sdk_session_id = ? AND panel_id = ? AND card_token = ?
+                """,
+                (self.binding.sdk_session_id, panel_id, card_token),
+            )
+        await self.refresh_taskdeck(interaction_id=interaction_id)
+        return {"status": "updated", "result": dict(result or {})}
+
+    async def refresh_taskdeck(self, *, interaction_id: str) -> None:
+        state = await self._database.fetchone(
+            """
+            SELECT panel_id, selected_card_token, page, expanded
+            FROM taskdeck_panel_state WHERE sdk_session_id = ?
+            """,
+            (self.binding.sdk_session_id,),
+        )
+        if state is None:
+            cards = await self._database.fetchone(
+                """
+                SELECT panel_id, card_token FROM task_card_projections
+                WHERE sdk_session_id = ?
+                ORDER BY first_seen_at, card_key LIMIT 1
+                """,
+                (self.binding.sdk_session_id,),
+            )
+            if cards is None:
+                return
+            data = {
+                "panel_id": str(cards["panel_id"]),
+                "selected_card_token": str(cards["card_token"]),
+                "page": 0,
+                "expanded": False,
+            }
+        else:
+            data = {
+                "panel_id": str(state["panel_id"]),
+                "selected_card_token": state["selected_card_token"],
+                "page": int(state["page"]),
+                "expanded": bool(state["expanded"]),
+            }
+        await self._require_inbox().commit_internal(
+            {"type": "copilotd.taskdeck.view_changed", "data": data},
+            internal_event_id=f"taskdeck-refresh:{interaction_id}",
+        )
 
     async def _cancel_queued(
         self,
@@ -1792,9 +2326,7 @@ class SessionRuntime:
                     raise DetachBlocked(blockers)
             if force and blockers:
                 await self.clear_queue()
-                await self.cancel_pending_interactions(
-                    reason="Cancelled by forced session close."
-                )
+                await self.cancel_pending_interactions(reason="Cancelled by forced session close.")
                 if self._inbox is not None and self._reducer is not None:
                     await self._force_active_unknown()
                 try:
@@ -1939,6 +2471,10 @@ class SessionRuntime:
         async with self._lifecycle_lock:
             if self.state != RuntimeState.DETACHED:
                 raise SessionNotReady(f"runtime cannot attach from state {self.state}")
+            if self.binding.config_snapshot_state != "verified":
+                raise SessionNotReady(
+                    "legacy session has no verified project configuration snapshot"
+                )
             self.state = RuntimeState.ATTACHING
             self._lease = await self._owner_leases.acquire(
                 self.binding.sdk_session_id,
@@ -1955,9 +2491,7 @@ class SessionRuntime:
                 and self._capabilities.supports("sessions_check_in_use")
             ):
                 try:
-                    in_use = await self._bridge.check_session_in_use(
-                        self.binding.sdk_session_id
-                    )
+                    in_use = await self._bridge.check_session_in_use(self.binding.sdk_session_id)
                 except Exception as error:
                     self.binding = await self._bindings.mark_attach_unknown(self.binding)
                     lease = self._lease
@@ -1981,29 +2515,38 @@ class SessionRuntime:
             self._start_components()
 
             try:
+                raw_options = self.binding.session_config_snapshot.get(
+                    "session_options",
+                    {},
+                )
+                if not isinstance(raw_options, dict):
+                    raise SessionNotReady("session configuration snapshot is invalid")
+                session_options = dict(raw_options)
                 if create:
-                    handle = await self._sdk_call(
-                        self._bridge.create_session(
-                            session_id=self.binding.sdk_session_id,
-                            working_directory=str(self.binding.cwd_snapshot),
-                            on_event=self._ingress,
-                            on_user_input_request=self._handle_user_input_request,
-                            on_exit_plan_mode_request=self._handle_exit_plan_mode_request,
-                            on_auto_mode_switch_request=self._handle_auto_mode_switch_request,
-                        )
-                    )
+                    create_kwargs = {
+                        "session_id": self.binding.sdk_session_id,
+                        "working_directory": str(self.binding.cwd_snapshot),
+                        "on_event": self._ingress,
+                        "on_user_input_request": self._handle_user_input_request,
+                        "on_exit_plan_mode_request": self._handle_exit_plan_mode_request,
+                        "on_auto_mode_switch_request": self._handle_auto_mode_switch_request,
+                    }
+                    if session_options:
+                        create_kwargs["session_config"] = session_options
+                    handle = await self._sdk_call(self._bridge.create_session(**create_kwargs))
                 else:
-                    handle = await self._sdk_call(
-                        self._bridge.resume_session(
-                            session_id=self.binding.sdk_session_id,
-                            working_directory=str(self.binding.cwd_snapshot),
-                            on_event=self._ingress,
-                            continue_pending_work=continue_pending_work,
-                            on_user_input_request=self._handle_user_input_request,
-                            on_exit_plan_mode_request=self._handle_exit_plan_mode_request,
-                            on_auto_mode_switch_request=self._handle_auto_mode_switch_request,
-                        )
-                    )
+                    resume_kwargs = {
+                        "session_id": self.binding.sdk_session_id,
+                        "working_directory": str(self.binding.cwd_snapshot),
+                        "on_event": self._ingress,
+                        "continue_pending_work": continue_pending_work,
+                        "on_user_input_request": self._handle_user_input_request,
+                        "on_exit_plan_mode_request": self._handle_exit_plan_mode_request,
+                        "on_auto_mode_switch_request": self._handle_auto_mode_switch_request,
+                    }
+                    if session_options:
+                        resume_kwargs["session_config"] = session_options
+                    handle = await self._sdk_call(self._bridge.resume_session(**resume_kwargs))
                 if handle.session_id != self.binding.sdk_session_id:
                     raise RuntimeError("SDK returned a different session ID")
             except Exception as error:
@@ -2099,20 +2642,14 @@ class SessionRuntime:
                             "data": {"observed": observed_model},
                         },
                         internal_event_id=(
-                            f"model:{self.binding.runtime_generation}:"
-                            f"initial:{observed_hash}"
+                            f"model:{self.binding.runtime_generation}:initial:{observed_hash}"
                         ),
                     )
             elif desired_model:
                 self.state = RuntimeState.DEGRADED
                 raise SessionNotReady("runtime model reconciliation is unavailable")
-            if (
-                self._capabilities is not None
-                and self._capabilities.supports("selected_agent")
-            ):
-                observed_agent = await self._sdk_call(
-                    self._bridge.get_current_agent(handle)
-                )
+            if self._capabilities is not None and self._capabilities.supports("selected_agent"):
+                observed_agent = await self._sdk_call(self._bridge.get_current_agent(handle))
                 await self._require_inbox().commit_internal(
                     {
                         "type": "copilotd.agent.observed",
@@ -2135,9 +2672,7 @@ class SessionRuntime:
             await self._require_inbox().commit_internal(
                 {
                     "type": "copilotd.config.observed",
-                    "data": {
-                        "version": int(config_row["desired_session_config_version"])
-                    },
+                    "data": {"version": int(config_row["desired_session_config_version"])},
                 },
                 internal_event_id=(
                     f"config:{self.binding.runtime_generation}:"
@@ -2248,12 +2783,8 @@ class SessionRuntime:
             (self.binding.sdk_session_id,),
         )
         cursor = None if cursor_state is None else cursor_state["event_cursor"]
-        cursor_epoch = (
-            0 if cursor_state is None else int(cursor_state["event_cursor_epoch"])
-        )
-        predecessor_id = (
-            None if cursor_state is None else cursor_state["event_predecessor_id"]
-        )
+        cursor_epoch = 0 if cursor_state is None else int(cursor_state["event_cursor_epoch"])
+        predecessor_id = None if cursor_state is None else cursor_state["event_predecessor_id"]
         if initialize:
             tail = await self._bridge.tail_event_log(handle)
             await self._advance_event_cursor(
@@ -2351,8 +2882,7 @@ class SessionRuntime:
             },
             source="snapshot",
             internal_event_id=(
-                f"event-cursor:{self.binding.runtime_generation}:"
-                f"{cursor_epoch}:{cursor_hash}"
+                f"event-cursor:{self.binding.runtime_generation}:{cursor_epoch}:{cursor_hash}"
             ),
         )
 
@@ -2394,9 +2924,7 @@ class SessionRuntime:
                     "ingress_overflow",
                     {
                         "first_lost_inbox_seq": incident.first_lost_inbox_seq,
-                        "first_lost_sdk_receive_seq": (
-                            incident.first_lost_sdk_receive_seq
-                        ),
+                        "first_lost_sdk_receive_seq": (incident.first_lost_sdk_receive_seq),
                         "lost_count": incident.lost_count,
                     },
                 )
@@ -2451,9 +2979,7 @@ class SessionRuntime:
             runtime_generation=self.binding.runtime_generation,
             owner_fence_token=self._require_fence_token(),
             kind="recovery_disconnect",
-            idempotency_key=(
-                f"{reason}:{self.binding.runtime_generation}:disconnect"
-            ),
+            idempotency_key=(f"{reason}:{self.binding.runtime_generation}:disconnect"),
             input_payload={},
         )
         if not created:
@@ -2687,9 +3213,7 @@ class SessionRuntime:
             self._permission_reconcile_task = None
         if self._mailbox is not None:
             try:
-                await self._mailbox.stop(
-                    timeout_seconds=self._shutdown_timeout_seconds
-                )
+                await self._mailbox.stop(timeout_seconds=self._shutdown_timeout_seconds)
             except Exception as error:
                 errors.append(error)
             self._mailbox = None
@@ -2699,9 +3223,7 @@ class SessionRuntime:
             self._renewal_task = None
         if self._reducer is not None:
             try:
-                await self._reducer.stop(
-                    timeout_seconds=self._shutdown_timeout_seconds
-                )
+                await self._reducer.stop(timeout_seconds=self._shutdown_timeout_seconds)
             except Exception as error:
                 errors.append(error)
             self._reducer = None

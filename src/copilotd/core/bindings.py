@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import time
 from dataclasses import dataclass
 from enum import StrEnum
@@ -56,6 +57,10 @@ class SessionBinding:
     owner_fence_token: int | None
     last_inbox_seq: int
     last_sdk_receive_seq: int | None
+    desired_session_config_version: int
+    session_config_snapshot: dict[str, object]
+    channel_config_snapshot: dict[str, object]
+    config_snapshot_state: str
     row_version: int
 
 
@@ -75,6 +80,9 @@ class SessionBindingRepository:
         cwd_snapshot: Path,
         project_source: str,
         project_id: str | None = None,
+        session_config_snapshot: dict[str, object] | None = None,
+        channel_config_snapshot: dict[str, object] | None = None,
+        session_config_version: int = 1,
         now: float | None = None,
     ) -> SessionBinding:
         timestamp = time.time() if now is None else now
@@ -83,8 +91,10 @@ class SessionBindingRepository:
             """
             INSERT INTO session_bindings(
                 thread_id, project_id, project_source, cwd_snapshot, sdk_session_id,
+                session_config_snapshot, channel_config_snapshot,
+                config_snapshot_state, desired_session_config_version,
                 created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, 'verified', ?, ?, ?)
             """,
             (
                 thread_id,
@@ -92,6 +102,9 @@ class SessionBindingRepository:
                 project_source,
                 str(resolved_cwd),
                 sdk_session_id,
+                json.dumps(session_config_snapshot or {}, sort_keys=True),
+                json.dumps(channel_config_snapshot or {}, sort_keys=True),
+                session_config_version,
                 timestamp,
                 timestamp,
             ),
@@ -168,9 +181,7 @@ class SessionBindingRepository:
             if binding.sdk_session_id != lease.sdk_session_id:
                 raise BindingConflict("owner lease does not match session binding")
             if binding.binding_intent not in {BindingIntent.ACTIVE, BindingIntent.CLOSED}:
-                raise BindingConflict(
-                    f"cannot attach binding with intent {binding.binding_intent}"
-                )
+                raise BindingConflict(f"cannot attach binding with intent {binding.binding_intent}")
             attachable_states = {
                 AttachmentState.ABSENT,
                 AttachmentState.RECOVERY_UNKNOWN,
@@ -181,9 +192,7 @@ class SessionBindingRepository:
                 and binding.owner_fence_token != lease.fence_token
             )
             if binding.attachment_state not in attachable_states and not stale_attached:
-                raise BindingConflict(
-                    f"cannot attach binding in state {binding.attachment_state}"
-                )
+                raise BindingConflict(f"cannot attach binding in state {binding.attachment_state}")
 
             generation = binding.runtime_generation + 1
             update = await connection.execute(
@@ -406,15 +415,9 @@ class SessionBindingRepository:
         timestamp = time.time() if now is None else now
         return await self._transition_attachment(
             binding,
-            state=(
-                AttachmentState.ABSENT
-                if succeeded
-                else AttachmentState.RECOVERY_UNKNOWN
-            ),
+            state=(AttachmentState.ABSENT if succeeded else AttachmentState.RECOVERY_UNKNOWN),
             permission_posture=(
-                PermissionPosture.UNVERIFIED
-                if succeeded
-                else PermissionPosture.UNKNOWN
+                PermissionPosture.UNVERIFIED if succeeded else PermissionPosture.UNKNOWN
             ),
             permission_verified_at=None,
             now=timestamp,
@@ -507,6 +510,10 @@ def _row_to_binding(row: Row) -> SessionBinding:
         owner_fence_token=row["owner_fence_token"],
         last_inbox_seq=row["last_inbox_seq"],
         last_sdk_receive_seq=row["last_sdk_receive_seq"],
+        desired_session_config_version=int(row["desired_session_config_version"]),
+        session_config_snapshot=json.loads(row["session_config_snapshot"]),
+        channel_config_snapshot=json.loads(row["channel_config_snapshot"]),
+        config_snapshot_state=str(row["config_snapshot_state"]),
         row_version=row["row_version"],
     )
 

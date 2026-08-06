@@ -6,7 +6,7 @@ from uuid import uuid4
 import pytest
 
 from copilotd.core.bindings import SessionBindingRepository
-from copilotd.core.projects import ProjectRegistry
+from copilotd.core.projects import ProjectRegistry, ProjectValidationError
 from copilotd.core.session_runtime import SessionRuntime
 from copilotd.core.sessions import (
     CreationIntentRepository,
@@ -42,16 +42,20 @@ class FakeBridge:
         self.resume_calls = 0
         self.handle: FakeHandle | None = None
         self.mode = "interactive"
+        self.create_kwargs: dict[str, Any] = {}
+        self.resume_kwargs: dict[str, Any] = {}
 
     async def create_session(self, **kwargs: Any) -> FakeHandle:
         self.create_calls += 1
+        self.create_kwargs = kwargs
         if self.fail_first_create and self.create_calls == 1:
             raise ConnectionError("create response lost")
         self.handle = FakeHandle(kwargs["session_id"])
         return self.handle
 
-    async def resume_session(self, session_id: str, **_kwargs: Any) -> FakeHandle:
+    async def resume_session(self, session_id: str, **kwargs: Any) -> FakeHandle:
         self.resume_calls += 1
+        self.resume_kwargs = kwargs
         self.handle = FakeHandle(session_id)
         return self.handle
 
@@ -82,12 +86,14 @@ class FakeThreads:
         self.ambiguous_first_create = ambiguous_first_create
         self.create_calls = 0
         self.reference: ThreadReference | None = None
+        self.create_kwargs: dict[str, Any] = {}
 
     async def find_thread(self, **_kwargs: Any) -> ThreadReference | None:
         return self.reference
 
     async def create_thread(self, **_kwargs: Any) -> ThreadReference:
         self.create_calls += 1
+        self.create_kwargs = _kwargs
         await asyncio.sleep(0)
         self.reference = ThreadReference(thread_id="thread-1")
         if self.ambiguous_first_create and self.create_calls == 1:
@@ -160,6 +166,236 @@ async def test_duplicate_gateway_delivery_creates_one_thread_session_and_send(
         assert bridge.handle is not None
         assert bridge.handle.send_calls == 1
         assert intent["state"] == "attached"
+        await sessions.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_future_session_snapshots_and_applies_project_configuration(
+    tmp_path: Path,
+) -> None:
+    home = tmp_path / "home"
+    repo = tmp_path / "repo"
+    skill = tmp_path / "skills"
+    plugin = tmp_path / "plugins"
+    for path in (home, repo, skill, plugin):
+        path.mkdir()
+    bridge = FakeBridge()
+    threads = FakeThreads()
+    async with Database(tmp_path / "project-session.sqlite3") as database:
+        service, sessions = await _build_service(database, home, bridge, threads)
+        projects = ProjectRegistry(database, resolved_home=home)
+        await projects.initialize()
+        await projects.bind("channel-project", repo)
+        await projects.set_project_env("channel-project", "TOKEN", "snapshot-secret")
+        await projects.set_mcp_server(
+            "channel-project",
+            name="local",
+            transport="stdio",
+            config={
+                "command": "node",
+                "args": ["server.js"],
+                "project_env_refs": ["TOKEN"],
+            },
+        )
+        await projects.set_skill_dir("channel-project", path=str(skill))
+        await projects.set_plugin_dir("channel-project", path=str(plugin))
+        await projects.set_custom_agent(
+            "channel-project",
+            name="reviewer",
+            description="Review code",
+            prompt="Review the current changes.",
+            tools=["tool.review"],
+        )
+        await projects.set_layout("channel-project", "text")
+
+        runtime = await service.create_from_source(
+            channel_id="channel-project",
+            source_kind="message",
+            source_id="source-project",
+            prompt="hello",
+            thread_name="Configured session",
+            send_initial_prompt=False,
+        )
+        binding = await SessionBindingRepository(database).by_thread("thread-1")
+        await projects.set_project_env(
+            "channel-project",
+            "TOKEN",
+            "new-secret-for-future-session",
+        )
+        unchanged = await SessionBindingRepository(database).by_thread("thread-1")
+
+        options = bridge.create_kwargs["session_config"]
+        assert options["mcp_servers"]["local"]["env"]["TOKEN"] == "snapshot-secret"
+        assert options["skill_directories"] == [str(skill)]
+        assert options["plugin_directories"] == [str(plugin)]
+        assert options["custom_agents"][0]["name"] == "reviewer"
+        assert threads.create_kwargs["layout"] == "text"
+        assert binding is not None
+        assert binding.desired_session_config_version == 6
+        assert binding.channel_config_snapshot["layout"] == "text"
+        assert unchanged is not None
+        assert unchanged.session_config_snapshot == binding.session_config_snapshot
+        assert (
+            unchanged.session_config_snapshot["session_options"]["mcp_servers"]["local"]["env"][
+                "TOKEN"
+            ]
+            == "snapshot-secret"
+        )
+        assert runtime.binding.sdk_session_id == binding.sdk_session_id
+        await sessions.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_unapplied_project_environment_fails_before_thread_creation(
+    tmp_path: Path,
+) -> None:
+    home = tmp_path / "home"
+    repo = tmp_path / "repo"
+    home.mkdir()
+    repo.mkdir()
+    bridge = FakeBridge()
+    threads = FakeThreads()
+    async with Database(tmp_path / "unapplied-env.sqlite3") as database:
+        service, sessions = await _build_service(database, home, bridge, threads)
+        projects = ProjectRegistry(database, resolved_home=home)
+        await projects.initialize()
+        await projects.bind("channel-env", repo)
+        await projects.set_project_env("channel-env", "UNUSED_TOKEN", "secret")
+
+        with pytest.raises(ProjectValidationError, match="cannot be applied"):
+            await service.create_from_source(
+                channel_id="channel-env",
+                source_kind="message",
+                source_id="source-env",
+                prompt="hello",
+                thread_name="Should not exist",
+            )
+
+        assert threads.create_calls == 0
+        assert bridge.create_calls == 0
+        await sessions.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_legacy_creation_intent_fails_closed_without_new_thread(
+    tmp_path: Path,
+) -> None:
+    home = tmp_path / "home"
+    home.mkdir()
+    bridge = FakeBridge()
+    threads = FakeThreads()
+    async with Database(tmp_path / "legacy-intent.sqlite3") as database:
+        service, sessions = await _build_service(database, home, bridge, threads)
+        projects = ProjectRegistry(database, resolved_home=home)
+        await projects.initialize()
+        project = await projects.resolve("channel-legacy")
+        config = await projects.session_config_snapshot("channel-legacy")
+        intents = CreationIntentRepository(database)
+        await intents.reserve(
+            source_kind="message",
+            source_id="source-legacy",
+            project=project,
+            config=config,
+        )
+        await database.execute(
+            """
+            UPDATE session_creation_intents
+            SET config_snapshot_state = 'legacy_unverified'
+            WHERE source_kind = 'message' AND source_id = 'source-legacy'
+            """
+        )
+
+        with pytest.raises(SessionCreationUnknown, match="legacy creation intent"):
+            await service.create_from_source(
+                channel_id="channel-legacy",
+                source_kind="message",
+                source_id="source-legacy",
+                prompt="hello",
+                thread_name="Legacy intent",
+            )
+
+        assert threads.create_calls == 0
+        assert bridge.create_calls == 0
+        await sessions.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_v11_backfill_verifies_bindings_and_only_blocks_ambiguous_intents(
+    tmp_path: Path,
+) -> None:
+    home = tmp_path / "home"
+    home.mkdir()
+    database_path = tmp_path / "upgrade-backfill.sqlite3"
+    async with Database(database_path) as database:
+        bindings = SessionBindingRepository(database)
+        await bindings.create(
+            thread_id="thread-upgrade",
+            sdk_session_id="session-upgrade",
+            cwd_snapshot=home,
+            project_source="implicit-home",
+        )
+        projects = ProjectRegistry(database, resolved_home=home)
+        await projects.initialize()
+        project = await projects.resolve("channel-upgrade")
+        config = await projects.session_config_snapshot("channel-upgrade")
+        intents = CreationIntentRepository(database)
+        await intents.reserve(
+            source_kind="message",
+            source_id="attached-source",
+            project=project,
+            config=config,
+        )
+        await intents.reserve(
+            source_kind="message",
+            source_id="ambiguous-source",
+            project=project,
+            config=config,
+        )
+        await database.execute(
+            """
+            UPDATE session_bindings
+            SET config_snapshot_state = 'legacy_unverified',
+                session_config_snapshot = '{}',
+                channel_config_snapshot = '{}'
+            WHERE thread_id = 'thread-upgrade'
+            """
+        )
+        await database.execute(
+            """
+            UPDATE session_creation_intents
+            SET config_snapshot_state = 'legacy_unverified',
+                project_config_snapshot = '{}',
+                channel_config_snapshot = '{}',
+                state = CASE source_id
+                    WHEN 'attached-source' THEN 'attached'
+                    ELSE 'creating'
+                END
+            """
+        )
+
+    bridge = FakeBridge()
+    threads = FakeThreads()
+    async with Database(database_path) as database:
+        binding = await SessionBindingRepository(database).by_thread("thread-upgrade")
+        attached = await CreationIntentRepository(database).by_source(
+            source_kind="message",
+            source_id="attached-source",
+        )
+        ambiguous = await CreationIntentRepository(database).by_source(
+            source_kind="message",
+            source_id="ambiguous-source",
+        )
+        _service, sessions = await _build_service(database, home, bridge, threads)
+        failures = await sessions.eager_resume()
+
+        assert binding is not None
+        assert binding.config_snapshot_state == "verified"
+        assert binding.session_config_snapshot == {"session_options": {}}
+        assert attached is not None and attached.config_snapshot_state == "verified"
+        assert ambiguous is not None
+        assert ambiguous.config_snapshot_state == "legacy_unverified"
+        assert failures == {}
+        assert bridge.resume_calls == 1
         await sessions.shutdown()
 
 
@@ -255,6 +491,13 @@ async def test_ambiguous_sdk_create_is_reconciled_by_resume_without_second_creat
                 thread_name="hello",
             )
 
+        rebound = tmp_path / "rebound"
+        rebound.mkdir()
+        projects = ProjectRegistry(database, resolved_home=home)
+        await projects.initialize()
+        await projects.bind("channel-1", rebound)
+        await projects.set_project_env("channel-1", "UNAPPLIED", "new-value")
+
         runtime = await service.create_from_source(
             channel_id="channel-1",
             source_kind="message",
@@ -266,4 +509,6 @@ async def test_ambiguous_sdk_create_is_reconciled_by_resume_without_second_creat
         assert runtime.handle is bridge.handle
         assert bridge.create_calls == 1
         assert bridge.resume_calls == 1
+        assert runtime.binding.project_source == "implicit-home"
+        assert runtime.binding.cwd_snapshot == home
         await sessions.shutdown()
