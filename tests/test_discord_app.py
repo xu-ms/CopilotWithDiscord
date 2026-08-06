@@ -907,3 +907,51 @@ async def test_critical_task_failure_closes_gateway_and_persists_incident(
     assert incident["runtime_generation"] == 4
     assert incident["kind"] == "background_task_failed"
     assert "event-reducer" in incident["detail"]
+
+
+@pytest.mark.asyncio
+async def test_runtime_health_loop_marks_unexpected_runtime_loss_and_recovery(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    bot = CopilotDiscordBot(
+        Settings(
+            _env_file=None,
+            data_dir=tmp_path / "data",
+            cache_dir=tmp_path / "cache",
+            log_dir=tmp_path / "logs",
+            heartbeat_interval_seconds=0.01,
+        )
+    )
+    failed = asyncio.Event()
+    recover = asyncio.Event()
+    calls = 0
+
+    async def healthcheck() -> None:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            failed.set()
+            raise RuntimeError("sidecar disconnected")
+        await recover.wait()
+
+    monkeypatch.setattr(bot.bridge, "healthcheck", healthcheck)
+    task = asyncio.create_task(bot._runtime_health_loop())
+    try:
+        await failed.wait()
+        for _ in range(100):
+            if calls >= 2:
+                break
+            await asyncio.sleep(0.005)
+        assert calls >= 2
+        assert bot.heartbeat.runtime_state == "down"
+        recover.set()
+        for _ in range(100):
+            if bot.heartbeat.runtime_state == "ready":
+                break
+            await asyncio.sleep(0.005)
+        assert bot.heartbeat.runtime_state == "ready"
+    finally:
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task

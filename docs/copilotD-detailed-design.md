@@ -216,6 +216,28 @@ OS service manager
 | `copilotd service uninstall` | 停止并注销 service；保留 SQLite、session state 和 logs |
 | `copilotd run --foreground` | 不注册 service 的显式开发入口 |
 
+restart 使用持久事务而不是“读一次 heartbeat 后 kill”：
+
+1. manager 写 `requested` fence，同时记录 PID、OS process start、generation 和
+   event-journal high-water mark；
+2. bot 关闭全局 create/resume/send admission，停止并 await queue/task/permission/owner-renew
+   producer，冻结并 await mailbox，再 drain reducer inbox；
+3. `acknowledged` 通过 producer counter + journal high-water 的同一条 CAS 提交；任何 SDK
+   callback 或 internal producer 在 requested/acknowledged/prepared/committed 阶段都持久计数，
+   ACK 后到达则令可逆阶段 violated；
+4. normal restart 只在 fenced snapshot 无 blocker 时进入 owner handoff；force 先原子提交
+   `prepared`，只把真实 in-flight 结果置 unknown，并保持 local queued/cancelled/terminal；
+5. `committed` 与 owner lease expiry、binding recovery_unknown 同事务；此后失败只能 fail-closed
+   terminate，不能 release/reopen。新 PID/generation/process-start 在启动 attach 前完成 committed
+   fence adoption，随后 queued claim 以新 generation/fence 重建 submission lease。
+
+schema 11 将 service-control protocol 固定为 v2：旧 v1 worker 在建立 v2 fence 前必须由 OS
+manager 停止并证明原 PID/process-start 已退出；新 worker 通过私有 handoff token、effective
+manager PID/start 和 generation 三重证明后才能 adoption。inbox observer 安装与 reserve 共用
+barrier；overflow 或非阻塞 SQLite accounting 失败写 0600 durable watermark，任何 watermark
+都会阻止 ACK/commit。rollback 有 persisted pending/attempts/complete 状态并有界重试；
+prepared/committed worker 自行退出，避免 fresh heartbeat 掩盖 stranded transaction。
+
 ### Heartbeat 协议
 
 bot 每 30 秒原子写入 heartbeat JSON；不是只 touch mtime：
@@ -263,7 +285,7 @@ steerable/unknown session；后两者即使当前没有 turn，也要求保持 a
 | bot heartbeat stale、有 protected work、无 sidecar/replay | 不自动强杀；写 alert，保留进程、任务、remote ingress 和 native schedule，等待人工 `--force` |
 | gateway down > 600 秒、无 protected work | freeze heartbeat，由 watchdog 重启 bot |
 | gateway down > 600 秒、有 protected work | 继续 heartbeat，不自动杀 bot/runtime；写告警并等待 gateway 恢复或人工 force |
-| 5 分钟内重启 >= 3 次 | 停止主动 kick loop，写 alerts log，并发本机桌面通知 |
+| 连续 3 个 5 分钟 watchdog 周期均发生重启 | 第 4 次停止主动 kick loop，写 alerts log，并发本机桌面通知；15 分钟窗口允许覆盖真实 cadence |
 
 这比 claudeD 的固定 hard ceiling 更保守：后台工作优先，不因 watchdog 误杀 session。
 
@@ -320,14 +342,14 @@ current-user Scheduled Task：
 
 | Task | Trigger/Settings |
 |---|---|
-| `copilotD Runtime` | AtLogOn；失败每 30 秒重启；`ExecutionTimeLimit=PT0S` |
-| `copilotD Bot` | AtLogOn；失败每 30 秒重启；`MultipleInstancesPolicy=IgnoreNew` |
+| `copilotD Runtime` | AtLogOn；失败每 1 分钟重启；`ExecutionTimeLimit=PT0S` |
+| `copilotD Bot` | AtLogOn；失败每 1 分钟重启；`MultipleInstancesPolicy=IgnoreNew` |
 | `copilotD Watchdog` | AtLogOn 后每 5 分钟重复；`StartWhenAvailable=true` |
 
 `bundled-runtime` topology 同样省略独立 Runtime task，只注册 Bot + Watchdog，并由
 status/export verifier 按已探测 topology 校验 2/3 个 task；两种 topology 都默认安装和启动。
 
-runtime/bot task 统一设置 `RestartCount=999`、`DisallowStartIfOnBatteries=false`、
+runtime/bot task 统一设置 schema-valid `RestartCount=255`、`RestartInterval=PT1M`、`DisallowStartIfOnBatteries=false`、
 `StopIfGoingOnBatteries=false`、`WakeToRun=false`，使用安装时解析出的绝对 Python/entrypoint
 和 working directory。安装总是先 `Unregister-ScheduledTask` 再
 `Register-ScheduledTask -Xml`，随后 `Start-ScheduledTask` 立即启动，避免磁盘 XML 已更新
@@ -2364,15 +2386,16 @@ claudeD issue 回归门禁：
 | 已实现 | 当前边界 |
 |---|---|
 | 官方 `github-copilot-sdk==1.0.8` + bundled runtime 1.0.73，stdio `--yolo`，create/resume 后 full allow-all 对账 | sidecar client transport 断开后 session retention 实测失败，因此不声明 detached continuation；crash window 保守标 outcome unknown |
-| 37 个唯一版本 SQLite migration：Foundation `0001`–`0009`、Native RPC `0010`–`0014`、Protocol `0015`–`0019`、Scheduler `0020`–`0028`、Protocol compatibility `0029`、Discord surface `0030`–`0037`；project `$HOME` fallback/cwd snapshot、owner fence、creation saga、strict-UUID event journal、reducer-owned operation/submission/native-command receipts、submission-task links、liveness leases、startup recovery inventory 与 eager resume；attach 时按 current state 结算 pending agent、强制 uncertain remote off | bundled runtime 进程死亡后的 in-flight execution 仍只能标 outcome unknown；真实 fixture 无 current-promotable task，task promote 保持 gated |
+| 42 个唯一版本 SQLite migration：Foundation `0001`–`0009`、Native RPC `0010`–`0014`、Protocol `0015`–`0019`、Scheduler `0020`–`0028`、Protocol compatibility `0029`、Discord surface `0030`–`0037`、保留 `0038`–`0039`、Operations forward migrations `0040`–`0044`；project `$HOME` fallback/cwd snapshot、owner fence、creation saga、strict-UUID event journal、reducer-owned operation/submission/native-command receipts、submission-task links、liveness leases、startup recovery inventory 与 eager resume；attach 时按 current state 结算 pending agent、强制 uncertain remote off；force restart 使用 producer/journal dual epoch、loss watermark admission fence 与 owner handoff | bundled runtime 进程死亡后的 in-flight execution 仍只能标 outcome unknown；真实 fixture 无 current-promotable task，task promote 保持 gated |
 | eventLog `read/tail` durable backfill（固定过滤 ephemeral）、cursor epoch/rebase/predecessor-gap diagnostics、overflow freeze/backfill/generation replacement；activity/queue/task/remote/schedule snapshot requested/applied epoch 与 query watermark；crossing command/agent snapshot 禁止 merge 并强制 requery | ephemeral idle/delta 离开 live window 后不可恢复，不从 transcript 猜 terminal；compaction 无 completion evidence 时保持 unknown 并阻塞普通 submission |
 | durable app FIFO；fresh readiness snapshot、reducer caught-up、config/agent/remote/schedule/task known gate 后只派发队首；attachment manifest READY + hash/size 复验，无 attachment-free fallback；`/queue add/list/remove/clear` | native queue entry 没有 stable opaque ID 时只以 snapshot-local opaque key 诊断；transport ambiguity 不自动重放 |
 | Discord core 命令；strict dynamic builtin manifest；Native-Gated `/ask`、`/session compact`、`/fleet`、`/tasks`、`/agent list|current`、`/after|every list|cancel`、`/remote status|off`、`/review`、`/security-review`、`/research`、`/rubber-duck`；全部 action 由 exact capability 决定 | `/session delete|fork` 按本次范围不实现；`/after|every create` 因 real invoke 返回 `text` 而非 required `completed` 不注册；agent select/deselect、task promote、remote on/export 的 real gate 未通过；elicitation/MCP OAuth 仍待接入 |
 | durable input attachment manifest、hash/size 复验、图片 blob 压缩；stream/final RenderOutbox；table hold 与 code/PNG/MD/CSV assets；Discord HTTP/rate-limit 错误分类，超上限 artifact 按序无损分片 | Discord archived/locked thread、attachment edit、exact 429 retry-after 仍需真实 gateway fixture |
 | tool/subagent/agent-scoped output 归并为原 thread 的单条 TaskDeck；4 秒 cadence、pending coalescing、terminal flush、select/expand/collapse/prev/next；typed task list/show/progress/message/cancel-all/remove/wait 与 Fleet projection；>=8000 字符 tool result/error 逐字附件化；零 child-thread 路径 | real current-promotable fixture 未通过，promote action 不注册；完整 reasoning summary/diff artifact lane 尚未实现 |
-| 共享 TaskRegistry、failure consumer、10 分钟 active-execution SUSPECT + non-destructive ping、结构化 heartbeat、protected-work watchdog、macOS bot/watchdog LaunchAgent 与 Windows Scheduled Task definitions | 当前拓扑没有独立 runtime service；真实 service 安装、sleep/wake 和 Windows 实机仍待验证 |
+| 共享 TaskRegistry、failure consumer、10 分钟 active-execution SUSPECT + non-destructive ping、结构化 heartbeat、完整 setup preflight、fresh PID/generation/current-fence status、bounded restart saga、restart-storm alert、10 MiB × 7 JSON log、macOS LaunchAgent 与 Windows Scheduled Task 的 bundled 2-unit / sidecar 3-unit install/status/uninstall/effective-definition contract | 默认 bundled runtime 没有独立 runtime service；sidecar 三组件需要显式 runtime argv/URI/connection token；真实 credentialed install、sleep/wake、macOS soak 与 Windows 实机未在 deterministic suite 中验证 |
 
-当前 deterministic 验证基线包括 `ruff check .` 与完整 pytest。仓库内 hash-checked
+当前 deterministic 验证基线包括 `ruff check src tests scripts`、完整 pytest、CLI JSON/error
+contract、service definition/effective-state simulations 与 wheel/sdist isolated install。仓库内 hash-checked
 fixture 固定 SDK 1.0.8 / runtime 1.0.73 / protocol 3、114-event inventory 与 capability
 evidence；`copilotd native-acceptance --real` 还要求 exact 环境确认，按 suite 创建 disposable
 repo/session、执行 supported mutation（包括 model set/readback/restore）、清理 remote/schedule/session，并生成 sanitized JSON

@@ -545,6 +545,26 @@ class SessionBindingRepository:
             expected_states=(AttachmentState.CREATING, AttachmentState.RESUMING),
         )
 
+    async def reset_cancelled_attachment(
+        self,
+        binding: SessionBinding,
+        *,
+        now: float | None = None,
+    ) -> SessionBinding:
+        timestamp = time.time() if now is None else now
+        return await self._transition_attachment(
+            binding,
+            state=AttachmentState.ABSENT,
+            permission_posture=PermissionPosture.UNVERIFIED,
+            permission_verified_at=None,
+            now=timestamp,
+            expected_states=(
+                AttachmentState.CREATING,
+                AttachmentState.RESUMING,
+                AttachmentState.ATTACHED,
+            ),
+        )
+
     async def mark_recovery_unknown(
         self,
         binding: SessionBinding,

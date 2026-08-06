@@ -102,6 +102,7 @@ class SdkProbe:
         keep_session: bool,
         probe_native_schedule: bool,
         probe_sidecar: bool,
+        expected_response: str | None = None,
     ) -> dict[str, Any]:
         self._settings.ensure_directories()
         matrix = self.static_matrix()
@@ -218,6 +219,16 @@ class SdkProbe:
                 live["accepted_message_id"] = accepted_message_id
                 await recorder.wait_for(SessionEventType.SESSION_IDLE, wait_seconds)
                 live["first_generation_event_count"] = len(recorder.events)
+                if expected_response is not None:
+                    live["expected_response"] = expected_response
+                    live["response_matched"] = _response_matches(
+                        recorder.events,
+                        expected_response,
+                    )
+                    if not live["response_matched"]:
+                        raise RuntimeError(
+                            f"live probe assistant response did not match {expected_response!r}"
+                        )
 
                 recorder.drain()
                 followup_message_id = await session.send(
@@ -1087,6 +1098,19 @@ def _error_detail(error: Exception) -> dict[str, str]:
         "type": type(error).__name__,
         "message": str(error),
     }
+
+
+def _response_matches(
+    events: list[dict[str, Any]],
+    expected: str,
+) -> bool:
+    for event in events:
+        if event.get("type") != SessionEventType.ASSISTANT_MESSAGE.value:
+            continue
+        data = event.get("data")
+        if isinstance(data, dict) and str(data.get("content", "")).strip() == expected:
+            return True
+    return False
 
 
 def _summarize_event_log(value: Any) -> dict[str, Any]:

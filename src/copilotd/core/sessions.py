@@ -6,14 +6,20 @@ import time
 import uuid
 from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass
 from enum import StrEnum
+from functools import partial
 from pathlib import Path
 from typing import Protocol
 
 from aiosqlite import Row
 
-from copilotd.core.bindings import SessionBinding, SessionBindingRepository
+from copilotd.core.bindings import (
+    BindingIntent,
+    SessionBinding,
+    SessionBindingRepository,
+)
 from copilotd.core.extensions import (
     ExtensionConfigFileSource,
     ExtensionConfigRepository,
@@ -27,6 +33,7 @@ from copilotd.core.projects import (
 )
 from copilotd.core.session_config import SessionConfigSnapshotError, SessionLaunchOptions
 from copilotd.core.session_runtime import (
+    ClosedSessionRequiresReactivation,
     RuntimeState,
     SessionAttachRejected,
     SessionAttachUnknown,
@@ -35,6 +42,10 @@ from copilotd.core.session_runtime import (
 from copilotd.storage.database import Database
 
 RuntimeFactory = Callable[[SessionBinding], SessionRuntime]
+_creation_admitted: ContextVar[bool] = ContextVar(
+    "copilotd_creation_admitted",
+    default=False,
+)
 
 
 class SessionRegistryNotAccepting(RuntimeError):
@@ -107,6 +118,12 @@ class SessionCreationUnknown(RuntimeError):
 class _SourceCreationLock:
     lock: asyncio.Lock
     users: int = 0
+
+
+@dataclass(slots=True)
+class _AttachmentTransition:
+    reactivate_requested: bool
+    task: asyncio.Task[SessionRuntime] | None = None
 
 
 class CreationIntentRepository:
@@ -349,6 +366,14 @@ class SessionRegistry:
         self._admission = asyncio.Condition()
         self._admitted_operations = 0
         self._mutation_lock = asyncio.Lock()
+        self._service_quiesced = False
+        self._service_quiesce_violations = 0
+        self._service_violation_callback: Callable[[str], None] | None = None
+        self._active_creations = 0
+        self._admission_condition = asyncio.Condition()
+        self._transition_lock = asyncio.Lock()
+        self._transitions: dict[str, _AttachmentTransition] = {}
+        self._transition_cleanup_tasks: set[asyncio.Task[None]] = set()
 
     def for_thread(self, thread_id: str) -> SessionRuntime | None:
         return self._runtimes.get(thread_id)
@@ -356,6 +381,7 @@ class SessionRegistry:
     def register(self, runtime: SessionRuntime) -> None:
         if not self._accepting:
             raise SessionRegistryNotAccepting("session registry is shutting down")
+        self._assert_registry_admission()
         self._register_admitted(runtime)
 
     def _register_admitted(self, runtime: SessionRuntime) -> None:
@@ -365,15 +391,162 @@ class SessionRegistry:
             raise RuntimeError(f"thread already has a SessionRuntime: {thread_id}")
         self._runtimes[thread_id] = runtime
 
+    def heartbeat_metrics(self) -> tuple[int, int, float | None]:
+        depth = 0
+        max_lag_ms = 0
+        last_callback_at: float | None = None
+        for runtime in self._runtimes.values():
+            inbox = runtime.inbox
+            if inbox is None:
+                continue
+            depth += inbox.size
+            max_lag_ms = max(max_lag_ms, inbox.lag_ms)
+            received_at = inbox.last_received_at
+            if received_at is not None:
+                last_callback_at = (
+                    received_at if last_callback_at is None else max(last_callback_at, received_at)
+                )
+        return depth, max_lag_ms, last_callback_at
+
     async def replace(self, binding: SessionBinding) -> SessionRuntime:
         async with self._admit():
             async with self._mutation_lock:
+                self._assert_registry_admission()
                 existing = self._runtimes.pop(binding.thread_id, None)
                 if existing is not None:
                     await existing.shutdown()
                 runtime = self._runtime_factory(binding)
                 self._register_admitted(runtime)
                 return runtime
+
+    async def ensure_attached(
+        self,
+        binding: SessionBinding,
+        *,
+        reactivate: bool = False,
+    ) -> SessionRuntime:
+        current = await self._bindings.by_thread(binding.thread_id)
+        if current is None:
+            raise RuntimeError("session binding disappeared before attach")
+        binding = current
+        if binding.binding_intent == BindingIntent.CLOSED and not reactivate:
+            raise ClosedSessionRequiresReactivation("closed session requires an explicit resume")
+        runtime = self.for_thread(binding.thread_id)
+        if (
+            runtime is not None
+            and runtime.state == RuntimeState.READY
+            and binding.binding_intent == BindingIntent.ACTIVE
+        ):
+            return runtime
+        for attempt in range(2):
+            async with self._transition_lock:
+                transition = self._transitions.get(binding.thread_id)
+                if (
+                    transition is not None
+                    and transition.task is not None
+                    and transition.task.done()
+                ):
+                    self._transitions.pop(binding.thread_id, None)
+                    transition = None
+                if transition is None:
+                    transition = _AttachmentTransition(
+                        reactivate_requested=reactivate,
+                    )
+                    transition.task = asyncio.create_task(
+                        self._ensure_attached_transition(
+                            binding,
+                            transition=transition,
+                        ),
+                        name=f"session-attach:{binding.thread_id}",
+                    )
+                    self._transitions[binding.thread_id] = transition
+                    transition.task.add_done_callback(
+                        partial(
+                            self._schedule_transition_cleanup,
+                            binding.thread_id,
+                            transition,
+                        )
+                    )
+                elif reactivate:
+                    transition.reactivate_requested = True
+                task = transition.task
+                assert task is not None
+            try:
+                return await asyncio.shield(task)
+            except ClosedSessionRequiresReactivation:
+                if not reactivate or attempt == 1:
+                    raise
+            finally:
+                if task.done():
+                    async with self._transition_lock:
+                        if self._transitions.get(binding.thread_id) is transition:
+                            self._transitions.pop(binding.thread_id, None)
+            binding = await self._bindings.by_thread(binding.thread_id) or binding
+        raise AssertionError("explicit reactivation retry did not settle")
+
+    def _schedule_transition_cleanup(
+        self,
+        thread_id: str,
+        transition: _AttachmentTransition,
+        task: asyncio.Task[SessionRuntime],
+    ) -> None:
+        if not task.cancelled():
+            task.exception()
+        cleanup = asyncio.create_task(
+            self._discard_completed_transition(
+                thread_id,
+                transition,
+                task,
+            ),
+            name=f"session-attach-cleanup:{thread_id}",
+        )
+        self._transition_cleanup_tasks.add(cleanup)
+        cleanup.add_done_callback(self._transition_cleanup_tasks.discard)
+
+    async def _discard_completed_transition(
+        self,
+        thread_id: str,
+        transition: _AttachmentTransition,
+        task: asyncio.Task[SessionRuntime],
+    ) -> None:
+        async with self._transition_lock:
+            if (
+                task.done()
+                and transition.task is task
+                and self._transitions.get(thread_id) is transition
+            ):
+                self._transitions.pop(thread_id, None)
+
+    async def _ensure_attached_transition(
+        self,
+        binding: SessionBinding,
+        *,
+        transition: _AttachmentTransition,
+    ) -> SessionRuntime:
+        async with self.creation_admission():
+            current = await self._bindings.by_thread(binding.thread_id)
+            if current is None:
+                raise RuntimeError("session binding disappeared during attach transition")
+            binding = current
+            if (
+                binding.binding_intent == BindingIntent.CLOSED
+                and not transition.reactivate_requested
+            ):
+                raise ClosedSessionRequiresReactivation(
+                    "closed session requires an explicit resume"
+                )
+            runtime = self.for_thread(binding.thread_id)
+            if runtime is None or runtime.state in {
+                RuntimeState.CLOSED,
+                RuntimeState.FENCED,
+                RuntimeState.RECOVERY_UNKNOWN,
+            }:
+                runtime = await self.replace(binding)
+            if runtime.state == RuntimeState.DETACHED:
+                await runtime.attach_resume(reactivate=transition.reactivate_requested)
+            if runtime.state != RuntimeState.READY:
+                raise RuntimeError(f"session attach settled in {runtime.state}")
+            return runtime
 
     async def eager_resume(self) -> dict[str, str]:
         failures: dict[str, str] = {}
@@ -396,6 +569,78 @@ class SessionRegistry:
             except SessionRegistryNotAccepting:
                 break
         return failures
+
+    async def begin_service_quiesce(
+        self,
+        on_violation: Callable[[str], None],
+        on_loss: Callable[[str], None],
+    ) -> None:
+        async with self._admission_condition:
+            self._service_quiesced = True
+            self._service_quiesce_violations = 0
+            self._service_violation_callback = on_violation
+            while self._active_creations:
+                await self._admission_condition.wait()
+        begun: list[SessionRuntime] = []
+        try:
+            for runtime in self._runtimes.values():
+                await runtime.begin_service_quiesce(
+                    on_violation,
+                    on_loss,
+                )
+                begun.append(runtime)
+        except BaseException:
+            for runtime in reversed(begun):
+                await runtime.end_service_quiesce()
+            raise
+
+    async def end_service_quiesce(self) -> None:
+        for runtime in self._runtimes.values():
+            await runtime.end_service_quiesce()
+        async with self._admission_condition:
+            self._service_quiesced = False
+            self._service_quiesce_violations = 0
+            self._service_violation_callback = None
+            self._admission_condition.notify_all()
+
+    async def drain_service_quiesce(self) -> None:
+        for runtime in self._runtimes.values():
+            await runtime.drain_service_quiesce()
+
+    def service_quiesce_metrics(self) -> tuple[int, int]:
+        depth = 0
+        violations = self._service_quiesce_violations
+        for runtime in self._runtimes.values():
+            runtime_depth, runtime_violations = runtime.service_quiesce_metrics()
+            depth += runtime_depth
+            violations += runtime_violations
+        return depth, violations
+
+    @asynccontextmanager
+    async def creation_admission(self):
+        async with self._admission_condition:
+            if self._service_quiesced:
+                self._record_registry_violation("session_creation")
+                raise RuntimeError("session creation is quiesced for service restart")
+            self._active_creations += 1
+        token = _creation_admitted.set(True)
+        try:
+            yield
+        finally:
+            _creation_admitted.reset(token)
+            async with self._admission_condition:
+                self._active_creations -= 1
+                self._admission_condition.notify_all()
+
+    def _assert_registry_admission(self) -> None:
+        if self._service_quiesced and not _creation_admitted.get():
+            self._record_registry_violation("runtime_registration")
+            raise RuntimeError("session runtime admission is quiesced for service restart")
+
+    def _record_registry_violation(self, source: str) -> None:
+        self._service_quiesce_violations += 1
+        if self._service_violation_callback is not None:
+            self._service_violation_callback(source)
 
     async def close_admission(self) -> None:
         async with self._admission:
@@ -477,28 +722,29 @@ class SessionCreationService:
         preallocated_session_id: str | None = None,
         worktree_intent_id: str | None = None,
     ) -> SessionRuntime:
-        draining = await self._intents.database.fetchone(
-            "SELECT value FROM global_config WHERE key = 'restart_draining'"
-        )
-        if draining is not None and draining["value"] == "1":
-            raise RuntimeError("copilotD is draining for restart")
-        source_key = (source_kind, source_id)
-        entry = await self._acquire_source_lock(source_key)
-        try:
-            return await self._create_from_source_locked(
-                channel_id=channel_id,
-                source_kind=source_kind,
-                source_id=source_id,
-                prompt=prompt,
-                thread_name=thread_name,
-                send_initial_prompt=send_initial_prompt,
-                project_snapshot=project_snapshot,
-                config_snapshot=config_snapshot,
-                preallocated_session_id=preallocated_session_id,
-                worktree_intent_id=worktree_intent_id,
+        async with self._sessions.creation_admission():
+            draining = await self._intents.database.fetchone(
+                "SELECT value FROM global_config WHERE key = 'restart_draining'"
             )
-        finally:
-            await self._release_source_lock(source_key, entry)
+            if draining is not None and draining["value"] == "1":
+                raise RuntimeError("copilotD is draining for restart")
+            source_key = (source_kind, source_id)
+            entry = await self._acquire_source_lock(source_key)
+            try:
+                return await self._create_from_source_locked(
+                    channel_id=channel_id,
+                    source_kind=source_kind,
+                    source_id=source_id,
+                    prompt=prompt,
+                    thread_name=thread_name,
+                    send_initial_prompt=send_initial_prompt,
+                    project_snapshot=project_snapshot,
+                    config_snapshot=config_snapshot,
+                    preallocated_session_id=preallocated_session_id,
+                    worktree_intent_id=worktree_intent_id,
+                )
+            finally:
+                await self._release_source_lock(source_key, entry)
 
     async def _create_from_source_locked(
         self,

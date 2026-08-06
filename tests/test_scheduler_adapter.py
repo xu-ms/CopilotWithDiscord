@@ -197,7 +197,7 @@ async def test_closed_scheduler_queue_reattaches_and_redrives_after_startup_leas
             WHERE thread_id = 'thread-1'
             """
         )
-        lease_expiry = time.time() + 0.1
+        lease_expiry = time.time() + 4
         await database.execute(
             """
             INSERT INTO session_owner_leases(

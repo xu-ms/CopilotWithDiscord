@@ -3,16 +3,33 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import os
 import platform
 import sys
-from importlib.metadata import version
+from dataclasses import asdict
+from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
 from typing import Any
 
-from copilotd.config import load_settings
+from pydantic import ValidationError
+
+from copilotd import __version__
+from copilotd.config import LegacyLayoutAdoption, Settings, load_settings
 from copilotd.discord_app import run_discord_bot
 from copilotd.logging import configure_logging
-from copilotd.ops.service import ServiceManager, status_dict
+from copilotd.ops.contracts import (
+    EXPECTED_RUNTIME_VERSION,
+    EXPECTED_SDK_VERSION,
+    LATEST_MIGRATION_VERSION,
+    SERVICE_STATUS_SCHEMA_VERSION,
+)
+from copilotd.ops.preflight import PreflightFailed, SetupPreflight
+from copilotd.ops.service import (
+    RestartBlocked,
+    ServiceError,
+    ServiceManager,
+    status_dict,
+)
 from copilotd.sdk.acceptance import ACCEPTANCE_SUITES, RealNativeAcceptance
 from copilotd.sdk.bridge import CopilotBridge
 from copilotd.sdk.capabilities import CapabilityRegistry
@@ -20,9 +37,22 @@ from copilotd.sdk.extension_probe import ExtensionAcceptanceProbe
 from copilotd.sdk.probe import SdkProbe, _to_jsonable
 from copilotd.storage.database import Database
 
+CLI_SCHEMA_VERSION = 1
+
+
+class JsonArgumentParser(argparse.ArgumentParser):
+    def error(self, message: str) -> None:
+        _print_error(
+            code="usage_error",
+            message=message,
+            exit_code=2,
+        )
+        raise SystemExit(2)
+
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(prog="copilotd")
+    parser = JsonArgumentParser(prog="copilotd")
+    parser.add_argument("--version", action="version", version=f"copilotd {__version__}")
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     subparsers.add_parser("db-init", help="create or migrate the durable SQLite database")
@@ -43,6 +73,7 @@ def build_parser() -> argparse.ArgumentParser:
     service_commands.add_parser("uninstall", help="unregister services but retain state")
     service_commands.add_parser("watchdog", help="run one protected-work-aware health check")
     service_commands.add_parser("logs", help="show service log paths")
+    service_commands.add_parser("runtime", help=argparse.SUPPRESS)
 
     probe = subparsers.add_parser("sdk-probe", help="record the Copilot SDK capability matrix")
     probe.add_argument("--live", action="store_true", help="start the runtime and run a live turn")
@@ -57,6 +88,10 @@ def build_parser() -> argparse.ArgumentParser:
     )
     probe.add_argument("--timeout", type=float, default=120)
     probe.add_argument("--keep-session", action="store_true")
+    probe.add_argument(
+        "--expect-response",
+        help="fail unless a live assistant message exactly matches this text",
+    )
     probe.add_argument(
         "--probe-native-schedule",
         action="store_true",
@@ -99,20 +134,47 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-async def run_command(args: argparse.Namespace) -> int:
-    settings = load_settings()
-    installing = args.command == "setup" or (
+async def run_command(
+    args: argparse.Namespace,
+    *,
+    settings: Settings | None = None,
+    preflight: SetupPreflight | None = None,
+    manager: ServiceManager | None = None,
+) -> int:
+    settings = load_settings() if settings is None else settings
+    install_request = args.command == "setup" or (
         args.command == "service" and args.service_command == "install"
     )
-    if installing and settings.discord_token is None:
+    if install_request and settings.discord_token is None:
         raise ValueError("COPILOTD_DISCORD_TOKEN is required for service installation")
+    replacement_command = (args.command == "run" and getattr(args, "foreground", False)) or (
+        args.command == "service" and args.service_command == "runtime"
+    )
+    legacy_layout_pending = settings.windows_legacy_layout_pending()
+    managed_replacement = (
+        legacy_layout_pending
+        and replacement_command
+        and settings.windows_migration_replacement_authorized()
+    )
+    if legacy_layout_pending and not install_request and not managed_replacement:
+        raise ValueError(
+            "legacy Windows state requires `copilotd setup` or "
+            "`copilotd service install` before this command"
+        )
     settings.ensure_directories()
-    configure_logging(settings.log_level)
+    configure_logging(
+        settings.log_level,
+        settings.log_dir,
+        stderr=os.environ.get("COPILOTD_MANAGED_SERVICE") != "1",
+    )
 
     if args.command == "db-init":
         async with Database(settings.database_path):
             pass
-        _print_json({"database": str(settings.database_path), "migrated": True})
+        _print_success(
+            "db-init",
+            {"database": str(settings.database_path), "migrated": True},
+        )
         return 0
 
     if args.command == "doctor":
@@ -130,8 +192,9 @@ async def run_command(args: argparse.Namespace) -> int:
             migrations = await database.fetchall(
                 "SELECT version, name, applied_at FROM schema_migrations ORDER BY version"
             )
+        latest_migration = max((int(row["version"]) for row in migrations), default=0)
         result = {
-            "copilotd_version": version("copilotd"),
+            "copilotd_version": _installed_version("copilotd", __version__),
             "sdk_version": version("github-copilot-sdk"),
             "python": platform.python_version(),
             "data_dir": str(settings.data_dir),
@@ -140,61 +203,139 @@ async def run_command(args: argparse.Namespace) -> int:
             "migrations": [dict(row) for row in migrations],
             "runtime": runtime_identity,
             "sdk": capabilities.to_dict(),
+            "gates": {
+                "sdk_version": EXPECTED_SDK_VERSION,
+                "runtime_version": EXPECTED_RUNTIME_VERSION,
+                "service_status_schema": SERVICE_STATUS_SCHEMA_VERSION,
+                "latest_migration": LATEST_MIGRATION_VERSION,
+                "migration_gate_ok": latest_migration == LATEST_MIGRATION_VERSION,
+            },
         }
-        _print_json(result)
+        _print_success("doctor", result)
         return 0
 
     if args.command == "run":
         if not args.foreground:
             raise ValueError("use `copilotd run --foreground`; service mode is installed by setup")
+        if settings.discord_token is None:
+            raise ValueError("COPILOTD_DISCORD_TOKEN is required")
         restart_requested = await run_discord_bot(settings)
         return 75 if restart_requested else 0
 
     if args.command == "setup":
-        manager = ServiceManager(settings)
-        await asyncio.to_thread(manager.install)
-        deadline = asyncio.get_running_loop().time() + 45
-        while True:
-            status = await asyncio.to_thread(manager.status)
-            if (
-                status.bot_loaded
-                and status.watchdog_loaded
-                and status.heartbeat_age_seconds is not None
-                and status.heartbeat_age_seconds <= 45
-            ):
-                _print_json(status_dict(status))
-                return 0
-            if asyncio.get_running_loop().time() >= deadline:
-                raise RuntimeError(
-                    "service installed but did not produce a healthy heartbeat within 45 seconds"
-                )
-            await asyncio.sleep(1)
+        selected_preflight = preflight or SetupPreflight(settings)
+        report = await selected_preflight.run()
+        report.require_success()
+        selected_manager = manager or ServiceManager(settings)
+        adoption = await _adopt_windows_legacy_layout(
+            settings,
+            selected_manager,
+        )
+        try:
+            async with Database(settings.database_path):
+                pass
+            receipt = await asyncio.to_thread(selected_manager.install)
+            status = await asyncio.to_thread(
+                selected_manager.verify_post_install,
+                receipt,
+            )
+        except BaseException:
+            if adoption is not None:
+                adoption.abandon()
+            raise
+        if adoption is not None:
+            adoption.complete()
+        _print_success(
+            "setup",
+            {
+                "preflight": report.as_dict(),
+                "install": asdict(receipt),
+                "status": status_dict(status),
+            },
+        )
+        return 0
 
     if args.command == "service":
-        manager = ServiceManager(settings)
+        selected_manager = manager or ServiceManager(settings)
         if args.service_command == "install":
-            await asyncio.to_thread(manager.install)
-            _print_json(status_dict(await asyncio.to_thread(manager.status)))
-        elif args.service_command == "status":
-            _print_json(status_dict(await asyncio.to_thread(manager.status)))
-        elif args.service_command == "restart":
-            await asyncio.to_thread(manager.restart, force=args.force)
-            _print_json({"restarted": True, "force": args.force})
-        elif args.service_command == "uninstall":
-            await asyncio.to_thread(manager.uninstall)
-            _print_json({"uninstalled": True, "state_retained": str(settings.data_dir)})
-        elif args.service_command == "watchdog":
-            outcome = await asyncio.to_thread(manager.watchdog)
-            _print_json({"watchdog": outcome})
-        elif args.service_command == "logs":
-            _print_json(
-                {
-                    "app": str(settings.log_dir / "copilotd.log"),
-                    "boot": str(settings.log_dir / "boot.log"),
-                    "watchdog": str(settings.log_dir / "watchdog.log"),
-                    "alerts": str(settings.log_dir / "alerts.log"),
-                }
+            selected_preflight = preflight or SetupPreflight(settings)
+            report = await selected_preflight.run()
+            report.require_success()
+            adoption = await _adopt_windows_legacy_layout(
+                settings,
+                selected_manager,
             )
+            try:
+                async with Database(settings.database_path):
+                    pass
+                receipt = await asyncio.to_thread(selected_manager.install)
+                status = await asyncio.to_thread(
+                    selected_manager.verify_post_install,
+                    receipt,
+                )
+            except BaseException:
+                if adoption is not None:
+                    adoption.abandon()
+                raise
+            if adoption is not None:
+                adoption.complete()
+            _print_success(
+                "service.install",
+                {
+                    "preflight": report.as_dict(),
+                    "install": asdict(receipt),
+                    "status": status_dict(status),
+                },
+            )
+        elif args.service_command == "status":
+            async with Database(settings.database_path):
+                pass
+            _print_success(
+                "service.status",
+                status_dict(await asyncio.to_thread(selected_manager.status)),
+            )
+        elif args.service_command == "restart":
+            async with Database(settings.database_path):
+                pass
+            receipt = await asyncio.to_thread(
+                selected_manager.restart,
+                force=args.force,
+            )
+            status = await asyncio.to_thread(
+                selected_manager.verify_restart,
+                receipt,
+            )
+            _print_success(
+                "service.restart",
+                {
+                    "restarted": True,
+                    "force": args.force,
+                    "restart": asdict(receipt),
+                    "status": status_dict(status),
+                },
+            )
+        elif args.service_command == "uninstall":
+            await asyncio.to_thread(selected_manager.uninstall)
+            _print_success(
+                "service.uninstall",
+                {
+                    "uninstalled": True,
+                    "state_retained": [str(path) for path in settings.durable_directories],
+                    "logs_retained": str(settings.log_dir),
+                },
+            )
+        elif args.service_command == "watchdog":
+            async with Database(settings.database_path):
+                pass
+            outcome = await asyncio.to_thread(selected_manager.watchdog)
+            _print_success("service.watchdog", {"watchdog": outcome})
+        elif args.service_command == "logs":
+            _print_success(
+                "service.logs",
+                {name: str(path) for name, path in settings.log_paths.items()},
+            )
+        elif args.service_command == "runtime":
+            await asyncio.to_thread(selected_manager.run_runtime)
         else:
             raise AssertionError(f"unhandled service command: {args.service_command}")
         return 0
@@ -221,10 +362,11 @@ async def run_command(args: argparse.Namespace) -> int:
                 keep_session=args.keep_session,
                 probe_native_schedule=args.probe_native_schedule,
                 probe_sidecar=args.probe_sidecar,
+                expected_response=args.expect_response,
             )
         else:
             result = SdkProbe(settings).static_matrix()
-        _print_json(result)
+        _print_success("sdk-probe", result)
         return 0
 
     if args.command == "native-acceptance":
@@ -243,16 +385,112 @@ async def run_command(args: argparse.Namespace) -> int:
     raise AssertionError(f"unhandled command: {args.command}")
 
 
-def main() -> None:
+async def _adopt_windows_legacy_layout(
+    settings: Settings,
+    manager: ServiceManager,
+) -> LegacyLayoutAdoption | None:
+    if manager.platform != "win32":
+        return None
+    adoption = await asyncio.to_thread(
+        settings.adopt_legacy_windows_layout,
+        platform_name="win32",
+        service_quiescer=manager.quiesce_windows_legacy_layout,
+        managed_replacement_token_hash=manager.handoff_token_hash,
+    )
+    settings.ensure_directories()
+    return adoption
+
+
+def main(argv: list[str] | None = None) -> None:
     parser = build_parser()
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
     try:
         exit_code = asyncio.run(run_command(args))
     except KeyboardInterrupt:
         exit_code = 130
+    except ValidationError as error:
+        _print_error("configuration_error", str(error), exit_code=2)
+        exit_code = 2
+    except ValueError as error:
+        _print_error("configuration_error", str(error), exit_code=2)
+        exit_code = 2
+    except OSError as error:
+        _print_error("configuration_error", str(error), exit_code=2)
+        exit_code = 2
+    except PreflightFailed as error:
+        _print_error(
+            "preflight_failed",
+            str(error),
+            exit_code=3,
+            detail={"failures": error.failures},
+        )
+        exit_code = 3
+    except RestartBlocked as error:
+        _print_error(
+            "restart_blocked",
+            str(error),
+            exit_code=4,
+            detail={"blockers": list(error.blockers)},
+        )
+        exit_code = 4
+    except ServiceError as error:
+        _print_error("service_error", str(error), exit_code=4)
+        exit_code = 4
+    except Exception as error:
+        _print_error(
+            "internal_error",
+            f"{type(error).__name__}: {error}",
+            exit_code=70,
+        )
+        exit_code = 70
     raise SystemExit(exit_code)
 
 
 def _print_json(value: Any) -> None:
     json.dump(value, sys.stdout, default=_to_jsonable, ensure_ascii=False, indent=2, sort_keys=True)
     sys.stdout.write("\n")
+
+
+def _print_success(command: str, result: Any) -> None:
+    _print_json(
+        {
+            "schema_version": CLI_SCHEMA_VERSION,
+            "ok": True,
+            "command": command,
+            "result": result,
+        }
+    )
+
+
+def _print_error(
+    code: str,
+    message: str,
+    *,
+    exit_code: int,
+    detail: dict[str, Any] | None = None,
+) -> None:
+    payload = {
+        "schema_version": CLI_SCHEMA_VERSION,
+        "ok": False,
+        "error": {
+            "code": code,
+            "message": message,
+            "exit_code": exit_code,
+            "detail": detail or {},
+        },
+    }
+    json.dump(
+        payload,
+        sys.stderr,
+        ensure_ascii=False,
+        indent=2,
+        sort_keys=True,
+    )
+    sys.stderr.write("\n")
+
+
+def _installed_version(package: str, fallback: str) -> str:
+    try:
+        return version(package)
+    except PackageNotFoundError:
+        return fallback

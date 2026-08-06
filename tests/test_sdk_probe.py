@@ -12,7 +12,7 @@ from copilotd.sdk.capabilities import (
     CapabilityRegistry,
     RuntimeIdentityMismatch,
 )
-from copilotd.sdk.probe import CapabilityResult, SdkProbe
+from copilotd.sdk.probe import CapabilityResult, SdkProbe, _response_matches
 from copilotd.storage.database import Database
 
 
@@ -373,3 +373,19 @@ def test_model_mutation_requires_round_trip_not_read_only_snapshot(
     exercised = probe._live_matrix(live, fixture, fixture_hash)
     assert exercised["capabilities"]["model_config"]["supported"] is True
     assert exercised["capabilities"]["model_config"]["evidence_kind"] == "live-model-mutation-probe"
+
+
+def test_live_probe_expected_response_requires_exact_assistant_message() -> None:
+    events = [
+        {
+            "type": "assistant.message",
+            "data": {"content": "COPILOTD_ACCEPTANCE_AUTH_OK"},
+        }
+    ]
+
+    assert _response_matches(events, "COPILOTD_ACCEPTANCE_AUTH_OK")
+    assert not _response_matches(events, "WRONG_ACCOUNT_SENTINEL")
+    assert not _response_matches(
+        [{"type": "session.idle", "data": {}}],
+        "COPILOTD_ACCEPTANCE_AUTH_OK",
+    )

@@ -4,6 +4,7 @@ import asyncio
 import hashlib
 import io
 import json
+import os
 import re
 import time
 import uuid
@@ -72,7 +73,6 @@ from copilotd.core.scheduler import SchedulerRepository, SchedulerWorker
 from copilotd.core.scheduler_adapter import ApplicationSchedulerAdapter
 from copilotd.core.session_runtime import (
     DetachBlocked,
-    RuntimeState,
     SessionNotReady,
     SessionRuntime,
 )
@@ -88,7 +88,9 @@ from copilotd.core.supervisor import ExecutionStallMonitor
 from copilotd.core.task_registry import TaskRegistry
 from copilotd.core.worktrees import SessionCreationWorktreeAdapter, WorktreeManager
 from copilotd.discord_native import NativeDiscordRegistrar
+from copilotd.ops.control import ServiceControlWorker
 from copilotd.ops.heartbeat import HeartbeatWriter
+from copilotd.ops.service import ServiceManager, SqliteRestartCoordinator
 from copilotd.ops.surface import LocalOpsSurface
 from copilotd.render.diffs import render_diff
 from copilotd.render.markdown import (
@@ -138,6 +140,8 @@ class CopilotDiscordBot(commands.Bot):
         discord_connector: aiohttp.BaseConnector | None = None,
         discord_http_trace: aiohttp.TraceConfig | None = None,
     ) -> None:
+        if os.environ.get("COPILOTD_MANAGED_SERVICE") == "1":
+            settings = settings.ensure_service_handoff_token()
         intents = discord.Intents.default()
         intents.message_content = True
         super().__init__(
@@ -166,7 +170,14 @@ class CopilotDiscordBot(commands.Bot):
                 runtime_serialized_frame_max_bytes=(settings.attachment_runtime_frame_max_bytes),
             ),
         )
-        self.heartbeat = HeartbeatWriter(self.database, settings.heartbeat_path)
+        self.heartbeat = HeartbeatWriter(
+            self.database,
+            settings.heartbeat_path,
+            interval_seconds=settings.heartbeat_interval_seconds,
+            gateway_down_seconds=settings.gateway_down_restart_seconds,
+            resume_suppression_seconds=settings.resume_suppression_seconds,
+            metrics_provider=self._heartbeat_metrics,
+        )
         self.ops_service = ops_service or LocalOpsSurface(self.database, settings)
         self.session_naming_adapter = session_naming_adapter
         self.model_summary_adapter = model_summary_adapter
@@ -204,8 +215,41 @@ class CopilotDiscordBot(commands.Bot):
         self._accepting_handlers = True
         self._admitted_handlers: set[asyncio.Task[Any]] = set()
 
+    def _heartbeat_metrics(self) -> tuple[int, int, float | None]:
+        if self.sessions is None:
+            return 0, 0, None
+        return self.sessions.heartbeat_metrics()
+
     async def setup_hook(self) -> None:
         await self.database.open()
+        coordinator = SqliteRestartCoordinator(self.settings.database_path)
+        recovery_fence = await asyncio.to_thread(coordinator.recovery_fence)
+        if recovery_fence is not None:
+            manager = ServiceManager(self.settings)
+            replacement_is_managed = await asyncio.to_thread(
+                manager.replacement_is_managed,
+                pid=os.getpid(),
+                process_started_at=self.heartbeat.process_started_at,
+            )
+            old_process_alive = await asyncio.to_thread(
+                manager.process_identity_alive,
+                pid=recovery_fence.expected_pid,
+                process_started_at=(recovery_fence.expected_process_started_at),
+            )
+            await asyncio.to_thread(
+                coordinator.recover_for_replacement,
+                replacement_pid=os.getpid(),
+                replacement_generation=self.heartbeat.process_generation,
+                replacement_process_started_at=(self.heartbeat.process_started_at),
+                manager_handoff_token=(
+                    None
+                    if self.settings.service_handoff_token is None
+                    else self.settings.service_handoff_token.get_secret_value()
+                ),
+                replacement_is_managed=replacement_is_managed,
+                old_process_identity_alive=old_process_alive,
+                now=time.time(),
+            )
         await garbage_collect_tool_spills(self.database)
         self.projects = ProjectRegistry(
             self.database,
@@ -321,6 +365,26 @@ class CopilotDiscordBot(commands.Bot):
             self.heartbeat.run(),
             name="copilotd-heartbeat",
             source="heartbeat",
+        )
+        self._tasks.create(
+            self._runtime_health_loop(),
+            name="copilotd-runtime-health",
+            source="runtime-health",
+        )
+        self._tasks.create(
+            ServiceControlWorker(
+                self.database,
+                self._require_sessions(),
+                process_generation=self.heartbeat.process_generation,
+                process_started_at=self.heartbeat.process_started_at,
+                handoff_token=(
+                    ""
+                    if self.settings.service_handoff_token is None
+                    else self.settings.service_handoff_token.get_secret_value()
+                ),
+            ).run(),
+            name="copilotd-service-control",
+            source="service-control",
         )
         self._register_application_commands()
         if self.settings.discord_guild_id is not None:
@@ -449,6 +513,24 @@ class CopilotDiscordBot(commands.Bot):
                 return
             finally:
                 self._tasks.errors.task_done()
+
+    async def _runtime_health_loop(self) -> None:
+        while True:
+            try:
+                async with asyncio.timeout(10):
+                    await self.bridge.healthcheck()
+            except asyncio.CancelledError:
+                raise
+            except Exception as error:
+                self.heartbeat.runtime_state = "down"
+                await logger.aerror(
+                    "runtime_healthcheck_failed",
+                    error_type=type(error).__name__,
+                    error=str(error),
+                )
+            else:
+                self.heartbeat.runtime_state = "ready"
+            await asyncio.sleep(self.settings.heartbeat_interval_seconds)
 
     async def on_ready(self) -> None:
         self.heartbeat.set_gateway("ready")
@@ -727,10 +809,8 @@ class CopilotDiscordBot(commands.Bot):
                         "in this original thread."
                     )
                 return
-            runtime = self._require_sessions().for_thread(str(message.channel.id))
-            if runtime is None:
-                runtime = await self._require_sessions().replace(binding)
-                await runtime.attach_resume()
+            sessions = self._require_sessions()
+            runtime = await sessions.ensure_attached(binding)
             try:
                 prepared = await self.attachment_service.prepare(
                     source_kind="discord-message",
@@ -1877,17 +1957,10 @@ class CopilotDiscordBot(commands.Bot):
                     binding = await self._require_bindings().by_session(session_id)
                     if binding is None:
                         raise CDSessionNotFoundError("the requested copilotD session is unknown")
-                runtime = self._require_sessions().for_thread(binding.thread_id)
-                if runtime is None or runtime.state in {
-                    RuntimeState.CLOSED,
-                    RuntimeState.FENCED,
-                    RuntimeState.RECOVERY_UNKNOWN,
-                }:
-                    runtime = await self._require_sessions().replace(binding)
-                if runtime.state == RuntimeState.DETACHED:
-                    await runtime.attach_resume(
-                        reactivate=binding.binding_intent == BindingIntent.CLOSED
-                    )
+                await self._require_sessions().ensure_attached(
+                    binding,
+                    reactivate=True,
+                )
                 thread = await self._thread_for_session(binding.sdk_session_id)
                 return f"Session resumed in its original thread: {thread.mention}"
 
@@ -3209,11 +3282,8 @@ class CopilotDiscordBot(commands.Bot):
         binding = await self._interaction_binding(interaction)
         if binding.binding_intent != BindingIntent.ACTIVE:
             raise ValueError("this Copilot session is closed; use /session resume first")
-        runtime = self._require_sessions().for_thread(binding.thread_id)
-        if runtime is None:
-            runtime = await self._require_sessions().replace(binding)
-            await runtime.attach_resume()
-        return runtime
+        sessions = self._require_sessions()
+        return await sessions.ensure_attached(binding)
 
     async def _deferred_set_skill_dir(self, channel_id: str, **kwargs: Any) -> Any:
         return await self._require_projects().set_skill_dir(channel_id, **kwargs)

@@ -21,9 +21,10 @@ The implementation follows [`docs/copilotD-detailed-design.md`](docs/copilotD-de
 - Durable SQLite event journal with strict UUID SDK IDs, app FIFO, reducer-owned
   operation receipts, liveness leases, epoch/watermark snapshots, render outbox,
   and attachment manifests.
-- Thirty-seven applied migrations use unique reserved namespaces: Foundation
+- Forty-two applied migrations use unique reserved namespaces: Foundation
   `0001`-`0009`, Native `0010`-`0014`, Protocol `0015`-`0019`, Scheduler
-  `0020`-`0028`, Protocol compatibility `0029`, and Discord `0030`-`0037`.
+  `0020`-`0028`, Protocol compatibility `0029`, and Discord `0030`-`0037`;
+  `0038`-`0039` are reserved and Operations uses forward-only `0040`-`0044`.
 - Durable event-log backfill with cursor rebase/gap diagnostics and ingress-overflow
   freeze/backfill/generation replacement; unrecoverable ephemeral gaps remain
   explicitly outcome-unknown.
@@ -65,8 +66,9 @@ The implementation follows [`docs/copilotD-detailed-design.md`](docs/copilotD-de
 - Intent-first `/project worktree` lifecycle with exact Git ownership checks, durable
   compensation/recovery, reference blockers, and capability-gated history forks.
 - Default always-on definitions for macOS LaunchAgents and Windows Scheduled Tasks,
-  plus a protected-work-aware watchdog, shared task-failure supervision, and a
-  non-destructive active-execution SUSPECT monitor.
+  effective-definition/PID verification, protected-work-aware restart coordination,
+  sleep/resume suppression, durable restart-storm alerts, shared task-failure
+  supervision, and a non-destructive active-execution SUSPECT monitor.
 
 Unsupported native capabilities fail closed and remain unregistered. The verified
 sidecar does not retain sessions after client transport disconnect, so the current
@@ -88,18 +90,22 @@ export COPILOTD_DISCORD_OPERATOR_IDS='123456789012345678'
 .venv/bin/copilotd setup
 ```
 
-`setup` fails before installation unless the Discord token is present. It writes configured
-secrets to the private service credential file (mode `0600` on macOS; current-user ACL on
-Windows). Service definitions, generated runners, logs, and acceptance evidence never
-contain token values. A runtime-reported managed policy/request fails deterministically
-with `UserNotAvailable` and never creates a Discord permission UI; ordinary typed requests
-remain owner-fenced `ApproveOnce`. For local development, use the explicit foreground
-entrypoint:
+`setup` first verifies the Discord token with Discord, starts the pinned Copilot runtime
+to validate authentication/version/model access using either the existing local Copilot
+CLI login or an optional `COPILOTD_GITHUB_TOKEN`, checks timezone data and private
+directories, then installs and starts the current platform definitions. It succeeds only
+after a new heartbeat reports `gateway_state=ready`, `runtime_state=ready`, and a PID that
+matches the effective OS-managed process. Configured credentials are stored in a private
+per-user service secret file (mode `0600` on macOS; current-user ACL on Windows) and are
+never embedded in a plist, Task XML, PowerShell script, log, or acceptance artifact.
+A runtime-reported managed policy/request fails deterministically with
+`UserNotAvailable` and never creates a Discord permission UI; ordinary typed requests
+remain owner-fenced `ApproveOnce`.
 
 `COPILOTD_DISCORD_OPERATOR_IDS` is a comma-separated allowlist. Administrative
 `/project` (including MCP, variables, agents, and worktrees) and runtime restart
 commands fail closed when the caller is not listed. Discord never reveals stored
-project variable values.
+project variable values. For local development, use the explicit foreground entrypoint:
 
 ```bash
 .venv/bin/copilotd run --foreground
@@ -112,6 +118,7 @@ Useful operations:
 .venv/bin/copilotd service logs
 .venv/bin/copilotd service restart
 .venv/bin/copilotd doctor
+.venv/bin/copilotd-ops-audit --repository .
 ```
 
 Project extension configuration is loaded from the immutable project snapshot at
@@ -124,6 +131,19 @@ publishes a new generation and performs a fenced same-session reattach.
 SDK 1.0.8 does not invoke `on_user_prompt_transformed` or `on_agent_stop`; copilotD does
 not register those silent callbacks. Durable `session.idle` events provide the supported
 agent-loop observation instead.
+
+`service restart` fails closed when the heartbeat is missing, malformed, stale, or does
+not match the OS PID. A normal restart also refuses active current-generation leases,
+queued work, remote exposure, native schedules, and trigger windows. `--force` first
+durably quiesces all create/resume/send/callback/internal producers, atomically compares
+producer and event-journal epochs, marks only true in-flight outcomes unknown, and commits
+owner-lease handoff before replacing the process. Once force preparation is durable, a
+later failure terminates fail-closed and cannot reopen the old process.
+
+The control protocol is versioned. Upgrades stop and verify a legacy worker before issuing
+a v2 fence; replacement adoption requires the private manager handoff token plus OS
+PID/start identity. Inbox overflow and accounting failures leave durable watermark files
+that block restart, while rollback is bounded and persistently retried.
 
 ## Development
 
@@ -176,6 +196,34 @@ evidence, and removes every temporary session:
 .venv/bin/copilotd sdk-probe --live-extensions
 ```
 
-Runtime data, cache, and logs use platform-specific user directories. Override them
-with `COPILOTD_DATA_DIR`, `COPILOTD_CACHE_DIR`, and `COPILOTD_LOG_DIR`. A guild-scoped
+Runtime paths are fixed by platform:
+
+| Platform | State | Heartbeat | Logs |
+|---|---|---|---|
+| macOS | `~/Library/Application Support/copilotd/` | `~/Library/Caches/copilotd/heartbeat.json` | `~/Library/Logs/copilotd/` |
+| Windows | `%LOCALAPPDATA%\copilotd\state\` | `%LOCALAPPDATA%\copilotd\cache\heartbeat.json` | `%LOCALAPPDATA%\copilotd\logs\` |
+
+On first Windows upgrade, only `setup` or `service install` may adopt a legacy
+`%LOCALAPPDATA%\copilotD\` state tree. The installer disables service triggers, proves the
+old process trees exited, holds SQLite exclusion while staging a durable unknown-outcome
+handoff, atomically swaps the tree, and verifies the reinstalled tasks. Other commands
+refuse to create split state until that migration completes; only the expected OS-managed
+bot/runtime carrying the journal-bound handoff token may start for install verification.
+
+`copilotd.log` is rotating JSON (10 MiB with seven backups); `boot.log`,
+`watchdog.log`, and `alerts.log` have distinct destinations. Override paths with
+`COPILOTD_DATA_DIR`, `COPILOTD_CACHE_DIR`, and `COPILOTD_LOG_DIR`. A guild-scoped
 development command sync can be selected with `COPILOTD_DISCORD_GUILD_ID`.
+
+The opt-in hardware/credential lanes are `scripts/acceptance-macos.sh` and
+`scripts/acceptance-windows.ps1`. They intentionally exit with failure when selected on
+the wrong OS or without required credentials/system facilities; they never silently
+skip. The workflow uses dedicated interactive self-hosted runners whose user profile is
+already authenticated to Copilot, runs a live SDK preflight, and requires permission to
+schedule a wake and put the machine to sleep. `scripts/package-smoke.sh` builds and
+installs both the wheel and sdist in isolated environments.
+
+The macOS lane refuses to overwrite pre-existing copilotD LaunchAgents, validates a real
+restart plus post-wake soak, scans its work artifacts for the Discord token, and always
+uninstalls its test service. Set `COPILOTD_ACCEPTANCE_EVIDENCE_DIR` to retain its
+permission-restricted sanitized JSON summary.

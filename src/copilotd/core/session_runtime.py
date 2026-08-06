@@ -4,6 +4,7 @@ import asyncio
 import hashlib
 import inspect
 import json
+import logging
 import time
 import uuid
 from collections.abc import Awaitable, Callable, Mapping
@@ -84,6 +85,7 @@ from copilotd.storage.leases import (
     MUTATION_HEADROOM_SECONDS,
     OWNER_LEASE_RENEW_SECONDS,
     FenceLost,
+    OwnerConflict,
     OwnerLease,
     OwnerLeaseStore,
 )
@@ -96,6 +98,7 @@ OAuthAuthorizer = Callable[
     Awaitable[Mapping[str, Any]],
 ]
 T = TypeVar("T")
+_LOGGER = logging.getLogger(__name__)
 
 
 class SessionHandle(Protocol):
@@ -362,6 +365,10 @@ class SubmissionClaimDeferred(OperationDeferred):
     pass
 
 
+class ClosedSessionRequiresReactivation(SessionNotReady):
+    pass
+
+
 class DetachBlocked(RuntimeError):
     def __init__(self, blockers: list[str]) -> None:
         self.blockers = blockers
@@ -458,6 +465,10 @@ class SessionRuntime:
         self._send_admissions_drained = asyncio.Event()
         self._send_admissions_drained.set()
         self._accepting_sends = False
+        self._service_quiesced = False
+        self._service_quiesce_violations = 0
+        self._service_quiesce_violation_callback: Callable[[str], None] | None = None
+        self._service_producers_stopped = False
 
     @property
     def handle(self) -> SessionHandle | None:
@@ -468,11 +479,10 @@ class SessionRuntime:
         return self._inbox
 
     async def attach_create(self) -> None:
-        try:
-            await self._attach(create=True, continue_pending_work=False)
-        except BaseException as error:
-            await self._cleanup_failed_attach(error)
-            raise
+        await self._attach_guarded(
+            create=True,
+            continue_pending_work=False,
+        )
 
     async def attach_resume(
         self,
@@ -480,16 +490,22 @@ class SessionRuntime:
         reactivate: bool = False,
         continue_pending_work: bool = False,
     ) -> None:
-        if reactivate and self.binding.binding_intent == BindingIntent.CLOSED:
-            self.binding = await self._bindings.activate(self.binding)
-        try:
-            await self._attach(
-                create=False,
-                continue_pending_work=continue_pending_work,
-            )
-        except BaseException as error:
-            await self._cleanup_failed_attach(error)
-            raise
+        current = await self._bindings.by_thread(self.binding.thread_id)
+        if current is None:
+            raise SessionNotReady("session binding disappeared before attach")
+        self.binding = current
+        if self.binding.binding_intent == BindingIntent.CLOSED:
+            scheduler_attachment = self.binding.attachment_reason == "scheduler_run"
+            if not reactivate and not scheduler_attachment:
+                raise ClosedSessionRequiresReactivation(
+                    "closed session requires an explicit resume"
+                )
+            if reactivate:
+                self.binding = await self._bindings.activate(self.binding)
+        await self._attach_guarded(
+            create=False,
+            continue_pending_work=continue_pending_work,
+        )
 
     async def send(
         self,
@@ -701,7 +717,7 @@ class SessionRuntime:
 
     async def _dispatch_next_queued(self) -> tuple[str, str] | None:
         async with self._queue_dispatch_lock:
-            if self.state != RuntimeState.READY:
+            if self.state != RuntimeState.READY or self._service_quiesced:
                 return None
             try:
                 readiness = await self._refresh_readiness()
@@ -1260,9 +1276,23 @@ class SessionRuntime:
         self,
         *,
         allow_attaching: bool = False,
-    ) -> dict[str, Any]:
+        only_if_pending: bool = False,
+    ) -> dict[str, Any] | None:
         await self._assert_owned_handle(allow_attaching=allow_attaching)
         async with self._snapshot_query_lock:
+            if only_if_pending:
+                rows = await self._database.fetchall(
+                    """
+                    SELECT requested_epoch, applied_epoch
+                    FROM reconciliation_state
+                    WHERE sdk_session_id = ? AND topic IN ('activity', 'queue')
+                    """,
+                    (self.binding.sdk_session_id,),
+                )
+                if rows and all(
+                    int(row["requested_epoch"]) <= int(row["applied_epoch"]) for row in rows
+                ):
+                    return None
             activity_epoch = await self._request_snapshot("activity")
             queue_epoch = await self._request_snapshot("queue")
             inbox = self._require_inbox()
@@ -1710,25 +1740,65 @@ class SessionRuntime:
             if self._task_reconcile_stop.is_set():
                 return
             self._task_reconcile_requested.clear()
+            if not await self._task_reconcile_owner_is_current():
+                return
             await self._require_inbox().join()
+            if not await self._task_reconcile_owner_is_current():
+                return
             topics = set(self._snapshot_topics)
             self._snapshot_topics.clear()
+            force_tasks = not topics
+            if not topics:
+                topics.add("tasks")
             if "tasks" in topics:
-                await self._query_snapshot_topic("tasks")
+                await self._query_snapshot_topic(
+                    "tasks",
+                    require_current_owner=True,
+                    only_if_pending=not force_tasks,
+                )
+                if not await self._task_reconcile_owner_is_current():
+                    return
                 topics.remove("tasks")
             if {"activity", "queue"}.intersection(topics):
                 try:
-                    await self._refresh_readiness()
+                    await self._refresh_readiness(only_if_pending=True)
                 except asyncio.CancelledError:
                     raise
                 except Exception:
-                    pass
+                    if not await self._task_reconcile_owner_is_current():
+                        return
+                if not await self._task_reconcile_owner_is_current():
+                    return
                 topics.difference_update({"activity", "queue"})
             for topic in sorted(topics):
-                await self._query_snapshot_topic(topic)
+                await self._query_snapshot_topic(
+                    topic,
+                    require_current_owner=True,
+                    only_if_pending=True,
+                )
+                if not await self._task_reconcile_owner_is_current():
+                    return
 
-    async def _query_snapshot_topic(self, topic: str) -> None:
+    async def _task_reconcile_owner_is_current(self) -> bool:
+        if self.state != RuntimeState.READY:
+            return False
+        if await self._is_current_owner():
+            return True
+        self.state = RuntimeState.FENCED
+        if self._mailbox is not None:
+            self._mailbox.freeze()
+        return False
+
+    async def _query_snapshot_topic(
+        self,
+        topic: str,
+        *,
+        require_current_owner: bool = False,
+        only_if_pending: bool = False,
+    ) -> None:
         async with self._snapshot_query_lock:
+            if require_current_owner and not await self._task_reconcile_owner_is_current():
+                return
             state = await self._database.fetchone(
                 """
                 SELECT requested_epoch, applied_epoch
@@ -1737,6 +1807,12 @@ class SessionRuntime:
                 """,
                 (self.binding.sdk_session_id, topic),
             )
+            if (
+                only_if_pending
+                and state is not None
+                and int(state["requested_epoch"]) <= int(state["applied_epoch"])
+            ):
+                return
             if state is None or int(state["requested_epoch"]) <= int(state["applied_epoch"]):
                 epoch = await self._request_snapshot(topic)
             else:
@@ -1806,6 +1882,8 @@ class SessionRuntime:
             except asyncio.CancelledError:
                 raise
             except Exception as error:
+                if require_current_owner and not await self._task_reconcile_owner_is_current():
+                    return
                 await self._commit_snapshot_failure(
                     topic,
                     epoch,
@@ -1813,6 +1891,8 @@ class SessionRuntime:
                     inbox.last_sdk_receive_seq,
                     error,
                 )
+                return
+            if require_current_owner and not await self._task_reconcile_owner_is_current():
                 return
             await self._commit_snapshot(
                 topic,
@@ -2261,6 +2341,103 @@ class SessionRuntime:
                 state="confirmed" if accepted else "rejected",
                 error_code=None if accepted else "already_resolved_or_expired",
             )
+
+    async def begin_service_quiesce(
+        self,
+        on_violation: Callable[[str], None],
+        on_loss: Callable[[str], None],
+    ) -> None:
+        async with self._admission_lock:
+            self._service_quiesced = True
+            self._service_quiesce_violations = 0
+            self._service_quiesce_violation_callback = on_violation
+            self._accepting_sends = False
+            if self._inbox is not None:
+                self._inbox.set_quiesce_observers(
+                    self._record_service_quiesce_producer,
+                    on_loss,
+                )
+                overflow = self._inbox.overflow
+                if overflow is not None and overflow.lost_count:
+                    on_loss("pre_quiesce_inbox_overflow")
+        if self._mailbox is not None:
+            await self._mailbox.pause_admission()
+            await self._mailbox.wait_idle()
+        async with self._queue_dispatch_lock:
+            pass
+        await self._stop_service_quiesce_producers()
+        await self.drain_service_quiesce()
+
+    async def end_service_quiesce(self) -> None:
+        if self._inbox is not None:
+            self._inbox.set_quiesce_observers(None, None)
+        await self._restart_service_quiesce_producers()
+        if self._mailbox is not None:
+            await self._mailbox.resume_admission()
+        async with self._admission_lock:
+            self._service_quiesced = False
+            self._service_quiesce_violations = 0
+            self._service_quiesce_violation_callback = None
+            if self.state == RuntimeState.READY:
+                self._accepting_sends = True
+
+    async def drain_service_quiesce(self) -> None:
+        if self._inbox is not None:
+            await self._inbox.join()
+
+    def service_quiesce_metrics(self) -> tuple[int, int]:
+        depth = 0 if self._inbox is None else self._inbox.size
+        return depth, self._service_quiesce_violations
+
+    def _record_service_quiesce_producer(self, source: str) -> None:
+        self._service_quiesce_violations += 1
+        callback = self._service_quiesce_violation_callback
+        if callback is not None:
+            callback(source)
+
+    async def _stop_service_quiesce_producers(self) -> None:
+        if self._service_producers_stopped:
+            return
+        self._queue_stop.set()
+        self._task_reconcile_stop.set()
+        self._task_reconcile_requested.set()
+        self._permission_reconcile_stop.set()
+        self._permission_reconcile_requested.set()
+        self._renewal_stop.set()
+        tasks = (
+            self._queue_task,
+            self._task_reconcile_task,
+            self._permission_reconcile_task,
+            self._renewal_task,
+        )
+        for task in tasks:
+            if task is None:
+                continue
+            task.cancel()
+        active = [task for task in tasks if task is not None]
+        try:
+            if active:
+                async with asyncio.timeout(self._shutdown_timeout_seconds):
+                    await asyncio.gather(*active, return_exceptions=True)
+        finally:
+            self._queue_task = None
+            self._task_reconcile_task = None
+            self._permission_reconcile_task = None
+            self._renewal_task = None
+            self._service_producers_stopped = True
+
+    async def _restart_service_quiesce_producers(self) -> None:
+        if not self._service_producers_stopped:
+            return
+        if self.state == RuntimeState.READY:
+            self._start_runtime_producers()
+        elif self.state == RuntimeState.DEGRADED and self._lease is not None:
+            self._renewal_stop.clear()
+            self._renewal_task = self._tasks.create(
+                self._renew_owner(),
+                name=f"owner-renew:{self.binding.sdk_session_id}",
+            )
+        self._service_producers_stopped = False
 
     async def set_mode(
         self,
@@ -4918,7 +5095,9 @@ class SessionRuntime:
         queued = await self._database.fetchone(
             """
             SELECT COUNT(*) FROM message_queue
-            WHERE thread_id = ? AND state NOT IN ('cancelled', 'submitted', 'failed')
+            WHERE thread_id = ? AND state NOT IN (
+              'cancelled', 'submitted', 'submitted_unknown', 'failed'
+            )
             """,
             (binding.thread_id,),
         )
@@ -5225,43 +5404,60 @@ class SessionRuntime:
                     lease=self._lease,
                 )
             else:
-                self._lease = await self._owner_leases.acquire(
-                    self.binding.sdk_session_id,
-                    self._owner_id,
-                )
-                self.binding = await self._bindings.begin_attachment(
-                    thread_id=self.binding.thread_id,
-                    lease=self._lease,
-                    state=(AttachmentState.CREATING if create else AttachmentState.RESUMING),
-                )
-            if (
-                not create
-                and self._capabilities is not None
-                and self._capabilities.supports("sessions_check_in_use")
-            ):
                 try:
-                    in_use = await self._bridge.check_session_in_use(self.binding.sdk_session_id)
-                except Exception as error:
-                    self.binding = await self._bindings.mark_attach_unknown(self.binding)
-                    lease = self._lease
-                    self._lease = None
-                    if lease is not None:
-                        await self._owner_leases.release(lease)
-                    self.state = RuntimeState.RECOVERY_UNKNOWN
-                    raise SessionAttachUnknown(
-                        "runtime in-use probe failed before resume"
-                    ) from error
-                if in_use:
-                    self.binding = await self._bindings.mark_owner_conflict(self.binding)
-                    lease = self._lease
-                    self._lease = None
-                    if lease is not None:
-                        await self._owner_leases.release(lease)
-                    self.state = RuntimeState.DETACHED
-                    raise SessionOwnerConflict(
-                        f"session {self.binding.sdk_session_id} is held by another process"
+                    self._lease = await self._acquire_owner_for_attachment()
+                except BaseException:
+                    cleanup = asyncio.create_task(
+                        self._release_unassigned_owner_lease(),
+                        name=f"owner-acquire-cleanup:{self.binding.sdk_session_id}",
                     )
-            self._start_components()
+                    try:
+                        await asyncio.shield(cleanup)
+                    except asyncio.CancelledError:
+                        await cleanup
+                    self.state = RuntimeState.DETACHED
+                    raise
+            try:
+                if not reuse_owner:
+                    self.binding = await self._bindings.begin_attachment(
+                        thread_id=self.binding.thread_id,
+                        lease=self._lease,
+                        state=(AttachmentState.CREATING if create else AttachmentState.RESUMING),
+                    )
+                if (
+                    not create
+                    and self._capabilities is not None
+                    and self._capabilities.supports("sessions_check_in_use")
+                ):
+                    try:
+                        in_use = await self._bridge.check_session_in_use(
+                            self.binding.sdk_session_id
+                        )
+                    except Exception as error:
+                        self.binding = await self._bindings.mark_attach_unknown(self.binding)
+                        lease = self._lease
+                        self._lease = None
+                        if lease is not None:
+                            await self._owner_leases.release(lease)
+                        self.state = RuntimeState.RECOVERY_UNKNOWN
+                        raise SessionAttachUnknown(
+                            "runtime in-use probe failed before resume"
+                        ) from error
+                    if in_use:
+                        self.binding = await self._bindings.mark_owner_conflict(self.binding)
+                        lease = self._lease
+                        self._lease = None
+                        if lease is not None:
+                            await self._owner_leases.release(lease)
+                        self.state = RuntimeState.DETACHED
+                        raise SessionOwnerConflict(
+                            f"session {self.binding.sdk_session_id} is held by another process"
+                        )
+                self._start_components()
+            except BaseException:
+                await self._shield_attachment_cleanup(mark_unknown=True)
+                raise
+
             try:
                 raw_options = self.binding.session_config_snapshot.get(
                     "session_options",
@@ -5309,18 +5505,10 @@ class SessionRuntime:
                     )
                 if handle.session_id != self.binding.sdk_session_id:
                     raise RuntimeError("SDK returned a different session ID")
-            except Exception as error:
-                self.binding = await self._bindings.mark_attach_unknown(self.binding)
-                self.state = RuntimeState.RECOVERY_UNKNOWN
-                try:
-                    await self._stop_components(release_owner=True)
-                except Exception as cleanup_error:
-                    raise SessionAttachUnknown(
-                        f"session {self.binding.sdk_session_id} attachment and cleanup are unknown"
-                    ) from ExceptionGroup(
-                        "attachment failed and component cleanup failed",
-                        [error, cleanup_error],
-                    )
+            except BaseException as error:
+                await self._shield_attachment_cleanup(mark_unknown=True)
+                if isinstance(error, asyncio.CancelledError):
+                    raise
                 raise SessionAttachUnknown(
                     f"session {self.binding.sdk_session_id} attachment is unknown"
                 ) from error
@@ -5465,30 +5653,221 @@ class SessionRuntime:
             self.state = RuntimeState.READY
             async with self._admission_lock:
                 self._accepting_sends = True
-            self._queue_stop.clear()
-            self._queue_task = self._tasks.create(
-                self._queue_pump(),
-                name=f"queue-pump:{self.binding.sdk_session_id}",
-                source="queue-pump",
-                session_id=self.binding.sdk_session_id,
-                runtime_generation=self.binding.runtime_generation,
+            self._start_runtime_producers()
+
+    async def _attach_guarded(
+        self,
+        *,
+        create: bool,
+        continue_pending_work: bool,
+    ) -> None:
+        try:
+            await self._attach(
+                create=create,
+                continue_pending_work=continue_pending_work,
             )
-            self._task_reconcile_stop.clear()
-            self._task_reconcile_task = self._tasks.create(
-                self._task_reconcile_loop(),
-                name=f"task-reconcile:{self.binding.sdk_session_id}",
-                source="snapshot-reconciler",
-                session_id=self.binding.sdk_session_id,
-                runtime_generation=self.binding.runtime_generation,
+        except asyncio.CancelledError:
+            if (
+                self._handle is not None or self._lease is not None or self._inbox is not None
+            ) and self.state not in {
+                RuntimeState.DETACHED,
+                RuntimeState.RECOVERY_UNKNOWN,
+            }:
+                await self._shield_cancelled_attachment_cleanup()
+            raise
+        except BaseException as error:
+            await self._cleanup_failed_attach(error)
+            raise
+
+    async def _shield_cancelled_attachment_cleanup(self) -> None:
+        cleanup = asyncio.create_task(
+            self._cleanup_cancelled_attachment(),
+            name=f"attach-cancel-cleanup:{self.binding.sdk_session_id}",
+        )
+        try:
+            await asyncio.shield(cleanup)
+        except asyncio.CancelledError:
+            await cleanup
+        except BaseException:
+            self.state = RuntimeState.RECOVERY_UNKNOWN
+            _LOGGER.exception(
+                "cancelled attachment cleanup failed for %s",
+                self.binding.sdk_session_id,
             )
-            self._permission_reconcile_stop.clear()
-            self._permission_reconcile_task = self._tasks.create(
-                self._permission_reconcile_loop(),
-                name=f"permission-reconcile:{self.binding.sdk_session_id}",
-                source="permission-reconciler",
-                session_id=self.binding.sdk_session_id,
-                runtime_generation=self.binding.runtime_generation,
+
+    async def _cleanup_cancelled_attachment(self) -> None:
+        disconnected = False
+        durable_state_set = False
+        lease = self._lease
+        fence_token = lease.fence_token if lease is not None else self.binding.owner_fence_token
+        try:
+            if self._handle is not None:
+                try:
+                    await self._sdk_call(self._handle.disconnect())
+                except BaseException:
+                    disconnected = False
+                else:
+                    disconnected = True
+            current = await self._bindings.by_thread(self.binding.thread_id)
+            if (
+                current is not None
+                and current.sdk_session_id == self.binding.sdk_session_id
+                and fence_token is not None
+                and current.owner_fence_token == fence_token
+            ):
+                if disconnected and current.attachment_state in {
+                    AttachmentState.CREATING,
+                    AttachmentState.RESUMING,
+                    AttachmentState.ATTACHED,
+                }:
+                    self.binding = await self._bindings.reset_cancelled_attachment(current)
+                    self.state = RuntimeState.DETACHED
+                    durable_state_set = True
+                elif current.attachment_state in {
+                    AttachmentState.CREATING,
+                    AttachmentState.RESUMING,
+                    AttachmentState.ATTACHED,
+                    AttachmentState.DISCONNECTING,
+                }:
+                    self.binding = await self._bindings.mark_recovery_unknown(current)
+                    self.state = RuntimeState.RECOVERY_UNKNOWN
+                    durable_state_set = True
+        except BaseException:
+            self.state = RuntimeState.RECOVERY_UNKNOWN
+            try:
+                async with self._database.transaction() as connection:
+                    cursor = await connection.execute(
+                        """
+                        UPDATE session_bindings
+                        SET attachment_state = 'recovery_unknown',
+                            attachment_reason = 'attach_cancel_cleanup_failed',
+                            permission_posture = 'unknown',
+                            permission_verified_at = NULL,
+                            updated_at = ?, row_version = row_version + 1
+                        WHERE thread_id = ? AND sdk_session_id = ?
+                          AND owner_fence_token = ?
+                          AND attachment_state IN (
+                            'creating', 'resuming', 'attached', 'disconnecting'
+                          )
+                        """,
+                        (
+                            time.time(),
+                            self.binding.thread_id,
+                            self.binding.sdk_session_id,
+                            fence_token,
+                        ),
+                    )
+                    durable_state_set = cursor.rowcount == 1
+                    await cursor.close()
+            except BaseException:
+                _LOGGER.exception(
+                    "could not mark cancelled attachment unknown for %s",
+                    self.binding.sdk_session_id,
+                )
+            _LOGGER.exception(
+                "attachment cancellation reconciliation failed for %s",
+                self.binding.sdk_session_id,
             )
+        finally:
+            if not durable_state_set:
+                self.state = RuntimeState.RECOVERY_UNKNOWN
+            try:
+                await self._stop_components(release_owner=True)
+            except BaseException:
+                self.state = RuntimeState.RECOVERY_UNKNOWN
+                _LOGGER.exception(
+                    "attachment cancellation component release failed for %s",
+                    self.binding.sdk_session_id,
+                )
+                if lease is not None:
+                    try:
+                        await self._owner_leases.release(lease)
+                    except BaseException:
+                        _LOGGER.exception(
+                            "attachment cancellation owner release failed for %s",
+                            self.binding.sdk_session_id,
+                        )
+        if disconnected and durable_state_set and (self.state != RuntimeState.RECOVERY_UNKNOWN):
+            self.state = RuntimeState.DETACHED
+
+    async def _shield_attachment_cleanup(self, *, mark_unknown: bool) -> None:
+        cleanup = asyncio.create_task(
+            self._cleanup_attachment_failure(mark_unknown=mark_unknown),
+            name=f"attach-cleanup:{self.binding.sdk_session_id}",
+        )
+        try:
+            await asyncio.shield(cleanup)
+        except asyncio.CancelledError:
+            await cleanup
+
+    async def _cleanup_attachment_failure(self, *, mark_unknown: bool) -> None:
+        lease = self._lease
+        if mark_unknown:
+            self.state = RuntimeState.RECOVERY_UNKNOWN
+        try:
+            if self._inbox is not None or self._lease is not None:
+                await self._stop_components(release_owner=True)
+        except BaseException:
+            self.state = RuntimeState.RECOVERY_UNKNOWN
+            _LOGGER.exception(
+                "attachment failure component cleanup failed for %s",
+                self.binding.sdk_session_id,
+            )
+            if lease is not None:
+                try:
+                    await self._owner_leases.release(lease)
+                except BaseException:
+                    _LOGGER.exception(
+                        "attachment failure owner release failed for %s",
+                        self.binding.sdk_session_id,
+                    )
+        if mark_unknown:
+            try:
+                fence_token = (
+                    lease.fence_token if lease is not None else self.binding.owner_fence_token
+                )
+                current = await self._bindings.by_thread(self.binding.thread_id)
+                if (
+                    current is not None
+                    and current.sdk_session_id == self.binding.sdk_session_id
+                    and fence_token is not None
+                    and current.owner_fence_token == fence_token
+                    and current.attachment_state
+                    in {AttachmentState.CREATING, AttachmentState.RESUMING}
+                ):
+                    self.binding = await self._bindings.mark_attach_unknown(current)
+            except BaseException:
+                _LOGGER.exception(
+                    "attachment failure recovery marking failed for %s",
+                    self.binding.sdk_session_id,
+                )
+        elif self.state != RuntimeState.RECOVERY_UNKNOWN:
+            self.state = RuntimeState.DETACHED
+
+    async def _acquire_owner_for_attachment(self) -> OwnerLease:
+        error: OwnerConflict | None = None
+        for attempt in range(5):
+            try:
+                return await self._owner_leases.acquire(
+                    self.binding.sdk_session_id,
+                    self._owner_id,
+                )
+            except OwnerConflict as conflict:
+                error = conflict
+                if attempt == 4:
+                    break
+                await asyncio.sleep(0.1 * (attempt + 1))
+        assert error is not None
+        raise error
+
+    async def _release_unassigned_owner_lease(self) -> None:
+        current = await self._owner_leases.current(self.binding.sdk_session_id)
+        if current is None or current.owner_id != self._owner_id:
+            return
+        try:
+            await self._owner_leases.release(current)
+        except FenceLost:
+            return
 
     def _start_components(self) -> None:
         self._loop = asyncio.get_running_loop()
@@ -5869,6 +6248,45 @@ class SessionRuntime:
                 f"{type(original_error).__name__} was followed by cleanup failure"
             ) from ExceptionGroup("attachment cleanup failed", errors)
 
+    def _start_runtime_producers(self) -> None:
+        self._queue_stop.clear()
+        self._queue_task = self._tasks.create(
+            self._queue_pump(),
+            name=f"queue-pump:{self.binding.sdk_session_id}",
+            source="queue-pump",
+            session_id=self.binding.sdk_session_id,
+            runtime_generation=self.binding.runtime_generation,
+        )
+        self._task_reconcile_stop.clear()
+        if self._snapshot_topics:
+            self._task_reconcile_requested.set()
+        else:
+            self._task_reconcile_requested.clear()
+        self._task_reconcile_task = self._tasks.create(
+            self._task_reconcile_loop(),
+            name=f"task-reconcile:{self.binding.sdk_session_id}",
+            source="snapshot-reconciler",
+            session_id=self.binding.sdk_session_id,
+            runtime_generation=self.binding.runtime_generation,
+        )
+        self._permission_reconcile_stop.clear()
+        self._permission_reconcile_task = self._tasks.create(
+            self._permission_reconcile_loop(),
+            name=f"permission-reconcile:{self.binding.sdk_session_id}",
+            source="permission-reconciler",
+            session_id=self.binding.sdk_session_id,
+            runtime_generation=self.binding.runtime_generation,
+        )
+        if self._renewal_task is None:
+            self._renewal_stop.clear()
+            self._renewal_task = self._tasks.create(
+                self._renew_owner(),
+                name=f"owner-renew:{self.binding.sdk_session_id}",
+                source="owner-renewal",
+                session_id=self.binding.sdk_session_id,
+                runtime_generation=self.binding.runtime_generation,
+            )
+
     async def _renew_owner(self) -> None:
         while not self._renewal_stop.is_set():
             try:
@@ -6114,6 +6532,8 @@ class SessionRuntime:
         allow_closing: bool = False,
         allow_attaching: bool = False,
     ) -> None:
+        if self._service_quiesced and not allow_closing:
+            raise SessionNotReady("session admission is quiesced for service restart")
         allowed = {RuntimeState.READY}
         if allow_closing:
             allowed.add(RuntimeState.CLOSING)
@@ -6243,7 +6663,8 @@ class SessionRuntime:
                 else:
                     await self._reducer.stop(timeout_seconds=self._shutdown_timeout_seconds)
             except Exception as error:
-                errors.append(error)
+                if self.state != RuntimeState.FENCED:
+                    errors.append(error)
             self._reducer = None
         self._inbox = None
         self._ingress = None
@@ -6263,7 +6684,8 @@ class SessionRuntime:
                 if not emergency:
                     errors.append(error)
             except Exception as error:
-                errors.append(error)
+                if not (self.state == RuntimeState.FENCED and isinstance(error, FenceLost)):
+                    errors.append(error)
         if errors:
             raise ExceptionGroup("session component shutdown failed", errors)
 

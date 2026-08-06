@@ -50,6 +50,7 @@ from copilotd.core.extensions import (
 from copilotd.core.mailbox import OperationAmbiguous, OperationRejected
 from copilotd.core.projects import ProjectRegistry
 from copilotd.core.session_runtime import (
+    ClosedSessionRequiresReactivation,
     DetachBlocked,
     RuntimeState,
     SessionAttachUnknown,
@@ -58,6 +59,7 @@ from copilotd.core.session_runtime import (
     SessionRuntime,
     SubmissionClaimDeferred,
 )
+from copilotd.core.sessions import SessionRegistry
 from copilotd.sdk.bridge import EventLogBatch, PermissionPostureError
 from copilotd.sdk.capabilities import CapabilityRegistry
 from copilotd.sdk.native import NativeCommandDefinition
@@ -4512,12 +4514,36 @@ async def test_busy_runtime_keeps_durable_fifo_and_dispatches_only_the_head(
             "prompt": "first queued prompt",
             "state": "local_queued",
         }
+        await database.execute(
+            """
+            UPDATE liveness_leases
+            SET state = 'orphaned',
+                runtime_generation = runtime_generation - 1,
+                owner_fence_token = owner_fence_token - 1,
+                released_at = refreshed_at
+            WHERE kind = 'submission' AND source_id = ?
+            """,
+            (queued_id,),
+        )
 
         bridge.processing = False
         dispatched = await runtime._dispatch_next_queued()
         assert dispatched is not None
         assert dispatched[0] == queued_id
         assert [item[0] for item in bridge.handle.sent] == ["first queued prompt"]
+        reactivated = await database.fetchone(
+            """
+            SELECT state, runtime_generation, owner_fence_token
+            FROM liveness_leases
+            WHERE kind = 'submission' AND source_id = ? AND state = 'active'
+            """,
+            (queued_id,),
+        )
+        assert dict(reactivated) == {
+            "state": "active",
+            "runtime_generation": runtime.binding.runtime_generation,
+            "owner_fence_token": runtime.binding.owner_fence_token,
+        }
         accepted_id = dispatched[1]
 
         second_id = await runtime.send(
@@ -4579,3 +4605,826 @@ async def test_busy_runtime_keeps_durable_fifo_and_dispatches_only_the_head(
         bridge.ingress(_event(SessionIdleData(), SessionEventType.SESSION_IDLE))
         await runtime.inbox.join()
         await runtime.close(idempotency_key="close-queue")
+
+
+@pytest.mark.asyncio
+async def test_owner_acquisition_conflict_retries_and_resets_attaching_state(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    session_id = str(uuid4())
+    async with Database(tmp_path / "owner-conflict.sqlite3") as database:
+        bindings = SessionBindingRepository(database)
+        binding = await bindings.create(
+            thread_id="thread-owner-conflict",
+            sdk_session_id=session_id,
+            cwd_snapshot=tmp_path,
+            project_source="implicit-home",
+        )
+        store = OwnerLeaseStore(database)
+        calls = 0
+
+        async def conflict(*_args: Any, **_kwargs: Any) -> None:
+            nonlocal calls
+            calls += 1
+            raise OwnerConflict("old owner still active")
+
+        async def no_wait(_delay: float) -> None:
+            return
+
+        monkeypatch.setattr(store, "acquire", conflict)
+        monkeypatch.setattr(
+            "copilotd.core.session_runtime.asyncio.sleep",
+            no_wait,
+        )
+        runtime = SessionRuntime(
+            database=database,
+            bridge=FakeBridge(session_id),
+            bindings=bindings,
+            owner_leases=store,
+            owner_id="replacement-owner",
+            binding=binding,
+        )
+
+        with pytest.raises(OwnerConflict):
+            await runtime.attach_resume()
+
+        assert calls == 5
+        assert runtime.state == RuntimeState.DETACHED
+        assert runtime.handle is None
+        assert runtime.inbox is None
+
+
+@pytest.mark.asyncio
+async def test_owner_acquisition_retry_can_attach_after_handoff(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    session_id = str(uuid4())
+    async with Database(tmp_path / "owner-handoff-retry.sqlite3") as database:
+        bindings = SessionBindingRepository(database)
+        binding = await bindings.create(
+            thread_id="thread-owner-handoff-retry",
+            sdk_session_id=session_id,
+            cwd_snapshot=tmp_path,
+            project_source="implicit-home",
+        )
+        store = OwnerLeaseStore(database)
+        acquire = store.acquire
+        calls = 0
+
+        async def transient_conflict(*args: Any, **kwargs: Any):
+            nonlocal calls
+            calls += 1
+            if calls < 3:
+                raise OwnerConflict("handoff not committed yet")
+            return await acquire(*args, **kwargs)
+
+        async def no_wait(_delay: float) -> None:
+            return
+
+        monkeypatch.setattr(store, "acquire", transient_conflict)
+        monkeypatch.setattr(
+            "copilotd.core.session_runtime.asyncio.sleep",
+            no_wait,
+        )
+        runtime = SessionRuntime(
+            database=database,
+            bridge=FakeBridge(session_id),
+            bindings=bindings,
+            owner_leases=store,
+            owner_id="replacement-owner",
+            binding=binding,
+        )
+
+        await runtime.attach_resume()
+
+        assert calls == 3
+        assert runtime.state == RuntimeState.READY
+        await runtime.close(idempotency_key="close-owner-handoff-retry")
+
+
+@pytest.mark.asyncio
+async def test_attach_cancellation_during_owner_acquire_resets_state(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    session_id = str(uuid4())
+    async with Database(tmp_path / "attach-cancel-owner.sqlite3") as database:
+        bindings = SessionBindingRepository(database)
+        binding = await bindings.create(
+            thread_id="thread-attach-cancel-owner",
+            sdk_session_id=session_id,
+            cwd_snapshot=tmp_path,
+            project_source="implicit-home",
+        )
+        store = OwnerLeaseStore(database)
+        started = asyncio.Event()
+        never = asyncio.Event()
+
+        async def blocked_acquire(*_args: Any, **_kwargs: Any):
+            started.set()
+            await never.wait()
+
+        monkeypatch.setattr(store, "acquire", blocked_acquire)
+        runtime = SessionRuntime(
+            database=database,
+            bridge=FakeBridge(session_id),
+            bindings=bindings,
+            owner_leases=store,
+            owner_id="cancelled-owner",
+            binding=binding,
+        )
+        attach = asyncio.create_task(runtime.attach_resume())
+        await started.wait()
+        attach.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await attach
+
+        assert runtime.state == RuntimeState.DETACHED
+        assert await store.current(session_id) is None
+
+
+@pytest.mark.asyncio
+async def test_attach_cancellation_after_begin_uses_acquired_owner_fence(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    session_id = str(uuid4())
+    async with Database(tmp_path / "attach-cancel-begin.sqlite3") as database:
+        bindings = SessionBindingRepository(database)
+        binding = await bindings.create(
+            thread_id="thread-attach-cancel-begin",
+            sdk_session_id=session_id,
+            cwd_snapshot=tmp_path,
+            project_source="implicit-home",
+        )
+        original_begin = bindings.begin_attachment
+        committed = asyncio.Event()
+        never = asyncio.Event()
+
+        async def committed_then_blocked(**kwargs: Any):
+            result = await original_begin(**kwargs)
+            committed.set()
+            await never.wait()
+            return result
+
+        monkeypatch.setattr(
+            bindings,
+            "begin_attachment",
+            committed_then_blocked,
+        )
+        store = OwnerLeaseStore(database)
+        runtime = SessionRuntime(
+            database=database,
+            bridge=FakeBridge(session_id),
+            bindings=bindings,
+            owner_leases=store,
+            owner_id="cancelled-begin-owner",
+            binding=binding,
+        )
+
+        attach = asyncio.create_task(runtime.attach_resume())
+        await committed.wait()
+        attach.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await attach
+
+        recovered = await bindings.by_thread(binding.thread_id)
+        owner = await store.current(session_id)
+        assert recovered is not None
+        assert recovered.runtime_generation == 1
+        assert recovered.owner_fence_token is not None
+        assert recovered.attachment_state == AttachmentState.RECOVERY_UNKNOWN
+        assert recovered.permission_posture == PermissionPosture.UNKNOWN
+        assert runtime.state == RuntimeState.RECOVERY_UNKNOWN
+        assert runtime.handle is None
+        assert runtime.inbox is None
+        assert owner is not None and owner.expires_at <= time.time()
+
+
+@pytest.mark.asyncio
+async def test_early_attach_recovery_db_error_still_releases_owner(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    session_id = str(uuid4())
+    async with Database(tmp_path / "attach-cleanup-db-error.sqlite3") as database:
+        bindings = SessionBindingRepository(database)
+        binding = await bindings.create(
+            thread_id="thread-attach-cleanup-db-error",
+            sdk_session_id=session_id,
+            cwd_snapshot=tmp_path,
+            project_source="implicit-home",
+        )
+        bridge = FakeBridge(session_id)
+        cleanup_started = False
+        original_by_thread = bindings.by_thread
+
+        async def failed_resume(**_kwargs: Any):
+            nonlocal cleanup_started
+            cleanup_started = True
+            raise RuntimeError("simulated SDK resume failure")
+
+        async def failing_cleanup_read(thread_id: str):
+            if cleanup_started:
+                raise RuntimeError("simulated cleanup database failure")
+            return await original_by_thread(thread_id)
+
+        monkeypatch.setattr(bridge, "resume_session", failed_resume)
+        monkeypatch.setattr(bindings, "by_thread", failing_cleanup_read)
+        store = OwnerLeaseStore(database)
+        runtime = SessionRuntime(
+            database=database,
+            bridge=bridge,
+            bindings=bindings,
+            owner_leases=store,
+            owner_id="cleanup-db-error-owner",
+            binding=binding,
+        )
+
+        with pytest.raises(SessionAttachUnknown, match="attachment is unknown"):
+            await runtime.attach_resume()
+
+        owner = await store.current(session_id)
+        assert runtime.state == RuntimeState.RECOVERY_UNKNOWN
+        assert runtime.handle is None
+        assert runtime.inbox is None
+        assert runtime._lease is None
+        assert owner is not None and owner.expires_at <= time.time()
+
+
+@pytest.mark.asyncio
+async def test_attach_cancellation_during_resume_releases_owner_and_recovers(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    session_id = str(uuid4())
+    async with Database(tmp_path / "attach-cancel-resume.sqlite3") as database:
+        bindings = SessionBindingRepository(database)
+        binding = await bindings.create(
+            thread_id="thread-attach-cancel-resume",
+            sdk_session_id=session_id,
+            cwd_snapshot=tmp_path,
+            project_source="implicit-home",
+        )
+        bridge = FakeBridge(session_id)
+        started = asyncio.Event()
+        never = asyncio.Event()
+
+        async def blocked_resume(**_kwargs: Any):
+            started.set()
+            await never.wait()
+
+        monkeypatch.setattr(bridge, "resume_session", blocked_resume)
+        store = OwnerLeaseStore(database)
+        runtime = SessionRuntime(
+            database=database,
+            bridge=bridge,
+            bindings=bindings,
+            owner_leases=store,
+            owner_id="cancelled-resume-owner",
+            binding=binding,
+        )
+        attach = asyncio.create_task(runtime.attach_resume())
+        await started.wait()
+        attach.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await attach
+
+        recovered = await bindings.by_thread(binding.thread_id)
+        owner = await store.current(session_id)
+        assert runtime.state == RuntimeState.RECOVERY_UNKNOWN
+        assert recovered is not None
+        assert recovered.attachment_state == AttachmentState.RECOVERY_UNKNOWN
+        assert owner is not None and owner.expires_at <= time.time()
+        assert runtime.inbox is None
+
+
+@pytest.mark.asyncio
+async def test_attach_cancellation_after_handle_disconnects_and_resets_binding(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    session_id = str(uuid4())
+    async with Database(tmp_path / "attach-cancel-handle.sqlite3") as database:
+        bindings = SessionBindingRepository(database)
+        binding = await bindings.create(
+            thread_id="thread-attach-cancel-handle",
+            sdk_session_id=session_id,
+            cwd_snapshot=tmp_path,
+            project_source="implicit-home",
+        )
+        bridge = FakeBridge(session_id)
+        entered = asyncio.Event()
+        never = asyncio.Event()
+
+        async def blocked_allow_all(_handle: FakeHandle) -> object:
+            entered.set()
+            await never.wait()
+            return object()
+
+        monkeypatch.setattr(bridge, "ensure_allow_all", blocked_allow_all)
+        store = OwnerLeaseStore(database)
+        runtime = SessionRuntime(
+            database=database,
+            bridge=bridge,
+            bindings=bindings,
+            owner_leases=store,
+            owner_id="cancelled-handle-owner",
+            binding=binding,
+        )
+        attach = asyncio.create_task(runtime.attach_resume())
+        await entered.wait()
+        attach.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await attach
+
+        recovered = await bindings.by_thread(binding.thread_id)
+        owner = await store.current(session_id)
+        assert bridge.handle.disconnect_calls == 1
+        assert recovered is not None
+        assert recovered.binding_intent == BindingIntent.ACTIVE
+        assert recovered.attachment_state == AttachmentState.ABSENT
+        assert runtime.state == RuntimeState.DETACHED
+        assert runtime.handle is None
+        assert runtime.inbox is None
+        assert owner is not None and owner.expires_at <= time.time()
+
+
+@pytest.mark.asyncio
+async def test_attach_cancellation_cleanup_failure_still_releases_owner(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    session_id = str(uuid4())
+    async with Database(tmp_path / "attach-cancel-cleanup.sqlite3") as database:
+        bindings = SessionBindingRepository(database)
+        binding = await bindings.create(
+            thread_id="thread-attach-cancel-cleanup",
+            sdk_session_id=session_id,
+            cwd_snapshot=tmp_path,
+            project_source="implicit-home",
+        )
+        bridge = FakeBridge(session_id)
+        entered = asyncio.Event()
+        never = asyncio.Event()
+
+        async def blocked_allow_all(_handle: FakeHandle) -> object:
+            entered.set()
+            await never.wait()
+            return object()
+
+        monkeypatch.setattr(bridge, "ensure_allow_all", blocked_allow_all)
+        store = OwnerLeaseStore(database)
+        runtime = SessionRuntime(
+            database=database,
+            bridge=bridge,
+            bindings=bindings,
+            owner_leases=store,
+            owner_id="cancelled-cleanup-owner",
+            binding=binding,
+        )
+        original_by_thread = bindings.by_thread
+        attach = asyncio.create_task(runtime.attach_resume())
+        await entered.wait()
+
+        async def failed_read(_thread_id: str):
+            raise RuntimeError("simulated cleanup read failure")
+
+        monkeypatch.setattr(bindings, "by_thread", failed_read)
+        attach.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await attach
+
+        recovered = await original_by_thread(binding.thread_id)
+        owner = await store.current(session_id)
+        assert bridge.handle.disconnect_calls == 1
+        assert recovered is not None
+        assert recovered.attachment_state == AttachmentState.RECOVERY_UNKNOWN
+        assert recovered.permission_posture == PermissionPosture.UNKNOWN
+        assert runtime.state == RuntimeState.RECOVERY_UNKNOWN
+        assert runtime.handle is None
+        assert runtime.inbox is None
+        assert owner is not None and owner.expires_at <= time.time()
+
+
+@pytest.mark.asyncio
+async def test_runtime_reactivation_is_single_flight_for_concurrent_messages(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    session_id = str(uuid4())
+    async with Database(tmp_path / "single-flight-resume.sqlite3") as database:
+        bindings = SessionBindingRepository(database)
+        binding = await bindings.create(
+            thread_id="thread-single-flight",
+            sdk_session_id=session_id,
+            cwd_snapshot=tmp_path,
+            project_source="implicit-home",
+        )
+        bridge = FakeBridge(session_id)
+        entered = asyncio.Event()
+        release = asyncio.Event()
+        resume_calls = 0
+        resume = bridge.resume_session
+
+        async def delayed_resume(**kwargs: Any):
+            nonlocal resume_calls
+            resume_calls += 1
+            entered.set()
+            await release.wait()
+            return await resume(**kwargs)
+
+        monkeypatch.setattr(bridge, "resume_session", delayed_resume)
+
+        def runtime_factory(current_binding):
+            return SessionRuntime(
+                database=database,
+                bridge=bridge,
+                bindings=bindings,
+                owner_leases=OwnerLeaseStore(database),
+                owner_id="single-flight-owner",
+                binding=current_binding,
+            )
+
+        registry = SessionRegistry(bindings, runtime_factory)
+        first = asyncio.create_task(registry.ensure_attached(binding))
+        await entered.wait()
+        second = asyncio.create_task(registry.ensure_attached(binding))
+        await asyncio.sleep(0)
+        assert not second.done()
+        release.set()
+        first_runtime, second_runtime = await asyncio.gather(first, second)
+
+        assert first_runtime is second_runtime
+        assert first_runtime.state == RuntimeState.READY
+        assert resume_calls == 1
+        await first_runtime.close(idempotency_key="close-single-flight")
+
+
+@pytest.mark.asyncio
+async def test_cancelled_single_flight_waiter_does_not_cache_completed_transition(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    session_id = str(uuid4())
+    async with Database(tmp_path / "cancelled-single-flight.sqlite3") as database:
+        bindings = SessionBindingRepository(database)
+        binding = await bindings.create(
+            thread_id="thread-cancelled-single-flight",
+            sdk_session_id=session_id,
+            cwd_snapshot=tmp_path,
+            project_source="implicit-home",
+        )
+        bridge = FakeBridge(session_id)
+        entered = asyncio.Event()
+        release = asyncio.Event()
+        resume = bridge.resume_session
+
+        async def delayed_resume(**kwargs: Any):
+            entered.set()
+            await release.wait()
+            return await resume(**kwargs)
+
+        monkeypatch.setattr(bridge, "resume_session", delayed_resume)
+
+        def runtime_factory(current_binding):
+            return SessionRuntime(
+                database=database,
+                bridge=bridge,
+                bindings=bindings,
+                owner_leases=OwnerLeaseStore(database),
+                owner_id="cancelled-single-flight-owner",
+                binding=current_binding,
+            )
+
+        registry = SessionRegistry(bindings, runtime_factory)
+        waiter = asyncio.create_task(registry.ensure_attached(binding))
+        await entered.wait()
+        waiter.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await waiter
+
+        assert binding.thread_id in registry._transitions
+        release.set()
+        for _ in range(200):
+            runtime = registry.for_thread(binding.thread_id)
+            if (
+                binding.thread_id not in registry._transitions
+                and runtime is not None
+                and runtime.state == RuntimeState.READY
+            ):
+                break
+            await asyncio.sleep(0.001)
+
+        runtime = registry.for_thread(binding.thread_id)
+        assert binding.thread_id not in registry._transitions
+        assert runtime is not None
+        assert runtime.state == RuntimeState.READY
+        await runtime.close(idempotency_key="close-cancelled-single-flight")
+
+
+@pytest.mark.asyncio
+async def test_closed_session_requires_explicit_resume(
+    tmp_path: Path,
+) -> None:
+    session_id = str(uuid4())
+    async with Database(tmp_path / "closed-explicit-resume.sqlite3") as database:
+        bindings = SessionBindingRepository(database)
+        binding = await bindings.create(
+            thread_id="thread-closed-explicit-resume",
+            sdk_session_id=session_id,
+            cwd_snapshot=tmp_path,
+            project_source="implicit-home",
+        )
+        bridge = FakeBridge(session_id)
+
+        def runtime_factory(current_binding):
+            return SessionRuntime(
+                database=database,
+                bridge=bridge,
+                bindings=bindings,
+                owner_leases=OwnerLeaseStore(database),
+                owner_id="closed-explicit-owner",
+                binding=current_binding,
+            )
+
+        registry = SessionRegistry(bindings, runtime_factory)
+        runtime = await registry.ensure_attached(binding)
+        await runtime.close(idempotency_key="close-explicit-resume")
+        closed = await bindings.by_thread(binding.thread_id)
+        assert closed is not None
+
+        with pytest.raises(
+            ClosedSessionRequiresReactivation,
+            match="explicit resume",
+        ):
+            await registry.ensure_attached(binding, reactivate=False)
+
+        resumed = await registry.ensure_attached(closed, reactivate=True)
+        assert resumed.state == RuntimeState.READY
+        assert bridge.resume_calls == 2
+        await resumed.close(idempotency_key="close-explicit-resume-again")
+
+
+@pytest.mark.asyncio
+async def test_single_flight_escalates_concurrent_explicit_reactivation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    session_id = str(uuid4())
+    async with Database(tmp_path / "reactivation-escalation.sqlite3") as database:
+        bindings = SessionBindingRepository(database)
+        binding = await bindings.create(
+            thread_id="thread-reactivation-escalation",
+            sdk_session_id=session_id,
+            cwd_snapshot=tmp_path,
+            project_source="implicit-home",
+        )
+        bridge = FakeBridge(session_id)
+
+        def runtime_factory(current_binding):
+            return SessionRuntime(
+                database=database,
+                bridge=bridge,
+                bindings=bindings,
+                owner_leases=OwnerLeaseStore(database),
+                owner_id="reactivation-escalation-owner",
+                binding=current_binding,
+            )
+
+        registry = SessionRegistry(bindings, runtime_factory)
+        original_by_thread = bindings.by_thread
+        transition_entered = asyncio.Event()
+        release_transition = asyncio.Event()
+        calls = 0
+
+        async def controlled_by_thread(thread_id: str):
+            nonlocal calls
+            calls += 1
+            if calls == 2:
+                transition_entered.set()
+                await release_transition.wait()
+            return await original_by_thread(thread_id)
+
+        monkeypatch.setattr(bindings, "by_thread", controlled_by_thread)
+        ordinary = asyncio.create_task(registry.ensure_attached(binding, reactivate=False))
+        await transition_entered.wait()
+        await database.execute(
+            """
+            UPDATE session_bindings
+            SET binding_intent = 'closed', row_version = row_version + 1
+            WHERE thread_id = ?
+            """,
+            (binding.thread_id,),
+        )
+        closed = await original_by_thread(binding.thread_id)
+        assert closed is not None
+        explicit = asyncio.create_task(registry.ensure_attached(closed, reactivate=True))
+        for _ in range(100):
+            transition = registry._transitions.get(binding.thread_id)
+            if transition is not None and transition.reactivate_requested:
+                break
+            await asyncio.sleep(0.001)
+        assert transition is not None and transition.reactivate_requested
+        release_transition.set()
+
+        ordinary_runtime, explicit_runtime = await asyncio.gather(
+            ordinary,
+            explicit,
+        )
+        assert ordinary_runtime is explicit_runtime
+        assert ordinary_runtime.state == RuntimeState.READY
+        assert bridge.resume_calls == 1
+        current = await original_by_thread(binding.thread_id)
+        assert current is not None
+        assert current.binding_intent == BindingIntent.ACTIVE
+        await ordinary_runtime.close(idempotency_key="close-reactivation-escalation")
+
+
+@pytest.mark.asyncio
+async def test_service_quiesce_stops_all_internal_inbox_producers(
+    tmp_path: Path,
+) -> None:
+    session_id = str(uuid4())
+    async with Database(tmp_path / "quiesce-producers.sqlite3") as database:
+        bindings = SessionBindingRepository(database)
+        binding = await bindings.create(
+            thread_id="thread-quiesce-producers",
+            sdk_session_id=session_id,
+            cwd_snapshot=tmp_path,
+            project_source="implicit-home",
+        )
+        runtime = SessionRuntime(
+            database=database,
+            bridge=FakeBridge(session_id),
+            bindings=bindings,
+            owner_leases=OwnerLeaseStore(database),
+            owner_id="process-quiesce-producers",
+            binding=binding,
+            queue_poll_seconds=60,
+        )
+        await runtime.attach_create()
+        producers: list[str] = []
+        losses: list[str] = []
+        assert runtime.inbox is not None
+        with runtime.inbox._lock:
+            runtime.inbox._record_overflow_locked(1, 1)
+
+        await runtime.begin_service_quiesce(
+            producers.append,
+            losses.append,
+        )
+
+        assert runtime._queue_task is None
+        assert runtime._task_reconcile_task is None
+        assert runtime._permission_reconcile_task is None
+        assert runtime._renewal_task is None
+        with pytest.raises(SessionNotReady):
+            await runtime.send(
+                "blocked",
+                idempotency_key="blocked-during-quiesce",
+            )
+        assert runtime.service_quiesce_metrics() == (0, 0)
+        assert losses == ["pre_quiesce_inbox_overflow"]
+
+        await runtime.end_service_quiesce()
+        assert runtime._queue_task is not None
+        assert runtime._task_reconcile_task is not None
+        assert runtime._permission_reconcile_task is not None
+        assert runtime._renewal_task is not None
+        await runtime.close(idempotency_key="close-quiesce-producers")
+
+
+@pytest.mark.asyncio
+async def test_aborted_quiesce_restores_degraded_owner_renewal(
+    tmp_path: Path,
+) -> None:
+    session_id = str(uuid4())
+    async with Database(tmp_path / "quiesce-degraded.sqlite3") as database:
+        bindings = SessionBindingRepository(database)
+        binding = await bindings.create(
+            thread_id="thread-quiesce-degraded",
+            sdk_session_id=session_id,
+            cwd_snapshot=tmp_path,
+            project_source="implicit-home",
+        )
+        runtime = SessionRuntime(
+            database=database,
+            bridge=FakeBridge(session_id),
+            bindings=bindings,
+            owner_leases=OwnerLeaseStore(database),
+            owner_id="process-quiesce-degraded",
+            binding=binding,
+            owner_renew_seconds=30,
+        )
+        await runtime.attach_create()
+        runtime.state = RuntimeState.DEGRADED
+
+        await runtime.begin_service_quiesce(
+            lambda _source: None,
+            lambda _source: None,
+        )
+        assert runtime._renewal_task is None
+        await runtime.end_service_quiesce()
+
+        assert runtime._renewal_task is not None
+        assert runtime._queue_task is None
+        assert runtime._task_reconcile_task is None
+        assert runtime._permission_reconcile_task is None
+        await runtime.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_task_reconcile_does_not_call_runtime_after_owner_fence_loss(
+    tmp_path: Path,
+) -> None:
+    session_id = str(uuid4())
+    async with Database(tmp_path / "fenced-reconcile.sqlite3") as database:
+        bindings = SessionBindingRepository(database)
+        binding = await bindings.create(
+            thread_id="thread-fenced-reconcile",
+            sdk_session_id=session_id,
+            cwd_snapshot=tmp_path,
+            project_source="implicit-home",
+        )
+        bridge = FakeBridge(session_id)
+        runtime = SessionRuntime(
+            database=database,
+            bridge=bridge,
+            bindings=bindings,
+            owner_leases=OwnerLeaseStore(database),
+            owner_id="process-fenced-reconcile",
+            binding=binding,
+        )
+        await runtime.attach_create()
+        for _ in range(100):
+            if bridge.task_snapshot_calls:
+                break
+            await asyncio.sleep(0.005)
+        initial_calls = bridge.task_snapshot_calls
+        assert initial_calls >= 1
+
+        runtime.state = RuntimeState.FENCED
+        runtime._task_reconcile_requested.set()
+        assert runtime._task_reconcile_task is not None
+        await asyncio.wait_for(runtime._task_reconcile_task, timeout=1)
+
+        assert bridge.task_snapshot_calls == initial_calls
+        await runtime.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_task_reconcile_rpc_failure_fences_if_owner_was_lost(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    session_id = str(uuid4())
+    async with Database(tmp_path / "fenced-reconcile-error.sqlite3") as database:
+        bindings = SessionBindingRepository(database)
+        binding = await bindings.create(
+            thread_id="thread-fenced-reconcile-error",
+            sdk_session_id=session_id,
+            cwd_snapshot=tmp_path,
+            project_source="implicit-home",
+        )
+        bridge = FakeBridge(session_id)
+        runtime = SessionRuntime(
+            database=database,
+            bridge=bridge,
+            bindings=bindings,
+            owner_leases=OwnerLeaseStore(database),
+            owner_id="process-fenced-reconcile-error",
+            binding=binding,
+        )
+        await runtime.attach_create()
+        for _ in range(100):
+            if bridge.task_snapshot_calls:
+                break
+            await asyncio.sleep(0.005)
+
+        async def lose_owner_then_fail(_handle: FakeHandle):
+            await database.execute(
+                """
+                UPDATE session_owner_leases SET expires_at = 0
+                WHERE sdk_session_id = ?
+                """,
+                (session_id,),
+            )
+            raise RuntimeError("transport failed after owner loss")
+
+        monkeypatch.setattr(bridge, "get_tasks", lose_owner_then_fail)
+        runtime._task_reconcile_requested.set()
+        assert runtime._task_reconcile_task is not None
+        await asyncio.wait_for(runtime._task_reconcile_task, timeout=1)
+
+        assert runtime.state == RuntimeState.FENCED
+        failed_snapshot = await database.fetchone(
+            """
+            SELECT COUNT(*) FROM event_journal
+            WHERE raw_type = 'copilotd.tasks.snapshot_failed'
+            """
+        )
+        assert failed_snapshot[0] == 0
+        await runtime.shutdown()

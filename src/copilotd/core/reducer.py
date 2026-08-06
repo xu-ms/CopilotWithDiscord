@@ -7630,6 +7630,10 @@ class EventReducerWorker:
                     internal_event_id=f"stop:{uuid.uuid4()}",
                 )
                 await worker
+        except asyncio.CancelledError:
+            worker.cancel()
+            await asyncio.gather(worker, return_exceptions=True)
+            raise
         except TimeoutError:
             worker.cancel()
             try:
@@ -7637,6 +7641,13 @@ class EventReducerWorker:
                     await asyncio.gather(worker, return_exceptions=True)
             except TimeoutError:
                 worker.add_done_callback(_consume_task_result)
+        except BaseException:
+            if worker.done():
+                _consume_task_result(worker)
+            else:
+                worker.cancel()
+                await asyncio.gather(worker, return_exceptions=True)
+            raise
         finally:
             self._task = None
             self._inbox.close()

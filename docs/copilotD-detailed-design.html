@@ -1184,6 +1184,33 @@ outcome unknown</td>
 </tr>
 </tbody>
 </table>
+<p>restart 使用持久事务而不是“读一次 heartbeat 后 kill”：</p>
+<ol type="1">
+<li>manager 写 <code>requested</code> fence，同时记录 PID、OS process
+start、generation 和 event-journal high-water mark；</li>
+<li>bot 关闭全局 create/resume/send admission，停止并 await
+queue/task/permission/owner-renew producer，冻结并 await mailbox，再 drain
+reducer inbox；</li>
+<li><code>acknowledged</code> 通过 producer counter + journal high-water
+的同一条 CAS 提交；任何 SDK callback 或 internal producer 在
+requested/acknowledged/prepared/committed 阶段都持久计数，ACK
+后到达则令可逆阶段 violated；</li>
+<li>normal restart 只在 fenced snapshot 无 blocker 时进入 owner
+handoff；force 先原子提交 <code>prepared</code>，只把真实 in-flight 结果置
+unknown，并保持 local queued/cancelled/terminal；</li>
+<li><code>committed</code> 与 owner lease expiry、binding recovery_unknown
+同事务；此后失败只能 fail-closed terminate，不能 release/reopen。新
+PID/generation/process-start 在启动 attach 前完成 committed fence
+adoption，随后 queued claim 以新 generation/fence 重建 submission lease。</li>
+</ol>
+<p>schema 11 将 service-control protocol 固定为 v2：旧 v1 worker 在建立 v2
+fence 前必须由 OS manager 停止并证明原 PID/process-start 已退出；新 worker
+通过私有 handoff token、effective manager PID/start 和 generation
+三重证明后才能 adoption。inbox observer 安装与 reserve 共用 barrier；overflow
+或非阻塞 SQLite accounting 失败写 0600 durable watermark，任何 watermark
+都会阻止 ACK/commit。rollback 有 persisted pending/attempts/complete 状态并有界重试；
+prepared/committed worker 自行退出，避免 fresh heartbeat 掩盖 stranded
+transaction。</p>
 <h3 id="heartbeat-协议">Heartbeat 协议</h3>
 <p>bot 每 30 秒原子写入 heartbeat JSON；不是只 touch mtime：</p>
 <div class="sourceCode" id="cb3"><pre
@@ -1258,8 +1285,9 @@ schedule，等待人工 <code>--force</code></td>
 恢复或人工 force</td>
 </tr>
 <tr>
-<td>5 分钟内重启 &gt;= 3 次</td>
-<td>停止主动 kick loop，写 alerts log，并发本机桌面通知</td>
+<td>连续 3 个 5 分钟 watchdog 周期均发生重启</td>
+<td>第 4 次停止主动 kick loop，写 alerts log，并发本机桌面通知；15
+分钟窗口允许覆盖真实 cadence</td>
 </tr>
 </tbody>
 </table>
@@ -1349,12 +1377,12 @@ current-user Scheduled Task：</p>
 <tbody>
 <tr>
 <td><code>copilotD Runtime</code></td>
-<td>AtLogOn；失败每 30 秒重启；<code>ExecutionTimeLimit=PT0S</code></td>
+<td>AtLogOn；失败每 1 分钟重启；<code>ExecutionTimeLimit=PT0S</code></td>
 </tr>
 <tr>
 <td><code>copilotD Bot</code></td>
-<td>AtLogOn；失败每 30
-秒重启；<code>MultipleInstancesPolicy=IgnoreNew</code></td>
+<td>AtLogOn；失败每 1
+分钟重启；<code>MultipleInstancesPolicy=IgnoreNew</code></td>
 </tr>
 <tr>
 <td><code>copilotD Watchdog</code></td>
@@ -1365,8 +1393,8 @@ current-user Scheduled Task：</p>
 <p><code>bundled-runtime</code> topology 同样省略独立 Runtime
 task，只注册 Bot + Watchdog，并由 status/export verifier 按已探测
 topology 校验 2/3 个 task；两种 topology 都默认安装和启动。</p>
-<p>runtime/bot task 统一设置
-<code>RestartCount=999</code>、<code>DisallowStartIfOnBatteries=false</code>、
+<p>runtime/bot task 统一设置 schema-valid
+<code>RestartCount=255</code>、<code>RestartInterval=PT1M</code>、<code>DisallowStartIfOnBatteries=false</code>、
 <code>StopIfGoingOnBatteries=false</code>、<code>WakeToRun=false</code>，使用安装时解析出的绝对
 Python/entrypoint 和 working directory。安装总是先
 <code>Unregister-ScheduledTask</code> 再
@@ -5299,18 +5327,21 @@ model、<code>/mode</code>、<code>/goal</code>、<code>/bare</code>、<code>/to
 unknown</td>
 </tr>
 <tr>
-<td>37 个唯一版本 SQLite migration：Foundation
+<td>42 个唯一版本 SQLite migration：Foundation
 <code>0001</code>–<code>0009</code>、Native RPC
 <code>0010</code>–<code>0014</code>、Protocol
 <code>0015</code>–<code>0019</code>、Scheduler
 <code>0020</code>–<code>0028</code>、Protocol compatibility
-<code>0029</code>、Discord surface <code>0030</code>–<code>0037</code>；project
+<code>0029</code>、Discord surface <code>0030</code>–<code>0037</code>、保留
+<code>0038</code>–<code>0039</code>、Operations forward migrations
+<code>0040</code>–<code>0044</code>；project
 <code>$HOME</code>
 fallback/cwd snapshot、owner fence、creation saga、strict-UUID event
 journal、reducer-owned operation/submission/native-command
 receipts、submission-task links、liveness leases、startup recovery
 inventory 与 eager resume；attach 时按 current state 结算 pending
-agent、强制 uncertain remote off</td>
+agent、强制 uncertain remote off；force restart 使用 producer/journal dual
+epoch、loss watermark admission fence 与 owner handoff</td>
 <td>bundled runtime 进程死亡后的 in-flight execution 仍只能标 outcome
 unknown；真实 fixture 无 current-promotable task，task promote 保持 gated</td>
 </tr>
@@ -5361,15 +5392,21 @@ projection；&gt;=8000 字符 tool result/error 逐字附件化；零 child-thre
 </tr>
 <tr>
 <td>共享 TaskRegistry、failure consumer、10 分钟 active-execution SUSPECT +
-non-destructive ping、结构化 heartbeat、protected-work watchdog、macOS
-bot/watchdog LaunchAgent 与 Windows Scheduled Task definitions</td>
-<td>当前拓扑没有独立 runtime service；真实 service 安装、sleep/wake 和
-Windows 实机仍待验证</td>
+non-destructive ping、结构化 heartbeat、完整 setup preflight、fresh
+PID/generation/current-fence status、bounded restart saga、restart-storm
+alert、10 MiB × 7 JSON log、macOS LaunchAgent 与 Windows Scheduled Task 的
+bundled 2-unit / sidecar 3-unit install/status/uninstall/effective-definition
+contract</td>
+<td>默认 bundled runtime 没有独立 runtime service；sidecar
+三组件需要显式 runtime argv/URI/connection token；真实 credentialed
+install、sleep/wake、macOS soak 与 Windows 实机未在 deterministic suite
+中验证</td>
 </tr>
 </tbody>
 </table>
-<p>当前 deterministic 验证基线包括 <code>ruff check .</code> 与完整 pytest。
-仓库内 hash-checked fixture 固定 SDK 1.0.8 / runtime 1.0.73 /
+<p>当前 deterministic 验证基线包括 <code>ruff check src tests scripts</code>、完整
+pytest、CLI JSON/error contract、service definition/effective-state simulations
+与 wheel/sdist isolated install。仓库内 hash-checked fixture 固定 SDK 1.0.8 / runtime 1.0.73 /
 protocol 3、114-event inventory 与 capability evidence；<code>copilotd
 native-acceptance --real</code> 还要求 exact 环境确认，按 suite 创建 disposable
 repo/session、执行 supported mutation（包括 model set/readback/restore）、清理
