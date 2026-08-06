@@ -505,3 +505,154 @@ async def test_emergency_stop_defers_unstarted_operation_and_runs_durable_requeu
             "error_code": "mailbox_emergency_deferred",
         },
     ]
+
+
+@pytest.mark.asyncio
+async def test_mailbox_isolates_fence_validator_exception_per_item(
+    tmp_path: Path,
+) -> None:
+    async with Database(tmp_path / "validator-exception.sqlite3") as database:
+        checks = 0
+
+        async def validate() -> bool:
+            nonlocal checks
+            checks += 1
+            if checks == 1:
+                raise RuntimeError("validator unavailable")
+            return True
+
+        async def operation() -> str:
+            return "second-completed"
+
+        mailbox, reducer = _start_mailbox(database, validate)
+
+        with pytest.raises(OperationAmbiguous, match="could not be settled"):
+            await asyncio.wait_for(
+                mailbox.submit(
+                    kind="fleet",
+                    idempotency_key="validator-failed",
+                    input_payload={},
+                    operation=operation,
+                ),
+                timeout=1,
+            )
+        assert (
+            await mailbox.submit(
+                kind="fleet",
+                idempotency_key="next-item",
+                input_payload={},
+                operation=operation,
+            )
+            == "second-completed"
+        )
+        assert mailbox._worker is not None and not mailbox._worker.done()
+        await mailbox.stop()
+        await reducer.stop()
+
+
+@pytest.mark.asyncio
+async def test_real_reducer_fence_loss_fails_current_and_queued_mailbox_items(
+    tmp_path: Path,
+) -> None:
+    async with Database(tmp_path / "real-fence-loss.sqlite3") as database:
+        current = True
+        inbox = ReducerInbox(
+            sdk_session_id="session-fenced",
+            generation=1,
+            fence_token=5,
+            capacity=128,
+        )
+
+        async def reducer_fence(_generation: int, _token: int) -> bool:
+            return current
+
+        async def mailbox_fence() -> bool:
+            return current
+
+        reducer = EventReducerWorker(
+            inbox=inbox,
+            reducer=JournalReducer(database),
+            batch_size=1,
+            fence_validator=reducer_fence,
+        )
+        reducer.start()
+        mailbox = CommandMailbox(
+            store=OperationStore(database, inbox),
+            sdk_session_id="session-fenced",
+            runtime_generation=1,
+            owner_fence_token=5,
+            fence_validator=mailbox_fence,
+        )
+        mailbox.start()
+        first_started = asyncio.Event()
+        release_first = asyncio.Event()
+
+        async def lose_fence() -> str:
+            nonlocal current
+            first_started.set()
+            await release_first.wait()
+            current = False
+            return "must-not-confirm"
+
+        first = asyncio.create_task(
+            mailbox.submit(
+                kind="fleet",
+                idempotency_key="first",
+                input_payload={},
+                operation=lose_fence,
+            )
+        )
+        await first_started.wait()
+        second = asyncio.create_task(
+            mailbox.submit(
+                kind="fleet",
+                idempotency_key="second",
+                input_payload={},
+                operation=lambda: asyncio.sleep(0, result="second"),
+            )
+        )
+        release_first.set()
+
+        with pytest.raises(OperationAmbiguous):
+            await asyncio.wait_for(first, timeout=1)
+        with pytest.raises(OperationAmbiguous):
+            await asyncio.wait_for(second, timeout=1)
+        assert mailbox._worker is not None and not mailbox._worker.done()
+        await mailbox.stop(timeout_seconds=0.1)
+        await reducer.stop(timeout_seconds=0.1)
+
+
+@pytest.mark.asyncio
+async def test_reducer_validator_exception_fails_active_batch_ack(
+    tmp_path: Path,
+) -> None:
+    async with Database(tmp_path / "validator-active-batch.sqlite3") as database:
+        inbox = ReducerInbox(
+            sdk_session_id="session-validator-error",
+            generation=1,
+            fence_token=5,
+            capacity=16,
+        )
+
+        async def raise_validator(_generation: int, _token: int) -> bool:
+            raise RuntimeError("validator crashed")
+
+        reducer = EventReducerWorker(
+            inbox=inbox,
+            reducer=JournalReducer(database),
+            batch_size=4,
+            fence_validator=raise_validator,
+        )
+        reducer.start()
+
+        with pytest.raises(RuntimeError, match="validator crashed"):
+            await asyncio.wait_for(
+                inbox.commit_internal(
+                    {"type": "copilotd.validator.test"},
+                    internal_event_id="validator-active-batch",
+                ),
+                timeout=1,
+            )
+        await asyncio.wait_for(inbox.join(), timeout=1)
+        assert not reducer.running
+        await reducer.stop(timeout_seconds=0.1)

@@ -630,11 +630,17 @@ class SdkProbe:
         if command_list_supported is False:
             for name in (
                 "builtin_after",
+                "builtin_after_result_completed",
                 "builtin_every",
+                "builtin_every_result_completed",
                 "builtin_research",
+                "builtin_research_result_agent_prompt",
                 "builtin_review",
+                "builtin_review_result_agent_prompt",
                 "builtin_rubber_duck",
+                "builtin_rubber_duck_result_agent_prompt",
                 "builtin_security_review",
+                "builtin_security_review_result_agent_prompt",
                 "commands_invoke",
                 "commands_result_agent_prompt",
                 "commands_result_completed",
@@ -686,15 +692,21 @@ class SdkProbe:
                 {"result_kind": invocation_kind},
             )
             for kind in ("agent-prompt", "completed", "select-subcommand", "text"):
+                observed = invocation_kind == kind
                 capabilities[f"commands_result_{kind.replace('-', '_')}"] = _evidence(
-                    invocation_kind == kind,
-                    "live-command-probe",
+                    True if observed else None,
+                    "live-command-probe" if observed else "unprobed",
                     {"observed_result_kind": invocation_kind},
                 )
             capabilities["builtin_after"] = _evidence(
                 _supported(native_schedule),
                 "live-command-probe",
                 native_schedule,
+            )
+            capabilities["builtin_after_result_completed"] = _evidence(
+                invocation_kind == "completed",
+                "live-command-probe",
+                {"observed_result_kind": invocation_kind},
             )
         checked_capabilities = CapabilityRegistry(self._settings).load_checked().capabilities
         for name in checked_capabilities:

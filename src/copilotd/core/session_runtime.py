@@ -1963,9 +1963,31 @@ class SessionRuntime:
 
     async def _prime_readiness(self) -> None:
         await self._refresh_readiness(allow_attaching=True)
-        for topic in sorted(self._supported_snapshot_topics() - {"activity", "queue"}):
-            await self._query_snapshot_topic(topic)
-        await self._require_inbox().join()
+        pending_topics = self._supported_snapshot_topics() - {"activity", "queue"}
+        for _ in range(8):
+            for topic in sorted(pending_topics):
+                await self._query_snapshot_topic(topic)
+            await self._require_inbox().join()
+            rows = await self._database.fetchall(
+                """
+                SELECT topic FROM reconciliation_state
+                WHERE sdk_session_id = ?
+                  AND topic IN ('agents', 'commands', 'remote',
+                                'schedules', 'tasks')
+                  AND (
+                      requested_epoch != applied_epoch
+                      OR status != 'idle'
+                  )
+                """,
+                (self.binding.sdk_session_id,),
+            )
+            pending_topics = {
+                str(row["topic"])
+                for row in rows
+                if str(row["topic"]) in self._supported_snapshot_topics()
+            }
+            if not pending_topics:
+                break
         blockers = await self._readiness_blockers(require_quiet=False)
         if blockers:
             self.state = RuntimeState.DEGRADED
@@ -3052,7 +3074,17 @@ class SessionRuntime:
             )
             payload = cast(dict[str, Any], result.to_dict())
             result_kind = str(payload["kind"])
-            self._require_capability(f"commands_result_{result_kind.replace('-', '_')}")
+            normalized_kind = result_kind.replace("-", "_")
+            exact_result_capability = (
+                f"builtin_{command_name.replace('-', '_')}_result_{normalized_kind}"
+            )
+            if (
+                self._capabilities is not None
+                and exact_result_capability in self._capabilities.capabilities
+            ):
+                self._require_capability(exact_result_capability)
+            else:
+                self._require_capability(f"commands_result_{normalized_kind}")
             selection_token = (
                 self._native_id("selection", invocation_id)
                 if payload["kind"] == NativeCommandResultKind.SELECT_SUBCOMMAND.value
@@ -5574,7 +5606,30 @@ class SessionRuntime:
             raise SessionNotReady("selected-agent state disappeared during attach")
         transition_id = row["pending_agent_transition_id"]
         target = row["pending_agent"]
-        if transition_id is None or target is None:
+        transition = (
+            None
+            if transition_id is None
+            else await self._database.fetchone(
+                """
+                SELECT transition_id, previous_agent, target_agent
+                FROM runtime_agent_transitions
+                WHERE transition_id = ? AND sdk_session_id = ?
+                  AND state IN ('pending', 'unknown')
+                """,
+                (str(transition_id), self.binding.sdk_session_id),
+            )
+        )
+        if transition is None:
+            transition = await self._database.fetchone(
+                """
+                SELECT transition_id, previous_agent, target_agent
+                FROM runtime_agent_transitions
+                WHERE sdk_session_id = ? AND state IN ('pending', 'unknown')
+                ORDER BY created_at DESC LIMIT 1
+                """,
+                (self.binding.sdk_session_id,),
+            )
+        if transition is None and (transition_id is None or target is None):
             await self._require_inbox().commit_internal(
                 {
                     "type": "copilotd.agent.observed",
@@ -5590,14 +5645,8 @@ class SessionRuntime:
             )
             return
 
-        transition = await self._database.fetchone(
-            """
-            SELECT previous_agent, target_agent
-            FROM runtime_agent_transitions
-            WHERE transition_id = ? AND sdk_session_id = ?
-            """,
-            (str(transition_id), self.binding.sdk_session_id),
-        )
+        if transition is not None:
+            transition_id = str(transition["transition_id"])
         previous = (
             str(row["desired_agent"]) if transition is None else str(transition["previous_agent"])
         )
@@ -5639,7 +5688,7 @@ class SessionRuntime:
         *,
         create: bool,
     ) -> None:
-        if self._capabilities is None or not self._capabilities.supports("remote_status"):
+        if self._capabilities is None:
             return
         row = await self._database.fetchone(
             """
@@ -5651,11 +5700,25 @@ class SessionRuntime:
         if row is None:
             raise SessionNotReady("remote state disappeared during attach")
         pending_transition_id = row["pending_remote_transition_id"]
-        should_force_off = (
-            not create
-            and self._capabilities.supports("remote_disable")
-            and (pending_transition_id is not None or row["runtime_remote_mode"] == "unknown")
+        remote_disable_supported = self._capabilities is not None and self._capabilities.supports(
+            "remote_disable"
         )
+        export_detach_safe = self._capabilities is not None and self._capabilities.supports(
+            "remote_export_detach_safe"
+        )
+        unsafe_persisted_mode = row["runtime_remote_mode"] == "on" or (
+            row["runtime_remote_mode"] == "export" and not export_detach_safe
+        )
+        uncertain_persisted_state = (
+            pending_transition_id is not None
+            or row["runtime_remote_mode"] == "unknown"
+            or unsafe_persisted_mode
+        )
+        if not create and uncertain_persisted_state and not remote_disable_supported:
+            raise SessionNotReady(
+                "unsafe persisted remote exposure cannot be disabled by this runtime"
+            )
+        should_force_off = not create and remote_disable_supported and uncertain_persisted_state
         if should_force_off:
 
             async def disable_uncertain_remote() -> None:
@@ -5819,7 +5882,12 @@ class SessionRuntime:
                             session_config=session_options or None,
                             launch_options=launch_options,
                             session_options=extension_session_options,
-                        )
+                        ),
+                        capture_result=lambda attached: setattr(
+                            self,
+                            "_handle",
+                            attached,
+                        ),
                     )
                 else:
                     handle = await self._sdk_call(
@@ -5838,12 +5906,18 @@ class SessionRuntime:
                             session_config=session_options or None,
                             launch_options=launch_options,
                             session_options=extension_session_options,
-                        )
+                        ),
+                        capture_result=lambda attached: setattr(
+                            self,
+                            "_handle",
+                            attached,
+                        ),
                     )
                 if handle.session_id != self.binding.sdk_session_id:
                     raise RuntimeError("SDK returned a different session ID")
             except BaseException as error:
-                await self._shield_attachment_cleanup(mark_unknown=True)
+                if self._handle is None:
+                    await self._shield_attachment_cleanup(mark_unknown=True)
                 if isinstance(error, asyncio.CancelledError):
                     raise
                 raise SessionAttachUnknown(
@@ -5860,15 +5934,6 @@ class SessionRuntime:
             except Exception as error:
                 self.binding = await self._bindings.mark_attach_unknown(self.binding)
                 self.state = RuntimeState.RECOVERY_UNKNOWN
-                try:
-                    await self._stop_components(release_owner=True)
-                except Exception as cleanup_error:
-                    raise SessionAttachUnknown(
-                        "event-log recovery and attachment cleanup failed"
-                    ) from ExceptionGroup(
-                        "event-log recovery failed and component cleanup failed",
-                        [error, cleanup_error],
-                    )
                 raise SessionAttachUnknown("event-log recovery failed during attach") from error
             try:
                 if self._require_permission_handler().managed_permissions_blocked:
@@ -6563,6 +6628,17 @@ class SessionRuntime:
                 except Exception as error:
                     errors.append(error)
             handle = self._handle
+            lease = self._lease
+            if (
+                handle is not None
+                and lease is not None
+                and await self._is_current_owner()
+                and not await self._is_mutation_safe_owner()
+            ):
+                try:
+                    self._lease = await self._owner_leases.renew(lease)
+                except Exception as error:
+                    errors.append(error)
             if (
                 handle is not None
                 and self._inbox is not None
@@ -6914,11 +6990,14 @@ class SessionRuntime:
         operation: Awaitable[T],
         *,
         timeout_seconds: float | None = None,
+        capture_result: Callable[[T], None] | None = None,
     ) -> T:
         async with asyncio.timeout(
             self._sdk_operation_timeout_seconds if timeout_seconds is None else timeout_seconds
         ):
             result = await operation
+        if capture_result is not None:
+            capture_result(result)
         lease = self._lease
         if lease is not None:
             latest = await self._bindings.by_thread(self.binding.thread_id)
@@ -6993,16 +7072,18 @@ class SessionRuntime:
             await self._cancel_component_task(self._renewal_task)
             self._renewal_task = None
         if self._reducer is not None:
+            reducer = self._reducer
             try:
                 if emergency:
-                    await self._reducer.emergency_stop(
-                        timeout_seconds=self._shutdown_timeout_seconds
-                    )
+                    await reducer.emergency_stop(timeout_seconds=self._shutdown_timeout_seconds)
                 else:
-                    await self._reducer.stop(timeout_seconds=self._shutdown_timeout_seconds)
+                    await reducer.stop(timeout_seconds=self._shutdown_timeout_seconds)
             except Exception as error:
                 if self.state != RuntimeState.FENCED:
                     errors.append(error)
+            else:
+                if reducer.failure is not None and self.state != RuntimeState.FENCED:
+                    errors.append(reducer.failure)
             self._reducer = None
         self._inbox = None
         self._ingress = None

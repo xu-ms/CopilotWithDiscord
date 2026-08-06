@@ -25,7 +25,7 @@ from copilotd.sdk.native import NativeCommandResult, NativeCommandResultKind
 
 REAL_ACCEPTANCE_ENV = "COPILOTD_REAL_ACCEPTANCE"
 REAL_ACCEPTANCE_CONFIRMATION = "I_UNDERSTAND_THIS_USES_REAL_COPILOT"
-ACCEPTANCE_SCHEMA_VERSION = 1
+ACCEPTANCE_SCHEMA_VERSION = 2
 ACCEPTANCE_SUITES = frozenset(
     {
         "agents",
@@ -362,6 +362,12 @@ class RealNativeAcceptance:
                     status="unregistered",
                     detail={"discovery": "absent from commands.list builtin inventory"},
                 )
+                self._record(
+                    f"{capability}_result_agent_prompt",
+                    supported=False,
+                    status="builtin-unregistered",
+                    detail={},
+                )
                 continue
             input_text = (
                 "Investigate this disposable repository and return a concise result."
@@ -392,15 +398,28 @@ class RealNativeAcceptance:
                 raise RealAcceptanceError(
                     f"verified builtin {name} failed real execution: {invoke_error}"
                 ) from invoke_error
+            expected_variant = final.kind == NativeCommandResultKind.AGENT_PROMPT
             self._record(
                 capability,
-                supported=True,
-                status=("passed" if turn_completed else "started-and-aborted-at-timeout"),
+                supported=expected_variant,
+                status=(
+                    "passed"
+                    if expected_variant and turn_completed
+                    else "started-and-aborted-at-timeout"
+                    if expected_variant
+                    else "unexpected-result-variant"
+                ),
                 detail={
                     "discovered_kind": builtins[name].kind,
                     "result_kind": final.kind.value,
                     "agent_turn_completed": turn_completed,
                 },
+            )
+            self._record(
+                f"{capability}_result_agent_prompt",
+                supported=expected_variant,
+                status=("observed" if expected_variant else "unexpected-result-variant"),
+                detail={"observed_result_kind": final.kind.value},
             )
 
     def _record_command_result_kinds(self) -> None:
@@ -817,6 +836,16 @@ class RealNativeAcceptance:
                 await asyncio.sleep(0.25)
             created_entries += len(created)
             direct = result.kind == NativeCommandResultKind.COMPLETED and len(created) == 1
+            self._record(
+                f"builtin_{name}_result_completed",
+                supported=result.kind == NativeCommandResultKind.COMPLETED,
+                status=(
+                    "observed"
+                    if result.kind == NativeCommandResultKind.COMPLETED
+                    else "unexpected-result-variant"
+                ),
+                detail={"observed_result_kind": result.kind.value},
+            )
             stopped = None
             if len(created) == 1:
                 try:
@@ -1122,6 +1151,7 @@ class RealNativeAcceptance:
                 for model in models
                 if str(model.get("id") or "") != original_model
                 and (model.get("policy") or {}).get("state") != "disabled"
+                and model.get("supportedReasoningEfforts")
             ),
             None,
         )
@@ -1140,16 +1170,47 @@ class RealNativeAcceptance:
             )
             return
         candidate_id = str(candidate["id"])
+        supported_efforts = [
+            str(effort) for effort in candidate.get("supportedReasoningEfforts") or []
+        ]
+        target_effort = next(
+            (
+                effort
+                for effort in supported_efforts
+                if effort not in {"none", current.get("reasoningEffort")}
+            ),
+            None,
+        )
+        limits = (candidate.get("capabilities") or {}).get("limits") or {}
+        target_context_tier = (
+            "long_context"
+            if int(limits.get("max_context_window_tokens") or 0) >= 1_000_000
+            else "default"
+        )
+        if target_effort is None:
+            self._record(
+                "model_config",
+                supported=False,
+                status="option-mutation-prerequisite-unavailable",
+                detail={"supported_reasoning_efforts": supported_efforts},
+            )
+            return
         restored = False
+        options_restored = False
+        options_changed = False
         try:
             await bridge.set_model(
                 session,
                 model=candidate_id,
-                reasoning_effort=None,
-                context_tier=None,
+                reasoning_effort=target_effort,
+                context_tier=target_context_tier,
             )
             changed = await bridge.get_current_model(session)
-            changed_confirmed = changed.get("modelId") == candidate_id
+            options_changed = (
+                changed.get("reasoningEffort") == target_effort
+                and changed.get("contextTier") == target_context_tier
+            )
+            changed_confirmed = changed.get("modelId") == candidate_id and options_changed
         except Exception as error:
             changed_confirmed = False
             change_error = type(error).__name__
@@ -1170,19 +1231,24 @@ class RealNativeAcceptance:
                     and original_model == "auto"
                     and restored_model is None
                 )
+                options_restored = restored_state.get("reasoningEffort") == current.get(
+                    "reasoningEffort"
+                ) and restored_state.get("contextTier") == current.get("contextTier")
             except Exception as restore_error:
                 raise RealAcceptanceError(
                     "model acceptance could not restore the original model: "
                     f"{type(restore_error).__name__}"
                 ) from restore_error
-        supported = changed_confirmed and restored
+        supported = changed_confirmed and restored and options_restored
         self._record(
             "model_config",
             supported=supported,
             status="passed" if supported else "set-readback-restore-failed",
             detail={
                 "changed_confirmed": changed_confirmed,
+                "options_changed": options_changed,
                 "restored": restored,
+                "options_restored": options_restored,
                 "change_error_type": change_error,
             },
         )

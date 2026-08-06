@@ -4084,7 +4084,9 @@ class JournalReducer:
         await cursor.close()
         reducer_watermark = 0 if binding is None else int(binding[0])
         caught_up = reducer_watermark >= query_end
-        crossed_scalar_event = topic in {"agents", "commands", "remote"} and query_end > query_start
+        crossed_scalar_event = topic in {"agents", "commands", "remote"} and (
+            query_end > query_start or reducer_watermark > query_end
+        )
         fresh = epoch == int(reconciliation["requested_epoch"]) and not crossed_scalar_event
         positive = _snapshot_has_positive_evidence(topic, values)
         negative_applied = fresh and caught_up and not positive
@@ -5630,7 +5632,16 @@ class JournalReducer:
             if event.raw_type == "subagent.deselected"
             else str(data.get("agentName") or data.get("agent_name") or "default")
         )
-        await connection.execute(
+        cursor = await connection.execute(
+            """
+            SELECT pending_agent, pending_agent_transition_id
+            FROM session_bindings WHERE sdk_session_id = ?
+            """,
+            (event.sdk_session_id,),
+        )
+        pending = await cursor.fetchone()
+        await cursor.close()
+        cursor = await connection.execute(
             """
             UPDATE session_bindings
             SET runtime_agent = ?,
@@ -5659,6 +5670,36 @@ class JournalReducer:
                 event.sdk_timestamp,
             ),
         )
+        applied = cursor.rowcount == 1
+        await cursor.close()
+        if (
+            applied
+            and pending is not None
+            and pending["pending_agent_transition_id"] is not None
+            and pending["pending_agent"] == agent
+        ):
+            await connection.execute(
+                """
+                UPDATE runtime_agent_transitions
+                SET state = 'confirmed',
+                    result_json = ?,
+                    settled_at = ?
+                WHERE transition_id = ? AND sdk_session_id = ?
+                  AND state IN ('pending', 'unknown')
+                """,
+                (
+                    _json_or_none(
+                        {
+                            "basis": "sdk_selected_event",
+                            "event_id": event.event_id,
+                            "observed_agent": agent,
+                        }
+                    ),
+                    now,
+                    str(pending["pending_agent_transition_id"]),
+                    event.sdk_session_id,
+                ),
+            )
 
     async def _split_observed_submission(
         self,
@@ -7691,14 +7732,20 @@ class EventReducerWorker:
         self._task_registry = task_registry or TaskRegistry()
         self._task: asyncio.Task[None] | None = None
         self._stopping = False
+        self._failure: Exception | None = None
 
     @property
     def running(self) -> bool:
         return self._task is not None and not self._task.done()
 
+    @property
+    def failure(self) -> Exception | None:
+        return self._failure
+
     def start(self) -> None:
         if self._task is not None:
             raise RuntimeError("reducer worker already started")
+        self._failure = None
         self._task = self._task_registry.create(
             self._run(),
             name=f"reducer:{self._inbox.sdk_session_id}",
@@ -7713,6 +7760,11 @@ class EventReducerWorker:
         self._stopping = True
         self._inbox.close_sdk()
         worker = self._task
+        if worker.done():
+            await asyncio.gather(worker, return_exceptions=True)
+            self._task = None
+            self._inbox.close()
+            return
         try:
             async with asyncio.timeout(timeout_seconds):
                 await self._inbox.commit_internal(
@@ -7760,6 +7812,15 @@ class EventReducerWorker:
             self._inbox.close()
 
     async def _run(self) -> None:
+        try:
+            await self._reduce_loop()
+        except BaseException as error:
+            if isinstance(error, Exception):
+                self._failure = error
+            self._inbox.fail_pending(error)
+            raise
+
+    async def _reduce_loop(self) -> None:
         while True:
             first = await self._inbox.get()
             batch = [first]
@@ -7768,38 +7829,45 @@ class EventReducerWorker:
                     batch.append(self._inbox.get_nowait())
                 except asyncio.QueueEmpty:
                     break
+            unacknowledged = list(batch)
 
-            if self._fence_validator is not None:
-                valid = await self._fence_validator(
-                    first.generation,
-                    first.fence_token,
-                )
-                if not valid:
-                    error = RuntimeError("reducer owner fence is no longer current")
-                    for envelope in batch:
-                        self._inbox.acknowledge(envelope, error=error)
-                    raise error
+            def acknowledge(
+                envelope: InboxEnvelope,
+                *,
+                error: BaseException | None = None,
+                pending: list[InboxEnvelope] = unacknowledged,
+            ) -> None:
+                self._inbox.acknowledge(envelope, error=error)
+                pending.remove(envelope)
 
-            events: list[AdaptedEvent] = []
-            valid_envelopes: list[InboxEnvelope] = []
-            for envelope in batch:
-                try:
-                    events.append(self._adapter.adapt(envelope))
-                except InvalidSdkEvent as error:
-                    await self._reducer.persist_incident(envelope, error)
-                    self._inbox.acknowledge(envelope)
-                else:
-                    valid_envelopes.append(envelope)
             try:
+                if self._fence_validator is not None:
+                    valid = await self._fence_validator(
+                        first.generation,
+                        first.fence_token,
+                    )
+                    if not valid:
+                        raise RuntimeError("reducer owner fence is no longer current")
+
+                events: list[AdaptedEvent] = []
+                valid_envelopes: list[InboxEnvelope] = []
+                for envelope in batch:
+                    try:
+                        events.append(self._adapter.adapt(envelope))
+                    except InvalidSdkEvent as error:
+                        await self._reducer.persist_incident(envelope, error)
+                        acknowledge(envelope)
+                    else:
+                        valid_envelopes.append(envelope)
                 if events:
                     await self._reducer.persist(events)
             except BaseException as error:
-                for envelope in valid_envelopes:
-                    self._inbox.acknowledge(envelope, error=error)
+                for envelope in list(unacknowledged):
+                    acknowledge(envelope, error=error)
                 raise
             should_stop = any(event.raw_type == "copilotd.reducer.stop" for event in events)
             for envelope in valid_envelopes:
-                self._inbox.acknowledge(envelope)
+                acknowledge(envelope)
             if should_stop and self._stopping:
                 return
 

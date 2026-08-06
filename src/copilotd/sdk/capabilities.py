@@ -24,7 +24,7 @@ MAIN_BRANCH_ONLY_EVENTS = (
     "session.context_cleared",
 )
 CHECKED_CAPABILITY_FIXTURE_SHA256 = (
-    "1eb79b0db120e1c401e53b0176fbccc9fa927ba8f8b11486073e2242dbeffbdc"
+    "21dd0a007daa42b098e98e74bd2141af1ad1012569c798d33681c37ca4c59ab1"
 )
 
 _REQUIRED_CAPABILITIES = frozenset(
@@ -36,12 +36,18 @@ _REQUIRED_CAPABILITIES = frozenset(
         "agents_list",
         "agents_select",
         "builtin_after",
+        "builtin_after_result_completed",
         "builtin_commands",
         "builtin_every",
+        "builtin_every_result_completed",
         "builtin_research",
+        "builtin_research_result_agent_prompt",
         "builtin_review",
+        "builtin_review_result_agent_prompt",
         "builtin_rubber_duck",
+        "builtin_rubber_duck_result_agent_prompt",
         "builtin_security_review",
+        "builtin_security_review_result_agent_prompt",
         "commands_invoke",
         "commands_list",
         "commands_result_agent_prompt",
@@ -169,44 +175,44 @@ _REMOTE_ACTION_CAPABILITIES = {
 _DERIVED_CAPABILITY_REQUIREMENTS: dict[str, frozenset[str]] = {
     "builtin_after": frozenset(
         {
+            "builtin_after_result_completed",
             "commands_invoke",
             "commands_list",
-            "commands_result_completed",
         }
     ),
     "builtin_every": frozenset(
         {
+            "builtin_every_result_completed",
             "commands_invoke",
             "commands_list",
-            "commands_result_completed",
         }
     ),
     "builtin_research": frozenset(
         {
+            "builtin_research_result_agent_prompt",
             "commands_invoke",
             "commands_list",
-            "commands_result_agent_prompt",
         }
     ),
     "builtin_review": frozenset(
         {
+            "builtin_review_result_agent_prompt",
             "commands_invoke",
             "commands_list",
-            "commands_result_agent_prompt",
         }
     ),
     "builtin_rubber_duck": frozenset(
         {
+            "builtin_rubber_duck_result_agent_prompt",
             "commands_invoke",
             "commands_list",
-            "commands_result_agent_prompt",
         }
     ),
     "builtin_security_review": frozenset(
         {
+            "builtin_security_review_result_agent_prompt",
             "commands_invoke",
             "commands_list",
-            "commands_result_agent_prompt",
         }
     ),
 }

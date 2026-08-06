@@ -169,7 +169,12 @@ class OperationStore:
         )
         if row is None:
             raise RuntimeError(f"operation disappeared: {record.operation_id}")
-        return _row_to_record(row)
+        transitioned = _row_to_record(row)
+        if transitioned.state != state:
+            raise OperationAmbiguous(
+                f"operation {record.operation_id} did not durably reach {state}"
+            )
+        return transitioned
 
     async def mark_unsettled_unknown(
         self,
@@ -327,12 +332,15 @@ class CommandMailbox:
                     OperationAmbiguous(f"operation {item.record.operation_id} was interrupted")
                 )
             self._queue.task_done()
-        await self._store.mark_unsettled_unknown(
-            sdk_session_id=self._sdk_session_id,
-            runtime_generation=self._runtime_generation,
-            owner_fence_token=self._owner_fence_token,
-            error_code="mailbox_stopped",
-        )
+        try:
+            await self._store.mark_unsettled_unknown(
+                sdk_session_id=self._sdk_session_id,
+                runtime_generation=self._runtime_generation,
+                owner_fence_token=self._owner_fence_token,
+                error_code="mailbox_stopped",
+            )
+        except Exception:
+            pass
         for future in list(self._futures.values()):
             if not future.done():
                 future.set_exception(
@@ -415,14 +423,21 @@ class CommandMailbox:
                 raise MailboxNotAccepting("command mailbox is not accepting operations")
             future = self._futures.get(idempotency_key)
             if future is None:
-                record, created = await self._store.begin(
-                    sdk_session_id=self._sdk_session_id,
-                    runtime_generation=self._runtime_generation,
-                    owner_fence_token=self._owner_fence_token,
-                    kind=kind,
-                    idempotency_key=idempotency_key,
-                    input_payload=input_payload,
-                )
+                try:
+                    record, created = await self._store.begin(
+                        sdk_session_id=self._sdk_session_id,
+                        runtime_generation=self._runtime_generation,
+                        owner_fence_token=self._owner_fence_token,
+                        kind=kind,
+                        idempotency_key=idempotency_key,
+                        input_payload=input_payload,
+                    )
+                except ValueError:
+                    raise
+                except Exception as error:
+                    raise OperationAmbiguous(
+                        "operation admission could not be durably established"
+                    ) from error
                 if not created:
                     return _settled_result(record)
 
@@ -457,7 +472,19 @@ class CommandMailbox:
     async def _run(self) -> None:
         while item := await self._queue.get():
             try:
-                await self._execute(item)
+                try:
+                    await self._execute(item)
+                except asyncio.CancelledError:
+                    raise
+                except Exception as error:
+                    await self._finish_ambiguous(
+                        item,
+                        item.record,
+                        error_code=type(error).__name__,
+                        message=(
+                            f"operation {item.record.operation_id} could not be settled: {error}"
+                        ),
+                    )
             finally:
                 self._queue.task_done()
         self._queue.task_done()
@@ -472,13 +499,11 @@ class CommandMailbox:
                     error_code="owner_fence_lost_before_start",
                 )
                 return
-            record = await self._store.transition(
+            await self._finish_ambiguous(
+                item,
                 record,
-                state=OperationState.UNKNOWN,
                 error_code="owner_fence_lost_before_start",
-            )
-            item.future.set_exception(
-                OperationAmbiguous(f"owner fence lost for operation {record.operation_id}")
+                message=f"owner fence lost for operation {record.operation_id}",
             )
             return
 
@@ -491,25 +516,21 @@ class CommandMailbox:
                     error_code="owner_fence_lost_before_dispatch",
                 )
                 return
-            record = await self._store.transition(
+            await self._finish_ambiguous(
+                item,
                 record,
-                state=OperationState.UNKNOWN,
                 error_code="owner_fence_lost_before_dispatch",
-            )
-            item.future.set_exception(
-                OperationAmbiguous(f"owner fence lost for operation {record.operation_id}")
+                message=f"owner fence lost for operation {record.operation_id}",
             )
             return
         try:
             result = await item.operation()
         except asyncio.CancelledError:
-            await self._store.transition(
+            await self._finish_ambiguous(
+                item,
                 record,
-                state=OperationState.UNKNOWN,
                 error_code="mailbox_cancelled",
-            )
-            item.future.set_exception(
-                OperationAmbiguous(f"operation {record.operation_id} was interrupted")
+                message=f"operation {record.operation_id} was interrupted",
             )
             raise
         except OperationDeferred as error:
@@ -530,25 +551,19 @@ class CommandMailbox:
             )
             item.future.set_exception(error)
         except Exception as error:
-            await self._store.transition(
+            await self._finish_ambiguous(
+                item,
                 record,
-                state=OperationState.UNKNOWN,
                 error_code=type(error).__name__,
-            )
-            item.future.set_exception(
-                OperationAmbiguous(f"operation {record.operation_id} outcome is unknown: {error}")
+                message=(f"operation {record.operation_id} outcome is unknown: {error}"),
             )
         else:
             if not await self._fence_validator():
-                await self._store.transition(
+                await self._finish_ambiguous(
+                    item,
                     record,
-                    state=OperationState.UNKNOWN,
                     error_code="owner_fence_lost_after_dispatch",
-                )
-                item.future.set_exception(
-                    OperationAmbiguous(
-                        f"owner fence was lost after operation {record.operation_id}"
-                    )
+                    message=(f"owner fence was lost after operation {record.operation_id}"),
                 )
                 return
             try:
@@ -562,15 +577,11 @@ class CommandMailbox:
                     ),
                 )
             except Exception as error:
-                await self._store.transition(
+                await self._finish_ambiguous(
+                    item,
                     record,
-                    state=OperationState.UNKNOWN,
                     error_code=type(error).__name__,
-                )
-                item.future.set_exception(
-                    OperationAmbiguous(
-                        f"operation {record.operation_id} result was not durably confirmed"
-                    )
+                    message=(f"operation {record.operation_id} result was not durably confirmed"),
                 )
             else:
                 item.future.set_result(result)
@@ -603,6 +614,27 @@ class CommandMailbox:
                     f"owner fence prevented operation {record.operation_id} from dispatch{detail}"
                 )
             )
+
+    async def _finish_ambiguous(
+        self,
+        item: _MailboxItem,
+        record: OperationRecord,
+        *,
+        error_code: str,
+        message: str,
+    ) -> None:
+        try:
+            await self._store.transition(
+                record,
+                state=OperationState.UNKNOWN,
+                error_code=error_code,
+            )
+        except Exception:
+            # The old owner may already be fenced from the reducer. Startup
+            # recovery owns the durable transition in that case.
+            pass
+        if not item.future.done():
+            item.future.set_exception(OperationAmbiguous(message))
 
 
 def _settled_result(record: OperationRecord) -> Any:

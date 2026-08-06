@@ -160,7 +160,7 @@ async def test_resume_rejects_failed_or_incompletely_cleaned_evidence(
     previous.write_text(
         json.dumps(
             {
-                "schema_version": 1,
+                "schema_version": acceptance_module.ACCEPTANCE_SCHEMA_VERSION,
                 "status": "failed",
                 "cleanup": {
                     "session_deleted": True,
@@ -181,6 +181,46 @@ async def test_resume_rejects_failed_or_incompletely_cleaned_evidence(
     )
 
     with pytest.raises(RealAcceptanceError, match="did not pass"):
+        await runner.run()
+
+
+@pytest.mark.asyncio
+async def test_resume_rejects_legacy_remote_detach_evidence(
+    tmp_path: Path,
+) -> None:
+    previous = tmp_path / "legacy-evidence.json"
+    previous.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "status": "passed",
+                "cleanup": {
+                    "session_deleted": True,
+                    "temporary_workspace_removed": True,
+                },
+                "identity": {},
+                "capabilities": {
+                    "remote_export_detach_safe": {
+                        "supported": True,
+                        "executed": True,
+                        "status": "passed",
+                        "evidence_kind": "real-disposable-runtime",
+                        "detail": {"export_steerable": False},
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    runner = RealNativeAcceptance(
+        Settings(_env_file=None, data_dir=tmp_path / "data"),
+        evidence_path=tmp_path / "new-evidence.json",
+        environ={REAL_ACCEPTANCE_ENV: REAL_ACCEPTANCE_CONFIRMATION},
+        suites={"agents"},
+        resume_evidence=(previous,),
+    )
+
+    with pytest.raises(RealAcceptanceError, match="unsupported schema"):
         await runner.run()
 
 
@@ -232,19 +272,26 @@ async def test_model_config_acceptance_requires_set_readback_restore(
     class ModelBridge:
         def __init__(self) -> None:
             self.current = "model-a"
-            self.set_calls: list[str] = []
+            self.effort: str | None = "high"
+            self.context_tier: str | None = "long_context"
+            self.set_calls: list[tuple[str, str | None, str | None]] = []
 
         async def list_models(self) -> list[dict[str, object]]:
             return [
                 {"id": "model-a"},
-                {"id": "model-b", "policy": {"state": "enabled"}},
+                {
+                    "id": "model-b",
+                    "policy": {"state": "enabled"},
+                    "supportedReasoningEfforts": ["none", "low", "high"],
+                    "capabilities": {"limits": {"max_context_window_tokens": 1_050_000}},
+                },
             ]
 
         async def get_current_model(self, _session: object) -> dict[str, object]:
             return {
                 "modelId": self.current,
-                "reasoningEffort": None,
-                "contextTier": None,
+                "reasoningEffort": self.effort,
+                "contextTier": self.context_tier,
             }
 
         async def set_model(
@@ -255,9 +302,10 @@ async def test_model_config_acceptance_requires_set_readback_restore(
             reasoning_effort: str | None,
             context_tier: str | None,
         ) -> None:
-            del reasoning_effort, context_tier
             self.current = model
-            self.set_calls.append(model)
+            self.effort = reasoning_effort
+            self.context_tier = context_tier
+            self.set_calls.append((model, reasoning_effort, context_tier))
 
     bridge = ModelBridge()
     runner = RealNativeAcceptance(
@@ -273,7 +321,47 @@ async def test_model_config_acceptance_requires_set_readback_restore(
     assert capability.supported
     assert capability.detail == {
         "changed_confirmed": True,
+        "options_changed": True,
         "restored": True,
+        "options_restored": True,
         "change_error_type": None,
     }
-    assert bridge.set_calls == ["model-b", "model-a"]
+    assert bridge.set_calls == [
+        ("model-b", "low", "long_context"),
+        ("model-a", "high", "long_context"),
+    ]
+
+    class DropsRestoredOptions(ModelBridge):
+        async def set_model(
+            self,
+            _session: object,
+            *,
+            model: str,
+            reasoning_effort: str | None,
+            context_tier: str | None,
+        ) -> None:
+            if model == "model-a":
+                reasoning_effort = None
+                context_tier = None
+            await super().set_model(
+                _session,
+                model=model,
+                reasoning_effort=reasoning_effort,
+                context_tier=context_tier,
+            )
+
+    drops_options = DropsRestoredOptions()
+    negative_runner = RealNativeAcceptance(
+        Settings(_env_file=None, data_dir=tmp_path / "negative-data"),
+        evidence_path=tmp_path / "negative-evidence.json",
+        environ={REAL_ACCEPTANCE_ENV: REAL_ACCEPTANCE_CONFIRMATION},
+        suites={"model"},
+    )
+    await negative_runner._exercise_model_config(
+        drops_options,
+        object(),  # type: ignore[arg-type]
+    )
+    negative = negative_runner._capabilities["model_config"]
+    assert not negative.supported
+    assert negative.detail["restored"] is True
+    assert negative.detail["options_restored"] is False

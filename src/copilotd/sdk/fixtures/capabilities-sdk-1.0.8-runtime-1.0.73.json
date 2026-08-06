@@ -52,6 +52,11 @@
       "evidence_kind": "real-acceptance-gate",
       "detail": "after created and stopped one schedule but returned text instead of required completed"
     },
+    "builtin_after_result_completed": {
+      "supported": false,
+      "evidence_kind": "real-acceptance-gate",
+      "detail": "after returned text rather than completed"
+    },
     "builtin_commands": {
       "supported": true,
       "evidence_kind": "live-rpc-fixture",
@@ -62,25 +67,50 @@
       "evidence_kind": "real-acceptance-gate",
       "detail": "every created and stopped one schedule but returned text instead of required completed"
     },
+    "builtin_every_result_completed": {
+      "supported": false,
+      "evidence_kind": "real-acceptance-gate",
+      "detail": "every returned text rather than completed"
+    },
     "builtin_research": {
       "supported": true,
       "evidence_kind": "real-acceptance-fixture",
       "detail": "research returned a runtime agent-prompt that was submitted in a disposable session"
+    },
+    "builtin_research_result_agent_prompt": {
+      "supported": true,
+      "evidence_kind": "real-acceptance-fixture",
+      "detail": "research returned agent-prompt"
     },
     "builtin_review": {
       "supported": true,
       "evidence_kind": "real-acceptance-fixture",
       "detail": "review returned a runtime agent-prompt and completed in a disposable repository"
     },
+    "builtin_review_result_agent_prompt": {
+      "supported": true,
+      "evidence_kind": "real-acceptance-fixture",
+      "detail": "review returned agent-prompt"
+    },
     "builtin_rubber_duck": {
       "supported": true,
       "evidence_kind": "real-acceptance-fixture",
       "detail": "rubber-duck returned a runtime agent-prompt and completed in a disposable repository"
     },
+    "builtin_rubber_duck_result_agent_prompt": {
+      "supported": true,
+      "evidence_kind": "real-acceptance-fixture",
+      "detail": "rubber-duck returned agent-prompt"
+    },
     "builtin_security_review": {
       "supported": true,
       "evidence_kind": "real-acceptance-fixture",
       "detail": "security-review returned a runtime agent-prompt and completed in a disposable repository"
+    },
+    "builtin_security_review_result_agent_prompt": {
+      "supported": true,
+      "evidence_kind": "real-acceptance-fixture",
+      "detail": "security-review returned agent-prompt"
     },
     "commands_invoke": {
       "supported": true,
@@ -175,7 +205,7 @@
     "model_config": {
       "supported": true,
       "evidence_kind": "real-acceptance-fixture",
-      "detail": "a disposable session changed to an alternate model, read it back, and restored the original auto model"
+      "detail": "a disposable session changed to an alternate model with low effort and long_context, read back every field, and restored the original model, effort, and context tier"
     },
     "models": {
       "supported": true,

@@ -308,8 +308,17 @@ def test_builtin_support_requires_invoke_and_exact_result_variant(
         supported=False,
     )
     without_variant = replace(manifest, capabilities=capabilities)
-    assert not without_variant.supports("builtin_review")
-    assert "review" not in without_variant.discord_command_roots()
+    assert without_variant.supports("builtin_review")
+    assert "review" in without_variant.discord_command_roots()
+
+    capabilities = dict(manifest.capabilities)
+    capabilities["builtin_review_result_agent_prompt"] = replace(
+        capabilities["builtin_review_result_agent_prompt"],
+        supported=False,
+    )
+    wrong_review_variant = replace(manifest, capabilities=capabilities)
+    assert not wrong_review_variant.supports("builtin_review")
+    assert "review" not in wrong_review_variant.discord_command_roots()
 
     capabilities = dict(manifest.capabilities)
     capabilities["commands_result_completed"] = replace(
@@ -389,3 +398,57 @@ def test_live_probe_expected_response_requires_exact_assistant_message() -> None
         [{"type": "session.idle", "data": {}}],
         "COPILOTD_ACCEPTANCE_AUTH_OK",
     )
+
+
+def test_schedule_variant_probe_does_not_disable_prompt_builtins(
+    tmp_path: Path,
+) -> None:
+    settings = Settings(_env_file=None, data_dir=tmp_path)
+    probe = SdkProbe(settings)
+    fixture = tmp_path / "schedule-variant.events.jsonl"
+    fixture.write_text("{}\n", encoding="utf-8")
+    fixture_hash = hashlib.sha256(fixture.read_bytes()).hexdigest()
+    supported = CapabilityResult(True, {})
+    live = {
+        "runtime": {
+            "runtime_version": "1.0.73",
+            "protocol_version": 3,
+            "ping_protocol_version": 3,
+        },
+        "accepted_user_event_id_mapping": True,
+        "activity": supported,
+        "processing": supported,
+        "commands": supported,
+        "context_info": supported,
+        "event_log_read": supported,
+        "event_log_tail": supported,
+        "models": supported,
+        "queue": supported,
+        "permission_posture": {"enabled": True, "mode": "on"},
+        "durable_history_recovered": True,
+        "session_id_matches": True,
+        "resume_session_id_matches": True,
+        "callback_survived_idle": True,
+        "agents": supported,
+        "agent_current": supported,
+        "mode_initial": supported,
+        "mode_autopilot": supported,
+        "sessions_check_in_use": supported,
+        "tasks": supported,
+        "task_list": supported,
+        "schedule": supported,
+        "metadata_snapshot": supported,
+        "usage_metrics": supported,
+        "native_schedule_direct": CapabilityResult(
+            False,
+            {"invocation": {"kind": "text"}},
+        ),
+    }
+    probe._write_matrix(probe._live_matrix(live, fixture, fixture_hash))
+
+    resolved = CapabilityRegistry(settings).resolve(live["runtime"])
+
+    assert resolved.supports("builtin_review")
+    assert resolved.supports("builtin_research")
+    assert not resolved.supports("builtin_after")
+    assert resolved.supports("commands_result_agent_prompt")

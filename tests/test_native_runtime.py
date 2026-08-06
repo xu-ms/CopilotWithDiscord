@@ -31,7 +31,12 @@ from copilotd.core.mailbox import OperationAmbiguous
 from copilotd.core.models import AdaptedEvent, InboxEnvelope
 from copilotd.core.native import NativeCapabilityError, NativeTaskAction
 from copilotd.core.reducer import JournalReducer
-from copilotd.core.session_runtime import DetachBlocked, SessionNotReady, SessionRuntime
+from copilotd.core.session_runtime import (
+    DetachBlocked,
+    SessionAttachUnknown,
+    SessionNotReady,
+    SessionRuntime,
+)
 from copilotd.sdk.bridge import EventLogBatch
 from copilotd.sdk.capabilities import CapabilityRegistry
 from copilotd.sdk.native import (
@@ -49,6 +54,7 @@ class NativeHandle:
         self.session_id = session_id
         self.sent: list[tuple[str, dict[str, Any]]] = []
         self.history: list[Any] = []
+        self.disconnect_calls = 0
 
     async def send(self, prompt: str, **kwargs: Any) -> str:
         self.sent.append((prompt, kwargs))
@@ -58,7 +64,7 @@ class NativeHandle:
         return None
 
     async def disconnect(self) -> None:
-        return None
+        self.disconnect_calls += 1
 
     async def get_events(self) -> list[Any]:
         return list(self.history)
@@ -98,6 +104,7 @@ class NativeBridge:
         ]
         self.command_results: dict[str, NativeCommandResult] = {}
         self.invocations: list[tuple[str, str | None]] = []
+        self.command_list_hook: Any = None
         self.ephemeral_answer = "side answer"
         self.compactions = 0
         self.compact_error: Exception | None = None
@@ -128,9 +135,13 @@ class NativeBridge:
         self.remote_url: str | None = None
         self.authenticated = True
         self.event_log_reads = 0
+        self.event_log_error: Exception | None = None
+        self.attach_hook: Any = None
 
     async def create_session(self, **kwargs: Any) -> NativeHandle:
         self.ingress = kwargs["on_event"]
+        if self.attach_hook is not None:
+            await self.attach_hook()
         return self.handle
 
     async def resume_session(self, session_id: str, **kwargs: Any) -> NativeHandle:
@@ -349,7 +360,12 @@ class NativeBridge:
         include_builtins: bool,
     ) -> tuple[NativeCommandDefinition, ...]:
         assert include_builtins
-        return tuple(self.commands)
+        snapshot = tuple(self.commands)
+        if self.command_list_hook is not None:
+            hook = self.command_list_hook
+            self.command_list_hook = None
+            await hook()
+        return snapshot
 
     async def invoke_command(
         self,
@@ -428,6 +444,8 @@ class NativeBridge:
     ) -> EventLogBatch:
         del cursor, max_events, wait_ms
         assert not include_ephemeral
+        if self.event_log_error is not None:
+            raise self.event_log_error
         self.event_log_reads += 1
         return EventLogBatch(
             cursor=f"cursor-{self.event_log_reads}",
@@ -753,6 +771,7 @@ async def test_agent_schedule_and_remote_transitions_reconcile_projections(
         "agents_deselect",
         "agents_select",
         "builtin_after",
+        "builtin_after_result_completed",
         "commands_invoke",
         "commands_result_completed",
         "remote_disable",
@@ -1015,12 +1034,11 @@ async def test_crossing_positive_command_and_agent_snapshots_cannot_resurrect_st
             )
         )
         await runtime.inbox.join()
-        command_end = runtime.inbox.last_sdk_receive_seq
         await runtime._commit_snapshot(
             "commands",
             command_epoch,
             command_start,
-            command_end,
+            command_start,
             {
                 "commands": [_command("review").to_dict()],
                 "manifest_generation": command_epoch,
@@ -1033,7 +1051,7 @@ async def test_crossing_positive_command_and_agent_snapshots_cannot_resurrect_st
             WHERE command_name = 'review'
             """
         )
-        assert review["state"] == "unavailable"
+        assert review is None or review["state"] == "unavailable"
 
         bridge.agents = []
         bridge.current_agent_name = "default"
@@ -1054,12 +1072,11 @@ async def test_crossing_positive_command_and_agent_snapshots_cannot_resurrect_st
             )
         )
         await runtime.inbox.join()
-        agent_end = runtime.inbox.last_sdk_receive_seq
         await runtime._commit_snapshot(
             "agents",
             agent_epoch,
             agent_start,
-            agent_end,
+            agent_start,
             {
                 "agents": [
                     {
@@ -1097,6 +1114,68 @@ async def test_crossing_positive_command_and_agent_snapshots_cannot_resurrect_st
         requested = {str(row["topic"]): int(row["requested_epoch"]) for row in stale_topics}
         assert requested["commands"] > command_epoch
         assert requested["agents"] > agent_epoch
+
+
+@pytest.mark.asyncio
+async def test_initial_crossing_command_snapshot_requeries_before_ready(
+    tmp_path: Path,
+) -> None:
+    session_id = str(uuid4())
+    database = Database(tmp_path / "initial-command-crossing.sqlite3")
+    await database.open()
+    bindings = SessionBindingRepository(database)
+    binding = await bindings.create(
+        thread_id="thread-initial-command-crossing",
+        sdk_session_id=session_id,
+        cwd_snapshot=tmp_path,
+        project_source="implicit-home",
+    )
+    bridge = NativeBridge(session_id)
+
+    async def remove_commands_during_first_list() -> None:
+        bridge.commands = []
+        bridge.ingress(
+            SessionEvent(
+                data=CommandsChangedData(commands=[]),
+                id=uuid4(),
+                timestamp=datetime.now(UTC),
+                type=SessionEventType.COMMANDS_CHANGED,
+            )
+        )
+
+    bridge.command_list_hook = remove_commands_during_first_list
+    runtime = SessionRuntime(
+        database=database,
+        bridge=bridge,
+        bindings=bindings,
+        owner_leases=OwnerLeaseStore(database),
+        owner_id="initial-command-crossing",
+        binding=binding,
+        capabilities=CapabilityRegistry(
+            Settings(_env_file=None, data_dir=tmp_path / "data")
+        ).load_checked(),
+    )
+    try:
+        await asyncio.wait_for(runtime.attach_create(), timeout=5)
+        assert runtime.state.value == "ready"
+        review = await database.fetchone(
+            """
+            SELECT state FROM runtime_command_manifest
+            WHERE command_name = 'review'
+            """
+        )
+        reconciliation = await database.fetchone(
+            """
+            SELECT requested_epoch, applied_epoch, status
+            FROM reconciliation_state WHERE topic = 'commands'
+            """
+        )
+        assert review is None or review["state"] == "unavailable"
+        assert reconciliation["status"] == "idle"
+        assert reconciliation["requested_epoch"] == reconciliation["applied_epoch"]
+    finally:
+        await runtime.shutdown()
+        await database.close()
 
 
 @pytest.mark.asyncio
@@ -1256,6 +1335,122 @@ async def test_attach_reconciles_crash_pending_agent_transition(
 
 
 @pytest.mark.asyncio
+async def test_recovered_agent_event_settles_transition_row_atomically(
+    tmp_path: Path,
+) -> None:
+    session_id = str(uuid4())
+    database = Database(tmp_path / "agent-event-recovery.sqlite3")
+    await database.open()
+    bindings = SessionBindingRepository(database)
+    binding = await bindings.create(
+        thread_id="thread-agent-event-recovery",
+        sdk_session_id=session_id,
+        cwd_snapshot=tmp_path,
+        project_source="implicit-home",
+    )
+    operation_id = str(uuid4())
+    transition_id = str(uuid4())
+    now = datetime.now(UTC).timestamp()
+    await database.execute(
+        """
+        INSERT INTO session_operations(
+            operation_id, sdk_session_id, runtime_generation,
+            owner_fence_token, kind, idempotency_key, input_hash,
+            state, created_at
+        ) VALUES (?, ?, 0, 0, 'agent', 'agent-event-recovery',
+                  'hash', 'started', ?)
+        """,
+        (operation_id, session_id, now),
+    )
+    await database.execute(
+        """
+        INSERT INTO runtime_agent_transitions(
+            transition_id, sdk_session_id, operation_id,
+            previous_agent, target_agent, state, created_at
+        ) VALUES (?, ?, ?, 'default', 'reviewer', 'pending', ?)
+        """,
+        (transition_id, session_id, operation_id, now),
+    )
+    await database.execute(
+        """
+        UPDATE session_bindings
+        SET pending_agent = 'reviewer',
+            pending_agent_transition_id = ?,
+            runtime_agent = 'unknown',
+            event_cursor = 'cursor-before'
+        WHERE sdk_session_id = ?
+        """,
+        (transition_id, session_id),
+    )
+    binding = await bindings.by_session(session_id)
+    assert binding is not None
+    bridge = NativeBridge(session_id)
+    bridge.current_agent_name = "reviewer"
+    recovered = SessionEvent(
+        data=SubagentSelectedData(
+            agent_display_name="Reviewer",
+            agent_name="reviewer",
+            tools=[],
+        ),
+        id=uuid4(),
+        timestamp=datetime.now(UTC),
+        type=SessionEventType.SUBAGENT_SELECTED,
+    )
+    bridge.event_log_batches = [
+        EventLogBatch(
+            cursor="cursor-after",
+            cursor_status="ok",
+            events=(recovered,),
+            has_more=False,
+            filtered_ephemeral=0,
+        )
+    ]
+    runtime = SessionRuntime(
+        database=database,
+        bridge=bridge,
+        bindings=bindings,
+        owner_leases=OwnerLeaseStore(database),
+        owner_id="agent-event-recovery",
+        binding=binding,
+        capabilities=CapabilityRegistry(
+            Settings(_env_file=None, data_dir=tmp_path / "data")
+        ).load_checked(),
+    )
+    try:
+        await asyncio.wait_for(runtime.attach_resume(), timeout=5)
+        row = await database.fetchone(
+            """
+            SELECT desired_agent, pending_agent, runtime_agent
+            FROM session_bindings WHERE sdk_session_id = ?
+            """,
+            (session_id,),
+        )
+        transition = await database.fetchone(
+            """
+            SELECT state, result_json FROM runtime_agent_transitions
+            WHERE transition_id = ?
+            """,
+            (transition_id,),
+        )
+        assert dict(row) == {
+            "desired_agent": "reviewer",
+            "pending_agent": None,
+            "runtime_agent": "reviewer",
+        }
+        assert transition["state"] == "confirmed"
+        assert any(
+            basis in transition["result_json"]
+            for basis in (
+                "sdk_selected_event",
+                "observed_target_after_resume",
+            )
+        )
+    finally:
+        await runtime.shutdown()
+        await database.close()
+
+
+@pytest.mark.asyncio
 async def test_attach_forces_off_and_abandons_pending_remote_transition(
     tmp_path: Path,
 ) -> None:
@@ -1346,6 +1541,121 @@ async def test_attach_forces_off_and_abandons_pending_remote_transition(
         assert "forced_off_during_attach" in transition["snapshot_json"]
     finally:
         await asyncio.wait_for(runtime.shutdown(), timeout=5)
+        await database.close()
+
+
+@pytest.mark.asyncio
+async def test_attach_forces_unverified_export_mode_off(
+    tmp_path: Path,
+) -> None:
+    session_id = str(uuid4())
+    database = Database(tmp_path / "remote-export-recovery.sqlite3")
+    await database.open()
+    bindings = SessionBindingRepository(database)
+    binding = await bindings.create(
+        thread_id="thread-remote-export-recovery",
+        sdk_session_id=session_id,
+        cwd_snapshot=tmp_path,
+        project_source="implicit-home",
+    )
+    await database.execute(
+        """
+        UPDATE session_bindings
+        SET runtime_remote_mode = 'export', remote_steerable = 0
+        WHERE sdk_session_id = ?
+        """,
+        (session_id,),
+    )
+    binding = await bindings.by_session(session_id)
+    assert binding is not None
+    bridge = NativeBridge(session_id)
+    bridge.remote_mode = "export"
+    manifest = CapabilityRegistry(
+        Settings(_env_file=None, data_dir=tmp_path / "data")
+    ).load_checked()
+    capabilities = dict(manifest.capabilities)
+    capabilities["remote_status"] = replace(
+        capabilities["remote_status"],
+        supported=False,
+    )
+    runtime = SessionRuntime(
+        database=database,
+        bridge=bridge,
+        bindings=bindings,
+        owner_leases=OwnerLeaseStore(database),
+        owner_id="remote-export-recovery",
+        binding=binding,
+        capabilities=replace(manifest, capabilities=capabilities),
+    )
+    try:
+        await asyncio.wait_for(runtime.attach_resume(), timeout=5)
+        row = await database.fetchone(
+            """
+            SELECT runtime_remote_mode, remote_steerable
+            FROM session_bindings WHERE sdk_session_id = ?
+            """,
+            (session_id,),
+        )
+        assert dict(row) == {
+            "runtime_remote_mode": "off",
+            "remote_steerable": 0,
+        }
+        assert bridge.remote_mode == "off"
+    finally:
+        await runtime.shutdown()
+        await database.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("persisted_mode", ["on", "unknown"])
+async def test_attach_fails_closed_when_unsafe_remote_cannot_be_disabled(
+    tmp_path: Path,
+    persisted_mode: str,
+) -> None:
+    session_id = str(uuid4())
+    database = Database(tmp_path / "remote-disable-unavailable.sqlite3")
+    await database.open()
+    bindings = SessionBindingRepository(database)
+    binding = await bindings.create(
+        thread_id="thread-remote-disable-unavailable",
+        sdk_session_id=session_id,
+        cwd_snapshot=tmp_path,
+        project_source="implicit-home",
+    )
+    await database.execute(
+        """
+        UPDATE session_bindings
+        SET runtime_remote_mode = ?, remote_steerable = ?
+        WHERE sdk_session_id = ?
+        """,
+        (
+            persisted_mode,
+            None if persisted_mode == "unknown" else 1,
+            session_id,
+        ),
+    )
+    binding = await bindings.by_session(session_id)
+    assert binding is not None
+    manifest = CapabilityRegistry(
+        Settings(_env_file=None, data_dir=tmp_path / "data")
+    ).load_checked()
+    capabilities = dict(manifest.capabilities)
+    for name in ("remote_disable", "remote_status"):
+        capabilities[name] = replace(capabilities[name], supported=False)
+    runtime = SessionRuntime(
+        database=database,
+        bridge=NativeBridge(session_id),
+        bindings=bindings,
+        owner_leases=OwnerLeaseStore(database),
+        owner_id="remote-disable-unavailable",
+        binding=binding,
+        capabilities=replace(manifest, capabilities=capabilities),
+    )
+    try:
+        with pytest.raises(SessionNotReady, match="cannot be disabled"):
+            await asyncio.wait_for(runtime.attach_resume(), timeout=5)
+    finally:
+        await runtime.shutdown()
         await database.close()
 
 
@@ -1457,6 +1767,93 @@ async def test_fleet_losing_lease_headroom_after_rpc_never_confirms(
             "owner_fence_lost_after_dispatch",
         }
         assert fleet is not None and fleet["state"] == "unknown"
+
+
+@pytest.mark.asyncio
+async def test_attach_post_rpc_fence_loss_retains_handle_for_cleanup(
+    tmp_path: Path,
+) -> None:
+    session_id = str(uuid4())
+    database = Database(tmp_path / "attach-post-fence.sqlite3")
+    await database.open()
+    bindings = SessionBindingRepository(database)
+    binding = await bindings.create(
+        thread_id="thread-attach-post-fence",
+        sdk_session_id=session_id,
+        cwd_snapshot=tmp_path,
+        project_source="implicit-home",
+    )
+    bridge = NativeBridge(session_id)
+    runtime = SessionRuntime(
+        database=database,
+        bridge=bridge,
+        bindings=bindings,
+        owner_leases=OwnerLeaseStore(database),
+        owner_id="attach-post-fence",
+        binding=binding,
+        capabilities=CapabilityRegistry(
+            Settings(_env_file=None, data_dir=tmp_path / "data")
+        ).load_checked(),
+    )
+
+    async def lose_headroom() -> None:
+        await database.execute(
+            """
+            UPDATE session_owner_leases
+            SET expires_at = ?
+            WHERE sdk_session_id = ?
+            """,
+            (datetime.now(UTC).timestamp() + 10, session_id),
+        )
+
+    bridge.attach_hook = lose_headroom
+    try:
+        with pytest.raises(SessionAttachUnknown):
+            await runtime.attach_create()
+        assert bridge.handle.disconnect_calls == 1
+        assert runtime.handle is None
+    finally:
+        await runtime.shutdown()
+        await database.close()
+
+
+@pytest.mark.asyncio
+async def test_event_log_recovery_failure_disconnects_attached_handle(
+    tmp_path: Path,
+) -> None:
+    session_id = str(uuid4())
+    database = Database(tmp_path / "event-log-attach-cleanup.sqlite3")
+    await database.open()
+    bindings = SessionBindingRepository(database)
+    binding = await bindings.create(
+        thread_id="thread-event-log-attach-cleanup",
+        sdk_session_id=session_id,
+        cwd_snapshot=tmp_path,
+        project_source="implicit-home",
+    )
+    binding = await bindings.by_session(session_id)
+    assert binding is not None
+    bridge = NativeBridge(session_id)
+    bridge.event_log_error = RuntimeError("event log unavailable")
+    runtime = SessionRuntime(
+        database=database,
+        bridge=bridge,
+        bindings=bindings,
+        owner_leases=OwnerLeaseStore(database),
+        owner_id="event-log-attach-cleanup",
+        binding=binding,
+        capabilities=CapabilityRegistry(
+            Settings(_env_file=None, data_dir=tmp_path / "data")
+        ).load_checked(),
+    )
+    try:
+        with pytest.raises(SessionAttachUnknown, match="event-log recovery"):
+            await runtime.attach_resume()
+        assert bridge.handle.disconnect_calls == 1
+        assert runtime.handle is None
+    finally:
+        await runtime.shutdown()
+        await database.close()
 
 
 @pytest.mark.asyncio

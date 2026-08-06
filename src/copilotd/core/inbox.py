@@ -237,6 +237,15 @@ class ReducerInbox:
             self._sdk_closed = True
             self._set_space_available()
 
+    def fail_pending(self, error: BaseException) -> None:
+        self.close()
+        while True:
+            try:
+                envelope = self._queue.get_nowait()
+            except asyncio.QueueEmpty:
+                return
+            self.acknowledge(envelope, error=error)
+
     def close_sdk(self) -> None:
         with self._lock:
             self._sdk_closed = True
