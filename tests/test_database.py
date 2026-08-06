@@ -39,6 +39,54 @@ def _create_migration_fixture(path: Path, *, through_version: int) -> None:
     connection.close()
 
 
+def _create_legacy_discord_v9_fixture(path: Path) -> None:
+    _create_migration_fixture(path, through_version=7)
+    connection = sqlite3.connect(path)
+    migration_root = resources.files("copilotd.storage.migrations")
+    for legacy_version, legacy_name, current_name in (
+        (
+            8,
+            "0008_render_streams_agent_id.sql",
+            "0030_render_streams_agent_id.sql",
+        ),
+        (
+            9,
+            "0009_render_attachment_delivery.sql",
+            "0031_render_attachment_delivery.sql",
+        ),
+    ):
+        migration = migration_root.joinpath(current_name)
+        connection.executescript(migration.read_text(encoding="utf-8"))
+        connection.execute(
+            "INSERT INTO schema_migrations VALUES (?, ?, ?)",
+            (legacy_version, legacy_name, time.time()),
+        )
+    connection.executemany(
+        """
+        INSERT INTO render_streams(
+            session_id, message_id, agent_id, content, finalized, updated_at
+        ) VALUES ('legacy-session', 'shared-message', ?, ?, 1, ?)
+        """,
+        (
+            ("agent-a", "content-a", 8.0),
+            ("agent-b", "content-b", 9.0),
+        ),
+    )
+    connection.execute(
+        """
+        INSERT INTO render_attachment_checkpoints(
+            session_id, render_message_id, agent_id,
+            first_discord_message_id, next_batch_index, finalized, updated_at
+        ) VALUES (
+            'legacy-session', 'shared-message', 'agent-b',
+            'discord-message', 2, 1, 9
+        )
+        """
+    )
+    connection.commit()
+    connection.close()
+
+
 @pytest.mark.asyncio
 async def test_initial_migration_creates_full_schema(tmp_path: Path) -> None:
     database_path = tmp_path / "copilotd.sqlite3"
@@ -207,6 +255,77 @@ async def test_discord_migrations_upgrade_copied_foundation_v9_database(
         "submission_task_links",
         "render_attachment_batches",
         "session_ui_metadata",
+        "trusted_local_artifact_snapshots",
+    } <= {row["name"] for row in tables}
+
+
+@pytest.mark.asyncio
+async def test_migrations_remap_copied_legacy_discord_v9_database(
+    tmp_path: Path,
+) -> None:
+    fixture_path = tmp_path / "copilotd-legacy-discord-v9-fixture.sqlite3"
+    database_path = tmp_path / "upgrade-legacy-discord-v9.sqlite3"
+    _create_legacy_discord_v9_fixture(fixture_path)
+    shutil.copy2(fixture_path, database_path)
+
+    async with Database(database_path) as database:
+        migrations = await database.fetchall(
+            "SELECT version, name FROM schema_migrations ORDER BY version"
+        )
+        streams = await database.fetchall(
+            """
+            SELECT session_id, message_id, agent_id, content, finalized, updated_at
+            FROM render_streams
+            WHERE session_id = 'legacy-session' AND message_id = 'shared-message'
+            ORDER BY agent_id
+            """
+        )
+        checkpoint = await database.fetchone(
+            """
+            SELECT agent_id, first_discord_message_id, next_batch_index, finalized
+            FROM render_attachment_checkpoints
+            WHERE session_id = 'legacy-session'
+              AND render_message_id = 'shared-message'
+            """
+        )
+        capability_columns = await database.fetchall("PRAGMA table_info(capabilities)")
+        tables = await database.fetchall("SELECT name FROM sqlite_master WHERE type = 'table'")
+
+    assert [row["version"] for row in migrations] == EXPECTED_MIGRATION_VERSIONS
+    migration_names = {int(row["version"]): str(row["name"]) for row in migrations}
+    assert migration_names[8] == "0008_durable_foundation.sql"
+    assert migration_names[9] == "0009_review_invariants.sql"
+    assert migration_names[30] == "0030_render_streams_agent_id.sql"
+    assert migration_names[31] == "0031_render_attachment_delivery.sql"
+    assert [dict(row) for row in streams] == [
+        {
+            "session_id": "legacy-session",
+            "message_id": "shared-message",
+            "agent_id": "agent-a",
+            "content": "content-a",
+            "finalized": 1,
+            "updated_at": 8.0,
+        },
+        {
+            "session_id": "legacy-session",
+            "message_id": "shared-message",
+            "agent_id": "agent-b",
+            "content": "content-b",
+            "finalized": 1,
+            "updated_at": 9.0,
+        },
+    ]
+    assert dict(checkpoint) == {
+        "agent_id": "agent-b",
+        "first_discord_message_id": "discord-message",
+        "next_batch_index": 2,
+        "finalized": 1,
+    }
+    assert "protocol_version" in {row["name"] for row in capability_columns}
+    assert {
+        "execution_health",
+        "snapshot_observations",
+        "submission_task_links",
         "trusted_local_artifact_snapshots",
     } <= {row["name"] for row in tables}
 

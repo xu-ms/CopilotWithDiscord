@@ -1,4 +1,5 @@
 import asyncio
+import time
 from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
@@ -40,7 +41,7 @@ from copilotd.core.session_runtime import (
 from copilotd.sdk.bridge import EventLogBatch, PermissionPostureError
 from copilotd.sdk.capabilities import CapabilityRegistry
 from copilotd.storage.database import Database
-from copilotd.storage.leases import OwnerConflict, OwnerLeaseStore
+from copilotd.storage.leases import FenceLost, OwnerConflict, OwnerLeaseStore
 
 
 class FakeHandle:
@@ -2196,6 +2197,133 @@ async def test_queue_blocks_agent_and_session_config_drift(tmp_path: Path) -> No
             "requested_agent_snapshot": "custom-agent",
         }
         await runtime.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_resubmit_queue_item_atomically_rejects_headroom_and_takeover_races(
+    tmp_path: Path,
+) -> None:
+    session_id = str(uuid4())
+    async with Database(tmp_path / "resubmit-fence.sqlite3") as database:
+        bindings = SessionBindingRepository(database)
+        binding = await bindings.create(
+            thread_id="thread-resubmit-fence",
+            sdk_session_id=session_id,
+            cwd_snapshot=tmp_path,
+            project_source="implicit-home",
+        )
+        bridge = FakeBridge(session_id)
+        owner_leases = OwnerLeaseStore(database)
+        runtime = SessionRuntime(
+            database=database,
+            bridge=bridge,
+            bindings=bindings,
+            owner_leases=owner_leases,
+            owner_id="process-original",
+            binding=binding,
+        )
+        await runtime.attach_create()
+        bridge.processing = True
+        original_id = await runtime.send(
+            "retry after drift",
+            idempotency_key="resubmit-fence-source",
+        )
+        await runtime._block_queue_item(original_id, "blocked_mode_drift")
+
+        await database.execute(
+            """
+            UPDATE session_owner_leases
+            SET expires_at = ?
+            WHERE sdk_session_id = ?
+            """,
+            (time.time() + 5, session_id),
+        )
+        with pytest.raises(FenceLost, match="mutation headroom"):
+            await runtime.resubmit_queue_item(
+                original_id,
+                idempotency_key="insufficient-headroom",
+            )
+        assert (
+            await database.fetchone(
+                "SELECT 1 FROM submissions WHERE parent_submission_id = ?",
+                (original_id,),
+            )
+            is None
+        )
+
+        assert runtime._lease is not None
+        runtime._lease = await owner_leases.renew(runtime._lease)
+        initial_check_done = asyncio.Event()
+        allow_transaction = asyncio.Event()
+        original_assert_owned_handle = runtime._assert_owned_handle
+
+        async def pause_after_initial_owner_check(
+            *,
+            allow_closing: bool = False,
+            allow_attaching: bool = False,
+        ) -> None:
+            await original_assert_owned_handle(
+                allow_closing=allow_closing,
+                allow_attaching=allow_attaching,
+            )
+            initial_check_done.set()
+            await allow_transaction.wait()
+
+        runtime._assert_owned_handle = pause_after_initial_owner_check  # type: ignore[method-assign]
+        resubmit = asyncio.create_task(
+            runtime.resubmit_queue_item(
+                original_id,
+                idempotency_key="takeover-race",
+            )
+        )
+        await initial_check_done.wait()
+        await database.execute(
+            """
+            UPDATE session_owner_leases
+            SET expires_at = 0
+            WHERE sdk_session_id = ?
+            """,
+            (session_id,),
+        )
+        takeover = await owner_leases.acquire(session_id, "process-takeover")
+        await database.execute(
+            """
+            UPDATE session_bindings
+            SET runtime_generation = runtime_generation + 1,
+                owner_fence_token = ?
+            WHERE sdk_session_id = ?
+            """,
+            (takeover.fence_token, session_id),
+        )
+        allow_transaction.set()
+
+        with pytest.raises(FenceLost, match="changed before queue resubmission"):
+            await resubmit
+        original = await database.fetchone(
+            "SELECT state FROM message_queue WHERE id = ?",
+            (original_id,),
+        )
+        replacements = await database.fetchall(
+            """
+            SELECT submission_id FROM submissions
+            WHERE parent_submission_id = ?
+            """,
+            (original_id,),
+        )
+        replacement_leases = await database.fetchall(
+            """
+            SELECT source_id FROM liveness_leases
+            WHERE sdk_session_id = ? AND source_id != ?
+            """,
+            (session_id, original_id),
+        )
+
+        assert original["state"] == "blocked_mode_drift"
+        assert replacements == []
+        assert replacement_leases == []
+        runtime._assert_owned_handle = original_assert_owned_handle  # type: ignore[method-assign]
+        with pytest.raises(ExceptionGroup, match="session component shutdown failed"):
+            await runtime._stop_components(release_owner=False)
 
 
 @pytest.mark.asyncio

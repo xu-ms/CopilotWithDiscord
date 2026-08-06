@@ -12,6 +12,77 @@ from typing import Any
 import aiosqlite
 
 _CORE_MIGRATION_VERSION = 37
+_LEGACY_MIGRATION_REMAPPINGS = (
+    (
+        8,
+        "0008_render_streams_agent_id.sql",
+        30,
+        "0030_render_streams_agent_id.sql",
+        frozenset({"render_streams"}),
+    ),
+    (
+        9,
+        "0009_render_attachment_delivery.sql",
+        31,
+        "0031_render_attachment_delivery.sql",
+        frozenset(
+            {
+                "render_attachment_batches",
+                "render_attachment_checkpoints",
+            }
+        ),
+    ),
+    (
+        10,
+        "0010_product_surface.sql",
+        32,
+        "0032_product_surface.sql",
+        frozenset(
+            {
+                "pinned_message_provenance",
+                "render_parent_diagnostics",
+                "session_projection_snapshots",
+                "session_ui_metadata",
+                "tool_output_streams",
+            }
+        ),
+    ),
+    (
+        11,
+        "0011_review_hardening.sql",
+        33,
+        "0033_review_hardening.sql",
+        frozenset({"render_batch_intents"}),
+    ),
+    (
+        12,
+        "0012_tool_spill_artifacts.sql",
+        34,
+        "0034_tool_spill_artifacts.sql",
+        frozenset({"tool_spill_artifacts"}),
+    ),
+    (
+        13,
+        "0013_attachment_inline_variants.sql",
+        35,
+        "0035_attachment_inline_variants.sql",
+        frozenset({"attachment_inline_variants"}),
+    ),
+    (
+        14,
+        "0014_trusted_local_artifacts.sql",
+        36,
+        "0036_trusted_local_artifacts.sql",
+        frozenset({"trusted_local_artifacts"}),
+    ),
+    (
+        15,
+        "0015_trusted_local_artifact_snapshots.sql",
+        37,
+        "0037_trusted_local_artifact_snapshots.sql",
+        frozenset({"trusted_local_artifact_snapshots"}),
+    ),
+)
 
 
 class Database:
@@ -42,6 +113,7 @@ class Database:
         if str(self.path) != ":memory:":
             await self._connection.execute("PRAGMA journal_mode = WAL")
         await self._ensure_migration_table()
+        await self._remap_legacy_migration_identities()
         await self.migrate()
         await self.apply_compatibility_patches()
 
@@ -70,6 +142,68 @@ class Database:
             )
             """
         )
+
+    async def _remap_legacy_migration_identities(self) -> None:
+        async with self.transaction() as connection:
+            cursor = await connection.execute(
+                "SELECT version, name, applied_at FROM schema_migrations"
+            )
+            rows = await cursor.fetchall()
+            await cursor.close()
+            applied = {
+                int(row["version"]): (str(row["name"]), float(row["applied_at"])) for row in rows
+            }
+            legacy_rows = [
+                remapping
+                for remapping in _LEGACY_MIGRATION_REMAPPINGS
+                if applied.get(remapping[0], (None, None))[0] == remapping[1]
+            ]
+            if not legacy_rows:
+                return
+
+            cursor = await connection.execute("SELECT name FROM sqlite_master WHERE type = 'table'")
+            tables = {str(row["name"]) for row in await cursor.fetchall()}
+            await cursor.close()
+            for (
+                legacy_version,
+                legacy_name,
+                current_version,
+                current_name,
+                required_tables,
+            ) in legacy_rows:
+                if not required_tables <= tables:
+                    missing = ", ".join(sorted(required_tables - tables))
+                    raise RuntimeError(
+                        f"legacy migration {legacy_name} is recorded but its schema "
+                        f"is missing: {missing}"
+                    )
+                if legacy_version == 8 and not await _render_streams_has_agent_key(connection):
+                    raise RuntimeError(
+                        "legacy migration 0008_render_streams_agent_id.sql is "
+                        "recorded but render_streams does not have the agent key"
+                    )
+
+                current = applied.get(current_version)
+                if current is not None and current[0] != current_name:
+                    raise RuntimeError(
+                        f"migration version {current_version} is already recorded as "
+                        f"{current[0]}, not {current_name}"
+                    )
+                if current is None:
+                    applied_at = applied[legacy_version][1]
+                    await connection.execute(
+                        """
+                        INSERT INTO schema_migrations(version, name, applied_at)
+                        VALUES (?, ?, ?)
+                        """,
+                        (current_version, current_name, applied_at),
+                    )
+                    applied[current_version] = (current_name, applied_at)
+                await connection.execute(
+                    "DELETE FROM schema_migrations WHERE version = ? AND name = ?",
+                    (legacy_version, legacy_name),
+                )
+                applied.pop(legacy_version)
 
     async def migrate(self) -> None:
         migration_root = resources.files("copilotd.storage.migrations")
@@ -309,6 +443,25 @@ class Database:
             return
         async with self._transaction_lock:
             yield
+
+
+async def _render_streams_has_agent_key(
+    connection: aiosqlite.Connection,
+) -> bool:
+    cursor = await connection.execute("PRAGMA table_info(render_streams)")
+    columns = await cursor.fetchall()
+    await cursor.close()
+    names = {str(row["name"]) for row in columns}
+    primary_key = [
+        str(row["name"])
+        for row in sorted(columns, key=lambda row: int(row["pk"]))
+        if int(row["pk"]) > 0
+    ]
+    return "agent_id" in names and primary_key == [
+        "session_id",
+        "message_id",
+        "agent_id",
+    ]
 
 
 def _split_sql_statements(sql: str) -> list[str]:

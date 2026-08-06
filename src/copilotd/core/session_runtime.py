@@ -1816,7 +1816,6 @@ class SessionRuntime:
             "blocked_agent_drift",
             "blocked_session_config_drift",
         }
-        now = time.time()
         replacement_id = str(
             uuid.uuid5(
                 uuid.NAMESPACE_URL,
@@ -1828,6 +1827,8 @@ class SessionRuntime:
         )
         async with self._queue_dispatch_lock:
             async with self._database.transaction() as connection:
+                now = time.time()
+                await self._assert_resubmit_write_fence(connection, now=now)
                 cursor = await connection.execute(
                     """
                     SELECT q.*, s.origin, s.runtime_schedule_id
@@ -1994,6 +1995,55 @@ class SessionRuntime:
                     ),
                 )
         return replacement_id
+
+    async def _assert_resubmit_write_fence(
+        self,
+        connection: Any,
+        *,
+        now: float,
+    ) -> None:
+        lease = self._lease
+        binding_fence = self.binding.owner_fence_token
+        if (
+            lease is None
+            or binding_fence is None
+            or lease.sdk_session_id != self.binding.sdk_session_id
+        ):
+            raise FenceLost("queue resubmission has no current owner fence")
+        cursor = await connection.execute(
+            """
+            SELECT 1
+            FROM session_owner_leases AS owner
+            JOIN session_bindings AS binding
+              ON binding.sdk_session_id = owner.sdk_session_id
+            WHERE owner.sdk_session_id = ?
+              AND owner.owner_id = ?
+              AND owner.fence_token = ?
+              AND owner.expires_at >= ?
+              AND binding.thread_id = ?
+              AND binding.runtime_generation = ?
+              AND binding.owner_fence_token = ?
+              AND binding.owner_fence_token = owner.fence_token
+              AND binding.binding_intent = 'active'
+              AND binding.attachment_state = 'attached'
+            """,
+            (
+                self.binding.sdk_session_id,
+                lease.owner_id,
+                lease.fence_token,
+                now + MUTATION_HEADROOM_SECONDS,
+                self.binding.thread_id,
+                self.binding.runtime_generation,
+                binding_fence,
+            ),
+        )
+        current = await cursor.fetchone()
+        await cursor.close()
+        if current is None:
+            raise FenceLost(
+                "owner fence, runtime generation, or mutation headroom "
+                "changed before queue resubmission"
+            )
 
     async def update_taskdeck_view(
         self,
