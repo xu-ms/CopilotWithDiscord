@@ -96,16 +96,40 @@ class FakeTree:
 
 
 class FakeHttp:
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        command_permissions: list[dict[str, object]] | None = None,
+    ) -> None:
         self.restore_calls: list[tuple[int, int, list[dict[str, object]]]] = []
+        self.command_permissions = command_permissions or []
+        self.permission_reads: list[tuple[int, int]] = []
+        self.permission_edits: list[tuple[int, int, int, dict[str, object]]] = []
 
     async def bulk_upsert_guild_commands(
         self,
         application_id: int,
         guild_id: int,
         commands: list[dict[str, object]],
-    ) -> None:
+    ) -> list[dict[str, object]]:
         self.restore_calls.append((application_id, guild_id, list(commands)))
+        return [{**command, "id": 9000 + index} for index, command in enumerate(commands, start=1)]
+
+    async def get_guild_application_command_permissions(
+        self,
+        application_id: int,
+        guild_id: int,
+    ) -> list[dict[str, object]]:
+        self.permission_reads.append((application_id, guild_id))
+        return list(self.command_permissions)
+
+    async def edit_application_command_permissions(
+        self,
+        application_id: int,
+        guild_id: int,
+        command_id: int,
+        payload: dict[str, object],
+    ) -> None:
+        self.permission_edits.append((application_id, guild_id, command_id, dict(payload)))
 
 
 class FakeBot:
@@ -281,8 +305,12 @@ class DryRunHttp(FakeHttp):
         application_id: int,
         guild_id: int,
         commands: list[dict[str, object]],
-    ) -> None:
-        await super().bulk_upsert_guild_commands(application_id, guild_id, commands)
+    ) -> list[dict[str, object]]:
+        return await super().bulk_upsert_guild_commands(
+            application_id,
+            guild_id,
+            commands,
+        )
 
 
 class DryRunBot:
@@ -440,6 +468,118 @@ async def test_manifest_restoration_uses_exact_snapshot(tmp_path: Path) -> None:
     assert snapshot == tree.snapshot
     assert http.restore_calls == [(10, 20, tree.snapshot)]
     assert bot.closed is True
+
+
+@pytest.mark.asyncio
+async def test_manifest_restores_role_and_user_overrides_to_new_command_ids(
+    tmp_path: Path,
+) -> None:
+    channel = FakeChannel(id=30)
+    guild = FakeGuild(id=20, channel=channel)
+    tree = FakeTree(
+        snapshot=[
+            {
+                "id": 101,
+                "name": "restricted",
+                "type": 1,
+                "description": "restricted",
+                "options": [],
+            }
+        ]
+    )
+    permissions = [
+        {
+            "id": "101",
+            "permissions": [
+                {"id": "501", "type": 1, "permission": True},
+                {"id": "601", "type": 2, "permission": False},
+            ],
+        }
+    ]
+    http = FakeHttp(command_permissions=permissions)
+    bot = FakeBot(application_id=10, guilds=[guild], tree=tree, http=http)
+    harness = DiscordRealHarness(
+        token="not-used",
+        evidence_path=tmp_path / "evidence.json",
+        guild_id=20,
+        application_id=10,
+        channel_id=30,
+        keep_resources=True,
+    )
+    harness._bot = bot
+    harness._guild_object = discord.Object(id=20)
+    harness._original_manifest = await harness._snapshot_guild_manifest(bot)
+
+    failures = await harness._cleanup()
+
+    expected_payload = {
+        "permissions": [
+            {"id": "501", "type": 1, "permission": True},
+            {"id": "601", "type": 2, "permission": False},
+        ]
+    }
+    assert failures == []
+    assert harness._original_manifest == [
+        {
+            "name": "restricted",
+            "type": 1,
+            "description": "restricted",
+            "options": [],
+        }
+    ]
+    assert http.permission_edits == [
+        (10, 20, 101, expected_payload),
+        (10, 20, 9001, expected_payload),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_manifest_override_restore_credentials_fail_before_sync(
+    tmp_path: Path,
+) -> None:
+    channel = FakeChannel(id=30)
+    guild = FakeGuild(id=20, channel=channel)
+    tree = FakeTree(
+        snapshot=[
+            {
+                "id": 101,
+                "name": "restricted",
+                "type": 1,
+                "description": "restricted",
+                "options": [],
+            }
+        ]
+    )
+    http = FakeHttp(
+        command_permissions=[
+            {
+                "id": "101",
+                "permissions": [
+                    {"id": "501", "type": 1, "permission": True},
+                ],
+            }
+        ]
+    )
+
+    async def forbidden_restore(*args, **kwargs):
+        raise RuntimeError("missing applications.commands.permissions.update")
+
+    http.edit_application_command_permissions = forbidden_restore  # type: ignore[assignment]
+    bot = FakeBot(application_id=10, guilds=[guild], tree=tree, http=http)
+    harness = DiscordRealHarness(
+        token="not-used",
+        evidence_path=tmp_path / "evidence.json",
+        guild_id=20,
+        application_id=10,
+        channel_id=30,
+    )
+
+    with pytest.raises(DiscordE2EError, match="manifest sync was not attempted"):
+        await harness._execute_ready_pipeline(bot, tmp_path)
+
+    assert tree.copy_calls == []
+    assert tree.sync_calls == []
+    assert http.restore_calls == []
 
 
 def test_manifest_merges_mutable_access_controls_from_attributes() -> None:
@@ -722,6 +862,61 @@ async def test_dry_run_traverses_snapshot_sync_channel_probe_cleanup_without_net
 
 
 @pytest.mark.asyncio
+async def test_production_probe_rejects_empty_reducer_outbox_path(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database = Database(tmp_path / "empty-production.sqlite3")
+    channel = DryRunChannel(id=30)
+    guild = DryRunGuild(id=20, channel=channel)
+    bot = DryRunBot(
+        application_id=10,
+        database=database,
+        guilds=[guild],
+    )
+    await database.open()
+    thread = DryRunThread(id=40, name="empty", channel=channel)
+    harness = DiscordRealHarness(
+        token="not-used",
+        evidence_path=tmp_path / "evidence.json",
+        guild_id=20,
+        application_id=10,
+        channel_id=30,
+        dry_run=True,
+    )
+    harness._bot = bot
+
+    class EmptyOutboxReducer:
+        def __init__(self, database, artifact_root=None) -> None:
+            self.database = database
+
+        async def persist(self, events) -> int:
+            for index in range(2):
+                await self.database.execute(
+                    """
+                    INSERT INTO event_journal(
+                        sdk_session_id, generation, inbox_seq, source,
+                        persistence_class, raw_type, reducer_hash,
+                        raw_payload, received_at
+                    ) VALUES (?, 0, ?, 'internal', 'internal', 'probe', ?, '{}', 0)
+                    """,
+                    (
+                        events[0].sdk_session_id,
+                        index + 1,
+                        f"empty-{index}",
+                    ),
+                )
+            return 2
+
+    monkeypatch.setattr(harness_module, "JournalReducer", EmptyOutboxReducer)
+    try:
+        with pytest.raises(DiscordE2EError, match="three known render intents"):
+            await harness._run_production_pipeline_probe(tmp_path, thread)
+    finally:
+        await bot.close()
+
+
+@pytest.mark.asyncio
 async def test_run_aggregates_original_cleanup_restore_and_write_errors(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -883,6 +1078,88 @@ async def test_run_preserves_cancellation_with_cleanup_failure(
     assert any(isinstance(error, asyncio.CancelledError) for error in errors)
     assert any("restore after cancellation failed" in str(error) for error in errors)
     assert (tmp_path / "cancel-evidence.json").is_file()
+
+
+@pytest.mark.asyncio
+async def test_cancellation_during_cleanup_waits_for_manifest_and_shutdown(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    delete_started = asyncio.Event()
+    release_delete = asyncio.Event()
+
+    class BlockingDeleteMessage(FakeMessage):
+        async def delete(self) -> None:
+            delete_started.set()
+            await release_delete.wait()
+            self.deleted = True
+
+    database = Database(tmp_path / "cleanup-cancel.sqlite3")
+    channel = DryRunChannel(id=30)
+    guild = DryRunGuild(id=20, channel=channel)
+    http = DryRunHttp()
+
+    def bot_factory(settings):
+        return DryRunBot(
+            application_id=10,
+            database=database,
+            guilds=[guild],
+            tree=DryRunTree(),
+            http=http,
+        )
+
+    harness = DiscordRealHarness(
+        token="not-used",
+        evidence_path=tmp_path / "cleanup-cancel-evidence.json",
+        guild_id=20,
+        application_id=10,
+        channel_id=30,
+        dry_run=True,
+        bot_factory=bot_factory,
+    )
+    message = BlockingDeleteMessage(id=700)
+
+    async def successful_pipeline(bot, root):
+        harness._guild_object = discord.Object(id=20)
+        harness._original_manifest = [
+            {
+                "name": "existing",
+                "type": 1,
+                "description": "old",
+                "options": [],
+            }
+        ]
+        harness._created_messages.append(message)
+
+    monkeypatch.setattr(harness, "_execute_ready_pipeline", successful_pipeline)
+    run_task = asyncio.create_task(harness.run())
+    await delete_started.wait()
+    run_task.cancel()
+    await asyncio.sleep(0)
+    assert not run_task.done()
+
+    release_delete.set()
+    with pytest.raises(asyncio.CancelledError):
+        await run_task
+
+    assert message.deleted is True
+    assert http.restore_calls == [
+        (
+            10,
+            20,
+            [
+                {
+                    "name": "existing",
+                    "type": 1,
+                    "description": "old",
+                    "options": [],
+                }
+            ],
+        )
+    ]
+    assert harness._bot is not None and harness._bot.closed is True
+    assert harness.evidence.cleaned_up is True
+    assert (tmp_path / "cleanup-cancel-evidence.json").is_file()
 
 
 def test_production_imports_do_not_install_direct_delivery_fallback() -> None:

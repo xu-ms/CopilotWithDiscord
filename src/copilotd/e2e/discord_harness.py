@@ -290,6 +290,7 @@ class DiscordRealHarness:
         self._stable_ids: dict[str, str] = {}
         self._created_messages: list[discord.Message] = []
         self._original_manifest: list[dict[str, Any]] | None = None
+        self._original_command_permissions: list[dict[str, Any]] = []
         self._http_rate_limit = HttpRateLimitObservation()
 
     def record_http_response(
@@ -438,20 +439,43 @@ class DiscordRealHarness:
             except BaseException as error:
                 errors.append(error)
             finally:
-                try:
-                    cleanup_errors = await self._cleanup()
-                except BaseException as error:
-                    cleanup_errors = [error]
+                cleanup_errors, cleanup_interruptions = await self._cleanup_to_completion()
                 self.evidence.finished_at = time.time()
                 try:
                     write_evidence(self._evidence_path, self.evidence)
                 except BaseException as error:
                     write_error = error
+                errors.extend(cleanup_interruptions)
                 errors.extend(cleanup_errors)
                 if write_error is not None:
                     errors.append(write_error)
         _raise_run_errors(errors)
         return self.evidence
+
+    async def _cleanup_to_completion(
+        self,
+    ) -> tuple[list[BaseException], list[BaseException]]:
+        cleanup_task = asyncio.create_task(
+            self._cleanup(),
+            name=f"discord-e2e-cleanup:{self._run_id}",
+        )
+        interruptions: list[BaseException] = []
+        while True:
+            try:
+                return await asyncio.shield(cleanup_task), interruptions
+            except asyncio.CancelledError as error:
+                if not cleanup_task.done():
+                    interruptions.append(error)
+                    continue
+                if cleanup_task.cancelled():
+                    return [error], interruptions
+                interruptions.append(error)
+                try:
+                    return cleanup_task.result(), interruptions
+                except BaseException as cleanup_error:
+                    return [cleanup_error], interruptions
+            except BaseException as error:
+                return [error], interruptions
 
     async def _prepare_dry_run_bot(self, bot: Any) -> None:
         database = getattr(bot, "database", None)
@@ -524,7 +548,86 @@ class DiscordRealHarness:
             commands = await fetch_commands(guild=self._guild_object)
         else:
             commands = bot.tree.get_commands(guild=self._guild_object)
-        return [_command_manifest_entry(command) for command in commands]
+        manifest = [_command_manifest_entry(command) for command in commands]
+        self._original_command_permissions = await self._snapshot_and_validate_command_permissions(
+            bot, commands
+        )
+        return manifest
+
+    async def _snapshot_and_validate_command_permissions(
+        self,
+        bot: CopilotDiscordBot,
+        commands: list[Any],
+    ) -> list[dict[str, Any]]:
+        get_permissions = getattr(
+            bot.http,
+            "get_guild_application_command_permissions",
+            None,
+        )
+        if not callable(get_permissions):
+            raise DiscordE2EError(
+                "cannot snapshot guild command permission overrides before manifest sync"
+            )
+        try:
+            raw_overrides = await get_permissions(
+                self._requested_application_id,
+                self._requested_guild_id,
+            )
+        except Exception as error:
+            raise DiscordE2EError(
+                "cannot read guild command permission overrides before manifest sync"
+            ) from error
+
+        commands_by_id = {
+            str(command_id): _command_identity(command)
+            for command in commands
+            if (command_id := _command_id(command)) is not None
+        }
+        snapshots: list[dict[str, Any]] = []
+        for raw_override in raw_overrides or []:
+            if not isinstance(raw_override, Mapping):
+                continue
+            permissions = _command_permission_entries(raw_override.get("permissions"))
+            if not permissions:
+                continue
+            original_command_id = str(raw_override.get("id", ""))
+            identity = commands_by_id.get(original_command_id)
+            if identity is None:
+                raise DiscordE2EError(
+                    "guild command permission override references an unknown command ID"
+                )
+            snapshots.append(
+                {
+                    "name": identity[1],
+                    "type": identity[0],
+                    "original_command_id": original_command_id,
+                    "permissions": permissions,
+                }
+            )
+
+        if not snapshots:
+            return []
+        edit_permissions = getattr(
+            bot.http,
+            "edit_application_command_permissions",
+            None,
+        )
+        if not callable(edit_permissions):
+            raise DiscordE2EError("cannot restore existing guild command permission overrides")
+        for snapshot in snapshots:
+            try:
+                await edit_permissions(
+                    self._requested_application_id,
+                    self._requested_guild_id,
+                    int(snapshot["original_command_id"]),
+                    {"permissions": _clone_json_value(snapshot["permissions"])},
+                )
+            except Exception as error:
+                raise DiscordE2EError(
+                    "credentials cannot restore guild command permission overrides; "
+                    "manifest sync was not attempted"
+                ) from error
+        return snapshots
 
     async def _sync_manifest(self, bot: CopilotDiscordBot) -> None:
         assert self._guild_object is not None
@@ -575,11 +678,48 @@ class DiscordRealHarness:
         bulk_upsert = getattr(bot.http, "bulk_upsert_guild_commands", None)
         if bulk_upsert is None:
             raise DiscordE2EError("missing bulk_upsert_guild_commands")
-        await bulk_upsert(
+        restored_commands = await bulk_upsert(
             self._requested_application_id,
             self._requested_guild_id,
             commands,
         )
+        if not self._original_command_permissions:
+            return
+        if not isinstance(restored_commands, list):
+            get_commands = getattr(bot.http, "get_guild_commands", None)
+            if not callable(get_commands):
+                raise DiscordE2EError(
+                    "restored command IDs are unavailable for permission override restore"
+                )
+            restored_commands = await get_commands(
+                self._requested_application_id,
+                self._requested_guild_id,
+            )
+        restored_ids = {
+            _command_identity(command): command_id
+            for command in restored_commands
+            if (command_id := _command_id(command)) is not None
+        }
+        edit_permissions = getattr(
+            bot.http,
+            "edit_application_command_permissions",
+            None,
+        )
+        if not callable(edit_permissions):
+            raise DiscordE2EError(
+                "missing edit_application_command_permissions during manifest restore"
+            )
+        for snapshot in self._original_command_permissions:
+            identity = (int(snapshot["type"]), str(snapshot["name"]))
+            restored_id = restored_ids.get(identity)
+            if restored_id is None:
+                raise DiscordE2EError(f"restored command ID is missing for `{identity[1]}`")
+            await edit_permissions(
+                self._requested_application_id,
+                self._requested_guild_id,
+                int(restored_id),
+                {"permissions": _clone_json_value(snapshot["permissions"])},
+            )
 
     async def _run_real_transport_cases(self, root: Path) -> None:
         channel = self._require_channel()
@@ -1117,19 +1257,62 @@ class DiscordRealHarness:
         )
         if await reducer.persist(events) != 2:
             raise DiscordE2EError("production reducer did not persist both probe events")
+        journal_count = await bot.database.fetchone(
+            """
+            SELECT COUNT(*) AS count FROM event_journal
+            WHERE sdk_session_id = ?
+            """,
+            (session_id,),
+        )
+        if journal_count is None or int(journal_count["count"]) != 2:
+            raise DiscordE2EError(
+                "production reducer probe did not journal exactly two known events"
+            )
         expected_rows = await bot.database.fetchall(
             """
-            SELECT payload FROM render_outbox
+            SELECT lane, payload FROM render_outbox
             WHERE session_id = ?
             ORDER BY logical_seq, created_at
             """,
             (session_id,),
         )
+        expected_intent_count = 3
+        if len(expected_rows) != expected_intent_count:
+            raise DiscordE2EError(
+                "production reducer probe did not create exactly three known render intents"
+            )
+        lanes = {str(row["lane"]) for row in expected_rows}
+        if lanes != {"assistant_final", "artifact", "taskdeck"}:
+            raise DiscordE2EError(
+                f"production reducer probe emitted unexpected lanes: {sorted(lanes)}"
+            )
+        known_payloads = [json.loads(str(row["payload"])) for row in expected_rows]
+        if sum(payload.get("content") == marker for payload in known_payloads) != 1:
+            raise DiscordE2EError(
+                "production reducer probe did not preserve the known marker intent"
+            )
+        expected_artifact_sha256 = _hash_bytes(exact_artifact)
+        intent_artifact_digests: list[str] = []
+        for payload in known_payloads:
+            attachments = payload.get("attachments")
+            if not isinstance(attachments, list):
+                continue
+            for attachment in attachments:
+                if not isinstance(attachment, dict):
+                    continue
+                body = attachment.get("content")
+                if isinstance(body, str):
+                    intent_artifact_digests.append(_hash_bytes(body.encode()))
+                elif isinstance(attachment.get("sha256"), str):
+                    intent_artifact_digests.append(str(attachment["sha256"]))
+        if intent_artifact_digests.count(expected_artifact_sha256) != 1:
+            raise DiscordE2EError(
+                "production reducer probe did not create the known exact artifact intent"
+            )
         expected_contents: list[str] = []
         expected_filenames: list[str] = []
         expected_sha256: list[str] = []
-        for row in expected_rows:
-            payload = json.loads(str(row["payload"]))
+        for payload in known_payloads:
             plan = await _discord_render_plan(
                 payload,
                 allowed_roots=(root,),
@@ -1144,7 +1327,11 @@ class DiscordRealHarness:
             _DryRunRenderTransport(thread, root, self._created_messages) if self._dry_run else bot
         )
         dispatcher = RenderOutboxDispatcher(bot.database, transport)
-        await dispatcher.drain(deadline_seconds=30)
+        delivered_count = await dispatcher.drain(deadline_seconds=30)
+        if delivered_count != expected_intent_count:
+            raise DiscordE2EError(
+                "production outbox probe did not deliver exactly three known intents"
+            )
         pending = await bot.database.fetchone(
             """
             SELECT COUNT(*) AS count FROM render_outbox
@@ -1166,7 +1353,26 @@ class DiscordRealHarness:
             """,
             (session_id,),
         )
+        if len(rows) != expected_intent_count:
+            raise DiscordE2EError(
+                "production outbox probe did not map exactly three Discord messages"
+            )
         messages = [await thread.fetch_message(int(row["discord_message_id"])) for row in rows]
+        if not self._dry_run:
+            actual_contents = [str(message.content) for message in messages]
+            if actual_contents.count(marker) != 1:
+                raise DiscordE2EError(
+                    "production Discord history did not contain the known marker exactly once"
+                )
+            actual_artifact_digests = [
+                _hash_bytes(await attachment.read(use_cached=True))
+                for message in messages
+                for attachment in message.attachments
+            ]
+            if actual_artifact_digests.count(expected_artifact_sha256) != 1:
+                raise DiscordE2EError(
+                    "production Discord history did not contain the known artifact digest"
+                )
         evidence = await self.record_ordered_delivery_probe(
             messages,
             expected_contents=expected_contents,
@@ -1181,6 +1387,16 @@ class DiscordRealHarness:
         else:
             evidence.feature = "production reducer/outbox exact delivery"
             evidence.transport = "JournalReducer -> RenderOutboxDispatcher -> real Discord"
+        evidence.assertions.extend(
+            [
+                "journal_event_count=2",
+                f"render_intent_count={expected_intent_count}",
+                f"render_message_count={len(rows)}",
+                f"known_marker={marker}",
+                f"known_artifact_sha256={expected_artifact_sha256}",
+                "delivery_path=JournalReducer->RenderOutboxDispatcher",
+            ]
+        )
         self.evidence.features.append(evidence)
 
     async def _cleanup(self) -> list[BaseException]:
@@ -1194,6 +1410,8 @@ class DiscordRealHarness:
                     await result
             except discord.NotFound:
                 return
+            except asyncio.CancelledError as error:
+                failures.append(error)
             except Exception as error:
                 failures.append(RuntimeError(f"{label}: {type(error).__name__}: {error}"))
 
@@ -1220,6 +1438,8 @@ class DiscordRealHarness:
             if bot is not None:
                 try:
                     await bot.close()
+                except asyncio.CancelledError as error:
+                    failures.append(error)
                 except Exception as error:
                     failures.append(RuntimeError(f"close bot: {type(error).__name__}: {error}"))
             runner = self._runner
@@ -1465,6 +1685,63 @@ def _clone_json_value(value: Any) -> Any:
     if isinstance(enum_value, (str, int, float, bool)):
         return enum_value
     return value
+
+
+def _command_value(command: Any, field: str) -> Any:
+    if isinstance(command, Mapping):
+        return command.get(field)
+    return getattr(command, field, None)
+
+
+def _command_id(command: Any) -> int | None:
+    value = _command_value(command, "id")
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _command_identity(command: Any) -> tuple[int, str]:
+    raw_type = _command_value(command, "type")
+    command_type = getattr(raw_type, "value", raw_type)
+    name = _command_value(command, "name")
+    if name is None:
+        raise DiscordE2EError("application command snapshot is missing a name")
+    try:
+        normalized_type = int(command_type)
+    except (TypeError, ValueError) as error:
+        raise DiscordE2EError(f"application command `{name}` has an invalid type") from error
+    return normalized_type, str(name)
+
+
+def _command_permission_entries(value: Any) -> list[dict[str, Any]]:
+    if not isinstance(value, list):
+        return []
+    entries: list[dict[str, Any]] = []
+    for item in value:
+        if not isinstance(item, Mapping):
+            continue
+        permission_id = item.get("id")
+        permission_type = getattr(item.get("type"), "value", item.get("type"))
+        permission = item.get("permission")
+        if permission_id is None or permission_type is None or not isinstance(permission, bool):
+            raise DiscordE2EError("guild command permission override is malformed")
+        try:
+            normalized_type = int(permission_type)
+        except (TypeError, ValueError) as error:
+            raise DiscordE2EError(
+                "guild command permission override has an invalid type"
+            ) from error
+        entries.append(
+            {
+                "id": str(permission_id),
+                "type": normalized_type,
+                "permission": permission,
+            }
+        )
+    return sorted(entries, key=lambda item: (item["type"], item["id"]))
 
 
 def _command_manifest_entry(command: Any) -> dict[str, Any]:
