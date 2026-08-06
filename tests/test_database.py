@@ -29,6 +29,7 @@ async def test_initial_migration_creates_full_schema(tmp_path: Path) -> None:
         "model_turns",
         "native_queue_items",
         "pending_interactions",
+        "pending_runtime_schedule_triggers",
         "plugin_dirs",
         "project_env",
         "project_config_revisions",
@@ -64,6 +65,7 @@ async def test_initial_migration_creates_full_schema(tmp_path: Path) -> None:
         "restart_intents",
         "worktree_events",
         "worktree_intents",
+        "worktree_process_state",
         "worktree_recovery_runs",
     }
 
@@ -100,6 +102,8 @@ async def test_migrations_are_idempotent(tmp_path: Path) -> None:
         23,
         24,
         25,
+        26,
+        27,
     ]
 
 
@@ -146,6 +150,8 @@ async def test_foundation_migration_upgrades_existing_v7_database(tmp_path: Path
         23,
         24,
         25,
+        26,
+        27,
     ]
     assert "protocol_version" in {row["name"] for row in capability_columns}
     assert {
@@ -159,6 +165,8 @@ async def test_foundation_migration_upgrades_existing_v7_database(tmp_path: Path
         "git_create_holder",
         "git_create_fence_token",
         "git_create_lease_expires_at",
+        "git_create_process_generation",
+        "git_create_retry_at",
     } <= {row["name"] for row in worktree_columns}
     assert {
         "execution_health",

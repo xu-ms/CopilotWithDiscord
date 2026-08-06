@@ -40,6 +40,10 @@ class OperationAmbiguous(RuntimeError):
     pass
 
 
+class MailboxNotAccepting(RuntimeError):
+    pass
+
+
 @dataclass(frozen=True, slots=True)
 class OperationRecord:
     operation_id: str
@@ -350,10 +354,10 @@ class CommandMailbox:
         on_fence_deferred: OperationCallable | None = None,
     ) -> Any:
         if not self._accepting:
-            raise RuntimeError("command mailbox is not accepting operations")
+            raise MailboxNotAccepting("command mailbox is not accepting operations")
         async with self._submission_lock:
             if not self._accepting:
-                raise RuntimeError("command mailbox is not accepting operations")
+                raise MailboxNotAccepting("command mailbox is not accepting operations")
             future = self._futures.get(idempotency_key)
             if future is None:
                 record, created = await self._store.begin(

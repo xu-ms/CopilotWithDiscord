@@ -22,6 +22,7 @@ from copilotd.core.projects import (
     ProjectSnapshot,
 )
 from copilotd.core.sessions import SessionCreationService, SessionCreationUnknown
+from copilotd.core.task_registry import TaskRegistry
 from copilotd.storage.database import Database
 
 WORKTREE_GIT_CREATE_LEASE_SECONDS = 300.0
@@ -106,6 +107,13 @@ class WorktreeConflict(WorktreeError):
         super().__init__(message)
 
 
+class WorktreeRetryPending(WorktreeConflict):
+    def __init__(self, intent_id: str, retry_at: float) -> None:
+        self.intent_id = intent_id
+        self.retry_at = retry_at
+        super().__init__(f"worktree Git creation retry is scheduled at {retry_at}")
+
+
 class WorktreeCapabilityError(WorktreeError):
     code = "CD-CAP-001"
 
@@ -180,6 +188,8 @@ class WorktreeIntent:
     git_create_holder: str | None
     git_create_fence_token: int
     git_create_lease_expires_at: float | None
+    git_create_process_generation: int | None
+    git_create_retry_at: float | None
     created_at: float
     updated_at: float
 
@@ -428,12 +438,24 @@ class WorktreeManager:
         worktrees_root: Path,
         adapter: WorktreeSessionAdapter,
         git: GitRunner | None = None,
+        process_owner_id: str | None = None,
+        git_create_lease_seconds: float = WORKTREE_GIT_CREATE_LEASE_SECONDS,
+        task_registry: TaskRegistry | None = None,
     ) -> None:
+        if git_create_lease_seconds <= 0:
+            raise ValueError("worktree Git creation lease must be positive")
         self._database = database
         self._projects = projects
         self._worktrees_root = worktrees_root.expanduser().resolve()
         self._adapter = adapter
         self._git = SubprocessGitRunner() if git is None else git
+        self._process_owner_id = process_owner_id or f"worktree:{uuid.uuid4()}"
+        self._process_generation: int | None = None
+        self._process_generation_lock = asyncio.Lock()
+        self._git_create_lease_seconds = git_create_lease_seconds
+        self._task_registry = task_registry
+        self._recovery_retry_tasks: dict[str, asyncio.Task[None]] = {}
+        self._active_git_holders: set[str] = set()
 
     async def create(
         self,
@@ -446,6 +468,7 @@ class WorktreeManager:
         now: float | None = None,
     ) -> WorktreeProjection:
         timestamp = time.time() if now is None else now
+        await self._ensure_process_generation(now=timestamp)
         normalized_name = _validate_worktree_name(name)
         _validate_base_ref(base_ref)
         if history_mode == WorktreeHistoryMode.FORK:
@@ -583,7 +606,9 @@ class WorktreeManager:
         return await self._projection_for_intent(intent_id)
 
     async def recover(self, *, now: float | None = None) -> WorktreeRecoveryReport:
+        schedule_retries = now is None
         timestamp = time.time() if now is None else now
+        await self._ensure_process_generation(now=timestamp)
         recovery_id = str(uuid.uuid4())
         rows = await self._database.fetchall(
             """
@@ -726,6 +751,10 @@ class WorktreeManager:
                     now=timestamp,
                 )
                 orphaned += 1
+            except WorktreeRetryPending as pending:
+                if schedule_retries:
+                    self._schedule_recovery_retry(pending)
+                orphaned += 1
             except WorktreeConflict as error:
                 await self._record_recovery_intervention(
                     intent,
@@ -762,6 +791,36 @@ class WorktreeManager:
             recovered_intents=recovered,
             orphaned_intents=orphaned,
         )
+
+    def _schedule_recovery_retry(self, pending: WorktreeRetryPending) -> None:
+        existing = self._recovery_retry_tasks.get(pending.intent_id)
+        if existing is not None and not existing.done():
+            return
+
+        async def retry() -> None:
+            await asyncio.sleep(max(0, pending.retry_at - time.time()))
+            await self.recover(now=max(time.time(), pending.retry_at))
+
+        if self._task_registry is None:
+            task = asyncio.create_task(
+                retry(),
+                name=f"worktree-recovery-retry:{pending.intent_id}",
+            )
+        else:
+            task = self._task_registry.create(
+                retry(),
+                name=f"worktree-recovery-retry:{pending.intent_id}",
+                source="worktree-recovery",
+            )
+        self._recovery_retry_tasks[pending.intent_id] = task
+
+        def clear(completed: asyncio.Task[None]) -> None:
+            if self._recovery_retry_tasks.get(pending.intent_id) is completed:
+                self._recovery_retry_tasks.pop(pending.intent_id, None)
+            if not completed.cancelled():
+                completed.exception()
+
+        task.add_done_callback(clear)
 
     async def _resume_create(
         self,
@@ -1027,8 +1086,12 @@ class WorktreeManager:
             )
             raise WorktreeConflict(detail)
         intent.target_path.parent.mkdir(parents=True, exist_ok=True)
-        result = await self._git.run(
-            [
+        result, side_effect_now = await self._run_git_creation_side_effect(
+            intent,
+            holder=holder,
+            fence_token=fence_token,
+            now=now,
+            argv=[
                 "git",
                 "worktree",
                 "add",
@@ -1042,12 +1105,56 @@ class WorktreeManager:
         )
         registration = await self._worktree_metadata(repo_root, intent.target_path)
         if result.returncode != 0 and registration is None:
+            command_path_collision = await asyncio.to_thread(
+                _find_casefold_path_collision,
+                intent.target_path,
+            )
+            command_branch = await self._git.run(
+                [
+                    "git",
+                    "show-ref",
+                    "--verify",
+                    "--quiet",
+                    f"refs/heads/{intent.branch_name}",
+                ],
+                cwd=repo_root,
+            )
+            if command_path_collision is not None or intent.target_path.exists():
+                detail = (
+                    "worktree path conflicted while Git creation was in progress: "
+                    f"{command_path_collision or intent.target_path}"
+                )
+                await self._settle_git_creation(
+                    intent.intent_id,
+                    holder=holder,
+                    fence_token=fence_token,
+                    state=WorktreeIntentState.FAILED,
+                    now=side_effect_now,
+                    error_code="worktree_path_conflict",
+                    error_detail=detail,
+                )
+                raise WorktreeConflict(detail)
+            if command_branch.returncode == 0:
+                detail = (
+                    "worktree branch appeared while Git creation was in progress: "
+                    f"{intent.branch_name}"
+                )
+                await self._settle_git_creation(
+                    intent.intent_id,
+                    holder=holder,
+                    fence_token=fence_token,
+                    state=WorktreeIntentState.FAILED,
+                    now=side_effect_now,
+                    error_code="worktree_branch_conflict",
+                    error_detail=detail,
+                )
+                raise WorktreeConflict(detail)
             await self._settle_git_creation(
                 intent.intent_id,
                 holder=holder,
                 fence_token=fence_token,
                 state=WorktreeIntentState.FAILED,
-                now=now,
+                now=side_effect_now,
                 error_code="git_worktree_add_failed",
                 error_detail=result.stderr.strip(),
             )
@@ -1064,7 +1171,7 @@ class WorktreeManager:
                     holder=holder,
                     fence_token=fence_token,
                     state=WorktreeIntentState.FAILED,
-                    now=now,
+                    now=side_effect_now,
                     error_code="worktree_path_conflict",
                     error_detail=str(error),
                 )
@@ -1074,9 +1181,91 @@ class WorktreeManager:
             holder=holder,
             fence_token=fence_token,
             state=WorktreeIntentState.GIT_CREATED,
-            now=now,
+            now=side_effect_now,
             created_branch=True,
         )
+
+    async def _ensure_process_generation(self, *, now: float) -> int:
+        if self._process_generation is not None:
+            return self._process_generation
+        async with self._process_generation_lock:
+            if self._process_generation is not None:
+                return self._process_generation
+            async with self._database.transaction() as connection:
+                state = await _fetchone(
+                    connection,
+                    """
+                    SELECT process_generation FROM worktree_process_state
+                    WHERE singleton = 1
+                    """,
+                    (),
+                )
+                if state is None:
+                    raise RuntimeError("worktree process state is not initialized")
+                generation = int(state["process_generation"]) + 1
+                await connection.execute(
+                    """
+                    UPDATE worktree_process_state
+                    SET process_owner_id = ?, process_generation = ?, started_at = ?
+                    WHERE singleton = 1
+                    """,
+                    (self._process_owner_id, generation, now),
+                )
+                stale = await _fetchall(
+                    connection,
+                    """
+                    SELECT intent_id, git_create_lease_expires_at
+                    FROM worktree_intents
+                    WHERE state = 'git_creating'
+                      AND (
+                          git_create_process_generation IS NULL
+                          OR git_create_process_generation != ?
+                      )
+                    """,
+                    (generation,),
+                )
+                for row in stale:
+                    retry_at = (
+                        now
+                        if row["git_create_lease_expires_at"] is None
+                        else max(now, float(row["git_create_lease_expires_at"]))
+                    )
+                    await connection.execute(
+                        """
+                        UPDATE worktree_intents
+                        SET git_create_holder = NULL, git_create_retry_at = ?,
+                            error_code = 'git_owner_generation_stale',
+                            error_detail = ?, updated_at = ?
+                        WHERE intent_id = ? AND state = 'git_creating'
+                        """,
+                        (
+                            retry_at,
+                            "previous worktree process generation was invalidated",
+                            now,
+                            row["intent_id"],
+                        ),
+                    )
+                    await connection.execute(
+                        """
+                        INSERT INTO worktree_events(
+                            event_id, intent_id, state, detail, created_at
+                        ) VALUES (?, ?, 'git_creating', ?, ?)
+                        """,
+                        (
+                            str(uuid.uuid4()),
+                            row["intent_id"],
+                            _canonical_json(
+                                {
+                                    "event": "git_owner_generation_invalidated",
+                                    "process_generation": generation,
+                                    "retry_at": retry_at,
+                                }
+                            ),
+                            now,
+                        ),
+                    )
+            self._process_generation = generation
+            return generation
 
     async def _claim_git_creation(
         self,
@@ -1084,8 +1273,20 @@ class WorktreeManager:
         *,
         now: float,
     ) -> WorktreeIntent:
+        process_generation = await self._ensure_process_generation(now=now)
         holder = uuid.uuid4().hex
         async with self._database.transaction() as connection:
+            process = await _fetchone(
+                connection,
+                """
+                SELECT 1 FROM worktree_process_state
+                WHERE singleton = 1 AND process_owner_id = ?
+                  AND process_generation = ?
+                """,
+                (self._process_owner_id, process_generation),
+            )
+            if process is None:
+                raise WorktreeConflict("worktree process generation is no longer current")
             row = await _fetchone(
                 connection,
                 "SELECT * FROM worktree_intents WHERE intent_id = ?",
@@ -1095,16 +1296,25 @@ class WorktreeManager:
                 raise WorktreeConflict("worktree intent disappeared before Git creation")
             state = WorktreeIntentState(str(row["state"]))
             lease_expires_at = row["git_create_lease_expires_at"]
+            retry_at = row["git_create_retry_at"]
+            retry_boundary = (
+                float(retry_at)
+                if retry_at is not None
+                else (now if lease_expires_at is None else float(lease_expires_at))
+            )
+            active_holder = (
+                row["git_create_process_generation"] == process_generation
+                and row["git_create_holder"] in self._active_git_holders
+            )
             claimable = state == WorktreeIntentState.RESERVED or (
                 state == WorktreeIntentState.GIT_CREATING
-                and (
-                    row["git_create_holder"] is None
-                    or lease_expires_at is None
-                    or float(lease_expires_at) <= now
-                )
+                and retry_boundary <= now
+                and not active_holder
             )
             if not claimable:
-                raise WorktreeConflict("another owner holds the worktree Git creation lease")
+                if active_holder and retry_boundary <= now:
+                    retry_boundary = now + self._git_create_lease_seconds / 3
+                raise WorktreeRetryPending(intent_id, retry_boundary)
             fence_token = int(row["git_create_fence_token"]) + 1
             updated = await connection.execute(
                 """
@@ -1112,6 +1322,8 @@ class WorktreeManager:
                 SET state = 'git_creating', git_create_holder = ?,
                     git_create_fence_token = ?,
                     git_create_lease_expires_at = ?,
+                    git_create_process_generation = ?,
+                    git_create_retry_at = NULL,
                     error_code = NULL, error_detail = NULL, updated_at = ?
                 WHERE intent_id = ? AND state = ?
                   AND git_create_fence_token = ?
@@ -1119,7 +1331,8 @@ class WorktreeManager:
                 (
                     holder,
                     fence_token,
-                    now + WORKTREE_GIT_CREATE_LEASE_SECONDS,
+                    now + self._git_create_lease_seconds,
+                    process_generation,
                     now,
                     intent_id,
                     state.value,
@@ -1142,6 +1355,7 @@ class WorktreeManager:
                         {
                             "git_create_holder": holder,
                             "git_create_fence_token": fence_token,
+                            "git_create_process_generation": process_generation,
                         }
                     ),
                     now,
@@ -1154,6 +1368,109 @@ class WorktreeManager:
             )
             assert claimed is not None
             return _row_to_intent(claimed)
+
+    async def _renew_git_creation(
+        self,
+        intent_id: str,
+        *,
+        holder: str,
+        fence_token: int,
+        now: float,
+    ) -> None:
+        process_generation = self._process_generation
+        if process_generation is None:
+            raise WorktreeConflict("worktree process generation is not initialized")
+        changed = await self._database.execute_count(
+            """
+            UPDATE worktree_intents
+            SET git_create_lease_expires_at = ?, updated_at = ?
+            WHERE intent_id = ? AND state = 'git_creating'
+              AND git_create_holder = ? AND git_create_fence_token = ?
+              AND git_create_process_generation = ?
+              AND git_create_lease_expires_at > ?
+              AND EXISTS (
+                  SELECT 1 FROM worktree_process_state p
+                  WHERE p.singleton = 1
+                    AND p.process_owner_id = ?
+                    AND p.process_generation = ?
+              )
+            """,
+            (
+                now + self._git_create_lease_seconds,
+                now,
+                intent_id,
+                holder,
+                fence_token,
+                process_generation,
+                now,
+                self._process_owner_id,
+                process_generation,
+            ),
+        )
+        if changed != 1:
+            raise WorktreeConflict("worktree Git creation lease is no longer current")
+
+    async def _run_git_creation_side_effect(
+        self,
+        intent: WorktreeIntent,
+        *,
+        holder: str,
+        fence_token: int,
+        now: float,
+        argv: list[str],
+        cwd: Path,
+    ) -> tuple[GitCommandResult, float]:
+        loop = asyncio.get_running_loop()
+        monotonic_started = loop.time()
+
+        def current_time() -> float:
+            return now + (loop.time() - monotonic_started)
+
+        self._active_git_holders.add(holder)
+        try:
+            await self._renew_git_creation(
+                intent.intent_id,
+                holder=holder,
+                fence_token=fence_token,
+                now=current_time(),
+            )
+            renewal_interval = max(
+                0.01,
+                min(30.0, self._git_create_lease_seconds / 3),
+            )
+
+            async def renew() -> None:
+                while True:
+                    await asyncio.sleep(renewal_interval)
+                    try:
+                        await self._renew_git_creation(
+                            intent.intent_id,
+                            holder=holder,
+                            fence_token=fence_token,
+                            now=current_time(),
+                        )
+                    except WorktreeConflict:
+                        return
+
+            renewal = asyncio.create_task(
+                renew(),
+                name=f"worktree-git-renew:{intent.intent_id}",
+            )
+            try:
+                result = await self._git.run(argv, cwd=cwd)
+            finally:
+                renewal.cancel()
+                await asyncio.gather(renewal, return_exceptions=True)
+            completed_at = current_time()
+            await self._renew_git_creation(
+                intent.intent_id,
+                holder=holder,
+                fence_token=fence_token,
+                now=completed_at,
+            )
+            return result, completed_at
+        finally:
+            self._active_git_holders.discard(holder)
 
     async def _settle_git_creation(
         self,
@@ -1169,15 +1486,26 @@ class WorktreeManager:
     ) -> WorktreeIntent:
         if state not in {WorktreeIntentState.GIT_CREATED, WorktreeIntentState.FAILED}:
             raise ValueError(f"invalid Git creation settlement state: {state}")
+        process_generation = self._process_generation
+        if process_generation is None:
+            raise WorktreeConflict("worktree process generation is not initialized")
         async with self._database.transaction() as connection:
             updated = await connection.execute(
                 """
                 UPDATE worktree_intents
                 SET state = ?, created_branch = COALESCE(?, created_branch),
                     git_create_holder = NULL, git_create_lease_expires_at = NULL,
+                    git_create_retry_at = NULL,
                     error_code = ?, error_detail = ?, updated_at = ?
                 WHERE intent_id = ? AND state = 'git_creating'
                   AND git_create_holder = ? AND git_create_fence_token = ?
+                  AND git_create_process_generation = ?
+                  AND EXISTS (
+                      SELECT 1 FROM worktree_process_state p
+                      WHERE p.singleton = 1
+                        AND p.process_owner_id = ?
+                        AND p.process_generation = ?
+                  )
                 """,
                 (
                     state.value,
@@ -1188,6 +1516,9 @@ class WorktreeManager:
                     intent_id,
                     holder,
                     fence_token,
+                    process_generation,
+                    self._process_owner_id,
+                    process_generation,
                 ),
             )
             if updated.rowcount != 1:
@@ -1316,6 +1647,8 @@ class WorktreeManager:
                         UPDATE worktree_intents
                         SET state = 'reserved', git_create_holder = NULL,
                             git_create_lease_expires_at = NULL,
+                            git_create_process_generation = NULL,
+                            git_create_retry_at = NULL,
                             error_code = NULL, error_detail = NULL, updated_at = ?
                         WHERE intent_id = ? AND state = 'failed'
                           AND error_code = ?
@@ -1971,6 +2304,14 @@ def _row_to_intent(row: Row) -> WorktreeIntent:
             None
             if row["git_create_lease_expires_at"] is None
             else float(row["git_create_lease_expires_at"])
+        ),
+        git_create_process_generation=(
+            None
+            if row["git_create_process_generation"] is None
+            else int(row["git_create_process_generation"])
+        ),
+        git_create_retry_at=(
+            None if row["git_create_retry_at"] is None else float(row["git_create_retry_at"])
         ),
         created_at=float(row["created_at"]),
         updated_at=float(row["updated_at"]),

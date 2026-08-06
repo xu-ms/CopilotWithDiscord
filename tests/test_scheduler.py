@@ -266,6 +266,30 @@ async def test_cron_planning_at_subminute_time_keeps_current_due_minute(
 
 
 @pytest.mark.asyncio
+async def test_fractional_interval_planning_keeps_exact_float_boundary(
+    tmp_path: Path,
+) -> None:
+    boundary = 3 * 1.2
+    async with Database(tmp_path / "fractional-boundary.sqlite3") as database:
+        repository = SchedulerRepository(database)
+        await repository.recover(now=0)
+        definition = await repository.create(
+            kind=ScheduleKind.NEW_SESSION,
+            expression="interval:1.2s",
+            timezone="UTC",
+            payload={"text": "scheduled"},
+            target_snapshot={},
+            now=0,
+        )
+
+        planned = await repository.plan_due("planner", now=boundary)
+        advanced = await repository.require(definition.id)
+
+    assert [run.planned_at_utc for run in planned] == [boundary]
+    assert advanced.next_run_at_utc == 4.8
+
+
+@pytest.mark.asyncio
 async def test_expired_run_claim_reassigns_monotonic_fence_without_new_attempt(
     tmp_path: Path,
 ) -> None:

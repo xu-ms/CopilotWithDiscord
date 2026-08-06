@@ -80,6 +80,8 @@ class ParsedSchedule:
             while candidate <= after_utc:
                 multiplier += 1
                 candidate = self.anchor_utc + multiplier * self.interval_seconds
+            if candidate <= after_utc:
+                raise AssertionError("interval next_after must strictly advance")
             return candidate
         return _cron_next(
             self.normalized,
@@ -107,9 +109,14 @@ class ParsedSchedule:
                 ((through - anchor) / interval).to_integral_value(rounding=ROUND_FLOOR)
             )
             latest = self.anchor_utc + multiplier * self.interval_seconds
+            while self.anchor_utc + (multiplier + 1) * self.interval_seconds <= through_utc:
+                multiplier += 1
+                latest = self.anchor_utc + multiplier * self.interval_seconds
             while latest > through_utc:
                 multiplier -= 1
                 latest = self.anchor_utc + multiplier * self.interval_seconds
+            if latest > through_utc:
+                raise AssertionError("interval latest_due must not exceed its boundary")
             return latest if latest >= first_due_utc else None
         latest = _cron_previous_or_at(
             self.normalized,

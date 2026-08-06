@@ -181,6 +181,7 @@ class CopilotDiscordBot(commands.Bot):
             self.projects,
             worktrees_root=self.settings.data_dir / "worktrees",
             adapter=SessionCreationWorktreeAdapter(self.creation, self.database),
+            task_registry=self._tasks,
         )
         await self.worktree_manager.recover()
         self.worktree_commands = WorktreeCommandService(self.worktree_manager)

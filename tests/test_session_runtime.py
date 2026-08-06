@@ -24,6 +24,7 @@ from copilotd.config import Settings
 from copilotd.core.attachments import AttachmentError
 from copilotd.core.bindings import (
     AttachmentState,
+    BindingConflict,
     BindingIntent,
     PermissionPosture,
     SessionBindingRepository,
@@ -708,6 +709,120 @@ async def test_owner_expiry_during_final_readiness_requeues_before_sdk_send(
     assert dict(queue) == {"state": "local_queued", "dispatch_attempt": 1}
     assert unknown[0] == 0
     assert bridge.handle.sent == []
+
+
+@pytest.mark.asyncio
+async def test_closed_intent_race_is_rejected_immediately_before_sdk_send(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    session_id = str(uuid4())
+    async with Database(tmp_path / "closed-final-dispatch.sqlite3") as database:
+        bindings = SessionBindingRepository(database)
+        binding = await bindings.create(
+            thread_id="thread-1",
+            sdk_session_id=session_id,
+            cwd_snapshot=tmp_path,
+            project_source="implicit-home",
+        )
+        bridge = FakeBridge(session_id)
+        runtime = SessionRuntime(
+            database=database,
+            bridge=bridge,
+            bindings=bindings,
+            owner_leases=OwnerLeaseStore(database),
+            owner_id="process-1",
+            binding=binding,
+            queue_poll_seconds=3_600,
+        )
+        await runtime.attach_create()
+        final_check_entered = asyncio.Event()
+        continue_final_check = asyncio.Event()
+        original_final_check = runtime._assert_pre_send_fence
+
+        async def delayed_final_check(*, requested_origin: str) -> None:
+            final_check_entered.set()
+            await continue_final_check.wait()
+            await original_final_check(requested_origin=requested_origin)
+
+        monkeypatch.setattr(runtime, "_assert_pre_send_fence", delayed_final_check)
+        send = asyncio.create_task(
+            runtime.send(
+                "must not cross close",
+                idempotency_key="closed-final-race",
+                mode="immediate",
+            )
+        )
+        await final_check_entered.wait()
+        await database.execute(
+            """
+            UPDATE session_bindings
+            SET binding_intent = 'closed', attachment_reason = NULL
+            WHERE thread_id = 'thread-1'
+            """
+        )
+        continue_final_check.set()
+
+        with pytest.raises(SubmissionClaimDeferred):
+            await send
+        queue = await database.fetchone("SELECT state, dispatch_attempt FROM message_queue")
+        await runtime.shutdown()
+
+    assert dict(queue) == {"state": "local_queued", "dispatch_attempt": 1}
+    assert bridge.handle.sent == []
+
+
+@pytest.mark.asyncio
+async def test_closed_intent_race_is_rejected_during_attachment(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    session_id = str(uuid4())
+    async with Database(tmp_path / "closed-attach-race.sqlite3") as database:
+        bindings = SessionBindingRepository(database)
+        binding = await bindings.create(
+            thread_id="thread-1",
+            sdk_session_id=session_id,
+            cwd_snapshot=tmp_path,
+            project_source="implicit-home",
+        )
+        leases = OwnerLeaseStore(database)
+        bridge = FakeBridge(session_id)
+        runtime = SessionRuntime(
+            database=database,
+            bridge=bridge,
+            bindings=bindings,
+            owner_leases=leases,
+            owner_id="process-1",
+            binding=binding,
+        )
+        lease_acquired = asyncio.Event()
+        continue_attachment = asyncio.Event()
+        original_acquire = leases.acquire
+
+        async def delayed_acquire(*args: Any, **kwargs: Any) -> object:
+            lease = await original_acquire(*args, **kwargs)
+            lease_acquired.set()
+            await continue_attachment.wait()
+            return lease
+
+        monkeypatch.setattr(leases, "acquire", delayed_acquire)
+        attach = asyncio.create_task(runtime.attach_resume())
+        await lease_acquired.wait()
+        await database.execute(
+            """
+            UPDATE session_bindings
+            SET binding_intent = 'closed', attachment_reason = NULL
+            WHERE thread_id = 'thread-1'
+            """
+        )
+        continue_attachment.set()
+
+        with pytest.raises(BindingConflict, match="explicit scheduler or recovery"):
+            await attach
+
+    assert bridge.resume_calls == 0
+    assert runtime.handle is None
 
 
 @pytest.mark.asyncio
@@ -1731,6 +1846,74 @@ async def test_shutdown_drains_successful_send_acceptance_before_unknown_transit
         "accepted_message_id": "accepted-during-shutdown",
     }
     assert operation["state"] == "confirmed"
+
+
+@pytest.mark.asyncio
+async def test_shutdown_after_admission_returns_durable_deferred_handoff_receipt(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    session_id = str(uuid4())
+    async with Database(tmp_path / "shutdown-handoff-gap.sqlite3") as database:
+        bindings = SessionBindingRepository(database)
+        binding = await bindings.create(
+            thread_id="thread-shutdown-gap",
+            sdk_session_id=session_id,
+            cwd_snapshot=tmp_path,
+            project_source="implicit-home",
+        )
+        bridge = FakeBridge(session_id)
+        runtime = SessionRuntime(
+            database=database,
+            bridge=bridge,
+            bindings=bindings,
+            owner_leases=OwnerLeaseStore(database),
+            owner_id="process-shutdown-gap",
+            binding=binding,
+            owner_renew_seconds=30,
+        )
+        await runtime.attach_create()
+        admitted = asyncio.Event()
+        continue_handoff = asyncio.Event()
+        original_dispatch = runtime._dispatch_submission
+
+        async def delayed_handoff(**kwargs: Any) -> str:
+            admitted.set()
+            await continue_handoff.wait()
+            return await original_dispatch(**kwargs)
+
+        monkeypatch.setattr(runtime, "_dispatch_submission", delayed_handoff)
+        send_task = asyncio.create_task(
+            runtime.send(
+                "durable across shutdown",
+                idempotency_key="shutdown-handoff-gap",
+                mode="immediate",
+            )
+        )
+        await admitted.wait()
+
+        await runtime.shutdown()
+        continue_handoff.set()
+        receipt = await send_task
+        durable = await database.fetchone(
+            """
+            SELECT s.submission_id, s.state AS submission_state,
+                   q.state AS queue_state
+            FROM submissions s JOIN message_queue q ON q.id = s.submission_id
+            """
+        )
+        operations = await database.fetchone(
+            "SELECT COUNT(*) FROM session_operations WHERE kind = 'send'"
+        )
+
+    assert receipt == durable["submission_id"]
+    assert dict(durable) == {
+        "submission_id": receipt,
+        "submission_state": "local_queued",
+        "queue_state": "local_queued",
+    }
+    assert operations[0] == 0
+    assert bridge.handle.sent == []
 
 
 @pytest.mark.asyncio

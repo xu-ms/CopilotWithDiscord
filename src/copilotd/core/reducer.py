@@ -2488,6 +2488,29 @@ class JournalReducer:
                         observed_at,
                     ),
                 )
+                await connection.execute(
+                    """
+                    UPDATE runtime_schedules
+                    SET state = 'triggered', next_run_at = NULL, updated_at = ?
+                    WHERE sdk_session_id = ? AND runtime_schedule_id = ?
+                      AND (recurrence IS NULL OR TRIM(recurrence) = '')
+                      AND EXISTS (
+                          SELECT 1 FROM pending_runtime_schedule_triggers p
+                          WHERE p.sdk_session_id =
+                                runtime_schedules.sdk_session_id
+                            AND p.runtime_schedule_id =
+                                runtime_schedules.runtime_schedule_id
+                      )
+                    """,
+                    (observed_at, event.sdk_session_id, schedule_id),
+                )
+                await connection.execute(
+                    """
+                    DELETE FROM pending_runtime_schedule_triggers
+                    WHERE sdk_session_id = ? AND runtime_schedule_id = ?
+                    """,
+                    (event.sdk_session_id, schedule_id),
+                )
             if fresh and caught_up:
                 if seen_schedule_ids:
                     placeholders = ", ".join("?" for _ in seen_schedule_ids)
@@ -2727,6 +2750,30 @@ class JournalReducer:
                   AND (recurrence IS NULL OR TRIM(recurrence) = '')
                 """,
                 (now, event.sdk_session_id, runtime_schedule_id),
+            )
+            await connection.execute(
+                """
+                INSERT INTO pending_runtime_schedule_triggers(
+                    sdk_session_id, runtime_schedule_id,
+                    user_event_id, observed_at
+                )
+                SELECT ?, ?, ?, ?
+                WHERE NOT EXISTS (
+                    SELECT 1 FROM runtime_schedules
+                    WHERE sdk_session_id = ? AND runtime_schedule_id = ?
+                )
+                ON CONFLICT(sdk_session_id, runtime_schedule_id) DO UPDATE SET
+                    user_event_id = excluded.user_event_id,
+                    observed_at = excluded.observed_at
+                """,
+                (
+                    event.sdk_session_id,
+                    runtime_schedule_id,
+                    event.event_id,
+                    event.received_at,
+                    event.sdk_session_id,
+                    runtime_schedule_id,
+                ),
             )
             await self._create_runtime_observed_submission(
                 connection,

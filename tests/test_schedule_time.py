@@ -283,6 +283,16 @@ def test_fractional_interval_exact_boundary_strictly_advances() -> None:
     assert parsed.next_after(third) > third
 
 
+def test_fractional_interval_latest_due_corrects_up_to_float_boundary() -> None:
+    parsed = parse_schedule("interval:1.2s", "UTC", anchor_utc=0)
+    third = 3 * 1.2
+
+    assert third == 3.5999999999999996
+    assert parsed.latest_due(1.2, third) == third
+    assert parsed.next_after(third) == 4.8
+    assert parsed.next_after(third) > third
+
+
 def test_cron_latest_due_includes_current_floored_minute() -> None:
     parsed = parse_schedule("cron:* * * * *", "UTC", anchor_utc=0)
 

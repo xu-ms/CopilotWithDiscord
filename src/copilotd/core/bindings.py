@@ -11,6 +11,8 @@ from aiosqlite import Connection, Row
 from copilotd.storage.database import Database
 from copilotd.storage.leases import OwnerLease
 
+TYPED_CLOSED_ATTACHMENT_REASONS = frozenset({"scheduler_run", "recovery_cleanup"})
+
 
 class BindingIntent(StrEnum):
     ACTIVE = "active"
@@ -211,8 +213,13 @@ class SessionBindingRepository:
                 raise BindingConflict("owner lease does not match session binding")
             await _require_project_admission(connection, binding.project_id)
             if binding.binding_intent not in {BindingIntent.ACTIVE, BindingIntent.CLOSED}:
+                raise BindingConflict(f"cannot attach binding with intent {binding.binding_intent}")
+            if (
+                binding.binding_intent == BindingIntent.CLOSED
+                and binding.attachment_reason not in TYPED_CLOSED_ATTACHMENT_REASONS
+            ):
                 raise BindingConflict(
-                    f"cannot attach binding with intent {binding.binding_intent}"
+                    "closed sessions require an explicit scheduler or recovery attachment"
                 )
             attachable_states = {
                 AttachmentState.ABSENT,
@@ -224,9 +231,7 @@ class SessionBindingRepository:
                 and binding.owner_fence_token != lease.fence_token
             )
             if binding.attachment_state not in attachable_states and not stale_attached:
-                raise BindingConflict(
-                    f"cannot attach binding in state {binding.attachment_state}"
-                )
+                raise BindingConflict(f"cannot attach binding in state {binding.attachment_state}")
 
             generation = binding.runtime_generation + 1
             update = await connection.execute(
@@ -449,15 +454,9 @@ class SessionBindingRepository:
         timestamp = time.time() if now is None else now
         return await self._transition_attachment(
             binding,
-            state=(
-                AttachmentState.ABSENT
-                if succeeded
-                else AttachmentState.RECOVERY_UNKNOWN
-            ),
+            state=(AttachmentState.ABSENT if succeeded else AttachmentState.RECOVERY_UNKNOWN),
             permission_posture=(
-                PermissionPosture.UNVERIFIED
-                if succeeded
-                else PermissionPosture.UNKNOWN
+                PermissionPosture.UNVERIFIED if succeeded else PermissionPosture.UNKNOWN
             ),
             permission_verified_at=None,
             now=timestamp,

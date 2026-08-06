@@ -998,6 +998,93 @@ async def test_exact_runtime_schedule_event_bypasses_app_correlation_and_settles
 
 
 @pytest.mark.asyncio
+async def test_native_one_shot_trigger_before_inventory_reconciles_when_row_arrives(
+    tmp_path: Path,
+) -> None:
+    session_id = "session-trigger-before-inventory"
+    async with Database(tmp_path / "trigger-before-inventory.sqlite3") as database:
+        await _insert_projection_binding(database, session_id)
+        native = _adapted(
+            "user.message",
+            {"content": "scheduled early", "agentMode": "interactive"},
+            1,
+            session_id=session_id,
+        )
+        native = replace(
+            native,
+            raw_payload={
+                "type": "user.message",
+                "runtimeScheduleId": "native-before-inventory",
+                "data": native.raw_payload["data"],
+            },
+        )
+        reducer = JournalReducer(database)
+        assert await reducer.persist([native]) == 1
+        pending = await database.fetchone(
+            """
+            SELECT user_event_id FROM pending_runtime_schedule_triggers
+            WHERE sdk_session_id = ? AND runtime_schedule_id =
+                  'native-before-inventory'
+            """,
+            (session_id,),
+        )
+        requested = _adapted(
+            "copilotd.snapshot.requested",
+            {"topic": "schedules"},
+            2,
+            source="internal",
+            session_id=session_id,
+        )
+        observed = _adapted(
+            "copilotd.snapshot.observed",
+            {
+                "topic": "schedules",
+                "epoch": 1,
+                "snapshot_id": "native-before-snapshot",
+                "query_start_sdk_receive_seq": 0,
+                "query_end_sdk_receive_seq": 0,
+                "payload": {
+                    "schedules": [
+                        {
+                            "id": "native-before-inventory",
+                            "builtinName": "after",
+                            "input": "once",
+                            "recurrence": None,
+                            "nextRunAt": 100,
+                            "state": "active",
+                        }
+                    ]
+                },
+                "observed_at": 105,
+            },
+            3,
+            source="snapshot",
+            session_id=session_id,
+        )
+
+        assert await reducer.persist([requested, observed]) == 2
+        schedule = await database.fetchone(
+            """
+            SELECT state, next_run_at FROM runtime_schedules
+            WHERE sdk_session_id = ? AND runtime_schedule_id =
+                  'native-before-inventory'
+            """,
+            (session_id,),
+        )
+        remaining = await database.fetchone(
+            """
+            SELECT COUNT(*) FROM pending_runtime_schedule_triggers
+            WHERE sdk_session_id = ?
+            """,
+            (session_id,),
+        )
+
+    assert pending["user_event_id"] == native.event_id
+    assert dict(schedule) == {"state": "triggered", "next_run_at": None}
+    assert remaining[0] == 0
+
+
+@pytest.mark.asyncio
 async def test_ambiguous_duplicate_prompt_does_not_pollute_app_submissions(
     tmp_path: Path,
 ) -> None:

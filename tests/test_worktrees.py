@@ -21,6 +21,7 @@ from copilotd.core.scheduler import (
 )
 from copilotd.core.worktrees import (
     DeterministicWorktreeAdapter,
+    GitCommandResult,
     SubprocessGitRunner,
     WorktreeCapabilityError,
     WorktreeConflict,
@@ -894,12 +895,32 @@ async def test_concurrent_git_creation_has_one_fenced_side_effect_holder(
             DeterministicWorktreeAdapter(),
         )
         manager._git = slow_git
+        manager._git_create_lease_seconds = 0.06
         first = asyncio.create_task(
             manager.create(parent_project_id=project_id, name="exclusive git")
         )
         await entered.wait()
+        initial_lease = await database.fetchone(
+            """
+            SELECT git_create_lease_expires_at FROM worktree_intents
+            WHERE parent_project_id = ? AND name = 'exclusive git'
+            """,
+            (project_id,),
+        )
+        await asyncio.sleep(0.15)
+        renewed_lease = await database.fetchone(
+            """
+            SELECT git_create_lease_expires_at FROM worktree_intents
+            WHERE parent_project_id = ? AND name = 'exclusive git'
+            """,
+            (project_id,),
+        )
         second = asyncio.create_task(
-            manager.create(parent_project_id=project_id, name="exclusive git")
+            manager.create(
+                parent_project_id=project_id,
+                name="exclusive git",
+                now=float(renewed_lease["git_create_lease_expires_at"]) + 1,
+            )
         )
         try:
             second_result = (
@@ -929,6 +950,9 @@ async def test_concurrent_git_creation_has_one_fenced_side_effect_holder(
         )
 
     assert slow_git.add_calls == 1
+    assert (
+        renewed_lease["git_create_lease_expires_at"] > initial_lease["git_create_lease_expires_at"]
+    )
     assert sum(not isinstance(result, Exception) for result in results) == 1
     assert any(isinstance(result, WorktreeConflict) for result in results)
     assert projection.state == "ready"
@@ -938,6 +962,90 @@ async def test_concurrent_git_creation_has_one_fenced_side_effect_holder(
         "git_create_fence_token": 1,
     }
     assert failed_events[0] == 0
+
+
+@pytest.mark.asyncio
+async def test_restart_invalidates_crashed_git_holder_and_retries_at_lease_expiry(
+    tmp_path: Path,
+) -> None:
+    entered = asyncio.Event()
+
+    class CrashedGitRunner:
+        def __init__(self) -> None:
+            self.delegate = SubprocessGitRunner()
+
+        async def run(self, argv: list[str], *, cwd: Path) -> object:
+            if argv[1:3] == ["worktree", "add"]:
+                entered.set()
+                await asyncio.Event().wait()
+            return await self.delegate.run(argv, cwd=cwd)
+
+    async with Database(tmp_path / "git-create-restart.sqlite3") as database:
+        manager, project_id = await _manager(
+            database,
+            tmp_path,
+            DeterministicWorktreeAdapter(),
+        )
+        manager._git = CrashedGitRunner()
+        manager._git_create_lease_seconds = 0.5
+        crashed = asyncio.create_task(
+            manager.create(parent_project_id=project_id, name="restart git")
+        )
+        await entered.wait()
+        crashed.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await crashed
+        abandoned = await database.fetchone(
+            """
+            SELECT intent_id, git_create_lease_expires_at,
+                   git_create_process_generation
+            FROM worktree_intents
+            WHERE parent_project_id = ? AND name = 'restart git'
+            """,
+            (project_id,),
+        )
+        lease_expires_at = float(abandoned["git_create_lease_expires_at"])
+
+        restarted = WorktreeManager(
+            database,
+            manager._projects,
+            worktrees_root=tmp_path / "managed worktrees",
+            adapter=DeterministicWorktreeAdapter(),
+            process_owner_id="restarted-process",
+        )
+        early = await restarted.recover()
+        scheduled = await database.fetchone(
+            """
+            SELECT state, git_create_holder, git_create_retry_at,
+                   git_create_process_generation
+            FROM worktree_intents WHERE intent_id = ?
+            """,
+            (abandoned["intent_id"],),
+        )
+        retry_task = restarted._recovery_retry_tasks[str(abandoned["intent_id"])]
+        await asyncio.wait_for(asyncio.shield(retry_task), timeout=2)
+        projection = (await restarted.list(parent_project_id=project_id))[0]
+        recovered = await database.fetchone(
+            """
+            SELECT state, git_create_holder, git_create_fence_token,
+                   git_create_process_generation
+            FROM worktree_intents WHERE intent_id = ?
+            """,
+            (abandoned["intent_id"],),
+        )
+
+    assert early.orphaned_intents == 1
+    assert dict(scheduled) == {
+        "state": "git_creating",
+        "git_create_holder": None,
+        "git_create_retry_at": lease_expires_at,
+        "git_create_process_generation": abandoned["git_create_process_generation"],
+    }
+    assert projection.state == "ready"
+    assert recovered["state"] == "ready"
+    assert recovered["git_create_holder"] is None
+    assert recovered["git_create_fence_token"] == 2
+    assert recovered["git_create_process_generation"] > abandoned["git_create_process_generation"]
 
 
 @pytest.mark.asyncio
@@ -1039,6 +1147,65 @@ async def test_branch_conflict_is_terminal_and_retryable_after_cleanup(
         "error_code": "worktree_branch_conflict",
         "git_create_holder": None,
     }
+    assert retried.state == "ready"
+
+
+@pytest.mark.asyncio
+async def test_branch_appearing_during_git_command_is_retryable_after_cleanup(
+    tmp_path: Path,
+) -> None:
+    class CommandRaceGitRunner:
+        def __init__(self) -> None:
+            self.delegate = SubprocessGitRunner()
+            self.inject_conflict = True
+
+        async def run(self, argv: list[str], *, cwd: Path) -> GitCommandResult:
+            if argv[1:3] == ["worktree", "add"] and self.inject_conflict:
+                self.inject_conflict = False
+                await self.delegate.run(
+                    ["git", "branch", argv[4]],
+                    cwd=cwd,
+                )
+                return GitCommandResult(
+                    returncode=128,
+                    stdout="",
+                    stderr="branch appeared during worktree add",
+                )
+            return await self.delegate.run(argv, cwd=cwd)
+
+    async with Database(tmp_path / "command-branch-race.sqlite3") as database:
+        manager, project_id = await _manager(
+            database,
+            tmp_path,
+            DeterministicWorktreeAdapter(),
+        )
+        parent = await database.fetchone(
+            "SELECT root_path FROM projects WHERE id = ?",
+            (project_id,),
+        )
+        repo_root = Path(str(parent["root_path"]))
+        racing_git = CommandRaceGitRunner()
+        manager._git = racing_git
+
+        with pytest.raises(WorktreeConflict, match="appeared"):
+            await manager.create(parent_project_id=project_id, name="command race")
+        failed = await database.fetchone(
+            """
+            SELECT intent_id, branch_name, state, error_code
+            FROM worktree_intents
+            WHERE parent_project_id = ? AND name = 'command race'
+            """,
+            (project_id,),
+        )
+        _git(repo_root, "branch", "-D", str(failed["branch_name"]))
+
+        retried = await manager.create(
+            parent_project_id=project_id,
+            name="command race",
+        )
+
+    assert failed["state"] == "failed"
+    assert failed["error_code"] == "worktree_branch_conflict"
     assert retried.state == "ready"
 
 

@@ -10,6 +10,7 @@ from enum import StrEnum
 from typing import Any, Literal, Protocol, TypeVar, cast
 
 from copilotd.core.bindings import (
+    TYPED_CLOSED_ATTACHMENT_REASONS,
     AttachmentState,
     BindingConflict,
     BindingIntent,
@@ -21,6 +22,7 @@ from copilotd.core.inbox import ReducerInbox, SdkEventIngress
 from copilotd.core.interactions import interaction_target_mode
 from copilotd.core.mailbox import (
     CommandMailbox,
+    MailboxNotAccepting,
     OperationAmbiguous,
     OperationDeferred,
     OperationRejected,
@@ -418,24 +420,50 @@ class SessionRuntime:
                     if dispatch_attempt == 0
                     else f"{idempotency_key}:{dispatch_attempt}"
                 )
-            return await self._dispatch_submission(
-                submission_id=submission_id,
-                idempotency_key=operation_key,
-                prompt=str(snapshot["prompt"]),
-                prompt_hash=str(snapshot["prompt_hash"]),
-                attachment_manifest_id=snapshot["attachment_manifest_id"],
-                attachments=attachments,
-                mode=mode,
-                agent_mode=cast(
-                    AgentMode,
-                    str(snapshot["requested_mode_snapshot"]),
-                ),
-                dispatch_attempt=dispatch_attempt,
-                requested_model_config=json.loads(str(snapshot["requested_model_config_snapshot"])),
-                requested_agent=str(snapshot["requested_agent_snapshot"]),
-                requested_session_config_version=int(snapshot["requested_session_config_version"]),
-                requested_attachment_count=int(snapshot["attachment_count"]),
-            )
+            try:
+                return await self._dispatch_submission(
+                    submission_id=submission_id,
+                    idempotency_key=operation_key,
+                    prompt=str(snapshot["prompt"]),
+                    prompt_hash=str(snapshot["prompt_hash"]),
+                    attachment_manifest_id=snapshot["attachment_manifest_id"],
+                    attachments=attachments,
+                    mode=mode,
+                    agent_mode=cast(
+                        AgentMode,
+                        str(snapshot["requested_mode_snapshot"]),
+                    ),
+                    dispatch_attempt=dispatch_attempt,
+                    requested_model_config=json.loads(
+                        str(snapshot["requested_model_config_snapshot"])
+                    ),
+                    requested_agent=str(snapshot["requested_agent_snapshot"]),
+                    requested_session_config_version=int(
+                        snapshot["requested_session_config_version"]
+                    ),
+                    requested_attachment_count=int(snapshot["attachment_count"]),
+                    requested_origin=str(snapshot["origin"]),
+                )
+            except (MailboxNotAccepting, SessionNotReady):
+                if self._accepting_sends and self.state == RuntimeState.READY:
+                    raise
+                deferred = await self._database.fetchone(
+                    """
+                    SELECT 1
+                    FROM submissions s
+                    JOIN message_queue q ON q.id = s.submission_id
+                    WHERE s.submission_id = ?
+                      AND s.state = 'local_queued'
+                      AND s.accepted_message_id IS NULL
+                      AND s.observed_user_event_id IS NULL
+                      AND q.state = 'local_queued'
+                      AND q.dispatch_attempt = ?
+                    """,
+                    (submission_id, dispatch_attempt),
+                )
+                if deferred is not None:
+                    return submission_id
+                raise
         dispatched = await self._dispatch_next_queued()
         if dispatched is not None and dispatched[0] == submission_id:
             return dispatched[1]
@@ -477,7 +505,8 @@ class SessionRuntime:
                 return None
             row = await self._database.fetchone(
                 """
-                SELECT q.*, s.prompt_hash, s.requested_delivery, s.attachment_count
+                SELECT q.*, s.prompt_hash, s.requested_delivery,
+                       s.attachment_count, s.origin
                 FROM message_queue AS q
                 JOIN submissions AS s ON s.submission_id = q.id
                 WHERE q.thread_id = ? AND q.state = 'local_queued'
@@ -591,6 +620,7 @@ class SessionRuntime:
                 requested_agent=str(row["requested_agent_snapshot"]),
                 requested_session_config_version=int(row["requested_session_config_version"]),
                 requested_attachment_count=int(row["attachment_count"]),
+                requested_origin=str(row["origin"]),
             )
             return str(row["id"]), message_id
 
@@ -610,6 +640,7 @@ class SessionRuntime:
         requested_agent: str,
         requested_session_config_version: int,
         requested_attachment_count: int,
+        requested_origin: str,
     ) -> str:
         inbox = self._require_inbox()
         if attachment_manifest_id is not None:
@@ -655,6 +686,7 @@ class SessionRuntime:
                     requested_model_config=requested_model_config,
                     requested_agent=requested_agent,
                     requested_session_config_version=(requested_session_config_version),
+                    requested_origin=requested_origin,
                 )
             except Exception as error:
                 owner_current = await self._is_current_owner()
@@ -3002,6 +3034,11 @@ class SessionRuntime:
         binding = await self._bindings.by_thread(self.binding.thread_id)
         if binding is None:
             raise SessionNotReady("session binding no longer exists")
+        if binding.binding_intent != BindingIntent.ACTIVE and not (
+            binding.binding_intent == BindingIntent.CLOSED
+            and binding.attachment_reason in TYPED_CLOSED_ATTACHMENT_REASONS
+        ):
+            raise SessionNotReady("session binding is closed without a typed dispatch exemption")
         if binding.project_id is not None:
             project = await self._database.fetchone(
                 "SELECT state FROM projects WHERE id = ?",
@@ -3054,6 +3091,7 @@ class SessionRuntime:
         requested_model_config: dict[str, Any],
         requested_agent: str,
         requested_session_config_version: int,
+        requested_origin: str,
     ) -> None:
         await self._assert_dispatchable()
         readiness = await self._refresh_readiness()
@@ -3100,9 +3138,9 @@ class SessionRuntime:
             and int(row["runtime_session_config_version"]) != requested_session_config_version
         ):
             raise SessionNotReady("claimed queue session-config snapshot drifted")
-        await self._assert_pre_send_fence()
+        await self._assert_pre_send_fence(requested_origin=requested_origin)
 
-    async def _assert_pre_send_fence(self) -> None:
+    async def _assert_pre_send_fence(self, *, requested_origin: str) -> None:
         lease = self._lease
         if self.state != RuntimeState.READY or self._handle is None:
             raise SessionNotReady(f"session runtime is {self.state}")
@@ -3117,6 +3155,15 @@ class SessionRuntime:
                 self._mailbox.freeze()
             raise FenceLost(f"owner fence lost for session {self.binding.sdk_session_id}")
         now = time.time()
+        typed_attachment_reason = (
+            "scheduler_run"
+            if requested_origin == "app_schedule"
+            else (
+                "recovery_cleanup"
+                if requested_origin in {"recovery", "recovery_cleanup"}
+                else "__not_typed__"
+            )
+        )
         current = await self._database.fetchone(
             """
             SELECT 1
@@ -3128,6 +3175,13 @@ class SessionRuntime:
               AND b.runtime_generation = ?
               AND b.owner_fence_token = ?
               AND b.attachment_state = 'attached'
+              AND (
+                  b.binding_intent = 'active'
+                  OR (
+                      b.binding_intent = 'closed'
+                      AND b.attachment_reason = ?
+                  )
+              )
               AND l.owner_id = ?
               AND l.expires_at - ? >= ?
             """,
@@ -3136,6 +3190,7 @@ class SessionRuntime:
                 self.binding.sdk_session_id,
                 self.binding.runtime_generation,
                 self.binding.owner_fence_token,
+                typed_attachment_reason,
                 self._owner_id,
                 now,
                 MUTATION_HEADROOM_SECONDS,
