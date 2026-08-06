@@ -4,7 +4,8 @@ import asyncio
 import json
 import time
 import uuid
-from collections.abc import Callable
+from collections.abc import AsyncIterator, Callable
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
@@ -14,14 +15,20 @@ from aiosqlite import Row
 
 from copilotd.core.bindings import SessionBinding, SessionBindingRepository
 from copilotd.core.projects import (
+    ProjectConfigSnapshot,
     ProjectRegistry,
     ProjectSessionConfigSnapshot,
     ProjectSnapshot,
 )
+from copilotd.core.session_config import SessionConfigSnapshotError, SessionLaunchOptions
 from copilotd.core.session_runtime import RuntimeState, SessionAttachUnknown, SessionRuntime
 from copilotd.storage.database import Database
 
 RuntimeFactory = Callable[[SessionBinding], SessionRuntime]
+
+
+class SessionRegistryNotAccepting(RuntimeError):
+    pass
 
 
 class CreationState(StrEnum):
@@ -50,6 +57,9 @@ class CreationIntent:
     channel_config_version: int
     config_snapshot_state: str
     state: CreationState
+    project_snapshot_json: str | None
+    session_config_snapshot_json: str | None
+    worktree_intent_id: str | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -106,13 +116,20 @@ class CreationIntentRepository:
         )
         return None if row is None else _row_to_intent(row)
 
+    @property
+    def database(self) -> Database:
+        return self._database
+
     async def reserve(
         self,
         *,
         source_kind: str,
         source_id: str,
         project: ProjectSnapshot,
-        config: ProjectSessionConfigSnapshot,
+        config: ProjectSessionConfigSnapshot | None = None,
+        config_snapshot: ProjectConfigSnapshot | None = None,
+        sdk_session_id: str | None = None,
+        worktree_intent_id: str | None = None,
         now: float | None = None,
     ) -> tuple[CreationIntent, bool]:
         timestamp = time.time() if now is None else now
@@ -126,9 +143,43 @@ class CreationIntentRepository:
             )
             row = await cursor.fetchone()
             await cursor.close()
+            draining = await connection.execute(
+                "SELECT value FROM global_config WHERE key = 'restart_draining'"
+            )
+            draining_row = await draining.fetchone()
+            await draining.close()
+            if draining_row is not None and draining_row["value"] == "1":
+                raise RuntimeError("copilotD is draining for restart")
+            if project.project_id is not None:
+                project_cursor = await connection.execute(
+                    "SELECT state, project_kind FROM projects WHERE id = ?",
+                    (project.project_id,),
+                )
+                project_row = await project_cursor.fetchone()
+                await project_cursor.close()
+                if (
+                    project_row is None
+                    or project_row["state"] == "closing"
+                    or (
+                        project_row["project_kind"] == "worktree"
+                        and project_row["state"] == "retired"
+                    )
+                ):
+                    raise RuntimeError("session project is closing or retired")
             if row is not None:
-                return _row_to_intent(row), False
+                intent = _row_to_intent(row)
+                if (
+                    intent.project_source != project.source.value
+                    or intent.project_id != project.project_id
+                    or intent.cwd_snapshot != project.cwd
+                ):
+                    raise ValueError("creation source was reused with a different project snapshot")
+                if sdk_session_id is not None and intent.sdk_session_id != sdk_session_id:
+                    raise ValueError("creation source was reused with a different session id")
+                return intent, False
 
+            project_json = _project_snapshot_json(project)
+            config_json = None if config_snapshot is None else config_snapshot.canonical_json()
             intent = CreationIntent(
                 creation_token=uuid.uuid4().hex,
                 source_kind=source_kind,
@@ -136,15 +187,20 @@ class CreationIntentRepository:
                 project_source=project.source.value,
                 project_id=project.project_id,
                 cwd_snapshot=project.cwd,
-                sdk_session_id=str(uuid.uuid4()),
+                sdk_session_id=str(uuid.uuid4()) if sdk_session_id is None else sdk_session_id,
                 thread_id=None,
-                project_config_snapshot=config.project_payload(),
-                channel_config_snapshot=config.channel_payload(),
-                layout=config.layout,
-                project_config_version=config.project_config_version,
-                channel_config_version=config.channel_config_version,
+                project_config_snapshot={} if config is None else config.project_payload(),
+                channel_config_snapshot={} if config is None else config.channel_payload(),
+                layout="text" if config is None else config.layout,
+                project_config_version=(
+                    project.config_version if config is None else config.project_config_version
+                ),
+                channel_config_version=(1 if config is None else config.channel_config_version),
                 config_snapshot_state="verified",
                 state=CreationState.RESERVED,
+                project_snapshot_json=project_json,
+                session_config_snapshot_json=config_json,
+                worktree_intent_id=worktree_intent_id,
             )
             await connection.execute(
                 """
@@ -154,9 +210,10 @@ class CreationIntentRepository:
                     project_config_snapshot, channel_config_snapshot, layout,
                     project_config_version, channel_config_version,
                     config_snapshot_state, state,
+                    project_snapshot_json, session_config_snapshot_json,
+                    worktree_intent_id,
                     created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'verified',
-                          ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     intent.creation_token,
@@ -171,12 +228,40 @@ class CreationIntentRepository:
                     intent.layout,
                     intent.project_config_version,
                     intent.channel_config_version,
+                    intent.config_snapshot_state,
                     intent.state.value,
+                    intent.project_snapshot_json,
+                    intent.session_config_snapshot_json,
+                    intent.worktree_intent_id,
                     timestamp,
                     timestamp,
                 ),
             )
             return intent, True
+
+    async def assert_side_effect_admitted(self, intent: CreationIntent) -> None:
+        async with self._database.transaction() as connection:
+            draining = await connection.execute(
+                "SELECT value FROM global_config WHERE key = 'restart_draining'"
+            )
+            draining_row = await draining.fetchone()
+            await draining.close()
+            if draining_row is not None and draining_row["value"] == "1":
+                raise RuntimeError("copilotD is draining for restart")
+            if intent.project_id is None:
+                return
+            project = await connection.execute(
+                "SELECT state, project_kind FROM projects WHERE id = ?",
+                (intent.project_id,),
+            )
+            project_row = await project.fetchone()
+            await project.close()
+            if (
+                project_row is None
+                or project_row["state"] == "closing"
+                or (project_row["project_kind"] == "worktree" and project_row["state"] == "retired")
+            ):
+                raise RuntimeError("session project is closing or retired")
 
     async def set_thread(
         self,
@@ -238,11 +323,20 @@ class SessionRegistry:
         self._bindings = bindings
         self._runtime_factory = runtime_factory
         self._runtimes: dict[str, SessionRuntime] = {}
+        self._accepting = True
+        self._admission = asyncio.Condition()
+        self._admitted_operations = 0
+        self._mutation_lock = asyncio.Lock()
 
     def for_thread(self, thread_id: str) -> SessionRuntime | None:
         return self._runtimes.get(thread_id)
 
     def register(self, runtime: SessionRuntime) -> None:
+        if not self._accepting:
+            raise SessionRegistryNotAccepting("session registry is shutting down")
+        self._register_admitted(runtime)
+
+    def _register_admitted(self, runtime: SessionRuntime) -> None:
         thread_id = runtime.binding.thread_id
         existing = self._runtimes.get(thread_id)
         if existing is not None and existing is not runtime:
@@ -250,40 +344,75 @@ class SessionRegistry:
         self._runtimes[thread_id] = runtime
 
     async def replace(self, binding: SessionBinding) -> SessionRuntime:
-        existing = self._runtimes.pop(binding.thread_id, None)
-        if existing is not None:
-            await existing.shutdown()
-        runtime = self._runtime_factory(binding)
-        self.register(runtime)
-        return runtime
+        async with self._admit():
+            async with self._mutation_lock:
+                existing = self._runtimes.pop(binding.thread_id, None)
+                if existing is not None:
+                    await existing.shutdown()
+                runtime = self._runtime_factory(binding)
+                self._register_admitted(runtime)
+                return runtime
 
     async def eager_resume(self) -> dict[str, str]:
         failures: dict[str, str] = {}
         for binding in await self._bindings.eager_bindings():
-            runtime = self._runtime_factory(binding)
-            self.register(runtime)
             try:
-                await runtime.attach_resume()
-            except Exception as error:
-                failures[binding.thread_id] = str(error)
-                self._runtimes.pop(binding.thread_id, None)
-                try:
-                    await runtime.shutdown()
-                except Exception as cleanup_error:
-                    failures[binding.thread_id] = f"{error}; cleanup failed: {cleanup_error}"
+                async with self._admit():
+                    runtime = self._runtime_factory(binding)
+                    self._register_admitted(runtime)
+                    try:
+                        await runtime.attach_resume()
+                    except Exception as error:
+                        failures[binding.thread_id] = str(error)
+                        self._runtimes.pop(binding.thread_id, None)
+                        try:
+                            await runtime.shutdown()
+                        except Exception as cleanup_error:
+                            failures[binding.thread_id] = (
+                                f"{error}; cleanup failed: {cleanup_error}"
+                            )
+            except SessionRegistryNotAccepting:
+                break
         return failures
 
-    async def shutdown(self) -> None:
-        runtimes = list(self._runtimes.values())
-        self._runtimes.clear()
+    async def close_admission(self) -> None:
+        async with self._admission:
+            self._accepting = False
+            await self._admission.wait_for(lambda: self._admitted_operations == 0)
+
+    async def shutdown(
+        self,
+        *,
+        emergency_session_id: str | None = None,
+    ) -> None:
+        await self.close_admission()
+        async with self._mutation_lock:
+            runtimes = list(self._runtimes.values())
+            self._runtimes.clear()
         errors: list[Exception] = []
         for runtime in runtimes:
             try:
-                await runtime.shutdown()
+                await runtime.shutdown(
+                    emergency=(emergency_session_id == runtime.binding.sdk_session_id)
+                )
             except Exception as error:
                 errors.append(error)
         if errors:
             raise ExceptionGroup("one or more session runtimes failed to shut down", errors)
+
+    @asynccontextmanager
+    async def _admit(self) -> AsyncIterator[None]:
+        async with self._admission:
+            if not self._accepting:
+                raise SessionRegistryNotAccepting("session registry is shutting down")
+            self._admitted_operations += 1
+        try:
+            yield
+        finally:
+            async with self._admission:
+                self._admitted_operations -= 1
+                if self._admitted_operations == 0:
+                    self._admission.notify_all()
 
 
 class SessionCreationService:
@@ -304,6 +433,10 @@ class SessionCreationService:
         self._source_locks: dict[tuple[str, str], _SourceCreationLock] = {}
         self._source_locks_guard = asyncio.Lock()
 
+    @property
+    def projects(self) -> ProjectRegistry:
+        return self._projects
+
     async def create_from_source(
         self,
         *,
@@ -313,7 +446,16 @@ class SessionCreationService:
         prompt: str,
         thread_name: str,
         send_initial_prompt: bool = True,
+        project_snapshot: ProjectSnapshot | None = None,
+        config_snapshot: ProjectConfigSnapshot | None = None,
+        preallocated_session_id: str | None = None,
+        worktree_intent_id: str | None = None,
     ) -> SessionRuntime:
+        draining = await self._intents.database.fetchone(
+            "SELECT value FROM global_config WHERE key = 'restart_draining'"
+        )
+        if draining is not None and draining["value"] == "1":
+            raise RuntimeError("copilotD is draining for restart")
         source_key = (source_kind, source_id)
         entry = await self._acquire_source_lock(source_key)
         try:
@@ -324,6 +466,10 @@ class SessionCreationService:
                 prompt=prompt,
                 thread_name=thread_name,
                 send_initial_prompt=send_initial_prompt,
+                project_snapshot=project_snapshot,
+                config_snapshot=config_snapshot,
+                preallocated_session_id=preallocated_session_id,
+                worktree_intent_id=worktree_intent_id,
             )
         finally:
             await self._release_source_lock(source_key, entry)
@@ -337,6 +483,10 @@ class SessionCreationService:
         prompt: str,
         thread_name: str,
         send_initial_prompt: bool,
+        project_snapshot: ProjectSnapshot | None,
+        config_snapshot: ProjectConfigSnapshot | None,
+        preallocated_session_id: str | None,
+        worktree_intent_id: str | None,
     ) -> SessionRuntime:
         intent = await self._intents.by_source(
             source_kind=source_kind,
@@ -344,24 +494,48 @@ class SessionCreationService:
         )
         if intent is None:
             config = await self._projects.session_config_snapshot(channel_id)
-            project = ProjectSnapshot(
-                project_id=config.project_id,
-                channel_id=channel_id,
-                source=config.source,
-                root_path=config.root_path,
-                cwd=config.cwd,
-                config_version=config.project_config_version,
+            project = (
+                ProjectSnapshot(
+                    project_id=config.project_id,
+                    channel_id=channel_id,
+                    source=config.source,
+                    root_path=config.root_path,
+                    cwd=config.cwd,
+                    config_version=config.project_config_version,
+                )
+                if project_snapshot is None
+                else project_snapshot
+            )
+            frozen_config = (
+                await self._projects.config_snapshot(project)
+                if config_snapshot is None
+                else config_snapshot
             )
             intent, _ = await self._intents.reserve(
                 source_kind=source_kind,
                 source_id=source_id,
                 project=project,
                 config=config,
+                config_snapshot=frozen_config,
+                sdk_session_id=preallocated_session_id,
+                worktree_intent_id=worktree_intent_id,
             )
+        elif intent.session_config_snapshot_json is not None:
+            frozen_config = ProjectConfigSnapshot.from_dict(
+                json.loads(intent.session_config_snapshot_json)
+            )
+        else:
+            frozen_config = None
         if intent.config_snapshot_state != "verified":
             raise SessionCreationUnknown(
                 "legacy creation intent has no verified project configuration snapshot"
             )
+        await self._intents.assert_side_effect_admitted(intent)
+        try:
+            SessionLaunchOptions.from_json(intent.session_config_snapshot_json)
+        except SessionConfigSnapshotError:
+            await self._intents.mark(intent, CreationState.FAILED)
+            raise
         if intent.thread_id is None:
             reference = await self._threads.find_thread(
                 channel_id=channel_id,
@@ -369,6 +543,11 @@ class SessionCreationService:
                 creation_token=intent.creation_token,
             )
             if reference is None:
+                if intent.state == CreationState.UNKNOWN:
+                    raise SessionCreationUnknown(
+                        "Discord thread creation remains unknown; "
+                        "the original token did not reconcile"
+                    )
                 try:
                     reference = await self._threads.create_thread(
                         channel_id=channel_id,
@@ -392,7 +571,13 @@ class SessionCreationService:
                 project_id=intent.project_id,
                 session_config_snapshot=intent.project_config_snapshot,
                 channel_config_snapshot=intent.channel_config_snapshot,
-                session_config_version=intent.project_config_version,
+                project_snapshot_json=intent.project_snapshot_json,
+                session_config_snapshot_json=intent.session_config_snapshot_json,
+                session_config_version=(
+                    intent.project_config_version
+                    if frozen_config is None
+                    else frozen_config.config_version
+                ),
             )
 
         runtime = self._sessions.for_thread(intent.thread_id)
@@ -476,4 +661,24 @@ def _row_to_intent(row: Row) -> CreationIntent:
         channel_config_version=int(row["channel_config_version"]),
         config_snapshot_state=str(row["config_snapshot_state"]),
         state=CreationState(row["state"]),
+        project_snapshot_json=row["project_snapshot_json"],
+        session_config_snapshot_json=row["session_config_snapshot_json"],
+        worktree_intent_id=row["worktree_intent_id"],
+    )
+
+
+def _project_snapshot_json(project: ProjectSnapshot) -> str:
+    return json.dumps(
+        {
+            "project_id": project.project_id,
+            "channel_id": project.channel_id,
+            "source": project.source.value,
+            "root_path": str(project.root_path),
+            "cwd": str(project.cwd),
+            "config_version": project.config_version,
+            "timezone": project.timezone,
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
     )

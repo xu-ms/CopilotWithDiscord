@@ -1,6 +1,7 @@
 import asyncio
 from collections.abc import Awaitable, Callable
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -8,6 +9,7 @@ from copilotd.core.inbox import ReducerInbox
 from copilotd.core.mailbox import (
     CommandMailbox,
     OperationAmbiguous,
+    OperationDeferred,
     OperationRejected,
     OperationStore,
 )
@@ -416,3 +418,90 @@ async def test_mailbox_rechecks_fence_after_rpc_before_confirming(
         }
         await mailbox.stop()
         await reducer.stop()
+
+
+@pytest.mark.asyncio
+async def test_emergency_stop_defers_unstarted_operation_and_runs_durable_requeue(
+    tmp_path: Path,
+) -> None:
+    async with Database(tmp_path / "mailbox-emergency.sqlite3") as database:
+        started = asyncio.Event()
+        never = asyncio.Event()
+        requeued = asyncio.Event()
+        pending = asyncio.Event()
+        second_called = False
+
+        async def validate() -> bool:
+            return True
+
+        async def hang() -> None:
+            started.set()
+            await never.wait()
+
+        async def must_not_start() -> None:
+            nonlocal second_called
+            second_called = True
+
+        async def durable_requeue() -> None:
+            requeued.set()
+
+        mailbox, reducer = _start_mailbox(database, validate)
+        original_begin = mailbox._store.begin
+
+        async def begin_and_signal(**kwargs: Any) -> Any:
+            result = await original_begin(**kwargs)
+            if kwargs["idempotency_key"] == "unstarted":
+                pending.set()
+            return result
+
+        mailbox._store.begin = begin_and_signal  # type: ignore[method-assign]
+        first = asyncio.create_task(
+            mailbox.submit(
+                kind="send",
+                idempotency_key="started",
+                input_payload={"prompt": "started"},
+                operation=hang,
+            )
+        )
+        await started.wait()
+        second = asyncio.create_task(
+            mailbox.submit(
+                kind="send",
+                idempotency_key="unstarted",
+                input_payload={"prompt": "queued"},
+                operation=must_not_start,
+                defer_on_fence_loss=True,
+                on_fence_deferred=durable_requeue,
+            )
+        )
+        await pending.wait()
+
+        await mailbox.emergency_stop()
+        with pytest.raises(OperationAmbiguous):
+            await first
+        with pytest.raises(OperationDeferred, match="deferred"):
+            await second
+        rows = await database.fetchall(
+            """
+            SELECT idempotency_key, state, error_code
+            FROM session_operations
+            WHERE idempotency_key IN ('started', 'unstarted')
+            ORDER BY idempotency_key
+            """
+        )
+        await reducer.stop()
+
+    assert requeued.is_set()
+    assert not second_called
+    assert [dict(row) for row in rows] == [
+        {
+            "idempotency_key": "started",
+            "state": "unknown",
+            "error_code": "mailbox_cancelled",
+        },
+        {
+            "idempotency_key": "unstarted",
+            "state": "rejected",
+            "error_code": "mailbox_emergency_deferred",
+        },
+    ]

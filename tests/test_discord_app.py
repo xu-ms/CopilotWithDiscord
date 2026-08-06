@@ -4,6 +4,7 @@ from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
+from unittest.mock import AsyncMock
 
 import discord
 import pytest
@@ -11,7 +12,9 @@ from discord.ext import commands
 from PIL import Image
 
 from copilotd.config import Settings
+from copilotd.core.bindings import SessionBindingRepository
 from copilotd.core.commands import UnknownInteractionError
+from copilotd.core.task_registry import TaskFailure
 from copilotd.discord_app import (
     CopilotDiscordBot,
     DiscordInteractionResponder,
@@ -30,6 +33,7 @@ from copilotd.render.outbox import (
 )
 from copilotd.render.tables import TableAsset
 from copilotd.sdk.capabilities import CapabilityRegistry
+from copilotd.storage.database import Database
 
 
 def test_discord_command_manifest_has_core_modes_and_no_deleted_roots(tmp_path: Path) -> None:
@@ -109,9 +113,15 @@ def test_discord_command_manifest_has_core_modes_and_no_deleted_roots(tmp_path: 
     assert {"bind", "info", "layout", "mention", "variable", "mcp", "skill", "plugin", "agent"} <= {
         command.name for command in project.commands
     }
-    assert {"health", "diagnostics", "debug", "log-tail", "event-dump"} == {
-        command.name for command in ops.commands
-    }
+    assert {
+        "health",
+        "scheduler",
+        "diagnostics",
+        "debug",
+        "log-tail",
+        "event-dump",
+        "restart-runtime",
+    } == {command.name for command in ops.commands}
     mcp = project.get_command("mcp")
     assert isinstance(mcp, discord.app_commands.Group)
     mcp_add = mcp.get_command("add")
@@ -191,6 +201,7 @@ def test_discord_registration_omits_commands_without_capability_evidence(
         "ops",
         "project",
         "queue",
+        "schedule",
         "session",
         "steer",
     }
@@ -271,6 +282,216 @@ def test_model_group_omits_set_when_mutation_is_not_verified(
 
     model = next(command for command in bot.tree.get_commands() if command.name == "model")
     assert {command.name for command in model.commands} == {"list"}
+
+
+def test_administrative_commands_require_explicit_operator_allowlist(
+    tmp_path: Path,
+) -> None:
+    denied = CopilotDiscordBot(Settings(data_dir=tmp_path))
+    interaction = SimpleNamespace(user=SimpleNamespace(id=42))
+    with pytest.raises(discord.app_commands.CheckFailure):
+        denied._require_operator(interaction)
+
+    allowed = CopilotDiscordBot(Settings(data_dir=tmp_path, discord_operator_ids="41,42"))
+    allowed._require_operator(interaction)
+
+
+@pytest.mark.asyncio
+async def test_bot_teardown_is_idempotent(tmp_path: Path) -> None:
+    bot = CopilotDiscordBot(Settings(data_dir=tmp_path))
+    bot.bridge.stop = AsyncMock()
+    bot.database.close = AsyncMock()
+
+    await bot.close()
+    await bot.close()
+
+    bot.bridge.stop.assert_awaited_once()
+    bot.database.close.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_shutdown_closes_gateway_and_registry_then_drains_admitted_handlers(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    order: list[str] = []
+    handler_started = asyncio.Event()
+    release_handler = asyncio.Event()
+    admission_closed = asyncio.Event()
+
+    async def gateway_close(_bot: commands.Bot) -> None:
+        order.append("gateway_closed")
+
+    class FakeSessions:
+        async def close_admission(self) -> None:
+            order.append("registry_closed")
+            admission_closed.set()
+
+        async def shutdown(self, *, emergency_session_id: str | None = None) -> None:
+            del emergency_session_id
+            order.append("sessions_snapshotted")
+
+    async def admitted_handler(_message: object) -> None:
+        handler_started.set()
+        await release_handler.wait()
+        order.append("handler_drained")
+
+    monkeypatch.setattr(commands.Bot, "close", gateway_close)
+    bot = CopilotDiscordBot(Settings(data_dir=tmp_path))
+    bot.sessions = FakeSessions()
+    bot.bridge.stop = AsyncMock(side_effect=lambda: order.append("bridge_stopped"))
+    bot.database.close = AsyncMock(side_effect=lambda: order.append("database_closed"))
+    monkeypatch.setattr(bot, "_on_message_admitted", admitted_handler)
+    handler = asyncio.create_task(bot.on_message(object()))
+    await handler_started.wait()
+
+    closing = asyncio.create_task(bot.close())
+    await admission_closed.wait()
+    assert not closing.done()
+    assert order[:2] == ["gateway_closed", "registry_closed"]
+
+    release_handler.set()
+    await handler
+    await closing
+
+    assert order.index("handler_drained") < order.index("sessions_snapshotted")
+    assert order.index("sessions_snapshotted") < order.index("bridge_stopped")
+
+
+@pytest.mark.asyncio
+async def test_ordinary_message_does_not_resume_closed_session_after_restart(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FakeThread:
+        def __init__(self, thread_id: str) -> None:
+            self.id = thread_id
+
+    async with Database(tmp_path / "closed-message.sqlite3") as database:
+        bindings = SessionBindingRepository(database)
+        await bindings.create(
+            thread_id="thread-1",
+            sdk_session_id="session-1",
+            cwd_snapshot=tmp_path,
+            project_source="implicit-home",
+        )
+        await database.execute(
+            """
+            UPDATE session_bindings
+            SET binding_intent = 'closed', attachment_state = 'absent'
+            WHERE thread_id = 'thread-1'
+            """
+        )
+        bot = CopilotDiscordBot(Settings(data_dir=tmp_path))
+        bot.bindings = bindings
+        bot.sessions = SimpleNamespace(
+            for_thread=lambda _thread_id: pytest.fail(
+                "ordinary ingress must not instantiate a closed runtime"
+            )
+        )
+        monkeypatch.setattr(discord, "Thread", FakeThread)
+        monkeypatch.setattr(
+            bot,
+            "_is_restart_draining",
+            AsyncMock(return_value=False),
+        )
+        message = SimpleNamespace(
+            author=SimpleNamespace(bot=False),
+            guild=object(),
+            channel=FakeThread("thread-1"),
+            content="do not resume implicitly",
+            attachments=[],
+            mentions=[],
+            reply=AsyncMock(),
+        )
+
+        await bot.on_message(message)
+
+    message.reply.assert_awaited_once()
+    assert "closed" in message.reply.await_args.args[0]
+    assert "/session resume" in message.reply.await_args.args[0]
+
+
+@pytest.mark.asyncio
+async def test_cancelled_close_caller_does_not_poison_shared_teardown(
+    tmp_path: Path,
+) -> None:
+    bot = CopilotDiscordBot(Settings(data_dir=tmp_path))
+    stop_started = asyncio.Event()
+    allow_stop = asyncio.Event()
+
+    async def delayed_stop() -> None:
+        stop_started.set()
+        await allow_stop.wait()
+
+    bot.bridge.stop = AsyncMock(side_effect=delayed_stop)
+    bot.database.close = AsyncMock()
+    first = asyncio.create_task(bot.close())
+    await stop_started.wait()
+    first.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await first
+    allow_stop.set()
+
+    await bot.close()
+
+    assert bot._closed_once
+    bot.bridge.stop.assert_awaited_once()
+    bot.database.close.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_fatal_worker_runs_full_application_teardown(tmp_path: Path) -> None:
+    bot = CopilotDiscordBot(Settings(data_dir=tmp_path))
+    bot.bridge.stop = AsyncMock()
+    bot.database.close = AsyncMock()
+    supervisor = bot._tasks.create(
+        bot._task_failure_loop(),
+        name="test-failure-supervisor",
+    )
+    await bot._tasks.errors.put(
+        TaskFailure(
+            name="failed-worker",
+            source="test",
+            session_id=None,
+            runtime_generation=None,
+            error=RuntimeError("worker failed"),
+        )
+    )
+
+    await asyncio.wait_for(supervisor, timeout=2)
+
+    assert bot._closed_once
+    bot.bridge.stop.assert_awaited_once()
+    bot.database.close.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_fatal_diagnostic_failure_still_runs_teardown(tmp_path: Path) -> None:
+    bot = CopilotDiscordBot(Settings(data_dir=tmp_path))
+    bot.bridge.stop = AsyncMock()
+    bot.database.execute = AsyncMock(side_effect=OSError("database unavailable"))
+    bot.database.close = AsyncMock()
+    supervisor = bot._tasks.create(
+        bot._task_failure_loop(),
+        name="test-diagnostic-failure-supervisor",
+    )
+    await bot._tasks.errors.put(
+        TaskFailure(
+            name="failed-reducer",
+            source="event-reducer",
+            session_id="session-1",
+            runtime_generation=1,
+            error=RuntimeError("reducer failed"),
+        )
+    )
+
+    await asyncio.wait_for(supervisor, timeout=2)
+
+    assert isinstance(bot._fatal_diagnostic_error, OSError)
+    assert bot._closed_once
+    bot.bridge.stop.assert_awaited_once()
+    bot.database.close.assert_awaited_once()
 
 
 def test_streaming_table_is_held_before_discord_edit() -> None:
@@ -630,14 +851,13 @@ async def test_critical_task_failure_closes_gateway_and_persists_incident(
     )
     await asyncio.wait_for(gateway_closed.wait(), timeout=1)
     await supervisor
-    incident = await bot.database.fetchone(
-        """
-        SELECT runtime_generation, kind, detail
-        FROM runtime_incidents WHERE session_id = 'session-1'
-        """
-    )
-    await bot._tasks.cancel_all()
-    await bot.database.close()
+    async with Database(bot.settings.database_path) as database:
+        incident = await database.fetchone(
+            """
+            SELECT runtime_generation, kind, detail
+            FROM runtime_incidents WHERE session_id = 'session-1'
+            """
+        )
 
     assert isinstance(bot._fatal_worker_error, RuntimeError)
     assert bot.heartbeat.runtime_state == "down"

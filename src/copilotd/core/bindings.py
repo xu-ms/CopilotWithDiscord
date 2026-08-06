@@ -7,10 +7,12 @@ from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
 
-from aiosqlite import Row
+from aiosqlite import Connection, Row
 
 from copilotd.storage.database import Database
 from copilotd.storage.leases import OwnerLease
+
+TYPED_CLOSED_ATTACHMENT_REASONS = frozenset({"scheduler_run", "recovery_cleanup"})
 
 
 class BindingIntent(StrEnum):
@@ -48,16 +50,23 @@ class SessionBinding:
     sdk_session_id: str
     binding_intent: BindingIntent
     attachment_state: AttachmentState
+    attachment_reason: str | None
     permission_posture: PermissionPosture
     desired_mode: str
     pending_mode: str | None
     pending_mode_transition_id: str | None
     runtime_mode: str
+    desired_agent: str
+    runtime_agent: str
+    desired_session_config_version: int
+    runtime_session_config_version: int | None
+    runtime_remote_mode: str
+    project_snapshot_json: str | None
+    session_config_snapshot_json: str | None
     runtime_generation: int
     owner_fence_token: int | None
     last_inbox_seq: int
     last_sdk_receive_seq: int | None
-    desired_session_config_version: int
     session_config_snapshot: dict[str, object]
     channel_config_snapshot: dict[str, object]
     config_snapshot_state: str
@@ -82,33 +91,40 @@ class SessionBindingRepository:
         project_id: str | None = None,
         session_config_snapshot: dict[str, object] | None = None,
         channel_config_snapshot: dict[str, object] | None = None,
+        project_snapshot_json: str | None = None,
+        session_config_snapshot_json: str | None = None,
         session_config_version: int = 1,
         now: float | None = None,
     ) -> SessionBinding:
         timestamp = time.time() if now is None else now
         resolved_cwd = await asyncio.to_thread(_resolve_path, cwd_snapshot)
-        await self._database.execute(
-            """
-            INSERT INTO session_bindings(
-                thread_id, project_id, project_source, cwd_snapshot, sdk_session_id,
-                session_config_snapshot, channel_config_snapshot,
-                config_snapshot_state, desired_session_config_version,
-                created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, 'verified', ?, ?, ?)
-            """,
-            (
-                thread_id,
-                project_id,
-                project_source,
-                str(resolved_cwd),
-                sdk_session_id,
-                json.dumps(session_config_snapshot or {}, sort_keys=True),
-                json.dumps(channel_config_snapshot or {}, sort_keys=True),
-                session_config_version,
-                timestamp,
-                timestamp,
-            ),
-        )
+        async with self._database.transaction() as connection:
+            await _require_project_admission(connection, project_id)
+            await connection.execute(
+                """
+                INSERT INTO session_bindings(
+                    thread_id, project_id, project_source, cwd_snapshot, sdk_session_id,
+                    session_config_snapshot, channel_config_snapshot,
+                    config_snapshot_state,
+                    project_snapshot_json, session_config_snapshot_json,
+                    desired_session_config_version, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, 'verified', ?, ?, ?, ?, ?)
+                """,
+                (
+                    thread_id,
+                    project_id,
+                    project_source,
+                    str(resolved_cwd),
+                    sdk_session_id,
+                    json.dumps(session_config_snapshot or {}, sort_keys=True),
+                    json.dumps(channel_config_snapshot or {}, sort_keys=True),
+                    project_snapshot_json,
+                    session_config_snapshot_json,
+                    session_config_version,
+                    timestamp,
+                    timestamp,
+                ),
+            )
         binding = await self.by_thread(thread_id)
         if binding is None:
             raise RuntimeError("created session binding could not be read back")
@@ -129,15 +145,81 @@ class SessionBindingRepository:
         return None if row is None else _row_to_binding(row)
 
     async def eager_bindings(self) -> list[SessionBinding]:
-        rows = await self._database.fetchall(
-            """
-            SELECT * FROM session_bindings
-            WHERE binding_intent = 'active'
-              AND attachment_state != 'terminal'
-            ORDER BY created_at, thread_id
-            """
-        )
+        async with self._database.transaction() as connection:
+            await connection.execute(
+                """
+                UPDATE session_bindings AS binding
+                SET attachment_reason = 'scheduler_run',
+                    updated_at = ?, row_version = row_version + 1
+                WHERE binding.binding_intent = 'closed'
+                  AND binding.attachment_reason IS NULL
+                  AND EXISTS (
+                      SELECT 1
+                      FROM message_queue AS queue
+                      JOIN submissions AS submission
+                        ON submission.submission_id = queue.id
+                      WHERE queue.thread_id = binding.thread_id
+                        AND queue.schedule_run_id IS NOT NULL
+                        AND queue.state = 'local_queued'
+                        AND submission.origin = 'app_schedule'
+                        AND submission.state = 'local_queued'
+                  )
+                """,
+                (time.time(),),
+            )
+            cursor = await connection.execute(
+                """
+                SELECT * FROM session_bindings AS binding
+                WHERE binding.attachment_state != 'terminal'
+                  AND (
+                      binding.binding_intent = 'active'
+                      OR (
+                          binding.binding_intent = 'closed'
+                          AND binding.attachment_reason = 'scheduler_run'
+                          AND EXISTS (
+                              SELECT 1
+                              FROM message_queue AS queue
+                              JOIN submissions AS submission
+                                ON submission.submission_id = queue.id
+                              WHERE queue.thread_id = binding.thread_id
+                                AND queue.schedule_run_id IS NOT NULL
+                                AND queue.state = 'local_queued'
+                                AND submission.origin = 'app_schedule'
+                                AND submission.state = 'local_queued'
+                          )
+                      )
+                  )
+                ORDER BY binding.created_at, binding.thread_id
+                """
+            )
+            rows = list(await cursor.fetchall())
+            await cursor.close()
         return [_row_to_binding(row) for row in rows]
+
+    async def set_attachment_reason(
+        self,
+        binding: SessionBinding,
+        reason: str | None,
+        *,
+        now: float | None = None,
+    ) -> SessionBinding:
+        if reason not in {None, "user_active", "scheduler_run", "recovery_cleanup"}:
+            raise ValueError(f"invalid attachment reason: {reason}")
+        timestamp = time.time() if now is None else now
+        changed = await self._database.execute_count(
+            """
+            UPDATE session_bindings
+            SET attachment_reason = ?, updated_at = ?, row_version = row_version + 1
+            WHERE thread_id = ? AND row_version = ?
+            """,
+            (reason, timestamp, binding.thread_id, binding.row_version),
+        )
+        if changed != 1:
+            raise BindingConflict("session binding changed while setting attachment reason")
+        result = await self.by_thread(binding.thread_id)
+        if result is None:
+            raise RuntimeError("session binding disappeared")
+        return result
 
     async def begin_attachment(
         self,
@@ -180,8 +262,16 @@ class SessionBindingRepository:
             binding = _row_to_binding(row)
             if binding.sdk_session_id != lease.sdk_session_id:
                 raise BindingConflict("owner lease does not match session binding")
+            await _require_project_admission(connection, binding.project_id)
             if binding.binding_intent not in {BindingIntent.ACTIVE, BindingIntent.CLOSED}:
                 raise BindingConflict(f"cannot attach binding with intent {binding.binding_intent}")
+            if (
+                binding.binding_intent == BindingIntent.CLOSED
+                and binding.attachment_reason not in TYPED_CLOSED_ATTACHMENT_REASONS
+            ):
+                raise BindingConflict(
+                    "closed sessions require an explicit scheduler or recovery attachment"
+                )
             attachable_states = {
                 AttachmentState.ABSENT,
                 AttachmentState.RECOVERY_UNKNOWN,
@@ -432,13 +522,23 @@ class SessionBindingRepository:
     ) -> SessionBinding:
         timestamp = time.time() if now is None else now
         async with self._database.transaction() as connection:
+            current = await connection.execute(
+                "SELECT * FROM session_bindings WHERE thread_id = ?",
+                (binding.thread_id,),
+            )
+            row = await current.fetchone()
+            await current.close()
+            if row is None:
+                raise BindingConflict("session binding does not exist")
+            observed = _row_to_binding(row)
+            await _require_project_admission(connection, observed.project_id)
             cursor = await connection.execute(
                 """
                 UPDATE session_bindings
                 SET binding_intent = 'active', updated_at = ?, row_version = row_version + 1
-                WHERE thread_id = ? AND binding_intent = 'closed'
+                WHERE thread_id = ? AND binding_intent = 'closed' AND row_version = ?
                 """,
-                (timestamp, binding.thread_id),
+                (timestamp, binding.thread_id, observed.row_version),
             )
             if cursor.rowcount != 1:
                 await cursor.close()
@@ -501,11 +601,18 @@ def _row_to_binding(row: Row) -> SessionBinding:
         sdk_session_id=row["sdk_session_id"],
         binding_intent=BindingIntent(row["binding_intent"]),
         attachment_state=AttachmentState(row["attachment_state"]),
+        attachment_reason=row["attachment_reason"],
         permission_posture=PermissionPosture(row["permission_posture"]),
         desired_mode=row["desired_mode"],
         pending_mode=row["pending_mode"],
         pending_mode_transition_id=row["pending_mode_transition_id"],
         runtime_mode=row["runtime_mode"],
+        desired_agent=row["desired_agent"],
+        runtime_agent=row["runtime_agent"],
+        runtime_session_config_version=row["runtime_session_config_version"],
+        runtime_remote_mode=row["runtime_remote_mode"],
+        project_snapshot_json=row["project_snapshot_json"],
+        session_config_snapshot_json=row["session_config_snapshot_json"],
         runtime_generation=row["runtime_generation"],
         owner_fence_token=row["owner_fence_token"],
         last_inbox_seq=row["last_inbox_seq"],
@@ -520,3 +627,23 @@ def _row_to_binding(row: Row) -> SessionBinding:
 
 def _resolve_path(path: Path) -> Path:
     return path.expanduser().resolve()
+
+
+async def _require_project_admission(
+    connection: Connection,
+    project_id: str | None,
+) -> None:
+    if project_id is None:
+        return
+    cursor = await connection.execute(
+        "SELECT state, project_kind FROM projects WHERE id = ?",
+        (project_id,),
+    )
+    project = await cursor.fetchone()
+    await cursor.close()
+    if project is None:
+        raise BindingConflict("session project does not exist")
+    if project["state"] == "closing" or (
+        project["project_kind"] == "worktree" and project["state"] == "retired"
+    ):
+        raise BindingConflict("session project is closing or closed")

@@ -51,8 +51,16 @@ from copilotd.core.commands import (
     TaskActionAdapter,
     UnknownInteractionError,
 )
+from copilotd.core.lifecycle_commands import (
+    DiscordParentType,
+    ProjectLifecycleService,
+    SchedulerCommandService,
+    WorktreeCommandService,
+)
 from copilotd.core.projects import ProjectRegistry
 from copilotd.core.recovery import RecoveryInventoryReport, StartupRecoveryInventory
+from copilotd.core.scheduler import SchedulerRepository, SchedulerWorker
+from copilotd.core.scheduler_adapter import ApplicationSchedulerAdapter
 from copilotd.core.session_runtime import (
     DetachBlocked,
     RuntimeState,
@@ -69,6 +77,7 @@ from copilotd.core.sessions import (
 from copilotd.core.spill_artifacts import garbage_collect_tool_spills
 from copilotd.core.supervisor import ExecutionStallMonitor
 from copilotd.core.task_registry import TaskRegistry
+from copilotd.core.worktrees import SessionCreationWorktreeAdapter, WorktreeManager
 from copilotd.discord_native import NativeDiscordRegistrar
 from copilotd.ops.heartbeat import HeartbeatWriter
 from copilotd.ops.surface import LocalOpsSurface
@@ -95,6 +104,16 @@ from copilotd.storage.leases import OwnerLeaseStore
 
 logger = structlog.get_logger(__name__)
 _TABLE_DELIMITER = re.compile(r"^\s*\|?\s*:?-{3,}:?\s*(?:\|\s*:?-{3,}:?\s*)+\|?\s*$")
+
+
+class _OperatorCommandGroup(app_commands.Group):
+    def __init__(self, bot: CopilotDiscordBot, **kwargs: Any) -> None:
+        super().__init__(**kwargs)
+        self._bot = bot
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        self._bot._require_operator(interaction)
+        return True
 
 
 class CopilotDiscordBot(commands.Bot):
@@ -150,6 +169,12 @@ class CopilotDiscordBot(commands.Bot):
         self.sessions: SessionRegistry | None = None
         self.creation: SessionCreationService | None = None
         self.dispatcher: RenderOutboxDispatcher | None = None
+        self.scheduler_repository: SchedulerRepository | None = None
+        self.scheduler_worker: SchedulerWorker | None = None
+        self.scheduler_commands: SchedulerCommandService | None = None
+        self.project_commands: ProjectLifecycleService | None = None
+        self.worktree_manager: WorktreeManager | None = None
+        self.worktree_commands: WorktreeCommandService | None = None
         self._tasks = TaskRegistry()
         self._owner_id = f"discord:{uuid.uuid4()}"
         self._commands_registered = False
@@ -157,6 +182,16 @@ class CopilotDiscordBot(commands.Bot):
         self._render_stop = asyncio.Event()
         self._render_task: asyncio.Task[None] | None = None
         self._after_render_send_hook: Callable[[int, str], Awaitable[None]] | None = None
+        self._fatal_diagnostic_error: Exception | None = None
+        self._restart_task: asyncio.Task[None] | None = None
+        self.restart_requested = False
+        self._close_lock = asyncio.Lock()
+        self._closed_once = False
+        self._shutdown_task: asyncio.Task[None] | None = None
+        self._fatal_session_id: str | None = None
+        self._shutdown_initiator: asyncio.Task[Any] | None = None
+        self._accepting_handlers = True
+        self._admitted_handlers: set[asyncio.Task[Any]] = set()
 
     async def setup_hook(self) -> None:
         await self.database.open()
@@ -215,6 +250,23 @@ class CopilotDiscordBot(commands.Bot):
             sessions=self.sessions,
             threads=DiscordThreadGateway(self),
         )
+        self.scheduler_repository = SchedulerRepository(self.database)
+        await self.scheduler_repository.recover()
+        self.scheduler_commands = SchedulerCommandService(
+            self.database,
+            self.projects,
+            self.scheduler_repository,
+        )
+        self.project_commands = ProjectLifecycleService(self.database, self.projects)
+        self.worktree_manager = WorktreeManager(
+            self.database,
+            self.projects,
+            worktrees_root=self.settings.data_dir / "worktrees",
+            adapter=SessionCreationWorktreeAdapter(self.creation, self.database),
+            task_registry=self._tasks,
+        )
+        await self.worktree_manager.recover()
+        self.worktree_commands = WorktreeCommandService(self.worktree_manager)
         self._tasks.create(
             self._task_failure_loop(),
             name="task-failure-supervisor",
@@ -232,6 +284,18 @@ class CopilotDiscordBot(commands.Bot):
                 thread_id=thread_id,
                 error=error,
             )
+        self.scheduler_worker = SchedulerWorker(
+            self.scheduler_repository,
+            ApplicationSchedulerAdapter(
+                self.database,
+                self.bindings,
+                self.sessions,
+                self.creation,
+                self.capabilities,
+            ),
+            owner_id=f"scheduler:{self._owner_id}",
+        )
+        await self.scheduler_worker.start()
         self.dispatcher = RenderOutboxDispatcher(self.database, self)
         self._render_task = self._tasks.create(
             self._render_loop(),
@@ -252,21 +316,47 @@ class CopilotDiscordBot(commands.Bot):
             await self.tree.sync()
 
     async def close(self) -> None:
+        async with self._close_lock:
+            if self._shutdown_task is None:
+                self._shutdown_task = asyncio.create_task(
+                    self._close_once(),
+                    name="copilotd-shutdown",
+                )
+            shutdown = self._shutdown_task
+        await asyncio.shield(shutdown)
+
+    async def _close_once(self) -> None:
         self.heartbeat.set_gateway("down")
         self.heartbeat.runtime_state = "down"
+        self._accepting_handlers = False
         errors: list[Exception] = []
+        try:
+            await super().close()
+        except Exception as error:
+            errors.append(error)
+        if self.sessions is not None:
+            try:
+                await self.sessions.close_admission()
+            except Exception as error:
+                errors.append(error)
+        try:
+            await self._drain_admitted_handlers()
+        except Exception as error:
+            errors.append(error)
+        if self.scheduler_worker is not None:
+            try:
+                await self.scheduler_worker.stop()
+            except Exception as error:
+                errors.append(error)
         try:
             await self._stop_render_consumer()
         except Exception as error:
             errors.append(error)
-        if self.dispatcher is not None:
-            try:
-                await self.dispatcher.drain()
-            except Exception as error:
-                errors.append(error)
         if self.sessions is not None:
             try:
-                await self.sessions.shutdown()
+                await self.sessions.shutdown(
+                    emergency_session_id=self._fatal_session_id,
+                )
             except Exception as error:
                 errors.append(error)
         if self.dispatcher is not None:
@@ -275,7 +365,12 @@ class CopilotDiscordBot(commands.Bot):
             except Exception as error:
                 errors.append(error)
         try:
-            await self._tasks.cancel_all()
+            excluded = (
+                frozenset()
+                if self._shutdown_initiator is None
+                else frozenset({self._shutdown_initiator})
+            )
+            await self._tasks.cancel_all(exclude=excluded)
         except Exception as error:
             errors.append(error)
         try:
@@ -286,7 +381,7 @@ class CopilotDiscordBot(commands.Bot):
             await self.database.close()
         except Exception as error:
             errors.append(error)
-        await super().close()
+        self._closed_once = True
         if errors:
             raise ExceptionGroup("copilotD shutdown failed", errors)
 
@@ -294,42 +389,48 @@ class CopilotDiscordBot(commands.Bot):
         while True:
             failure = await self._tasks.errors.get()
             try:
-                self.heartbeat.runtime_state = "down"
-                await logger.aerror(
-                    "background_task_failed",
-                    task_name=failure.name,
-                    source=failure.source,
-                    session_id=failure.session_id,
-                    runtime_generation=failure.runtime_generation,
-                    error_type=type(failure.error).__name__,
-                    error=str(failure.error),
-                )
-                if failure.session_id is not None:
-                    await self.database.execute(
-                        """
-                        INSERT INTO runtime_incidents(
-                            timestamp, runtime_generation, session_id,
-                            kind, detail
-                        ) VALUES (?, ?, ?, 'background_task_failed', ?)
-                        """,
-                        (
-                            time.time(),
-                            failure.runtime_generation or 0,
-                            failure.session_id,
-                            json.dumps(
-                                {
-                                    "task_name": failure.name,
-                                    "source": failure.source,
-                                    "error_type": type(failure.error).__name__,
-                                    "message": str(failure.error),
-                                },
-                                sort_keys=True,
-                            ),
-                        ),
-                    )
                 self._fatal_worker_error = failure.error
+                self._fatal_session_id = failure.session_id
+                self._shutdown_initiator = asyncio.current_task()
+                self.heartbeat.runtime_state = "down"
                 self.heartbeat.set_gateway("down")
-                await super().close()
+                try:
+                    await logger.aerror(
+                        "background_task_failed",
+                        task_name=failure.name,
+                        source=failure.source,
+                        session_id=failure.session_id,
+                        runtime_generation=failure.runtime_generation,
+                        error_type=type(failure.error).__name__,
+                        error=str(failure.error),
+                    )
+                    if failure.session_id is not None:
+                        await self.database.execute(
+                            """
+                            INSERT INTO runtime_incidents(
+                                timestamp, runtime_generation, session_id,
+                                kind, detail
+                            ) VALUES (?, ?, ?, 'background_task_failed', ?)
+                            """,
+                            (
+                                time.time(),
+                                failure.runtime_generation or 0,
+                                failure.session_id,
+                                json.dumps(
+                                    {
+                                        "task_name": failure.name,
+                                        "source": failure.source,
+                                        "error_type": type(failure.error).__name__,
+                                        "message": str(failure.error),
+                                    },
+                                    sort_keys=True,
+                                ),
+                            ),
+                        )
+                except Exception as diagnostic_error:
+                    self._fatal_diagnostic_error = diagnostic_error
+                finally:
+                    await self.close()
                 return
             finally:
                 self._tasks.errors.task_done()
@@ -349,6 +450,15 @@ class CopilotDiscordBot(commands.Bot):
         self.heartbeat.set_gateway("ready")
 
     async def on_interaction(self, interaction: discord.Interaction) -> None:
+        task = self._admit_handler()
+        if task is None:
+            return
+        try:
+            await self._on_interaction_admitted(interaction)
+        finally:
+            self._admitted_handlers.discard(task)
+
+    async def _on_interaction_admitted(self, interaction: discord.Interaction) -> None:
         data = interaction.data
         custom_id = str(data.get("custom_id", "")) if isinstance(data, dict) else ""
         if interaction.type == discord.InteractionType.component and custom_id.startswith("cdi:"):
@@ -536,18 +646,31 @@ class CopilotDiscordBot(commands.Bot):
         await responder.send_followup(_interaction_result_text(result))
 
     async def on_message(self, message: discord.Message) -> None:
+        task = self._admit_handler()
+        if task is None:
+            return
+        try:
+            await self._on_message_admitted(message)
+        finally:
+            self._admitted_handlers.discard(task)
+
+    async def _on_message_admitted(self, message: discord.Message) -> None:
         if message.author.bot or message.guild is None:
+            return
+        if await self._is_restart_draining():
+            await message.reply("copilotD is draining for restart; no new work was accepted.")
             return
         prompt = self._clean_prompt(message)
         if isinstance(message.channel, discord.Thread):
             binding = await self._require_bindings().by_thread(str(message.channel.id))
             if binding is None or (not prompt and not message.attachments):
                 return
-            if binding.binding_intent == BindingIntent.CLOSED:
-                await message.reply(
-                    "[CD-SESSION-002] This session is closed; use `/session resume` "
-                    "in this original thread."
-                )
+            if binding.binding_intent != BindingIntent.ACTIVE:
+                if binding.binding_intent == BindingIntent.CLOSED:
+                    await message.reply(
+                        "[CD-SESSION-002] This session is closed; use `/session resume` "
+                        "in this original thread."
+                    )
                 return
             runtime = self._require_sessions().for_thread(str(message.channel.id))
             if runtime is None:
@@ -635,22 +758,43 @@ class CopilotDiscordBot(commands.Bot):
         idempotency_key: str,
     ) -> str:
         try:
-            binding = await self._require_bindings().by_session(session_id)
-            if binding is None:
-                raise RenderPermanentError(f"no Discord binding for SDK session {session_id}")
-            thread = await self._thread_for_session(session_id)
-            plan = await _discord_render_plan(
-                payload,
-                allowed_roots=(binding.cwd_snapshot,),
-                max_bytes=self.settings.discord_upload_max_bytes,
-            )
-            message_id = await self._deliver_render_plan(
-                thread=thread,
-                session_id=session_id,
-                payload=payload,
-                plan=plan,
-                delivery_id=idempotency_key,
-            )
+            if session_id.startswith(("thread:", "channel:", "ops:")):
+                destination = await self._render_destination(session_id)
+                content, assets = await _discord_render(payload)
+                content, assets = _prepare_discord_assets(
+                    content,
+                    assets,
+                    max_bytes=self.settings.discord_upload_max_bytes,
+                )
+                message = await destination.send(
+                    content=content or "\u200b",
+                    files=_discord_files(assets[:10]),
+                    view=_render_view(payload),
+                    silent=True,
+                )
+                for index in range(10, len(assets), 10):
+                    await destination.send(
+                        files=_discord_files(assets[index : index + 10]),
+                        silent=True,
+                    )
+                message_id = str(message.id)
+            else:
+                binding = await self._require_bindings().by_session(session_id)
+                if binding is None:
+                    raise RenderPermanentError(f"no Discord binding for SDK session {session_id}")
+                thread = await self._thread_for_session(session_id)
+                plan = await _discord_render_plan(
+                    payload,
+                    allowed_roots=(binding.cwd_snapshot,),
+                    max_bytes=self.settings.discord_upload_max_bytes,
+                )
+                message_id = await self._deliver_render_plan(
+                    thread=thread,
+                    session_id=session_id,
+                    payload=payload,
+                    plan=plan,
+                    delivery_id=idempotency_key,
+                )
         except RenderDeliveryError:
             raise
         except (discord.HTTPException, OSError, TimeoutError) as error:
@@ -674,24 +818,44 @@ class CopilotDiscordBot(commands.Bot):
         idempotency_key: str,
     ) -> None:
         try:
-            binding = await self._require_bindings().by_session(session_id)
-            if binding is None:
-                raise RenderPermanentError(f"no Discord binding for SDK session {session_id}")
-            thread = await self._thread_for_session(session_id)
-            message = await thread.fetch_message(int(message_id))
-            plan = await _discord_render_plan(
-                payload,
-                allowed_roots=(binding.cwd_snapshot,),
-                max_bytes=self.settings.discord_upload_max_bytes,
-            )
-            await self._deliver_render_plan(
-                thread=thread,
-                session_id=session_id,
-                payload=payload,
-                plan=plan,
-                delivery_id=idempotency_key,
-                first_message=message,
-            )
+            if session_id.startswith(("thread:", "channel:", "ops:")):
+                destination = await self._render_destination(session_id)
+                message = await destination.fetch_message(int(message_id))
+                content, assets = await _discord_render(payload)
+                content, assets = _prepare_discord_assets(
+                    content,
+                    assets,
+                    max_bytes=self.settings.discord_upload_max_bytes,
+                )
+                await message.edit(
+                    content=content or "\u200b",
+                    attachments=_discord_files(assets[:10]),
+                    view=_render_view(payload),
+                )
+                for index in range(10, len(assets), 10):
+                    await destination.send(
+                        files=_discord_files(assets[index : index + 10]),
+                        silent=True,
+                    )
+            else:
+                binding = await self._require_bindings().by_session(session_id)
+                if binding is None:
+                    raise RenderPermanentError(f"no Discord binding for SDK session {session_id}")
+                thread = await self._thread_for_session(session_id)
+                message = await thread.fetch_message(int(message_id))
+                plan = await _discord_render_plan(
+                    payload,
+                    allowed_roots=(binding.cwd_snapshot,),
+                    max_bytes=self.settings.discord_upload_max_bytes,
+                )
+                await self._deliver_render_plan(
+                    thread=thread,
+                    session_id=session_id,
+                    payload=payload,
+                    plan=plan,
+                    delivery_id=idempotency_key,
+                    first_message=message,
+                )
         except RenderDeliveryError:
             raise
         except (discord.HTTPException, OSError, TimeoutError) as error:
@@ -1160,6 +1324,38 @@ class CopilotDiscordBot(commands.Bot):
                 raise _render_delivery_error(error) from error
         return channel
 
+    async def _render_destination(
+        self,
+        destination_id: str,
+    ) -> discord.Thread | discord.TextChannel:
+        if destination_id.startswith("thread:"):
+            channel_id = destination_id.removeprefix("thread:")
+            channel = self.get_channel(int(channel_id))
+            if channel is None:
+                channel = await self.fetch_channel(int(channel_id))
+            if not isinstance(channel, discord.Thread):
+                raise RenderPermanentError(f"schedule render thread is unavailable: {channel_id}")
+            if channel.archived and not channel.locked:
+                await channel.edit(archived=False)
+            return channel
+        if destination_id.startswith("channel:"):
+            channel_id = destination_id.removeprefix("channel:")
+            channel = self.get_channel(int(channel_id))
+            if channel is None:
+                channel = await self.fetch_channel(int(channel_id))
+            if isinstance(channel, discord.TextChannel):
+                return channel
+            raise RenderPermanentError(
+                "schedule channel rendering requires a text channel or a "
+                "Discord integration hook that supplies a status thread"
+            )
+        if destination_id == "ops:scheduler":
+            raise RenderPermanentError("schedule run has no durable Discord render destination")
+        try:
+            return await self._thread_for_session(destination_id)
+        except RuntimeError as error:
+            raise RenderPermanentError(str(error)) from error
+
     async def _find_thread_for_message(self, message_id: str) -> discord.Thread:
         mapping = await self.database.fetchone(
             """
@@ -1498,34 +1694,44 @@ class CopilotDiscordBot(commands.Bot):
             return
         self._commands_registered = True
         session = app_commands.Group(name="session", description="Manage Copilot sessions")
-        project = app_commands.Group(name="project", description="Manage channel projects")
+        project = _OperatorCommandGroup(
+            self,
+            name="project",
+            description="Manage channel projects",
+        )
         model = app_commands.Group(name="model", description="Inspect or change Copilot models")
         queue = app_commands.Group(name="queue", description="Manage the durable message queue")
+        schedule = app_commands.Group(name="schedule", description="Manage app-owned schedules")
         ops = app_commands.Group(name="ops", description="Inspect copilotD operations")
-        variable = app_commands.Group(
+        worktree = _OperatorCommandGroup(
+            self,
+            name="worktree",
+            description="Manage project Git worktrees",
+        )
+        variable = _OperatorCommandGroup(
+            self,
             name="variable",
-            description="Manage future-session project environment variables",
-            parent=project,
+            description="Manage future-session project variables",
         )
-        mcp = app_commands.Group(
+        mcp = _OperatorCommandGroup(
+            self,
             name="mcp",
-            description="Manage future-session MCP configuration",
-            parent=project,
+            description="Manage typed future-session MCP servers",
         )
-        skill = app_commands.Group(
+        skill = _OperatorCommandGroup(
+            self,
             name="skill",
             description="Manage future-session skill directories",
-            parent=project,
         )
-        plugin = app_commands.Group(
+        plugin = _OperatorCommandGroup(
+            self,
             name="plugin",
             description="Manage future-session plugin directories",
-            parent=project,
         )
-        custom_agent = app_commands.Group(
+        custom_agent = _OperatorCommandGroup(
+            self,
             name="agent",
             description="Manage future-session custom agents",
-            parent=project,
         )
 
         @session.command(name="new", description="Create a new Copilot session thread")
@@ -1735,6 +1941,110 @@ class CopilotDiscordBot(commands.Bot):
                 interaction,
                 "project info",
                 lambda _: self._project_info_projection(_parent_channel_id(interaction)),
+            )
+
+        @project.command(name="timezone", description="Set the project IANA timezone")
+        async def project_timezone(
+            interaction: discord.Interaction,
+            value: str,
+        ) -> None:
+            await interaction.response.defer(ephemeral=True)
+            await self._require_project_commands().set_timezone(
+                _parent_channel_id(interaction),
+                value,
+            )
+            await interaction.followup.send(
+                f"Project timezone is `{value}`.",
+                ephemeral=True,
+            )
+
+        @variable.command(name="remove", description="Remove a future-session variable")
+        async def project_variable_remove(
+            interaction: discord.Interaction,
+            name: str,
+        ) -> None:
+            await interaction.response.defer(ephemeral=True)
+            project_snapshot = await self._require_projects().resolve(
+                _parent_channel_id(interaction)
+            )
+            version = await self._require_project_commands().variable_remove(
+                project_snapshot.project_id,
+                name,
+            )
+            await interaction.followup.send(
+                f"Variable removed in project config version `{version}`.",
+                ephemeral=True,
+            )
+
+        @worktree.command(name="create", description="Create a managed Git worktree")
+        @app_commands.choices(
+            history=[
+                app_commands.Choice(name="none", value="none"),
+                app_commands.Choice(name="fork", value="fork"),
+            ]
+        )
+        async def project_worktree_create(
+            interaction: discord.Interaction,
+            name: str,
+            base: str = "HEAD",
+            history: app_commands.Choice[str] | None = None,
+        ) -> None:
+            await interaction.response.defer(ephemeral=True)
+            project_snapshot = await self._require_projects().resolve(
+                _parent_channel_id(interaction)
+            )
+            source_session_id = None
+            if isinstance(interaction.channel, discord.Thread):
+                source_session_id = (await self._interaction_binding(interaction)).sdk_session_id
+            projection = await self._require_worktree_commands().create(
+                project_id=project_snapshot.project_id,
+                name=name,
+                base_ref=base,
+                history="none" if history is None else history.value,
+                source_session_id=source_session_id,
+            )
+            await interaction.followup.send(
+                f"Worktree `{projection.name}` ready at `{projection.path}` "
+                f"on `{projection.branch_name}`"
+                + ("" if projection.thread_id is None else f" in <#{projection.thread_id}>"),
+                ephemeral=True,
+            )
+
+        @worktree.command(name="list", description="List managed Git worktrees")
+        async def project_worktree_list(interaction: discord.Interaction) -> None:
+            await interaction.response.defer(ephemeral=True)
+            project_snapshot = await self._require_projects().resolve(
+                _parent_channel_id(interaction)
+            )
+            items = await self._require_worktree_commands().list(project_snapshot.project_id)
+            if not items:
+                await interaction.followup.send("No managed worktrees.", ephemeral=True)
+                return
+            text = "\n".join(
+                f"`{item.name}` · `{item.state}` · `{item.branch_name}` · "
+                f"sessions `{item.session_count}` · schedules `{item.schedule_count}` · "
+                f"`{item.path}`"
+                for item in items
+            )
+            await _send_ephemeral_text(interaction, text, "copilotd-worktrees.txt")
+
+        @worktree.command(name="close", description="Close a managed Git worktree")
+        async def project_worktree_close(
+            interaction: discord.Interaction,
+            name: str,
+        ) -> None:
+            await interaction.response.defer(ephemeral=True)
+            project_snapshot = await self._require_projects().resolve(
+                _parent_channel_id(interaction)
+            )
+            projection = await self._require_worktree_commands().close(
+                project_snapshot.project_id,
+                name=name,
+            )
+            await interaction.followup.send(
+                f"Worktree `{projection.name}` closed; branch "
+                f"`{projection.branch_name}` was preserved.",
+                ephemeral=True,
             )
 
         @project.command(name="layout", description="Set future Discord thread organization")
@@ -2555,6 +2865,187 @@ class CopilotDiscordBot(commands.Bot):
         self.tree.add_command(app_commands.ContextMenu(name="Ask Copilot", callback=ask_copilot))
         self.tree.add_command(app_commands.ContextMenu(name="Pin message", callback=pin_message))
 
+        @schedule.command(
+            name="message",
+            description="Schedule a prompt for this immutable session target",
+        )
+        async def schedule_message(
+            interaction: discord.Interaction,
+            when: str,
+            text: str,
+            timezone: str | None = None,
+        ) -> None:
+            await interaction.response.defer(ephemeral=True)
+            binding = await self._interaction_binding(interaction)
+            definition = await self._require_scheduler_commands().create_message(
+                thread_id=binding.thread_id,
+                expression=when,
+                text=text,
+                timezone=timezone,
+                created_by=str(interaction.user.id),
+                channel_id=_parent_channel_id(interaction),
+            )
+            await interaction.followup.send(
+                f"Schedule `{definition.id}` enabled; next UTC run `{definition.next_run_at_utc}`.",
+                ephemeral=True,
+            )
+
+        @schedule.command(
+            name="new-session",
+            description="Schedule a new session from an immutable project snapshot",
+        )
+        async def schedule_new_session(
+            interaction: discord.Interaction,
+            when: str,
+            text: str,
+            timezone: str | None = None,
+        ) -> None:
+            await interaction.response.defer(ephemeral=True)
+            definition = await self._require_scheduler_commands().create_new_session(
+                channel_id=_parent_channel_id(interaction),
+                expression=when,
+                text=text,
+                timezone=timezone,
+                created_by=str(interaction.user.id),
+                thread_name=_thread_name(text),
+            )
+            await interaction.followup.send(
+                f"New-session schedule `{definition.id}` enabled; next UTC run "
+                f"`{definition.next_run_at_utc}`.",
+                ephemeral=True,
+            )
+
+        @schedule.command(name="list", description="List app-owned schedules")
+        async def schedule_list(interaction: discord.Interaction) -> None:
+            await interaction.response.defer(ephemeral=True)
+            thread_id = (
+                str(interaction.channel.id)
+                if isinstance(interaction.channel, discord.Thread)
+                else None
+            )
+            project_snapshot = await self._require_projects().resolve(
+                _parent_channel_id(interaction)
+            )
+            definitions = await self._require_scheduler_commands().list(
+                project_id=None if thread_id is not None else project_snapshot.project_id,
+                thread_id=thread_id,
+                channel_id=(
+                    None
+                    if thread_id is not None or project_snapshot.project_id is not None
+                    else _parent_channel_id(interaction)
+                ),
+            )
+            if not definitions:
+                await interaction.followup.send("No app-owned schedules.", ephemeral=True)
+                return
+            lines = [
+                f"`{item.id}` · `{item.kind.value}` · `{item.state.value}` · "
+                f"`{item.expression}` @ `{item.timezone}` · next `{item.next_run_at_utc}`"
+                for item in definitions
+            ]
+            await _send_ephemeral_text(interaction, "\n".join(lines), "copilotd-schedules.txt")
+
+        @schedule.command(name="show", description="Show a schedule and recent runs")
+        async def schedule_show(
+            interaction: discord.Interaction,
+            schedule_id: str,
+        ) -> None:
+            await interaction.response.defer(ephemeral=True)
+            detail = await self._require_scheduler_commands().show(schedule_id)
+            lines = [
+                f"`{detail.definition.id}` · `{detail.definition.kind.value}` · "
+                f"`{detail.definition.state.value}`",
+                f"`{detail.definition.expression}` @ `{detail.definition.timezone}`",
+                f"next UTC: `{detail.definition.next_run_at_utc}`",
+            ]
+            lines.extend(
+                f"`{run.run_id}` · `{run.status.value}` · attempt `{run.attempt}` · "
+                f"fence `{run.fence_token}` · basis `{run.completion_basis or '-'}` · "
+                f"error `{run.error_code or '-'}`"
+                for run in detail.runs[:20]
+            )
+            await _send_ephemeral_text(
+                interaction,
+                "\n".join(lines),
+                "copilotd-schedule-detail.txt",
+            )
+
+        @schedule.command(name="toggle", description="Enable or disable future claims")
+        async def schedule_toggle(
+            interaction: discord.Interaction,
+            schedule_id: str,
+            enabled: bool,
+        ) -> None:
+            await interaction.response.defer(ephemeral=True)
+            definition = await self._require_scheduler_commands().toggle(
+                schedule_id,
+                enabled=enabled,
+            )
+            await interaction.followup.send(
+                f"Schedule `{definition.id}` is `{definition.state.value}`.",
+                ephemeral=True,
+            )
+
+        @schedule.command(name="delete", description="Soft-delete a terminal schedule")
+        async def schedule_delete(
+            interaction: discord.Interaction,
+            schedule_id: str,
+        ) -> None:
+            await interaction.response.defer(ephemeral=True)
+            await self._require_scheduler_commands().delete(schedule_id)
+            await interaction.followup.send("Schedule deleted.", ephemeral=True)
+
+        @schedule.command(name="run-now", description="Create an independent manual run")
+        async def schedule_run_now(
+            interaction: discord.Interaction,
+            schedule_id: str,
+        ) -> None:
+            await interaction.response.defer(ephemeral=True)
+            run = await self._require_scheduler_commands().run_now(schedule_id)
+            await interaction.followup.send(
+                f"Manual run `{run.run_id}` is `{run.status.value}`.",
+                ephemeral=True,
+            )
+
+        @ops.command(name="scheduler", description="Show scheduler and runtime health")
+        async def ops_scheduler(interaction: discord.Interaction) -> None:
+            await interaction.response.defer(ephemeral=True)
+            status = await self._require_scheduler_commands().status()
+            heartbeat = await self.heartbeat.snapshot()
+            text = (
+                f"scheduler: `{status.worker_state}`; enabled "
+                f"`{status.enabled_definitions}`; due `{status.due_definitions}`\n"
+                f"runs: pending `{status.pending_runs}`; claimed `{status.claimed_runs}`; "
+                f"waiting `{status.waiting_runs}`; unknown `{status.unknown_runs}`\n"
+                f"sessions: attached `{heartbeat.attached_sessions}`; protected work "
+                f"`{heartbeat.protected_work}`\n"
+                f"restart blockers: `{len(status.restart_blockers)}`"
+            )
+            await interaction.followup.send(text, ephemeral=True)
+
+        @ops.command(name="restart-runtime", description="Restart with durable outcome semantics")
+        async def ops_restart_runtime(
+            interaction: discord.Interaction,
+            force: bool = False,
+        ) -> None:
+            self._require_operator(interaction)
+            await interaction.response.defer(ephemeral=True)
+            restart_id = await self._require_scheduler_repository().prepare_restart(
+                requested_by=str(interaction.user.id),
+                force=force,
+            )
+            try:
+                await interaction.followup.send(
+                    f"Runtime restart `{restart_id}` prepared"
+                    + (" with unknown outcomes fenced." if force else "."),
+                    ephemeral=True,
+                )
+            finally:
+                self._restart_task = asyncio.create_task(
+                    self._restart_after_ack(),
+                    name="discord-runtime-restart",
+                )
+
         @self.tree.error
         async def application_command_error(
             interaction: discord.Interaction,
@@ -2583,11 +3074,18 @@ class CopilotDiscordBot(commands.Bot):
             self.capabilities.supports("models") and self.capabilities.supports("model_config")
         ):
             model.remove_command("set")
+        project.add_command(variable)
+        project.add_command(mcp)
+        project.add_command(skill)
+        project.add_command(plugin)
+        project.add_command(custom_agent)
+        project.add_command(worktree)
         self.tree.add_command(session)
         self.tree.add_command(project)
         if "model" in manifest:
             self.tree.add_command(model)
         self.tree.add_command(queue)
+        self.tree.add_command(schedule)
         self.tree.add_command(ops)
         for command_name in ("autopilot", "context", "plan", "usage"):
             if command_name not in manifest:
@@ -2621,6 +3119,8 @@ class CopilotDiscordBot(commands.Bot):
 
     async def _interaction_runtime(self, interaction: discord.Interaction) -> SessionRuntime:
         binding = await self._interaction_binding(interaction)
+        if binding.binding_intent != BindingIntent.ACTIVE:
+            raise ValueError("this Copilot session is closed; use /session resume first")
         runtime = self._require_sessions().for_thread(binding.thread_id)
         if runtime is None:
             runtime = await self._require_sessions().replace(binding)
@@ -2671,6 +3171,60 @@ class CopilotDiscordBot(commands.Bot):
         if self.creation is None:
             raise RuntimeError("session creation service is not initialized")
         return self.creation
+
+    def _require_scheduler_repository(self) -> SchedulerRepository:
+        if self.scheduler_repository is None:
+            raise RuntimeError("scheduler repository is not initialized")
+        return self.scheduler_repository
+
+    def _require_scheduler_commands(self) -> SchedulerCommandService:
+        if self.scheduler_commands is None:
+            raise RuntimeError("scheduler commands are not initialized")
+        return self.scheduler_commands
+
+    def _require_project_commands(self) -> ProjectLifecycleService:
+        if self.project_commands is None:
+            raise RuntimeError("project lifecycle commands are not initialized")
+        return self.project_commands
+
+    def _require_worktree_commands(self) -> WorktreeCommandService:
+        if self.worktree_commands is None:
+            raise RuntimeError("worktree commands are not initialized")
+        return self.worktree_commands
+
+    async def _restart_after_ack(self) -> None:
+        await asyncio.sleep(0.5)
+        self.restart_requested = True
+        await self.close()
+
+    async def _is_restart_draining(self) -> bool:
+        row = await self.database.fetchone(
+            "SELECT value FROM global_config WHERE key = 'restart_draining'"
+        )
+        return row is not None and row["value"] == "1"
+
+    def _admit_handler(self) -> asyncio.Task[Any] | None:
+        if not self._accepting_handlers:
+            return None
+        task = asyncio.current_task()
+        if task is None:
+            return None
+        self._admitted_handlers.add(task)
+        return task
+
+    async def _drain_admitted_handlers(self) -> None:
+        current = asyncio.current_task()
+        while admitted := [
+            task for task in self._admitted_handlers if task is not current and not task.done()
+        ]:
+            await asyncio.gather(*admitted, return_exceptions=True)
+
+    def _require_operator(self, interaction: discord.Interaction) -> None:
+        operators = self.settings.operator_user_ids
+        if not operators or interaction.user.id not in operators:
+            raise app_commands.CheckFailure(
+                "this administrative command requires an explicitly configured operator"
+            )
 
 
 class DiscordThreadGateway:
@@ -3517,7 +4071,7 @@ def _message_parent_channel_id(message: discord.Message) -> str:
 
 
 def _payload_session_hint(payload: dict[str, Any]) -> str | None:
-    value = payload.get("session_id")
+    value = payload.get("render_destination", payload.get("session_id"))
     return None if value is None else str(value)
 
 
@@ -3669,6 +4223,32 @@ def _map_command_error(error: BaseException) -> CDCommandError:
     return CDRuntimeError(str(error) or error.__class__.__name__)
 
 
+def _discord_parent_type(interaction: discord.Interaction) -> DiscordParentType:
+    channel = interaction.channel
+    parent = channel.parent if isinstance(channel, discord.Thread) else channel
+    if isinstance(parent, discord.ForumChannel):
+        return DiscordParentType.FORUM
+    if isinstance(parent, discord.TextChannel):
+        return DiscordParentType.TEXT
+    raise ValueError("project layout requires a text or forum Discord parent")
+
+
+def _csv_options(value: str | None) -> tuple[str, ...]:
+    if value is None:
+        return ()
+    return tuple(item.strip() for item in value.split(",") if item.strip())
+
+
+def _key_value_options(value: str | None) -> dict[str, str]:
+    result: dict[str, str] = {}
+    for item in _csv_options(value):
+        name, separator, option = item.partition("=")
+        if not separator or not name.strip():
+            raise ValueError("key/value options must use comma-separated NAME=VALUE pairs")
+        result[name.strip()] = option
+    return result
+
+
 async def _send_ephemeral_text(
     interaction: discord.Interaction,
     text: str,
@@ -3684,7 +4264,7 @@ async def _send_ephemeral_text(
     )
 
 
-async def run_discord_bot(settings: Settings) -> None:
+async def run_discord_bot(settings: Settings) -> bool:
     if settings.discord_token is None:
         raise RuntimeError("COPILOTD_DISCORD_TOKEN is required")
     bot = CopilotDiscordBot(settings)
@@ -3693,4 +4273,6 @@ async def run_discord_bot(settings: Settings) -> None:
         if bot._fatal_worker_error is not None:
             raise RuntimeError("critical copilotD worker failed") from bot._fatal_worker_error
     finally:
-        await bot.close()
+        if not bot.is_closed():
+            await bot.close()
+    return bot.restart_requested

@@ -37,6 +37,11 @@ class HeartbeatSnapshot:
     last_reducer_progress_at: str | None
     durable_replay_capable: bool
     suspect_executions: int = 0
+    app_scheduler_state: str = "stopped"
+    enabled_app_schedules: int = 0
+    active_app_schedule_runs: int = 0
+    unknown_app_schedule_runs: int = 0
+    scheduler_last_tick_at: str | None = None
 
     @property
     def protected_work(self) -> bool:
@@ -47,6 +52,8 @@ class HeartbeatSnapshot:
                 self.active_or_unknown_native_schedules,
                 self.remote_steerable_or_unknown_sessions,
                 self.pending_interactions,
+                self.active_app_schedule_runs,
+                self.unknown_app_schedule_runs,
             )
         )
 
@@ -88,9 +95,7 @@ class HeartbeatWriter:
         while True:
             snapshot = await self.snapshot()
             gateway_down_for = (
-                0.0
-                if self.gateway_down_since is None
-                else time.time() - self.gateway_down_since
+                0.0 if self.gateway_down_since is None else time.time() - self.gateway_down_since
             )
             if not (
                 self.gateway_state == "down"
@@ -117,7 +122,17 @@ class HeartbeatWriter:
               (SELECT COUNT(*) FROM pending_interactions
                WHERE state = 'pending') AS pending_interactions,
               (SELECT COUNT(*) FROM execution_health
-               WHERE state = 'suspect') AS suspect_executions
+               WHERE state = 'suspect') AS suspect_executions,
+              (SELECT COUNT(*) FROM schedules
+               WHERE state = 'enabled') AS enabled_app_schedules,
+              (SELECT COUNT(*) FROM schedule_runs
+               WHERE status IN (
+                   'claimed', 'submitting', 'accepted', 'waiting'
+               )) AS active_app_schedule_runs,
+              (SELECT COUNT(*) FROM schedule_runs
+               WHERE status IN (
+                   'target_unknown', 'dispatch_unknown', 'outcome_unknown'
+               )) AS unknown_app_schedule_runs
             """
         )
         latest = await self._database.fetchone(
@@ -127,6 +142,12 @@ class HeartbeatWriter:
             FROM session_bindings
             """
         )
+        scheduler = await self._database.fetchone(
+            """
+            SELECT worker_state, last_tick_at
+            FROM scheduler_state WHERE singleton = 1
+            """
+        )
         return HeartbeatSnapshot(
             schema_version=1,
             pid=os.getpid(),
@@ -134,9 +155,7 @@ class HeartbeatWriter:
             written_at=_rfc3339(time.time()),
             gateway_state=self.gateway_state,
             gateway_down_since=(
-                None
-                if self.gateway_down_since is None
-                else _rfc3339(self.gateway_down_since)
+                None if self.gateway_down_since is None else _rfc3339(self.gateway_down_since)
             ),
             runtime_state=self.runtime_state,
             attached_sessions=int(counts["attached_sessions"]),
@@ -148,11 +167,18 @@ class HeartbeatWriter:
             ingress_queue_depth=0,
             max_reducer_lag_ms=0,
             last_callback_at=_optional_rfc3339(latest["last_callback_at"]),
-            last_reducer_progress_at=_optional_rfc3339(
-                latest["last_reducer_progress_at"]
-            ),
+            last_reducer_progress_at=_optional_rfc3339(latest["last_reducer_progress_at"]),
             durable_replay_capable=self._durable_replay_capable,
             suspect_executions=int(counts["suspect_executions"]),
+            app_scheduler_state=(
+                "stopped" if scheduler is None else str(scheduler["worker_state"])
+            ),
+            enabled_app_schedules=int(counts["enabled_app_schedules"]),
+            active_app_schedule_runs=int(counts["active_app_schedule_runs"]),
+            unknown_app_schedule_runs=int(counts["unknown_app_schedule_runs"]),
+            scheduler_last_tick_at=(
+                None if scheduler is None else _optional_rfc3339(scheduler["last_tick_at"])
+            ),
         )
 
 

@@ -9,7 +9,7 @@ import pytest
 
 from copilotd.storage.database import Database
 
-EXPECTED_MIGRATION_VERSIONS = [*range(1, 15), *range(30, 38)]
+EXPECTED_MIGRATION_VERSIONS = [*range(1, 15), *range(20, 29), *range(30, 38)]
 
 
 def _create_migration_fixture(path: Path, *, through_version: int) -> None:
@@ -108,8 +108,11 @@ async def test_initial_migration_creates_full_schema(tmp_path: Path) -> None:
         "model_turns",
         "native_queue_items",
         "pending_interactions",
+        "pending_runtime_schedule_triggers",
         "plugin_dirs",
         "project_env",
+        "project_config_revisions",
+        "project_worktrees",
         "projects",
         "protocol_requests",
         "reconciliation_state",
@@ -130,8 +133,12 @@ async def test_initial_migration_creates_full_schema(tmp_path: Path) -> None:
         "runtime_schedule_actions",
         "runtime_schedules",
         "runtime_task_actions",
+        "schedule_run_attempts",
         "schedule_runs",
         "schedules",
+        "scheduler_events",
+        "scheduler_render_intents",
+        "scheduler_state",
         "schema_migrations",
         "session_bindings",
         "session_creation_intents",
@@ -156,6 +163,11 @@ async def test_initial_migration_creates_full_schema(tmp_path: Path) -> None:
         "trusted_local_artifacts",
         "trusted_local_artifact_snapshots",
         "usage_samples",
+        "restart_intents",
+        "worktree_events",
+        "worktree_intents",
+        "worktree_process_state",
+        "worktree_recovery_runs",
     }
 
     async with Database(database_path) as database:
@@ -201,6 +213,7 @@ async def test_foundation_migration_upgrades_existing_v7_database(tmp_path: Path
         versions = await database.fetchall("SELECT version FROM schema_migrations ORDER BY version")
         capability_columns = await database.fetchall("PRAGMA table_info(capabilities)")
         event_columns = await database.fetchall("PRAGMA table_info(event_journal)")
+        worktree_columns = await database.fetchall("PRAGMA table_info(worktree_intents)")
         tables = await database.fetchall("SELECT name FROM sqlite_master WHERE type = 'table'")
 
     assert [row["version"] for row in versions] == EXPECTED_MIGRATION_VERSIONS
@@ -212,6 +225,13 @@ async def test_foundation_migration_upgrades_existing_v7_database(tmp_path: Path
         "tool_call_id",
         "correlation_id",
     } <= {row["name"] for row in event_columns}
+    assert {
+        "git_create_holder",
+        "git_create_fence_token",
+        "git_create_lease_expires_at",
+        "git_create_process_generation",
+        "git_create_retry_at",
+    } <= {row["name"] for row in worktree_columns}
     assert {
         "compaction_runs",
         "execution_health",
@@ -343,6 +363,275 @@ async def test_migrations_remap_copied_legacy_discord_v9_database(
         "submission_task_links",
         "trusted_local_artifact_snapshots",
     } <= {row["name"] for row in tables}
+
+
+@pytest.mark.asyncio
+async def test_v20_backfills_existing_enabled_schedule_planning_fields(
+    tmp_path: Path,
+) -> None:
+    database_path = tmp_path / "upgrade-v9-schedule.sqlite3"
+    connection = sqlite3.connect(database_path)
+    connection.execute(
+        """
+        CREATE TABLE schema_migrations (
+            version INTEGER PRIMARY KEY,
+            name TEXT NOT NULL,
+            applied_at REAL NOT NULL
+        )
+        """
+    )
+    migration_root = resources.files("copilotd.storage.migrations")
+    for migration in sorted(
+        item
+        for item in migration_root.iterdir()
+        if item.name.endswith(".sql") and int(item.name.partition("_")[0]) <= 9
+    ):
+        connection.executescript(migration.read_text(encoding="utf-8"))
+        version = int(migration.name.partition("_")[0])
+        connection.execute(
+            "INSERT INTO schema_migrations VALUES (?, ?, ?)",
+            (version, migration.name, time.time()),
+        )
+    connection.execute(
+        """
+        INSERT INTO schedules(
+            id, kind, expression, timezone, payload, target_snapshot,
+            misfire_policy, state, created_at, updated_at
+        ) VALUES ('legacy-schedule', 'new_session', 'cron:0 9 * * *',
+                  'UTC', '{}', '{}', 'latest', 'enabled', 10, 20)
+        """
+    )
+    connection.commit()
+    connection.close()
+
+    async with Database(database_path) as database:
+        schedule = await database.fetchone(
+            """
+            SELECT normalized_expression, next_run_at_utc
+            FROM schedules WHERE id = 'legacy-schedule'
+            """
+        )
+
+    assert dict(schedule) == {
+        "normalized_expression": "0 9 * * *",
+        "next_run_at_utc": 20.0,
+    }
+
+
+@pytest.mark.asyncio
+async def test_v24_repairs_links_for_existing_v23_database(tmp_path: Path) -> None:
+    database_path = tmp_path / "upgrade-v23.sqlite3"
+    connection = sqlite3.connect(database_path)
+    connection.execute(
+        """
+        CREATE TABLE schema_migrations (
+            version INTEGER PRIMARY KEY,
+            name TEXT NOT NULL,
+            applied_at REAL NOT NULL
+        )
+        """
+    )
+    migration_root = resources.files("copilotd.storage.migrations")
+    for migration in sorted(
+        item
+        for item in migration_root.iterdir()
+        if item.name.endswith(".sql") and int(item.name.partition("_")[0]) <= 23
+    ):
+        connection.executescript(migration.read_text(encoding="utf-8"))
+        version = int(migration.name.partition("_")[0])
+        connection.execute(
+            "INSERT INTO schema_migrations VALUES (?, ?, ?)",
+            (version, migration.name, time.time()),
+        )
+    connection.execute(
+        """
+        INSERT INTO session_bindings(
+            thread_id, project_source, cwd_snapshot, sdk_session_id,
+            created_at, updated_at
+        ) VALUES ('thread-1', 'implicit-home', '/tmp', 'session-1', 1, 1)
+        """
+    )
+    connection.execute(
+        """
+        INSERT INTO schedules(
+            id, thread_id, kind, expression, timezone, payload,
+            target_snapshot, misfire_policy, state, created_at, updated_at
+        ) VALUES ('schedule-1', 'thread-1', 'message', 'cron:0 9 * * *',
+                  'UTC', '{}', '{}', 'latest', 'enabled', 1, 1)
+        """
+    )
+    connection.execute(
+        """
+        INSERT INTO schedule_runs(
+            run_id, schedule_id, planned_key, planned_at_utc, status,
+            created_at, updated_at
+        ) VALUES ('run-1', 'schedule-1', 'manual:1', 1, 'submitting', 1, 1)
+        """
+    )
+    connection.execute(
+        """
+        INSERT INTO submissions(
+            submission_id, sdk_session_id, origin, schedule_run_id, state, created_at
+        ) VALUES ('old', 'session-1', 'app_schedule', 'run-1', 'cancelled', 1)
+        """
+    )
+    connection.execute(
+        """
+        INSERT INTO submissions(
+            submission_id, sdk_session_id, origin, parent_submission_id,
+            state, created_at
+        ) VALUES ('new', 'session-1', 'app_schedule', 'old', 'local_queued', 2)
+        """
+    )
+    connection.execute(
+        """
+        INSERT INTO message_queue(
+            id, thread_id, schedule_run_id, prompt,
+            requested_mode_snapshot, requested_model_config_snapshot,
+            requested_session_config_version, position, state, created_at, updated_at
+        ) VALUES ('old', 'thread-1', 'run-1', 'old', 'interactive', '{}',
+                  1, 1, 'cancelled', 1, 1)
+        """
+    )
+    connection.execute(
+        """
+        INSERT INTO message_queue(
+            id, thread_id, prompt, requested_mode_snapshot,
+            requested_model_config_snapshot, requested_session_config_version,
+            position, state, replaces_id, created_at, updated_at
+        ) VALUES ('new', 'thread-1', 'new', 'interactive', '{}',
+                  1, 2, 'local_queued', 'old', 2, 2)
+        """
+    )
+    connection.execute(
+        """
+        UPDATE schedule_runs SET result_submission_id = 'new'
+        WHERE run_id = 'run-1'
+        """
+    )
+    connection.commit()
+    connection.close()
+
+    async with Database(database_path) as database:
+        queue = await database.fetchall(
+            """
+            SELECT id, schedule_run_id, dispatch_attempt
+            FROM message_queue ORDER BY id
+            """
+        )
+        submissions = await database.fetchall(
+            """
+            SELECT submission_id, schedule_run_id
+            FROM submissions ORDER BY submission_id
+            """
+        )
+
+    assert [dict(row) for row in queue] == [
+        {"id": "new", "schedule_run_id": "run-1", "dispatch_attempt": 0},
+        {"id": "old", "schedule_run_id": None, "dispatch_attempt": 0},
+    ]
+    assert [dict(row) for row in submissions] == [
+        {"submission_id": "new", "schedule_run_id": "run-1"},
+        {"submission_id": "old", "schedule_run_id": None},
+    ]
+
+
+@pytest.mark.asyncio
+async def test_v24_backfills_unambiguous_legacy_run_link_before_repair(
+    tmp_path: Path,
+) -> None:
+    database_path = tmp_path / "upgrade-v23-unambiguous.sqlite3"
+    connection = sqlite3.connect(database_path)
+    connection.execute(
+        """
+        CREATE TABLE schema_migrations (
+            version INTEGER PRIMARY KEY,
+            name TEXT NOT NULL,
+            applied_at REAL NOT NULL
+        )
+        """
+    )
+    migration_root = resources.files("copilotd.storage.migrations")
+    for migration in sorted(
+        item
+        for item in migration_root.iterdir()
+        if item.name.endswith(".sql") and int(item.name.partition("_")[0]) <= 23
+    ):
+        connection.executescript(migration.read_text(encoding="utf-8"))
+        version = int(migration.name.partition("_")[0])
+        connection.execute(
+            "INSERT INTO schema_migrations VALUES (?, ?, ?)",
+            (version, migration.name, time.time()),
+        )
+    connection.execute(
+        """
+        INSERT INTO session_bindings(
+            thread_id, project_source, cwd_snapshot, sdk_session_id,
+            created_at, updated_at
+        ) VALUES ('thread-1', 'implicit-home', '/legacy', 'session-1', 1, 1)
+        """
+    )
+    connection.execute(
+        """
+        INSERT INTO schedules(
+            id, thread_id, kind, expression, timezone, payload,
+            target_snapshot, misfire_policy, state, created_at, updated_at
+        ) VALUES ('schedule-1', 'thread-1', 'message', 'cron:0 9 * * *',
+                  'UTC', '{}', '{}', 'latest', 'enabled', 1, 1)
+        """
+    )
+    connection.execute(
+        """
+        INSERT INTO schedule_runs(
+            run_id, schedule_id, planned_key, planned_at_utc, status,
+            created_at, updated_at
+        ) VALUES ('run-1', 'schedule-1', 'manual:1', 1, 'submitting', 1, 1)
+        """
+    )
+    connection.execute(
+        """
+        INSERT INTO submissions(
+            submission_id, sdk_session_id, origin, schedule_run_id, state, created_at
+        ) VALUES ('legacy-submission', 'session-1', 'app_schedule',
+                  'run-1', 'local_queued', 1)
+        """
+    )
+    connection.execute(
+        """
+        INSERT INTO message_queue(
+            id, thread_id, schedule_run_id, prompt,
+            requested_mode_snapshot, requested_model_config_snapshot,
+            requested_session_config_version, position, state, created_at, updated_at
+        ) VALUES ('legacy-submission', 'thread-1', 'run-1', 'legacy',
+                  'interactive', '{}', 1, 1, 'local_queued', 1, 1)
+        """
+    )
+    connection.commit()
+    connection.close()
+
+    async with Database(database_path) as database:
+        run = await database.fetchone(
+            """
+            SELECT result_submission_id FROM schedule_runs
+            WHERE run_id = 'run-1'
+            """
+        )
+        queue = await database.fetchone(
+            """
+            SELECT schedule_run_id FROM message_queue
+            WHERE id = 'legacy-submission'
+            """
+        )
+        submission = await database.fetchone(
+            """
+            SELECT schedule_run_id FROM submissions
+            WHERE submission_id = 'legacy-submission'
+            """
+        )
+
+    assert run["result_submission_id"] == "legacy-submission"
+    assert queue["schedule_run_id"] == "run-1"
+    assert submission["schedule_run_id"] == "run-1"
 
 
 @pytest.mark.asyncio

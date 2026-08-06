@@ -2,6 +2,7 @@ import asyncio
 import hashlib
 import json
 import threading
+from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
@@ -103,8 +104,19 @@ async def _insert_projection_binding(database: Database, session_id: str) -> Non
         """
         INSERT INTO session_bindings(
             thread_id, project_source, cwd_snapshot, sdk_session_id,
+            attachment_state, permission_posture,
             runtime_generation, owner_fence_token, created_at, updated_at
-        ) VALUES ('thread-projection', 'home', '/tmp', ?, 1, 7, 1, 1)
+        ) VALUES ('thread-projection', 'home', '/tmp', ?,
+                  'attached', 'verified_allow_all', 1, 7, 1, 1)
+        """,
+        (session_id,),
+    )
+    await database.execute(
+        """
+        INSERT INTO session_owner_leases(
+            sdk_session_id, owner_id, fence_token,
+            acquired_at, renewed_at, expires_at
+        ) VALUES (?, 'test-owner', 7, 1, 1, 9999999999)
         """,
         (session_id,),
     )
@@ -1706,6 +1718,228 @@ async def test_user_message_correlation_retains_facts_and_creates_runtime_observ
         observed.event_id,
         external.event_id,
     ]
+
+
+@pytest.mark.asyncio
+async def test_exact_runtime_schedule_event_bypasses_app_correlation_and_settles_one_shot(
+    tmp_path: Path,
+) -> None:
+    session_id = "session-native-schedule"
+    prompt = "same scheduled prompt"
+    async with Database(tmp_path / "native-schedule-correlation.sqlite3") as database:
+        await _insert_projection_binding(database, session_id)
+        await database.execute(
+            """
+            INSERT INTO runtime_schedules(
+                sdk_session_id, runtime_schedule_id, builtin_name,
+                invocation_input, recurrence, next_run_at, state, updated_at
+            ) VALUES (?, 'native-once', 'after', 'once', NULL, 100,
+                      'active', 1)
+            """,
+            (session_id,),
+        )
+        queued = _adapted(
+            "copilotd.submission.queued",
+            {
+                "submission_id": "submission-app",
+                "thread_id": "thread-projection",
+                "origin": "app_message",
+                "prompt": prompt,
+                "prompt_hash": hashlib.sha256(prompt.encode()).hexdigest(),
+                "requested_mode": "interactive",
+                "requested_delivery": "enqueue",
+                "attachment_count": 0,
+            },
+            1,
+            source="internal",
+            session_id=session_id,
+        )
+        accepted = _adapted(
+            "copilotd.submission.accepted",
+            {"submission_id": "submission-app", "message_id": "accepted-app"},
+            2,
+            source="internal",
+            session_id=session_id,
+        )
+        native = _adapted(
+            "user.message",
+            {"content": prompt, "agentMode": "interactive", "delivery": "queued"},
+            3,
+            session_id=session_id,
+        )
+        native = replace(
+            native,
+            raw_payload={
+                "type": "user.message",
+                "runtimeScheduleId": "native-once",
+                "data": native.raw_payload["data"],
+            },
+        )
+        snapshot_requested = _adapted(
+            "copilotd.snapshot.requested",
+            {"topic": "schedules"},
+            4,
+            source="internal",
+            session_id=session_id,
+        )
+        snapshot_omission = _adapted(
+            "copilotd.snapshot.observed",
+            {
+                "topic": "schedules",
+                "epoch": 1,
+                "snapshot_id": "schedule-snapshot-1",
+                "query_start_sdk_receive_seq": 0,
+                "query_end_sdk_receive_seq": 0,
+                "payload": {"schedules": []},
+                "observed_at": 105,
+            },
+            5,
+            source="snapshot",
+            session_id=session_id,
+        )
+
+        assert (
+            await JournalReducer(database).persist(
+                [
+                    queued,
+                    accepted,
+                    native,
+                    snapshot_requested,
+                    snapshot_omission,
+                ]
+            )
+            == 5
+        )
+        app_submission = await database.fetchone(
+            """
+            SELECT state, observed_user_event_id
+            FROM submissions WHERE submission_id = 'submission-app'
+            """
+        )
+        runtime_submission = await database.fetchone(
+            """
+            SELECT origin, runtime_schedule_id, observed_user_event_id
+            FROM submissions
+            WHERE sdk_session_id = ? AND origin = 'runtime_observed'
+            """,
+            (session_id,),
+        )
+        native_schedule = await database.fetchone(
+            """
+            SELECT state, next_run_at FROM runtime_schedules
+            WHERE sdk_session_id = ? AND runtime_schedule_id = 'native-once'
+            """,
+            (session_id,),
+        )
+        close_blockers = await database.fetchone(
+            """
+            SELECT COUNT(*) FROM runtime_schedules
+            WHERE sdk_session_id = ? AND state IN ('active', 'unknown')
+            """,
+            (session_id,),
+        )
+
+    assert dict(app_submission) == {
+        "state": "submitted",
+        "observed_user_event_id": None,
+    }
+    assert dict(runtime_submission) == {
+        "origin": "runtime_observed",
+        "runtime_schedule_id": "native-once",
+        "observed_user_event_id": native.event_id,
+    }
+    assert dict(native_schedule) == {
+        "state": "triggered",
+        "next_run_at": None,
+    }
+    assert close_blockers[0] == 0
+
+
+@pytest.mark.asyncio
+async def test_native_one_shot_trigger_before_inventory_reconciles_when_row_arrives(
+    tmp_path: Path,
+) -> None:
+    session_id = "session-trigger-before-inventory"
+    async with Database(tmp_path / "trigger-before-inventory.sqlite3") as database:
+        await _insert_projection_binding(database, session_id)
+        native = _adapted(
+            "user.message",
+            {"content": "scheduled early", "agentMode": "interactive"},
+            1,
+            session_id=session_id,
+        )
+        native = replace(
+            native,
+            raw_payload={
+                "type": "user.message",
+                "runtimeScheduleId": "native-before-inventory",
+                "data": native.raw_payload["data"],
+            },
+        )
+        reducer = JournalReducer(database)
+        assert await reducer.persist([native]) == 1
+        pending = await database.fetchone(
+            """
+            SELECT user_event_id FROM pending_runtime_schedule_triggers
+            WHERE sdk_session_id = ? AND runtime_schedule_id =
+                  'native-before-inventory'
+            """,
+            (session_id,),
+        )
+        requested = _adapted(
+            "copilotd.snapshot.requested",
+            {"topic": "schedules"},
+            2,
+            source="internal",
+            session_id=session_id,
+        )
+        observed = _adapted(
+            "copilotd.snapshot.observed",
+            {
+                "topic": "schedules",
+                "epoch": 1,
+                "snapshot_id": "native-before-snapshot",
+                "query_start_sdk_receive_seq": 0,
+                "query_end_sdk_receive_seq": 0,
+                "payload": {
+                    "schedules": [
+                        {
+                            "id": "native-before-inventory",
+                            "builtinName": "after",
+                            "input": "once",
+                            "recurrence": None,
+                            "nextRunAt": 100,
+                            "state": "active",
+                        }
+                    ]
+                },
+                "observed_at": 105,
+            },
+            3,
+            source="snapshot",
+            session_id=session_id,
+        )
+
+        assert await reducer.persist([requested, observed]) == 2
+        schedule = await database.fetchone(
+            """
+            SELECT state, next_run_at FROM runtime_schedules
+            WHERE sdk_session_id = ? AND runtime_schedule_id =
+                  'native-before-inventory'
+            """,
+            (session_id,),
+        )
+        remaining = await database.fetchone(
+            """
+            SELECT COUNT(*) FROM pending_runtime_schedule_triggers
+            WHERE sdk_session_id = ?
+            """,
+            (session_id,),
+        )
+
+    assert pending["user_event_id"] == native.event_id
+    assert dict(schedule) == {"state": "triggered", "next_run_at": None}
+    assert remaining[0] == 0
 
 
 @pytest.mark.asyncio
