@@ -1,8 +1,8 @@
 # copilotD 详细设计与实施计划
 
 > 当前阶段：详细设计 v2.5 已批准，设计承诺的 repository implementation 已完成对齐；
-> 当前按顺序执行完整 deterministic/package gate、真实 Copilot Bridge 功能矩阵、
-> 真实 Discord 消息 gallery 与平台实机验收。
+> 完整 deterministic gate 与真实 Copilot Bridge 功能矩阵已通过，剩余顺序为真实 Discord
+> 消息 gallery、macOS 长时/服务验收和 Windows 实机验收。
 >
 > 本版固定前提：单用户、私有部署、Copilot runtime 全程 `--yolo`，不设计多用户共享、
 > 工具确认流程、安全沙箱或租户隔离。
@@ -2388,31 +2388,52 @@ claudeD issue 回归门禁：
 
 ### 当前实现快照（2026-08-06）
 
-repository implementation 已按本设计完成对齐；剩余工作是 credentialed Bridge、真实 Discord、
-macOS/Windows 实机与长时稳定性验收，不再以 mock/fixture 结果替代真实 gate：
+repository implementation 已按本设计完成对齐，credentialed Bridge 全矩阵已完成；
+剩余工作是真实 Discord、macOS/Windows 实机与长时稳定性验收，不再以 mock/fixture
+结果替代真实 gate：
 
 | 已实现 | 当前边界 |
 |---|---|
-| 官方 `github-copilot-sdk==1.0.8` + bundled runtime 1.0.73，stdio `--yolo`，create/resume 后 full allow-all 对账 | sidecar client transport 断开后 session retention 实测失败，因此不声明 detached continuation；crash window 保守标 outcome unknown |
-| 44 个唯一版本 SQLite migration：Foundation `0001`–`0009`、Native RPC `0010`–`0014`、Protocol `0015`–`0019`、Scheduler `0020`–`0028`、Protocol compatibility `0029`、Discord surface `0030`–`0037`、保留 `0038`–`0039`、Operations `0040`–`0044`、session deletion `0045`、attachment lifecycle `0046`；project `$HOME` fallback/cwd snapshot、owner fence、creation saga、strict-UUID event journal、reducer-owned operation/submission/native-command receipts、submission-task links、liveness leases、startup recovery inventory 与 eager resume；attach 时按 current state 结算 pending agent、强制 uncertain remote off；force restart 使用 producer/journal dual epoch、loss watermark admission fence 与 owner handoff | bundled runtime 进程死亡后的 in-flight execution 仍只能标 outcome unknown；真实 fixture 无 current-promotable task，task promote 保持 gated |
+| 官方 `github-copilot-sdk==1.0.8` + bundled runtime 1.0.73，stdio `--yolo`，create/resume 后 full allow-all 对账；client 默认 `enable_remote_sessions=false`，create/resume 显式 `RemoteSessionMode.OFF`，attach 再确认 disable；空 session 在首次 activity 前不会出现在 metadata/list，首次 prompt 后可 resume | sidecar client transport 断开后 session retention 实测失败，因此不声明 detached continuation；crash window 保守标 outcome unknown |
+| 44 个唯一版本 SQLite migration：Foundation `0001`–`0009`、Native RPC `0010`–`0014`、Protocol `0015`–`0019`、Scheduler `0020`–`0028`、Protocol compatibility `0029`、Discord surface `0030`–`0037`、保留 `0038`–`0039`、Operations `0040`–`0044`、session deletion `0045`、attachment lifecycle `0046`；project `$HOME` fallback/cwd snapshot、owner fence、creation saga、strict-UUID event journal、reducer-owned operation/submission/native-command receipts、submission-task links、liveness leases、startup recovery inventory 与 eager resume；attach 时按 current state 结算 pending agent、强制 uncertain remote off；force restart 使用 producer/journal dual epoch、loss watermark admission fence 与 owner handoff | bundled runtime 进程死亡后的 in-flight execution 仍只能标 outcome unknown |
 | eventLog `read/tail` durable backfill（固定过滤 ephemeral）、cursor epoch/rebase/predecessor-gap diagnostics、overflow freeze/backfill/generation replacement；activity/queue/task/remote/schedule snapshot requested/applied epoch 与 query watermark；crossing command/agent snapshot 禁止 merge 并强制 requery | ephemeral idle/delta 离开 live window 后不可恢复，不从 transcript 猜 terminal；compaction 无 completion evidence 时保持 unknown 并阻塞普通 submission |
 | durable app FIFO；fresh readiness snapshot、reducer caught-up、config/agent/remote/schedule/task known gate 后只派发队首；attachment manifest READY + hash/size 复验，无 attachment-free fallback；`/queue add/list/remove/clear`；project variables 只解析到 typed MCP/environment reference，不作为任意 process environment 注入 | native queue entry 没有 stable opaque ID 时只以 snapshot-local opaque key 诊断；transport ambiguity 不自动重放 |
-| Discord core 命令；strict dynamic builtin manifest；Native-Gated `/ask`、`/session compact`、`/fleet`、`/tasks`、`/agent list|current`、`/after|every list|cancel`、`/remote status|off`、`/review`、`/security-review`、`/research`、`/rubber-duck`；thread-first `/session delete session-id?`；JSON-Schema elicitation 与 MCP OAuth typed/exactly-once response plane；全部 action 由 exact capability 决定 | current-runtime fork 仍 capability-gated 且不注册；`/after|every create` 因 real invoke 返回 `text` 而非 required `completed` 不注册；agent select/deselect、task promote、remote on/export 的 real gate 未通过 |
+| Discord core 命令；strict dynamic builtin manifest；Native-Gated `/ask`、`/session compact`、`/fleet`、`/tasks`（含真实 promote）、`/agent list`、`/agent current`、`/after list`、`/after cancel`、`/every list`、`/every cancel`、`/remote status`、`/remote off`、`/review`、`/security-review`、`/research`、`/rubber-duck`；thread-first `/session delete session-id?`；JSON-Schema elicitation 与 MCP OAuth typed/exactly-once response plane；全部 action 由 exact capability 决定 | current-runtime fork 仍 capability-gated 且不注册；`/after create` 与 `/every create` 因 real invoke 返回 `text` 而非 required `completed` 不注册；agent select/deselect、remote on/export 的 real gate 未通过 |
 | durable input attachment manifest、hash/size 复验、图片 blob 压缩；中断的 `preparing` 可按 Discord channel/message locator 重启恢复，ready orphan 幂等重提，引用释放后默认保留 7 天再 GC；stream/final RenderOutbox；table hold 与 code/PNG/MD/CSV assets；Discord HTTP/rate-limit 错误分类，超上限 artifact 按序无损分片 | Discord archived/locked thread、attachment edit、exact 429 retry-after 仍需真实 gateway fixture |
-| tool/subagent/agent-scoped output 归并为原 thread 的单条 embed-backed TaskDeck；每页最多 8 张 embed、总字符受 Discord 6000 限制，4 秒 cadence、pending coalescing、terminal flush、select/expand/collapse/prev/next，embed/asset hash 与 crash recovery 保持原位 edit；reasoning delta/coalesced thinking 与 configured final concise reasoning summary 已实现，`assistant.streaming_delta` 不进入 Discord UI；structured tool diff 与 local workspace diff artifact lane；typed task list/show/progress/message/cancel-all/remove/wait 与 Fleet projection；>=8000 字符 tool result/error 逐字附件化；零 child-thread 路径 | real current-promotable fixture 未通过，promote action 不注册；Discord 上的 diff 附件/图片 delivery 仍受 upload limit 与 archived/locked thread 约束 |
+| tool/subagent/agent-scoped output 归并为原 thread 的单条 embed-backed TaskDeck；每页最多 8 张 embed、总字符受 Discord 6000 限制，4 秒 cadence、pending coalescing、terminal flush、select/expand/collapse/prev/next，embed/asset hash 与 crash recovery 保持原位 edit；reasoning delta/coalesced thinking 与 configured final concise reasoning summary 已实现，`assistant.streaming_delta` 不进入 Discord UI；structured tool diff 与 local workspace diff artifact lane；typed task list/show/progress/message/promote/cancel-all/remove/wait 与 Fleet projection；>=8000 字符 tool result/error 逐字附件化；零 child-thread 路径 | Discord 上的 diff 附件/图片 delivery 仍受 upload limit 与 archived/locked thread 约束 |
 | durable `DELETING → DELETE_UNKNOWN/DELETED` permanent-delete saga；stable SDK `delete_session(session_id)` + metadata not-found reconcile；non-deleted app schedule reference fail-closed；active target force teardown、15 秒 bounded native task/schedule/queue/remote cleanup、unprovable result unknown；confirmed delete 后才清 attachment/worktree metadata；abort 等 correlated abort + aborted-idle；unexpected `session.shutdown` terminalizes current handle and enters recovery | SDK response loss 仍需显式 retry，同一 mapping/session ID 保留；缺失 native capability 明确记录 unknown；只有 explicit close 可完成 CLOSED |
 | 共享 TaskRegistry、failure consumer、app scheduler fatal-loop supervision、10 分钟 active-execution SUSPECT + non-destructive ping、结构化 heartbeat、完整 setup preflight、fresh PID/generation/current-fence status、bounded restart saga、restart-storm alert、10 MiB × 7 JSON log、macOS LaunchAgent 与 Windows Scheduled Task 的 bundled 2-unit / sidecar 3-unit install/status/uninstall/effective-definition contract；owned Git 在 POSIX 使用 inherited `flock`，Windows 使用 `msvcrt` byte lock、独立进程组与 `taskkill /T /F` | 默认 bundled runtime 没有独立 runtime service；sidecar 三组件需要显式 runtime argv/URI/connection token；真实 credentialed install、sleep/wake、macOS soak 与 Windows 实机未在 deterministic suite 中验证 |
 
-当前 deterministic 验证基线为 793 个 pytest case、`ruff check .`、`ruff format --check .`、
+`CopilotBridge` 是生产与 acceptance 唯一 SDK facade；公开 `.client` escape hatch 已删除，
+core send/abort/disconnect/history、transport、Native、protocol/extension 与 scheduler/worktree
+调用全部走 typed wrapper。67 个 public operation 均在 `BRIDGE_ACCEPTANCE_LANES` 中分档，
+新增未分类 operation 会令 deterministic gate 失败。
+
+当前 deterministic 验证基线为 812 个 pytest case、`ruff check .`、`ruff format --check .`、
 `compileall`、ops/design audit、CLI JSON/error contract、service definition/effective-state
-simulations，以及 wheel/sdist 的 isolated build/install。`copilotd doctor` 已真实启动 bundled
-runtime 并确认 SDK 1.0.8 / runtime 1.0.73 / protocol 3、authentication 与 migration 46。
-仓库内 hash-checked fixture 固定 114-event inventory 与 capability evidence；
-`copilotd native-acceptance --real` 仍要求 exact 环境确认，按 suite 创建 disposable
-repo/session、执行 supported mutation（包括 model set/readback/restore）、清理
-remote/schedule/session，并生成 sanitized JSON evidence；unsupported action 保存 real
-discovery/gate，不由 deterministic fixture 冒充。这个快照用于区分“已验证实现”和后续设计，
-不降低以下章节对最终产品的契约要求。
+simulations，以及 wheel/sdist 的 isolated build/install；全量 pytest 还把
+`PytestUnhandledThreadExceptionWarning` 升级为 error，已修复 failure-path test 遗留的
+aiosqlite worker。`copilotd doctor` 已真实启动 bundled runtime并确认 SDK 1.0.8 /
+runtime 1.0.73 / protocol 3、authentication 与 migration 46。
+
+真实 Copilot phase-2 evidence 使用同一 pinned identity，均为 disposable workspace/session 且
+cleanup 已确认：
+
+| acceptance lane | 真实结果 | 关键结论 | evidence SHA-256 |
+|---|---|---|---|
+| Broad Bridge | passed；77 gates = 26 supported / 6 unsupported / 45 unprobed；67 wrappers classified | callback 跨 idle、abort + `idle(aborted=true)` + 后续恢复、1/5/10 MiB、mode restore、create 后首次 activity 才可 list/resume 均通过；accepted message ID 与 `user.message` event ID 不相等；sidecar detach retention 失败 | `c257969f8ffa541619060afde50132ca3244a016cc8eb837dfc289a162ced6ec` |
+| Native RPC | passed；45 exact gates = 33 supported / 12 unsupported | model/effort/context 改写、readback 与完整恢复通过；同一显式 model 的 optional fields 需经 `Auto` 中转清理；专用 synchronous-agent fixture 连续两次真实 promote 通过；after/every create 返回 `text`，agent select/deselect 与 remote on/export 保持 unsupported | `fca1b96b4f1e823f458fe3ec52983f62cf078dc59d7e98e24d1b048135002e07` |
+| Protocol/extensions | passed；11 features = 8 passed / 3 unprobed | permission、registered external tool、MCP/config reattach、isolated missing-auth fail-closed 等只走 Bridge；无双响应；session/workspace cleanup 完成 | `57f69511525274051d6d34c9bdbdb24fff129314978713d1febc707fb1eddac7` |
+| App scheduler/worktree | passed；6 product features passed / 1 history-fork gated；authentication 与 cleanup 通过 | scheduled message、closed-session resume、crash recovery、new session、blank worktree 全部通过；真正 history fork 继续按 capability fail closed | `497059e7472f8878b446c8edb631dad58e480328dbcc2df5e42722e83863f2bc` |
+| Checked capability fixture | exact supported flags 与本次 45-gate Native evidence 零差异 | 固定 114-event inventory；`tasks_promote=true` | `3120c690ea9e8a1943d4ad17871b2d1c48db54eb87b50bb244d910090af7699a` |
+
+Broad event fixture SHA-256 为
+`f12a52fb3057318f4e0ef18e64086c580268a922184ed9ceb6a42ab3643d261d`。
+67-operation Bridge wrapper coverage manifest SHA-256 为
+`7dd858027bcb17ac77311e31073ae8dab89917ff8d32986fe360ab35cac713a4`，
+其中 unclassified/uncovered 均为 0。
+unsupported/unprobed action 保存真实 discovery/gate，不由 deterministic fixture 冒充。
+这个快照用于区分“已验证实现”和后续设计，不降低以下章节对最终产品的契约要求。
 
 ### HTML 交付要求
 
@@ -2504,9 +2525,9 @@ discovery/gate，不由 deterministic fixture 冒充。这个快照用于区分�
 
 ## 待办
 
-1. 运行完整 Ruff/pytest/compile/package/ops/design gate，提交唯一 phase-1 implementation commit。
-2. 对真实 Copilot 逐项执行 Bridge 功能矩阵和负能力门禁，保存脱敏 evidence；未执行、skip、
-   mock 或未观测结果继续标 unsupported/unprobed。
+1. [完成] 运行完整 Ruff/pytest/compile/ops/design deterministic gate。
+2. [完成] 对真实 Copilot 逐项执行 Bridge broad/Native/protocol/scheduler-worktree 功能矩阵和
+   负能力门禁，保存脱敏 evidence；未执行或未观测结果继续标 unsupported/unprobed。
 3. 向真实 Discord 发送 text/stream/reasoning/tool/diff/table/image/file/interaction/TaskDeck/
    error/usage 等完整 gallery，保留消息供人工 review，并记录稳定 Discord ID。
 4. 实机验证 macOS LaunchAgent 与 Windows Scheduled Task 的 install/login/sleep/wake/crash/

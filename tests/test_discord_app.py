@@ -94,6 +94,7 @@ def test_discord_command_manifest_has_core_modes_and_no_deleted_roots(tmp_path: 
             "cancel",
             "list",
             "message",
+            "promote",
             "progress",
             "remove",
             "show",
@@ -1252,40 +1253,43 @@ async def test_critical_task_failure_closes_gateway_and_persists_incident(
 ) -> None:
     bot = CopilotDiscordBot(Settings(data_dir=tmp_path))
     await bot.database.open()
-    gateway_closed = asyncio.Event()
+    try:
+        gateway_closed = asyncio.Event()
 
-    async def fake_base_close(_bot: commands.Bot) -> None:
-        gateway_closed.set()
+        async def fake_base_close(_bot: commands.Bot) -> None:
+            gateway_closed.set()
 
-    monkeypatch.setattr(commands.Bot, "close", fake_base_close)
-    supervisor = asyncio.create_task(bot._task_failure_loop())
+        monkeypatch.setattr(commands.Bot, "close", fake_base_close)
+        supervisor = asyncio.create_task(bot._task_failure_loop())
 
-    async def fail() -> None:
-        raise RuntimeError("reducer stopped")
+        async def fail() -> None:
+            raise RuntimeError("reducer stopped")
 
-    bot._tasks.create(
-        fail(),
-        name="reducer:session-1",
-        source="event-reducer",
-        session_id="session-1",
-        runtime_generation=4,
-    )
-    await asyncio.wait_for(gateway_closed.wait(), timeout=1)
-    await supervisor
-    async with Database(bot.settings.database_path) as database:
-        incident = await database.fetchone(
-            """
-            SELECT runtime_generation, kind, detail
-            FROM runtime_incidents WHERE session_id = 'session-1'
-            """
+        bot._tasks.create(
+            fail(),
+            name="reducer:session-1",
+            source="event-reducer",
+            session_id="session-1",
+            runtime_generation=4,
         )
+        await asyncio.wait_for(gateway_closed.wait(), timeout=1)
+        await supervisor
+        async with Database(bot.settings.database_path) as database:
+            incident = await database.fetchone(
+                """
+                SELECT runtime_generation, kind, detail
+                FROM runtime_incidents WHERE session_id = 'session-1'
+                """
+            )
 
-    assert isinstance(bot._fatal_worker_error, RuntimeError)
-    assert bot.heartbeat.runtime_state == "down"
-    assert bot.heartbeat.gateway_state == "down"
-    assert incident["runtime_generation"] == 4
-    assert incident["kind"] == "background_task_failed"
-    assert "event-reducer" in incident["detail"]
+        assert isinstance(bot._fatal_worker_error, RuntimeError)
+        assert bot.heartbeat.runtime_state == "down"
+        assert bot.heartbeat.gateway_state == "down"
+        assert incident["runtime_generation"] == 4
+        assert incident["kind"] == "background_task_failed"
+        assert "event-reducer" in incident["detail"]
+    finally:
+        await bot.database.close()
 
 
 @pytest.mark.asyncio

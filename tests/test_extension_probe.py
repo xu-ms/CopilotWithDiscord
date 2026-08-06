@@ -11,6 +11,7 @@ from copilotd.sdk.extension_probe import (
     ExtensionAcceptanceProbe,
     LiveAcceptanceAuthError,
     _correlate_mcp_tool_evidence,
+    _delete_session,
     _protocol_response_evidence,
 )
 
@@ -61,6 +62,31 @@ def test_cli_exposes_explicit_live_extension_acceptance_selector() -> None:
 
     assert args.command == "sdk-probe"
     assert args.live_extensions is True
+
+
+@pytest.mark.asyncio
+async def test_extension_cleanup_requires_authoritative_session_absence() -> None:
+    class PresentBridge:
+        async def delete_session(self, _session_id: str) -> None:
+            return None
+
+        async def session_exists(self, _session_id: str) -> bool:
+            return True
+
+    with pytest.raises(RuntimeError, match="deletion was not confirmed"):
+        await _delete_session(PresentBridge(), "session-1")
+
+
+@pytest.mark.asyncio
+async def test_extension_cleanup_accepts_lost_delete_response_after_absence() -> None:
+    class AbsentBridge:
+        async def delete_session(self, _session_id: str) -> None:
+            raise RuntimeError("delete response lost")
+
+        async def session_exists(self, _session_id: str) -> bool:
+            return False
+
+    await _delete_session(AbsentBridge(), "session-1")
 
 
 def test_protocol_response_evidence_is_unprobed_without_real_request() -> None:

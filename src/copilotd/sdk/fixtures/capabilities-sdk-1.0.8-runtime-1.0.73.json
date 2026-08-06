@@ -358,9 +358,9 @@
       "detail": "tasks.getProgress returned typed progress for a disposable Fleet task"
     },
     "tasks_promote": {
-      "supported": false,
-      "evidence_kind": "real-acceptance-gate",
-      "detail": "current-promotable lookup did not yield a promotable task in repeated Fleet fixtures"
+      "supported": true,
+      "evidence_kind": "real-acceptance-fixture",
+      "detail": "tasks.getCurrentPromotable and promoteToBackground completed for a disposable synchronous agent task"
     },
     "tasks_remove": {
       "supported": true,

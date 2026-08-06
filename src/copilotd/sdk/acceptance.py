@@ -13,14 +13,11 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-from copilot.generated.rpc import (
-    TasksStartAgentRequest,
-)
 from copilot.session import CopilotSession
 from copilot.session_events import SessionEvent, SessionEventType
 
 from copilotd.config import Settings
-from copilotd.sdk.bridge import CopilotBridge
+from copilotd.sdk.bridge import CopilotBridge, ManagedAwarePermissionHandler
 from copilotd.sdk.native import NativeCommandResult, NativeCommandResultKind
 
 REAL_ACCEPTANCE_ENV = "COPILOTD_REAL_ACCEPTANCE"
@@ -97,6 +94,10 @@ class AcceptanceRecorder:
                 self.queue.task_done()
                 if event.type == event_type:
                     return event
+
+
+async def _disposable_owner_is_valid() -> bool:
+    return True
 
 
 class RealNativeAcceptance:
@@ -209,6 +210,7 @@ class RealNativeAcceptance:
                 encoding="utf-8",
             )
             recorder = AcceptanceRecorder()
+            execution_error: BaseException | None = None
             try:
                 await bridge.start()
                 bridge_started = True
@@ -231,6 +233,9 @@ class RealNativeAcceptance:
                     session_id=session_id,
                     working_directory=workspace,
                     on_event=recorder.callback,
+                    permission_handler=ManagedAwarePermissionHandler(
+                        approval_validator=_disposable_owner_is_valid
+                    ),
                 )
                 await bridge.ensure_allow_all(session)
                 if "commands" in self._suites:
@@ -252,6 +257,8 @@ class RealNativeAcceptance:
                 if "remote" in self._suites:
                     await self._exercise_remote(bridge, session)
                 self._record_aggregate_capabilities()
+            except BaseException as caught:
+                execution_error = caught
             finally:
                 cleanup_errors: list[Exception] = []
                 if session is not None:
@@ -287,7 +294,7 @@ class RealNativeAcceptance:
                             "type": type(cleanup_error).__name__
                         }
                     try:
-                        await session.disconnect()
+                        await bridge.disconnect(session)
                     except Exception as cleanup_error:
                         cleanup_errors.append(cleanup_error)
                         report["cleanup"]["disconnect_error"] = {
@@ -297,11 +304,21 @@ class RealNativeAcceptance:
                         session = None
                 if bridge_started:
                     try:
-                        await bridge.client.delete_session(session_id)
+                        await bridge.delete_session(session_id)
                         deleted = True
                     except Exception as cleanup_error:
-                        cleanup_errors.append(cleanup_error)
                         report["cleanup"]["delete_error"] = {"type": type(cleanup_error).__name__}
+                        try:
+                            deleted = not await bridge.session_exists(session_id)
+                            report["cleanup"]["session_absence_confirmed"] = deleted
+                        except Exception as reconcile_error:
+                            cleanup_errors.extend((cleanup_error, reconcile_error))
+                            report["cleanup"]["delete_reconcile_error"] = {
+                                "type": type(reconcile_error).__name__
+                            }
+                        else:
+                            if not deleted:
+                                cleanup_errors.append(cleanup_error)
                     try:
                         await bridge.stop()
                     except Exception as cleanup_error:
@@ -316,7 +333,18 @@ class RealNativeAcceptance:
                     )
                 if cleanup_errors:
                     names = ", ".join(type(error).__name__ for error in cleanup_errors)
+                    if execution_error is not None:
+                        report["execution_error"] = {
+                            "type": type(execution_error).__name__,
+                            "message": _sanitize_string(str(execution_error)),
+                        }
+                        raise RealAcceptanceError(
+                            "real acceptance failed with "
+                            f"{type(execution_error).__name__}; cleanup failed: {names}"
+                        ) from execution_error
                     raise RealAcceptanceError(f"real acceptance cleanup failed: {names}")
+            if execution_error is not None:
+                raise execution_error
         report["cleanup"]["temporary_workspace_removed"] = True
 
     async def _exercise_commands(
@@ -450,7 +478,8 @@ class RealNativeAcceptance:
             if not result.prompt:
                 raise RealAcceptanceError("agent-prompt result omitted its runtime prompt")
             recorder.drain()
-            await session.send(
+            await bridge.send(
+                session,
                 result.prompt,
                 agent_mode=result.mode or "interactive",
             )
@@ -460,7 +489,7 @@ class RealNativeAcceptance:
                     timeout_seconds=self._timeout_seconds,
                 )
             except TimeoutError:
-                await session.abort()
+                await bridge.abort(session)
                 try:
                     await recorder.wait_for(
                         SessionEventType.SESSION_IDLE,
@@ -492,7 +521,7 @@ class RealNativeAcceptance:
         session: CopilotSession,
         recorder: AcceptanceRecorder,
     ) -> None:
-        history_before = len(await session.get_events())
+        history_before = len(await bridge.get_events(session))
         event_start = len(recorder.events)
         try:
             answer = await bridge.ephemeral_query(
@@ -509,7 +538,7 @@ class RealNativeAcceptance:
                 )
                 return
             raise
-        history_after = len(await session.get_events())
+        history_after = len(await bridge.get_events(session))
         observed = recorder.events[event_start:]
         tool_events = [
             event.raw_type or event.type.value
@@ -537,7 +566,8 @@ class RealNativeAcceptance:
         recorder: AcceptanceRecorder,
     ) -> None:
         recorder.drain()
-        await session.send(
+        await bridge.send(
+            session,
             "Remember the marker COPILOTD_ACCEPTANCE_MARKER and reply briefly.",
             agent_mode="interactive",
         )
@@ -549,6 +579,7 @@ class RealNativeAcceptance:
             result = await bridge.compact_history(
                 session,
                 focus="Retain the acceptance marker.",
+                timeout_seconds=self._timeout_seconds,
             )
         except Exception as compact_error:
             if _is_method_missing(compact_error):
@@ -582,6 +613,11 @@ class RealNativeAcceptance:
         recorder: AcceptanceRecorder,
     ) -> None:
         recorder.drain()
+        promotion_result: tuple[bool, str, dict[str, Any]] = (
+            False,
+            "fleet-not-started",
+            {"promotable_observed": False, "promoted": False},
+        )
         try:
             started = await bridge.start_fleet(
                 session,
@@ -608,6 +644,12 @@ class RealNativeAcceptance:
         else:
             if not started:
                 raise RealAcceptanceError("fleet.start returned started=false")
+            promotion_result = await self._probe_task_promotion(
+                bridge,
+                session,
+                wait_seconds=min(self._timeout_seconds, 30),
+            )
+            promotion_result[2]["fixture"] = "fleet-sync-wait"
             await recorder.wait_for(
                 SessionEventType.SESSION_IDLE,
                 timeout_seconds=self._timeout_seconds,
@@ -618,6 +660,42 @@ class RealNativeAcceptance:
                 status="passed",
                 detail={"started": True},
             )
+
+        if not promotion_result[0] and not promotion_result[1].startswith("error:"):
+            recorder.drain()
+            try:
+                await bridge.send(
+                    session,
+                    (
+                        "Use the task tool exactly once with agent_type `general-purpose`. "
+                        "Keep the task call synchronous: do not run it in the background. "
+                        "Tell the child agent to run `sleep 30`, inspect README.md, and return "
+                        "one sentence. Wait for the child, then reply with exactly `done`. "
+                        "Do not inspect the file or run the shell command yourself."
+                    ),
+                    mode="enqueue",
+                    agent_mode="interactive",
+                )
+                promotion_result = await self._probe_task_promotion(
+                    bridge,
+                    session,
+                    wait_seconds=min(self._timeout_seconds, 30),
+                )
+                promotion_result[2]["fixture"] = "foreground-agent-sync-wait"
+                await recorder.wait_for(
+                    SessionEventType.SESSION_IDLE,
+                    timeout_seconds=self._timeout_seconds,
+                )
+            except Exception as promotion_error:
+                promotion_result = (
+                    False,
+                    f"error:{type(promotion_error).__name__}",
+                    {
+                        "fixture": "foreground-agent-sync-wait",
+                        "promotable_observed": False,
+                        "promoted": False,
+                    },
+                )
         await bridge.refresh_tasks(session)
         tasks = await bridge.list_tasks(session)
         self._record(
@@ -633,19 +711,16 @@ class RealNativeAcceptance:
         task_id = None if active is None else str(active["id"])
         if task_id is None:
             try:
-                created = await session.rpc.tasks.start_agent(
-                    TasksStartAgentRequest(
-                        agent_type="general-purpose",
-                        name="acceptance-worker",
-                        description="Disposable native task acceptance worker",
-                        prompt=(
-                            "Run `sleep 20`, then inspect README.md and report one sentence. "
-                            "Do not modify files."
-                        ),
+                task_id = await bridge.start_agent_task(
+                    session,
+                    agent_type="general-purpose",
+                    name="acceptance-worker",
+                    description="Disposable native task acceptance worker",
+                    prompt=(
+                        "Run `sleep 20`, then inspect README.md and report one sentence. "
+                        "Do not modify files."
                     ),
-                    timeout=10,
                 )
-                task_id = created.agent_id
             except Exception as setup_error:
                 self._record_task_gates(
                     status="setup-unavailable",
@@ -687,20 +762,12 @@ class RealNativeAcceptance:
             status=message_status,
             detail={"sent": bool(message.get("sent"))},
         )
-        promotable = await bridge.get_current_promotable_task(session)
-        promote_id = task_id if promotable is None else str(promotable.get("id") or task_id)
-        try:
-            promoted = await bridge.promote_task(session, promote_id)
-        except Exception as promote_error:
-            promoted = False
-            promote_status = f"error:{type(promote_error).__name__}"
-        else:
-            promote_status = "passed" if promoted else "gated-not-promotable"
+        promoted, promote_status, promote_detail = promotion_result
         self._record(
             "tasks_promote",
             supported=promoted,
             status=promote_status,
-            detail={"promoted": promoted},
+            detail=promote_detail,
         )
         try:
             cancelled = await bridge.cancel_task(session, task_id)
@@ -773,6 +840,55 @@ class RealNativeAcceptance:
             status="passed",
             detail={"wait_completed": True},
         )
+
+    async def _probe_task_promotion(
+        self,
+        bridge: CopilotBridge,
+        session: CopilotSession,
+        *,
+        wait_seconds: float,
+    ) -> tuple[bool, str, dict[str, Any]]:
+        deadline = asyncio.get_running_loop().time() + wait_seconds
+        promotable_observed = False
+        attempts = 0
+        while True:
+            attempts += 1
+            try:
+                promotable = await bridge.get_current_promotable_task(session)
+                if promotable is not None:
+                    promotable_observed = True
+                    task_id = str(promotable.get("id", ""))
+                    if task_id and await bridge.promote_task(session, task_id):
+                        return (
+                            True,
+                            "passed",
+                            {
+                                "promotable_observed": True,
+                                "promoted": True,
+                                "poll_attempts": attempts,
+                            },
+                        )
+            except Exception as error:
+                return (
+                    False,
+                    f"error:{type(error).__name__}",
+                    {
+                        "promotable_observed": promotable_observed,
+                        "promoted": False,
+                        "poll_attempts": attempts,
+                    },
+                )
+            if asyncio.get_running_loop().time() >= deadline:
+                return (
+                    False,
+                    "gated-not-promotable",
+                    {
+                        "promotable_observed": promotable_observed,
+                        "promoted": False,
+                        "poll_attempts": attempts,
+                    },
+                )
+            await asyncio.sleep(0.2)
 
     def _record_task_gates(self, *, status: str, detail: dict[str, Any]) -> None:
         for name in (
@@ -1198,6 +1314,9 @@ class RealNativeAcceptance:
         restored = False
         options_restored = False
         options_changed = False
+        changed: dict[str, Any] = {}
+        restored_state: dict[str, Any] = {}
+        restore_via_auto = False
         try:
             await bridge.set_model(
                 session,
@@ -1218,6 +1337,13 @@ class RealNativeAcceptance:
             change_error = None
         finally:
             try:
+                optional_field_needs_clear = (
+                    current.get("reasoningEffort") is None
+                    and changed.get("reasoningEffort") is not None
+                ) or (current.get("contextTier") is None and changed.get("contextTier") is not None)
+                if optional_field_needs_clear and original_model != "auto" and "auto" in model_ids:
+                    await bridge.set_model(session, model="auto")
+                    restore_via_auto = True
                 await bridge.set_model(
                     session,
                     model=original_model,
@@ -1250,6 +1376,10 @@ class RealNativeAcceptance:
                 "restored": restored,
                 "options_restored": options_restored,
                 "change_error_type": change_error,
+                "original_config": _model_config_detail(current),
+                "changed_config": _model_config_detail(changed),
+                "restored_config": _model_config_detail(restored_state),
+                "restore_via_auto": restore_via_auto,
             },
         )
 
@@ -1384,6 +1514,14 @@ class RealNativeAcceptance:
             encoding="utf-8",
         )
         temporary.replace(self._evidence_path)
+
+
+def _model_config_detail(config: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "modelId": config.get("modelId"),
+        "reasoningEffort": config.get("reasoningEffort"),
+        "contextTier": config.get("contextTier"),
+    }
 
 
 def sanitize_evidence(value: Any, *, key: str = "") -> Any:

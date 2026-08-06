@@ -15,11 +15,11 @@ from copilot.generated.rpc import (
     CommandsListRequest,
     EventLogReadRequest,
     FleetStartRequest,
-    HandlePendingToolCallRequest,
     HistoryCompactRequest,
     MCPHeadersHandlePendingHeadersRefreshRequest,
     MCPHeadersHandlePendingHeadersRefreshRequestKind,
     MCPHeadersHandlePendingHeadersRefreshRequestRequest,
+    MCPListToolsRequest,
     MetadataContextInfoRequest,
     ModeSetRequest,
     PermissionDecisionApproveOnce,
@@ -38,6 +38,7 @@ from copilot.generated.rpc import (
     TasksPromoteToBackgroundRequest,
     TasksRemoveRequest,
     TasksSendMessageRequest,
+    TasksStartAgentRequest,
     UIEphemeralQueryRequest,
     UIHandlePendingSamplingRequest,
     UIHandlePendingSessionLimitsExhaustedRequest,
@@ -78,6 +79,76 @@ class EventLogBatch:
 
 PermissionAuditCallback = Callable[[dict[str, Any]], Awaitable[None]]
 ApprovalValidator = Callable[[], Awaitable[bool]]
+
+BRIDGE_ACCEPTANCE_LANES: dict[str, tuple[str, ...]] = {
+    "start": ("broad", "native", "extensions", "scheduler-worktree"),
+    "stop": ("broad", "native", "extensions", "scheduler-worktree"),
+    "force_stop": ("sidecar",),
+    "create_session": ("broad", "native", "extensions"),
+    "resume_session": ("broad", "scheduler-worktree"),
+    "delete_session": ("broad", "native", "extensions", "scheduler-worktree"),
+    "session_exists": ("broad", "native", "extensions", "scheduler-worktree"),
+    "list_sessions": ("broad", "extensions", "sidecar"),
+    "send": ("broad", "native", "extensions", "scheduler-worktree"),
+    "abort": ("broad", "native"),
+    "disconnect": ("broad", "native", "extensions", "scheduler-worktree"),
+    "get_events": ("broad", "native", "sidecar"),
+    "ensure_allow_all": ("broad", "native", "extensions", "scheduler-worktree"),
+    "set_allow_all": ("extensions",),
+    "set_approve_all": ("extensions",),
+    "get_mode": ("broad",),
+    "set_mode": ("broad",),
+    "list_models": ("broad", "native", "extensions", "scheduler-worktree"),
+    "healthcheck": ("broad",),
+    "set_model": ("native",),
+    "respond_session_limits": ("extensions",),
+    "respond_sampling": ("extensions",),
+    "respond_mcp_headers": ("extensions",),
+    "get_mcp_servers": ("broad", "extensions"),
+    "list_mcp_tools": ("extensions",),
+    "get_plugins": ("extensions",),
+    "get_skills": ("broad", "extensions"),
+    "get_agents": ("broad", "extensions"),
+    "get_current_model": ("broad", "native"),
+    "get_context": ("broad",),
+    "read_plan": ("broad",),
+    "get_usage": ("broad",),
+    "get_readiness": ("broad", "scheduler-worktree"),
+    "clear_native_queue": ("broad",),
+    "get_tasks": ("broad",),
+    "refresh_tasks": ("broad", "native"),
+    "list_tasks": ("broad", "native"),
+    "get_task_progress": ("native",),
+    "send_task_message": ("native",),
+    "get_current_promotable_task": ("native",),
+    "promote_task": ("native",),
+    "cancel_task": ("native",),
+    "remove_task": ("native",),
+    "wait_for_tasks": ("native",),
+    "start_agent_task": ("native",),
+    "get_native_schedules": ("broad", "native", "scheduler-worktree", "sidecar"),
+    "stop_native_schedule": ("broad", "native"),
+    "get_remote_state": ("broad", "native", "scheduler-worktree"),
+    "get_current_agent": ("broad", "native"),
+    "list_agents": ("native",),
+    "get_current_agent_info": ("broad", "native"),
+    "select_agent": ("native",),
+    "deselect_agent": ("native",),
+    "list_commands": ("broad", "native"),
+    "invoke_command": ("broad", "native", "sidecar"),
+    "ephemeral_query": ("native",),
+    "compact_history": ("native",),
+    "start_fleet": ("native",),
+    "get_session_auth": ("broad", "native"),
+    "enable_remote": ("native",),
+    "disable_remote": ("native", "scheduler-worktree"),
+    "tail_event_log": ("broad",),
+    "read_event_log": ("broad", "native"),
+    "check_session_in_use": ("broad", "scheduler-worktree"),
+    "transport_ping": ("broad",),
+    "runtime_identity": ("broad", "native", "extensions", "scheduler-worktree"),
+    "managed_settings_available": ("deterministic",),
+}
 
 
 class ManagedAwarePermissionHandler:
@@ -169,8 +240,7 @@ class CopilotBridge:
         self._settings = settings
         self._client: CopilotClient | None = None
 
-    @property
-    def client(self) -> CopilotClient:
+    def _require_client(self) -> CopilotClient:
         if self._client is None:
             raise RuntimeError("Copilot bridge is not started")
         return self._client
@@ -201,7 +271,7 @@ class CopilotBridge:
             ),
             use_logged_in_user=(github_token is None or not self._settings.sdk_no_auto_login),
             session_idle_timeout_seconds=0,
-            enable_remote_sessions=True,
+            enable_remote_sessions=False,
             **auth_options,
         )
         try:
@@ -268,7 +338,7 @@ class CopilotBridge:
         managed = self._managed_session_options()
         if permission_handler is None:
             raise PermissionPostureError("explicit fence-validating permission handler is required")
-        return await self.client.create_session(
+        return await self._require_client().create_session(
             **options,
             **managed,
             session_id=session_id,
@@ -276,6 +346,7 @@ class CopilotBridge:
             streaming=True,
             include_sub_agent_streaming_events=True,
             manage_schedule_enabled=False,
+            remote_session=RemoteSessionMode.OFF,
             on_event=on_event,
             on_permission_request=permission_handler,
             on_user_input_request=on_user_input_request,
@@ -311,7 +382,7 @@ class CopilotBridge:
         managed = self._managed_session_options()
         if permission_handler is None:
             raise PermissionPostureError("explicit fence-validating permission handler is required")
-        return await self.client.resume_session(
+        return await self._require_client().resume_session(
             session_id,
             **options,
             **managed,
@@ -319,6 +390,7 @@ class CopilotBridge:
             streaming=True,
             include_sub_agent_streaming_events=True,
             manage_schedule_enabled=False,
+            remote_session=RemoteSessionMode.OFF,
             continue_pending_work=continue_pending_work,
             on_event=on_event,
             on_permission_request=permission_handler,
@@ -332,11 +404,44 @@ class CopilotBridge:
 
     async def delete_session(self, session_id: str) -> None:
         """Permanently delete one persisted SDK session by its stable ID."""
-        await self.client.delete_session(session_id)
+        await self._require_client().delete_session(session_id)
 
     async def session_exists(self, session_id: str) -> bool:
         """Authoritatively reconcile whether a persisted SDK session still exists."""
-        return await self.client.get_session_metadata(session_id) is not None
+        return await self._require_client().get_session_metadata(session_id) is not None
+
+    async def list_sessions(self) -> tuple[str, ...]:
+        sessions = await self._require_client().list_sessions()
+        return tuple(str(getattr(item, "session_id", getattr(item, "id", ""))) for item in sessions)
+
+    async def send(
+        self,
+        session: CopilotSession,
+        prompt: str,
+        *,
+        attachments: list[Any] | None = None,
+        mode: Literal["enqueue", "immediate"] | None = None,
+        agent_mode: Literal["interactive", "plan", "autopilot", "shell"] | None = None,
+        request_headers: dict[str, str] | None = None,
+        display_prompt: str | None = None,
+    ) -> str:
+        return await session.send(
+            prompt,
+            attachments=attachments,
+            mode=mode,
+            agent_mode=agent_mode,
+            request_headers=request_headers,
+            display_prompt=display_prompt,
+        )
+
+    async def abort(self, session: CopilotSession) -> None:
+        await session.abort()
+
+    async def disconnect(self, session: CopilotSession) -> None:
+        await session.disconnect()
+
+    async def get_events(self, session: CopilotSession) -> tuple[SessionEvent, ...]:
+        return tuple(await session.get_events())
 
     async def ensure_allow_all(self, session: CopilotSession) -> PermissionPosture:
         state = await session.rpc.permissions.get_allow_all(timeout=10)
@@ -373,6 +478,40 @@ class CopilotBridge:
             )
         return posture
 
+    async def set_allow_all(
+        self,
+        session: CopilotSession,
+        *,
+        enabled: bool,
+        mode: str,
+    ) -> None:
+        result = await session.rpc.permissions.set_allow_all(
+            PermissionsSetAllowAllRequest(
+                enabled=enabled,
+                mode=PermissionsAllowAllMode(mode),
+                source=PermissionsSetAAllSource.RPC,
+            ),
+            timeout=10,
+        )
+        if getattr(result, "success", True) is not True:
+            raise PermissionPostureError("allow-all mutation was not accepted")
+
+    async def set_approve_all(
+        self,
+        session: CopilotSession,
+        *,
+        enabled: bool,
+    ) -> None:
+        result = await session.rpc.permissions.set_approve_all(
+            PermissionsSetApproveAllRequest(
+                enabled=enabled,
+                source=PermissionsSetAAllSource.RPC,
+            ),
+            timeout=10,
+        )
+        if getattr(result, "success", False) is not True:
+            raise PermissionPostureError("approve-all mutation was not accepted")
+
     async def get_mode(self, session: CopilotSession) -> str:
         return (await session.rpc.mode.get(timeout=10)).value
 
@@ -383,19 +522,19 @@ class CopilotBridge:
         )
 
     async def list_models(self) -> list[dict[str, Any]]:
-        return [model.to_dict() for model in await self.client.list_models()]
+        return [model.to_dict() for model in await self._require_client().list_models()]
 
     async def healthcheck(self) -> None:
-        await self.client.ping("copilotd-heartbeat")
+        await self._require_client().ping("copilotd-heartbeat")
 
     async def set_model(
         self,
         session: CopilotSession,
         *,
         model: str,
-        reasoning_effort: str | None,
-        reasoning_summary: str | None,
-        context_tier: str | None,
+        reasoning_effort: str | None = None,
+        reasoning_summary: str | None = None,
+        context_tier: str | None = None,
     ) -> None:
         await session.set_model(
             model,
@@ -457,26 +596,23 @@ class CopilotBridge:
         )
         return bool(result.success)
 
-    async def respond_external_tool(
-        self,
-        session: CopilotSession,
-        request_id: str,
-        *,
-        result: str | None = None,
-        error: str | None = None,
-    ) -> bool:
-        response = await session.rpc.tools.handle_pending_tool_call(
-            HandlePendingToolCallRequest(
-                request_id=request_id,
-                result=result,
-                error=error,
-            ),
-            timeout=10,
-        )
-        return bool(response.success)
-
     async def get_mcp_servers(self, session: CopilotSession) -> dict[str, Any]:
         return cast(dict[str, Any], (await session.rpc.mcp.list(timeout=10)).to_dict())
+
+    async def list_mcp_tools(
+        self,
+        session: CopilotSession,
+        *,
+        server_name: str,
+    ) -> list[dict[str, Any]]:
+        result = await session.rpc.mcp.list_tools(
+            MCPListToolsRequest(server_name=server_name),
+            timeout=10,
+        )
+        return [cast(dict[str, Any], tool.to_dict()) for tool in result.tools]
+
+    async def get_plugins(self, session: CopilotSession) -> dict[str, Any]:
+        return cast(dict[str, Any], (await session.rpc.plugins.list(timeout=10)).to_dict())
 
     async def get_skills(self, session: CopilotSession) -> dict[str, Any]:
         return cast(dict[str, Any], (await session.rpc.skills.list(timeout=10)).to_dict())
@@ -498,6 +634,10 @@ class CopilotBridge:
             timeout=10,
         )
         return None if result.context_info is None else result.context_info.to_dict()
+
+    async def read_plan(self, session: CopilotSession) -> dict[str, Any]:
+        result = await session.rpc.plan.read(timeout=10)
+        return cast(dict[str, Any], result.to_dict())
 
     async def get_usage(self, session: CopilotSession) -> dict[str, Any]:
         metrics = await session.rpc.usage.get_metrics(timeout=10)
@@ -589,6 +729,26 @@ class CopilotBridge:
         wait_seconds: float,
     ) -> None:
         await session.rpc.tasks.wait_for_pending(timeout=wait_seconds)
+
+    async def start_agent_task(
+        self,
+        session: CopilotSession,
+        *,
+        agent_type: str,
+        name: str,
+        description: str,
+        prompt: str,
+    ) -> str:
+        result = await session.rpc.tasks.start_agent(
+            TasksStartAgentRequest(
+                agent_type=agent_type,
+                name=name,
+                description=description,
+                prompt=prompt,
+            ),
+            timeout=10,
+        )
+        return result.agent_id
 
     async def get_native_schedules(self, session: CopilotSession) -> list[dict[str, Any]]:
         schedules = await session.rpc.schedule.list(timeout=10)
@@ -692,10 +852,11 @@ class CopilotBridge:
         session: CopilotSession,
         *,
         focus: str | None,
+        timeout_seconds: float = 180,
     ) -> dict[str, Any]:
         result = await session.rpc.history.compact(
             HistoryCompactRequest(custom_instructions=focus),
-            timeout=30,
+            timeout=timeout_seconds,
         )
         return cast(dict[str, Any], result.to_dict())
 
@@ -762,23 +923,25 @@ class CopilotBridge:
         )
 
     async def check_session_in_use(self, session_id: str) -> bool:
-        result = await self.client.rpc.sessions.check_in_use(
+        result = await self._require_client().rpc.sessions.check_in_use(
             SessionsCheckInUseRequest(session_ids=[session_id]),
             timeout=10,
         )
         return session_id in result.in_use
 
-    async def transport_ping(self) -> dict[str, object]:
-        result = await self.client.ping("copilotd-stall-monitor")
+    async def transport_ping(self, message: str = "copilotd-stall-monitor") -> dict[str, object]:
+        result = await self._require_client().ping(message)
         return {
             "status": "ok",
             "protocol_version": result.protocol_version,
+            "message": result.message,
         }
 
     async def runtime_identity(self) -> dict[str, Any]:
-        status = await self.client.get_status()
-        ping = await self.client.ping("copilotd")
-        auth = await self.client.get_auth_status()
+        client = self._require_client()
+        status = await client.get_status()
+        ping = await client.ping("copilotd")
+        auth = await client.get_auth_status()
         return {
             "runtime_version": status.version,
             "protocol_version": status.protocol_version,
@@ -807,6 +970,7 @@ _FORCED_SESSION_OPTIONS = {
     "streaming",
     "include_sub_agent_streaming_events",
     "manage_schedule_enabled",
+    "remote_session",
     "on_event",
     "on_permission_request",
     "on_user_input_request",

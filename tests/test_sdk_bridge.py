@@ -1,10 +1,12 @@
 import asyncio
 from dataclasses import dataclass
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 from copilot.generated.rpc import (
     PermissionsAllowAllMode,
+    RemoteSessionMode,
     SessionMode,
     SlashCommandAgentPromptResult,
     SlashCommandCompletedResult,
@@ -14,7 +16,12 @@ from copilot.generated.rpc import (
 )
 from pydantic import SecretStr
 
-from copilotd.sdk.bridge import CopilotBridge, ManagedAwarePermissionHandler, PermissionPostureError
+from copilotd.sdk.bridge import (
+    BRIDGE_ACCEPTANCE_LANES,
+    CopilotBridge,
+    ManagedAwarePermissionHandler,
+    PermissionPostureError,
+)
 from copilotd.sdk.native import (
     NativeCapabilityUnavailable,
     NativeCommandResultKind,
@@ -24,6 +31,31 @@ from copilotd.sdk.native import (
 
 async def _approval_allowed() -> bool:
     return True
+
+
+def test_every_public_bridge_operation_has_an_acceptance_lane() -> None:
+    public_operations = {
+        name
+        for name, member in vars(CopilotBridge).items()
+        if not name.startswith("_") and callable(member)
+    }
+
+    assert public_operations == set(BRIDGE_ACCEPTANCE_LANES)
+    assert all(lanes for lanes in BRIDGE_ACCEPTANCE_LANES.values())
+
+
+def test_sdk_session_rpc_and_send_and_wait_do_not_bypass_bridge() -> None:
+    source_root = Path(__file__).parents[1] / "src" / "copilotd"
+    bridge_path = source_root / "sdk" / "bridge.py"
+    offenders: list[str] = []
+    for path in source_root.rglob("*.py"):
+        source = path.read_text(encoding="utf-8")
+        if path != bridge_path and ".rpc." in source:
+            offenders.append(f"{path.relative_to(source_root)}: raw RPC")
+        if ".send_and_wait(" in source:
+            offenders.append(f"{path.relative_to(source_root)}: send_and_wait")
+
+    assert offenders == []
 
 
 @dataclass
@@ -121,6 +153,50 @@ async def test_approve_all_is_verified_even_when_allow_all_is_already_on() -> No
     assert posture.approve_all_confirmed
     assert permissions.set_allow_all_calls == 0
     assert permissions.set_approve_all_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_compact_history_uses_caller_timeout() -> None:
+    class FakeHistory:
+        timeout: float | None = None
+
+        async def compact(self, request: object, *, timeout: float) -> object:  # noqa: ASYNC109
+            self.timeout = timeout
+            return SimpleNamespace(to_dict=lambda: {"success": True, "request": request})
+
+    history = FakeHistory()
+    session = SimpleNamespace(rpc=SimpleNamespace(history=history))
+    bridge = object.__new__(CopilotBridge)
+
+    result = await bridge.compact_history(
+        session,
+        focus="retain marker",
+        timeout_seconds=240,
+    )
+
+    assert result["success"]
+    assert history.timeout == 240
+
+
+@pytest.mark.asyncio
+async def test_set_model_defaults_optional_configuration_to_none() -> None:
+    class FakeModelSession:
+        kwargs: dict[str, object] | None = None
+
+        async def set_model(self, model: str, **kwargs: object) -> None:
+            self.kwargs = {"model": model, **kwargs}
+
+    session = FakeModelSession()
+    bridge = object.__new__(CopilotBridge)
+
+    await bridge.set_model(session, model="auto")
+
+    assert session.kwargs == {
+        "model": "auto",
+        "reasoning_effort": None,
+        "reasoning_summary": None,
+        "context_tier": None,
+    }
 
 
 @pytest.mark.asyncio
@@ -245,6 +321,12 @@ class FakeClient:
         assert session_id == "session-stable-id"
         return self.metadata
 
+    async def list_sessions(self) -> list[object]:
+        return [
+            SimpleNamespace(session_id="session-one"),
+            SimpleNamespace(id="session-two"),
+        ]
+
 
 @pytest.mark.asyncio
 async def test_bridge_deletes_and_reconciles_by_stable_session_id() -> None:
@@ -258,6 +340,53 @@ async def test_bridge_deletes_and_reconciles_by_stable_session_id() -> None:
     assert not await bridge.session_exists("session-stable-id")
 
     assert client.deleted_session_ids == ["session-stable-id"]
+
+
+@pytest.mark.asyncio
+async def test_bridge_routes_handwritten_session_operations_without_client_escape() -> None:
+    class FakeCoreSession:
+        def __init__(self) -> None:
+            self.calls: list[tuple[str, object]] = []
+
+        async def send(self, prompt: str, **kwargs: object) -> str:
+            self.calls.append(("send", {"prompt": prompt, **kwargs}))
+            return "message-1"
+
+        async def abort(self) -> None:
+            self.calls.append(("abort", None))
+
+        async def disconnect(self) -> None:
+            self.calls.append(("disconnect", None))
+
+        async def get_events(self) -> list[object]:
+            self.calls.append(("get_events", None))
+            return [SimpleNamespace(id="event-1")]
+
+    client = FakeClient()
+    bridge = object.__new__(CopilotBridge)
+    bridge._client = client
+    session = FakeCoreSession()
+
+    message_id = await bridge.send(
+        session,
+        "prompt",
+        mode="enqueue",
+        agent_mode="interactive",
+    )
+    events = await bridge.get_events(session)
+    await bridge.abort(session)
+    await bridge.disconnect(session)
+
+    assert message_id == "message-1"
+    assert len(events) == 1
+    assert await bridge.list_sessions() == ("session-one", "session-two")
+    assert not hasattr(CopilotBridge, "client")
+    assert [name for name, _payload in session.calls] == [
+        "send",
+        "get_events",
+        "abort",
+        "disconnect",
+    ]
 
 
 class HungStopClient:
@@ -310,6 +439,7 @@ async def test_bridge_start_omits_absent_token_and_uses_local_login(
     await bridge.start()
 
     options = clients[0].kwargs
+    assert options["enable_remote_sessions"] is False
     if expected_token is None:
         assert "github_token" not in options
         assert options["use_logged_in_user"] is True
@@ -357,6 +487,7 @@ async def test_bridge_preregisters_event_handler_and_forces_runtime_options() ->
     assert client.create_kwargs["enable_managed_settings"] is True
     assert client.create_kwargs["github_token"] == "session-token"
     assert client.create_kwargs["manage_schedule_enabled"] is False
+    assert client.create_kwargs["remote_session"] == RemoteSessionMode.OFF
     assert client.create_kwargs["streaming"] is True
     assert client.create_kwargs["mcp_servers"] == session_config["mcp_servers"]
     assert client.create_kwargs["custom_agents"] == session_config["custom_agents"]
@@ -365,6 +496,7 @@ async def test_bridge_preregisters_event_handler_and_forces_runtime_options() ->
     assert client.resume_id == "session-1"
     assert client.resume_kwargs["on_event"] is callback
     assert client.resume_kwargs["continue_pending_work"] is False
+    assert client.resume_kwargs["remote_session"] == RemoteSessionMode.OFF
 
 
 @pytest.mark.asyncio

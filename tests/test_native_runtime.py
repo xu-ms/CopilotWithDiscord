@@ -152,6 +152,23 @@ class NativeBridge:
     async def ensure_allow_all(self, _session: NativeHandle) -> object:
         return object()
 
+    async def send(
+        self,
+        session: NativeHandle,
+        prompt: str,
+        **kwargs: Any,
+    ) -> str:
+        return await session.send(prompt, **kwargs)
+
+    async def abort(self, session: NativeHandle) -> None:
+        await session.abort()
+
+    async def disconnect(self, session: NativeHandle) -> None:
+        await session.disconnect()
+
+    async def get_events(self, session: NativeHandle) -> list[Any]:
+        return await session.get_events()
+
     async def get_mode(self, _session: NativeHandle) -> str:
         return self.mode
 
@@ -1545,6 +1562,51 @@ async def test_attach_forces_off_and_abandons_pending_remote_transition(
 
 
 @pytest.mark.asyncio
+async def test_fresh_create_enforces_remote_off_posture(tmp_path: Path) -> None:
+    session_id = str(uuid4())
+    database = Database(tmp_path / "fresh-create-remote-off.sqlite3")
+    await database.open()
+    bindings = SessionBindingRepository(database)
+    binding = await bindings.create(
+        thread_id="thread-fresh-create-remote-off",
+        sdk_session_id=session_id,
+        cwd_snapshot=tmp_path,
+        project_source="implicit-home",
+    )
+    bridge = NativeBridge(session_id)
+    bridge.remote_mode = "on"
+    manifest = CapabilityRegistry(
+        Settings(_env_file=None, data_dir=tmp_path / "data")
+    ).load_checked()
+    runtime = SessionRuntime(
+        database=database,
+        bridge=bridge,
+        bindings=bindings,
+        owner_leases=OwnerLeaseStore(database),
+        owner_id="fresh-create-remote-off",
+        binding=binding,
+        capabilities=manifest,
+    )
+    try:
+        await asyncio.wait_for(runtime.attach_create(), timeout=5)
+        row = await database.fetchone(
+            """
+            SELECT runtime_remote_mode, remote_steerable
+            FROM session_bindings WHERE sdk_session_id = ?
+            """,
+            (session_id,),
+        )
+        assert dict(row) == {
+            "runtime_remote_mode": "off",
+            "remote_steerable": 0,
+        }
+        assert bridge.remote_mode == "off"
+    finally:
+        await asyncio.wait_for(runtime.shutdown(), timeout=5)
+        await database.close()
+
+
+@pytest.mark.asyncio
 async def test_attach_forces_unverified_export_mode_off(
     tmp_path: Path,
 ) -> None:
@@ -1652,7 +1714,7 @@ async def test_attach_fails_closed_when_unsafe_remote_cannot_be_disabled(
         capabilities=replace(manifest, capabilities=capabilities),
     )
     try:
-        with pytest.raises(SessionNotReady, match="cannot be disabled"):
+        with pytest.raises(SessionNotReady, match="cannot be enforced"):
             await asyncio.wait_for(runtime.attach_resume(), timeout=5)
     finally:
         await runtime.shutdown()

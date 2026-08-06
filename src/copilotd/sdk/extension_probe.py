@@ -14,13 +14,6 @@ from pathlib import Path
 from typing import Any
 
 from copilot import CopilotClient, RuntimeConnection
-from copilot.generated.rpc import (
-    MCPListToolsRequest,
-    PermissionsAllowAllMode,
-    PermissionsSetAAllSource,
-    PermissionsSetAllowAllRequest,
-    PermissionsSetApproveAllRequest,
-)
 from copilot.tools import Tool, ToolResult
 
 from copilotd.config import Settings
@@ -116,12 +109,19 @@ class ExtensionAcceptanceProbe:
             _assert_sanitized(result)
             return result
         finally:
+            cleanup_errors: list[Exception] = []
             for session_id in session_ids:
                 try:
-                    await bridge.client.delete_session(session_id)
-                except Exception:
-                    pass
-            await bridge.stop()
+                    await _delete_session(bridge, session_id)
+                except Exception as error:
+                    cleanup_errors.append(error)
+            try:
+                await bridge.stop()
+            except Exception as error:
+                cleanup_errors.append(error)
+            if cleanup_errors:
+                names = ", ".join(type(error).__name__ for error in cleanup_errors)
+                raise RuntimeError(f"extension acceptance cleanup failed: {names}")
 
     def write_evidence(self, result: dict[str, Any]) -> tuple[Path, str]:
         self._settings.cache_dir.mkdir(parents=True, exist_ok=True)
@@ -170,6 +170,7 @@ class ExtensionAcceptanceProbe:
         session_holder: dict[str, Any] = {}
         deferred_responses: list[tuple[str, str]] = []
         loop = asyncio.get_running_loop()
+        event_queue: asyncio.Queue[Any] = asyncio.Queue()
         local_server = _fixture_path("disposable_mcp_server.py")
         skill_directory, plugin_directory = await asyncio.to_thread(
             _create_extension_fixtures,
@@ -306,6 +307,7 @@ class ExtensionAcceptanceProbe:
         def on_event(event: Any) -> None:
             raw_type = event.type.value
             events.append(raw_type)
+            loop.call_soon_threadsafe(event_queue.put_nowait, event)
             data = event.to_dict().get("data", {})
             if raw_type in {
                 "session.managed_settings_resolved",
@@ -356,18 +358,16 @@ class ExtensionAcceptanceProbe:
                 schedule_protocol_response(kind, request_id)
             deferred_responses.clear()
             await _wait_for_mcp_status(
+                bridge,
                 session,
                 "local",
                 "connected",
                 wait_seconds=wait_seconds,
             )
-            tools = await session.rpc.mcp.list_tools(
-                MCPListToolsRequest(server_name="local"),
-                timeout=10,
-            )
+            tools = await bridge.list_mcp_tools(session, server_name="local")
             agents = await bridge.get_agents(session)
             skills = await bridge.get_skills(session)
-            plugins = (await session.rpc.plugins.list(timeout=10)).to_dict()
+            plugins = await bridge.get_plugins(session)
             skill_states = {
                 str(item.get("name")): bool(item.get("enabled"))
                 for item in skills.get("skills", [])
@@ -379,23 +379,13 @@ class ExtensionAcceptanceProbe:
                 if isinstance(item, dict)
             )
 
-            await session.rpc.permissions.set_allow_all(
-                PermissionsSetAllowAllRequest(
-                    enabled=False,
-                    mode=PermissionsAllowAllMode.OFF,
-                    source=PermissionsSetAAllSource.RPC,
-                ),
-                timeout=10,
-            )
-            await session.rpc.permissions.set_approve_all(
-                PermissionsSetApproveAllRequest(
-                    enabled=False,
-                    source=PermissionsSetAAllSource.RPC,
-                ),
-                timeout=10,
-            )
-            permission_message = await asyncio.wait_for(
-                session.send_and_wait(
+            await bridge.set_allow_all(session, enabled=False, mode="off")
+            await bridge.set_approve_all(session, enabled=False)
+            permission_message = await _send_and_wait_for_message(
+                bridge,
+                session,
+                event_queue,
+                (
                     "In this disposable directory only, perform exactly these actions: "
                     "(1) use shell to run `printf shell-ok > shell-marker.txt`; "
                     "(2) use write to create write-marker.txt containing write-ok; "
@@ -403,24 +393,30 @@ class ExtensionAcceptanceProbe:
                     "(4) invoke copilotd_external_acceptance. "
                     "Then reply exactly PROTOCOL_ACCEPTANCE_DONE."
                 ),
-                timeout=wait_seconds,
+                wait_seconds=wait_seconds,
             )
             restored = await bridge.ensure_allow_all(session)
 
-            elicitation_message = await asyncio.wait_for(
-                session.send_and_wait(
+            elicitation_message = await _send_and_wait_for_message(
+                bridge,
+                session,
+                event_queue,
+                (
                     "Call local/request_elicitation exactly once, then reply exactly "
                     "ELICITATION_ACCEPTANCE_DONE."
                 ),
-                timeout=wait_seconds,
+                wait_seconds=wait_seconds,
             )
             before_sampling = len(events)
-            sampling_message = await asyncio.wait_for(
-                session.send_and_wait(
+            sampling_message = await _send_and_wait_for_message(
+                bridge,
+                session,
+                event_queue,
+                (
                     "Call local/request_sampling exactly once. Whether the server rejects "
                     "it or succeeds, reply exactly SAMPLING_GATE_DONE."
                 ),
-                timeout=wait_seconds,
+                wait_seconds=wait_seconds,
             )
             await asyncio.sleep(0)
             await response_tasks.wait_empty(wait_seconds=30)
@@ -496,7 +492,7 @@ class ExtensionAcceptanceProbe:
             primary = {
                 "extension_config": _passed(
                     verified=(
-                        "get_acceptance_env" in {tool.name for tool in tools.tools}
+                        "get_acceptance_env" in {str(tool.get("name")) for tool in tools}
                         and "acceptance_agent"
                         in {
                             str(item.get("name"))
@@ -509,7 +505,7 @@ class ExtensionAcceptanceProbe:
                         and "acceptance-plugin" in plugin_names
                     ),
                     mcp_connected=True,
-                    mcp_tools=sorted(tool.name for tool in tools.tools),
+                    mcp_tools=sorted(str(tool.get("name")) for tool in tools),
                     custom_agent_loaded=(
                         "acceptance_agent"
                         in {
@@ -591,15 +587,31 @@ class ExtensionAcceptanceProbe:
             }
             return primary
         finally:
-            await response_tasks.cancel_all(wait_seconds=5)
+            cleanup_errors: list[Exception] = []
+            try:
+                await response_tasks.cancel_all(wait_seconds=5)
+            except Exception as error:
+                cleanup_errors.append(error)
             if session is not None:
-                await session.disconnect()
-            await _delete_session(bridge, session_id)
+                try:
+                    await bridge.disconnect(session)
+                except Exception as error:
+                    cleanup_errors.append(error)
+            try:
+                await _delete_session(bridge, session_id)
+            except Exception as error:
+                cleanup_errors.append(error)
             try:
                 await permission_leases.release(permission_lease)
-            except Exception:
-                pass
-            await permission_database.close()
+            except Exception as error:
+                cleanup_errors.append(error)
+            try:
+                await permission_database.close()
+            except Exception as error:
+                cleanup_errors.append(error)
+            if cleanup_errors:
+                names = ", ".join(type(error).__name__ for error in cleanup_errors)
+                raise RuntimeError(f"primary extension cleanup failed: {names}")
 
     async def _run_oauth(
         self,
@@ -647,7 +659,9 @@ class ExtensionAcceptanceProbe:
                 session_id=session_id,
                 working_directory=str(workspace),
                 on_event=lambda event: events.append(event.type.value),
-                permission_handler=ManagedAwarePermissionHandler(),
+                permission_handler=ManagedAwarePermissionHandler(
+                    approval_validator=_disposable_owner_is_valid
+                ),
                 on_mcp_auth_request=authorize,
                 session_options={
                     "mcp_servers": {
@@ -662,15 +676,13 @@ class ExtensionAcceptanceProbe:
                 },
             )
             await _wait_for_mcp_status(
+                bridge,
                 session,
                 "oauth",
                 "connected",
                 wait_seconds=wait_seconds,
             )
-            tools = await session.rpc.mcp.list_tools(
-                MCPListToolsRequest(server_name="oauth"),
-                timeout=10,
-            )
+            tools = await bridge.list_mcp_tools(session, server_name="oauth")
             return {
                 "mcp_http_oauth": _passed(
                     verified=(
@@ -678,27 +690,40 @@ class ExtensionAcceptanceProbe:
                         and requests[0].get("reason") == "initial"
                         and "mcp.oauth_required" in events
                         and "mcp.oauth_completed" in events
-                        and [tool.name for tool in tools.tools] == ["whoami"]
+                        and [str(tool.get("name")) for tool in tools] == ["whoami"]
                     ),
                     handler_calls=len(requests),
                     request_reason=requests[0].get("reason") if requests else None,
                     requested_event="mcp.oauth_required" in events,
                     completed_event="mcp.oauth_completed" in events,
-                    tools=sorted(tool.name for tool in tools.tools),
+                    tools=sorted(str(tool.get("name")) for tool in tools),
                     token_persisted=False,
                 )
             }
         finally:
+            cleanup_errors: list[Exception] = []
             if session is not None:
-                await session.disconnect()
-            await _delete_session(bridge, session_id)
-            if process.returncode is None:
-                process.terminate()
                 try:
-                    await asyncio.wait_for(process.wait(), timeout=5)
-                except TimeoutError:
-                    process.kill()
-                    await process.wait()
+                    await bridge.disconnect(session)
+                except Exception as error:
+                    cleanup_errors.append(error)
+            try:
+                await _delete_session(bridge, session_id)
+            except Exception as error:
+                cleanup_errors.append(error)
+            try:
+                if process.returncode is None:
+                    process.terminate()
+                    try:
+                        await asyncio.wait_for(process.wait(), timeout=5)
+                    except TimeoutError:
+                        process.kill()
+                        await process.wait()
+            except Exception as error:
+                cleanup_errors.append(error)
+            if cleanup_errors:
+                names = ", ".join(type(error).__name__ for error in cleanup_errors)
+                raise RuntimeError(f"OAuth extension cleanup failed: {names}")
 
     async def _run_reattach(
         self,
@@ -791,11 +816,8 @@ class ExtensionAcceptanceProbe:
             agent_names = {
                 str(item.get("name")) for item in agents.get("agents", []) if isinstance(item, dict)
             }
-            tools = await runtime.handle.rpc.mcp.list_tools(
-                MCPListToolsRequest(server_name="second"),
-                timeout=10,
-            )
-            tool_names = sorted(tool.name for tool in tools.tools)
+            tools = await bridge.list_mcp_tools(runtime.handle, server_name="second")
+            tool_names = sorted(str(tool.get("name")) for tool in tools)
             if runtime.inbox is not None:
                 await runtime.inbox.join()
             await runtime._refresh_all_snapshots()
@@ -867,13 +889,23 @@ class ExtensionAcceptanceProbe:
             runtime = None
             return result
         finally:
+            cleanup_errors: list[Exception] = []
             if runtime is not None:
                 try:
                     await runtime.shutdown()
-                except Exception:
-                    pass
-            await database.close()
-            await _delete_session(bridge, session_id)
+                except Exception as error:
+                    cleanup_errors.append(error)
+            try:
+                await database.close()
+            except Exception as error:
+                cleanup_errors.append(error)
+            try:
+                await _delete_session(bridge, session_id)
+            except Exception as error:
+                cleanup_errors.append(error)
+            if cleanup_errors:
+                names = ", ".join(type(error).__name__ for error in cleanup_errors)
+                raise RuntimeError(f"reattach extension cleanup failed: {names}")
 
     async def _probe_missing_auth_gate(self) -> dict[str, Any]:
         runtime_path = os.environ.get("COPILOT_CLI_PATH")
@@ -924,8 +956,7 @@ class ExtensionAcceptanceProbe:
     ) -> list[str]:
         if not session_ids:
             return []
-        sessions = await bridge.client.list_sessions()
-        active = {str(getattr(item, "session_id", getattr(item, "id", ""))) for item in sessions}
+        active = set(await bridge.list_sessions())
         return sorted(session_ids.intersection(active))
 
 
@@ -953,6 +984,7 @@ def _acceptance_hooks(seen: list[str]) -> dict[str, Callable[..., Awaitable[Any]
 
 
 async def _wait_for_mcp_status(
+    bridge: CopilotBridge,
     session: Any,
     server_name: str,
     expected: str,
@@ -961,15 +993,49 @@ async def _wait_for_mcp_status(
 ) -> None:
     deadline = asyncio.get_running_loop().time() + wait_seconds
     while asyncio.get_running_loop().time() < deadline:
-        listing = await session.rpc.mcp.list(timeout=10)
+        listing = await bridge.get_mcp_servers(session)
         server = next(
-            (item for item in listing.servers if item.name == server_name),
+            (
+                item
+                for item in listing.get("servers", [])
+                if isinstance(item, dict) and str(item.get("name")) == server_name
+            ),
             None,
         )
-        if server is not None and server.status.value == expected:
+        if server is not None and str(server.get("status")) == expected:
             return
         await asyncio.sleep(0.2)
     raise TimeoutError(f"MCP server did not reach expected state: {expected}")
+
+
+async def _send_and_wait_for_message(
+    bridge: CopilotBridge,
+    session: Any,
+    event_queue: asyncio.Queue[Any],
+    prompt: str,
+    *,
+    wait_seconds: float,
+) -> Any:
+    while not event_queue.empty():
+        event_queue.get_nowait()
+        event_queue.task_done()
+    await bridge.send(
+        session,
+        prompt,
+        mode="enqueue",
+        agent_mode="interactive",
+    )
+    final_message = None
+    async with asyncio.timeout(wait_seconds):
+        while True:
+            event = await event_queue.get()
+            event_queue.task_done()
+            if event.type.value == "assistant.message":
+                final_message = event
+            if event.type.value == "session.idle":
+                if final_message is None:
+                    raise RuntimeError("session became idle without a final assistant message")
+                return final_message
 
 
 async def _wait_for_event_type(
@@ -1120,15 +1186,21 @@ async def _wait_runtime_idle(
 
 
 async def _delete_session(bridge: CopilotBridge, session_id: str) -> None:
+    delete_error: Exception | None = None
     try:
-        await bridge.client.delete_session(session_id)
-    except Exception:
-        sessions = await bridge.client.list_sessions()
-        if any(
-            str(getattr(item, "session_id", getattr(item, "id", ""))) == session_id
-            for item in sessions
-        ):
-            raise
+        await bridge.delete_session(session_id)
+    except Exception as error:
+        delete_error = error
+    try:
+        exists = await bridge.session_exists(session_id)
+    except Exception as error:
+        raise RuntimeError("extension session absence reconciliation failed") from error
+    if exists:
+        raise RuntimeError("extension session deletion was not confirmed") from delete_error
+
+
+async def _disposable_owner_is_valid() -> bool:
+    return True
 
 
 def _fixture_path(name: str) -> Path:

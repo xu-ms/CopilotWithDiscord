@@ -4,9 +4,11 @@ import json
 import signal
 from datetime import UTC, datetime
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
+import copilotd.acceptance.live_scheduler_worktree as live_module
 from copilotd.acceptance.live_scheduler_worktree import (
     DisposableThreadGateway,
     LiveAcceptanceError,
@@ -146,6 +148,7 @@ async def test_disposable_gateway_is_idempotent_for_injected_thread_hook() -> No
         source_id="source",
         name="name",
         creation_token="token",
+        layout="text",
     )
     found = await gateway.find_thread(
         channel_id="channel",
@@ -155,3 +158,121 @@ async def test_disposable_gateway_is_idempotent_for_injected_thread_hook() -> No
 
     assert found == created
     assert gateway.create_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_live_cleanup_failure_still_stops_every_resource(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FakeDatabase:
+        instance: "FakeDatabase | None" = None
+
+        def __init__(self, _path: Path) -> None:
+            self.closed = False
+            FakeDatabase.instance = self
+
+        async def open(self) -> None:
+            return None
+
+        async def fetchall(self, _query: str) -> list[dict[str, str]]:
+            return [{"sdk_session_id": "leftover-session"}]
+
+        async def close(self) -> None:
+            self.closed = True
+
+    class FakeBridge:
+        instance: "FakeBridge | None" = None
+
+        def __init__(self, _settings: object) -> None:
+            self.stopped = False
+            FakeBridge.instance = self
+
+        async def delete_session(self, _session_id: str) -> None:
+            raise RuntimeError("delete response lost")
+
+        async def session_exists(self, _session_id: str) -> bool:
+            return True
+
+        async def stop(self) -> None:
+            self.stopped = True
+
+    class FakeProjects:
+        async def resolve(self, _channel_id: str) -> object:
+            return object()
+
+        async def config_snapshot(self, _project: object) -> object:
+            return object()
+
+    class FakeCreation:
+        async def create_from_source(self, **_kwargs: object) -> object:
+            return SimpleNamespace(binding=SimpleNamespace(thread_id="thread-1"))
+
+    class FakeSessions:
+        def __init__(self) -> None:
+            self.shutdown_called = False
+
+        async def shutdown(self) -> None:
+            self.shutdown_called = True
+
+    class FakeWorker:
+        def __init__(self) -> None:
+            self.stop_called = False
+
+        async def stop(self) -> None:
+            self.stop_called = True
+
+    class Harness(LiveSchedulerWorktreeHarness):
+        def __init__(self) -> None:
+            super().__init__(
+                output_dir=tmp_path,
+                namespace="cleanup-failure",
+                features=("scheduled_message",),
+            )
+            self.fake_sessions = FakeSessions()
+            self.fake_worker = FakeWorker()
+
+        async def _authenticate(self, _bridge: object) -> None:
+            return None
+
+        async def _build_app(
+            self,
+            _settings: object,
+            _database: object,
+            _bridge: object,
+            _repo: Path,
+        ) -> tuple[object, ...]:
+            return (
+                FakeProjects(),
+                object(),
+                self.fake_sessions,
+                FakeCreation(),
+                object(),
+                self.fake_worker,
+                object(),
+            )
+
+        async def _feature_scheduled_message(
+            self,
+            _context: dict[str, object],
+        ) -> dict[str, object]:
+            return {"executed": True}
+
+    monkeypatch.setattr(live_module, "Database", FakeDatabase)
+    monkeypatch.setattr(live_module, "CopilotBridge", FakeBridge)
+    harness = Harness()
+
+    with pytest.raises(LiveAcceptanceError, match="cleanup"):
+        await harness.run()
+
+    assert harness.fake_worker.stop_called
+    assert harness.fake_sessions.shutdown_called
+    assert FakeBridge.instance is not None and FakeBridge.instance.stopped
+    assert FakeDatabase.instance is not None and FakeDatabase.instance.closed
+    cleanup = json.loads(
+        (tmp_path / "cleanup-failure" / "cleanup.json").read_text(encoding="utf-8")
+    )
+    assert cleanup["outcome"] == "failed"
+    assert cleanup["detail"]["all_steps_attempted"] is True
+    assert cleanup["detail"]["bridge_stopped"] is True
+    assert cleanup["detail"]["database_closed"] is True

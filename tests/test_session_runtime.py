@@ -151,6 +151,18 @@ class FakeBridge:
         assert session_id == self.handle.session_id
         return self.handle
 
+    async def send(self, session: FakeHandle, prompt: str, **kwargs: Any) -> str:
+        return await session.send(prompt, **kwargs)
+
+    async def abort(self, session: FakeHandle) -> None:
+        await session.abort()
+
+    async def disconnect(self, session: FakeHandle) -> None:
+        await session.disconnect()
+
+    async def get_events(self, session: FakeHandle) -> tuple[Any, ...]:
+        return tuple(await session.get_events())
+
     async def ensure_allow_all(self, _session: FakeHandle) -> object:
         self.allow_all_calls += 1
         if self.permission_error is not None:
@@ -3247,6 +3259,61 @@ async def test_requested_snapshot_epoch_blocks_dispatch_until_applied(
             await runtime._assert_dispatchable()
         await runtime._query_snapshot_topic("tasks")
         await runtime._assert_dispatchable()
+        await runtime.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_prime_readiness_retries_crossed_extension_snapshot(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    session_id = str(uuid4())
+    async with Database(tmp_path / "extension-snapshot-race.sqlite3") as database:
+        bindings = SessionBindingRepository(database)
+        binding = await bindings.create(
+            thread_id="thread-extension-snapshot-race",
+            sdk_session_id=session_id,
+            cwd_snapshot=tmp_path,
+            project_source="implicit-home",
+        )
+        runtime = SessionRuntime(
+            database=database,
+            bridge=FakeBridge(session_id),
+            bindings=bindings,
+            owner_leases=OwnerLeaseStore(database),
+            owner_id="process-extension-snapshot-race",
+            binding=binding,
+            capabilities=CapabilityRegistry(
+                Settings(_env_file=None, data_dir=tmp_path)
+            ).load_checked(),
+        )
+        await runtime.attach_create()
+        assert runtime.inbox is not None
+        await runtime.inbox.commit_internal(
+            {
+                "type": "copilotd.snapshot.requested",
+                "data": {"topic": "extensions"},
+            },
+            source="snapshot",
+            internal_event_id="snapshot-request:test-stale-extensions",
+        )
+
+        original_query = runtime._query_snapshot_topic
+        extension_calls = 0
+
+        async def crossed_query(topic: str) -> None:
+            nonlocal extension_calls
+            if topic == "extensions":
+                extension_calls += 1
+                if extension_calls == 1:
+                    return
+            await original_query(topic)
+
+        monkeypatch.setattr(runtime, "_query_snapshot_topic", crossed_query)
+
+        await runtime._prime_readiness()
+
+        assert extension_calls == 2
         await runtime.shutdown()
 
 

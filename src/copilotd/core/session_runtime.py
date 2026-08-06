@@ -166,6 +166,24 @@ class RuntimeBridge(Protocol):
 
     async def ensure_allow_all(self, session: SessionHandle) -> Any: ...
 
+    async def send(
+        self,
+        session: SessionHandle,
+        prompt: str,
+        *,
+        attachments: list[Any] | None = None,
+        mode: DeliveryMode | None = None,
+        agent_mode: AgentMode | None = None,
+        request_headers: dict[str, str] | None = None,
+        display_prompt: str | None = None,
+    ) -> str: ...
+
+    async def abort(self, session: SessionHandle) -> None: ...
+
+    async def disconnect(self, session: SessionHandle) -> None: ...
+
+    async def get_events(self, session: SessionHandle) -> tuple[Any, ...]: ...
+
     async def get_mode(self, session: SessionHandle) -> str: ...
 
     async def set_mode(self, session: SessionHandle, mode: str) -> None: ...
@@ -1002,7 +1020,8 @@ class SessionRuntime:
                     "complete serialized session.send frame exceeds runtime limit"
                 )
             message_id = await self._sdk_call(
-                self._require_handle().send(
+                self._bridge.send(
+                    self._require_handle(),
                     prompt,
                     attachments=attachments,
                     mode=mode,
@@ -1485,7 +1504,7 @@ class SessionRuntime:
             if self._mailbox is not None:
                 self._mailbox.freeze()
             try:
-                await self._sdk_call(self._require_handle().disconnect())
+                await self._sdk_call(self._bridge.disconnect(self._require_handle()))
             except Exception as error:
                 await claim_store.transition(
                     claim,
@@ -1972,8 +1991,8 @@ class SessionRuntime:
                 """
                 SELECT topic FROM reconciliation_state
                 WHERE sdk_session_id = ?
-                  AND topic IN ('agents', 'commands', 'remote',
-                                'schedules', 'tasks')
+                  AND topic IN ('agents', 'commands', 'extensions', 'mcp',
+                                'remote', 'schedules', 'tasks')
                   AND (
                       requested_epoch != applied_epoch
                       OR status != 'idle'
@@ -3172,7 +3191,7 @@ class SessionRuntime:
         async def dispatch() -> str:
             await self._assert_owned_handle()
             handle = self._require_handle()
-            history_before = len(await handle.get_events())
+            history_before = len(await self._bridge.get_events(handle))
             receive_before = self._require_inbox().last_sdk_receive_seq
             operation_id = await self._operation_id(operation_key)
             await self._require_inbox().commit_internal(
@@ -3191,7 +3210,7 @@ class SessionRuntime:
             )
             answer = await self._sdk_call(self._bridge.ephemeral_query(handle, question))
             await self._require_inbox().join()
-            history_after = len(await handle.get_events())
+            history_after = len(await self._bridge.get_events(handle))
             receive_after = self._require_inbox().last_sdk_receive_seq
             tool_event = await self._database.fetchone(
                 """
@@ -5116,7 +5135,7 @@ class SessionRuntime:
 
         async def dispatch() -> None:
             await self._assert_owned_handle()
-            await self._sdk_call(self._require_handle().abort())
+            await self._sdk_call(self._bridge.abort(self._require_handle()))
 
         await mailbox.submit(
             kind="abort",
@@ -5190,7 +5209,7 @@ class SessionRuntime:
 
             async def disconnect() -> None:
                 await self._assert_owned_handle(allow_closing=True)
-                await self._sdk_call(self._require_handle().disconnect())
+                await self._sdk_call(self._bridge.disconnect(self._require_handle()))
 
             succeeded = False
             try:
@@ -5714,11 +5733,9 @@ class SessionRuntime:
             or row["runtime_remote_mode"] == "unknown"
             or unsafe_persisted_mode
         )
-        if not create and uncertain_persisted_state and not remote_disable_supported:
-            raise SessionNotReady(
-                "unsafe persisted remote exposure cannot be disabled by this runtime"
-            )
-        should_force_off = not create and remote_disable_supported and uncertain_persisted_state
+        if not remote_disable_supported and (create or uncertain_persisted_state):
+            raise SessionNotReady("remote-off attach posture cannot be enforced by this runtime")
+        should_force_off = remote_disable_supported
         if should_force_off:
 
             async def disable_uncertain_remote() -> None:
@@ -5730,16 +5747,28 @@ class SessionRuntime:
                 idempotency_key=(
                     "remote-reconcile-off:"
                     f"{self.binding.runtime_generation}:"
-                    f"{pending_transition_id or 'unknown'}"
+                    f"{pending_transition_id or 'attach'}"
                 ),
                 input_payload={
                     "target": "off",
-                    "basis": "resume_pending_or_unknown",
+                    "basis": (
+                        "fresh_create"
+                        if create
+                        else "resume_pending_or_unknown"
+                        if uncertain_persisted_state
+                        else "resume_attach_posture"
+                    ),
                 },
                 operation=disable_uncertain_remote,
             )
-        if create or should_force_off:
-            basis = "fresh_create" if create else "resume_forced_off_pending_or_unknown"
+        if should_force_off:
+            basis = (
+                "fresh_create_forced_off"
+                if create
+                else "resume_forced_off_pending_or_unknown"
+                if uncertain_persisted_state
+                else "resume_forced_off_attach_posture"
+            )
             await self._require_inbox().commit_internal(
                 {
                     "type": "copilotd.remote.observed",
@@ -6106,7 +6135,7 @@ class SessionRuntime:
         try:
             if self._handle is not None:
                 try:
-                    await self._sdk_call(self._handle.disconnect())
+                    await self._sdk_call(self._bridge.disconnect(self._handle))
                 except BaseException:
                     disconnected = False
                 else:
@@ -6584,7 +6613,7 @@ class SessionRuntime:
             )
             raise FenceLost("insufficient owner lease headroom for overflow disconnect")
         try:
-            await self._sdk_call(handle.disconnect())
+            await self._sdk_call(self._bridge.disconnect(handle))
         except Exception as error:
             await store.transition(
                 record,

@@ -18,22 +18,17 @@ from pathlib import Path
 from typing import Any
 
 from copilot import CopilotClient, RuntimeConnection
-from copilot.generated.rpc import (
-    CommandsInvokeRequest,
-    CommandsListRequest,
-    EventLogReadRequest,
-    MetadataContextInfoRequest,
-    ModeSetRequest,
-    ScheduleStopRequest,
-    SessionMode,
-)
 from copilot.session import CopilotSession
 from copilot.session_events import SessionEvent, SessionEventType
 from pydantic import SecretStr
 
 from copilotd.config import Settings
 from copilotd.core.task_registry import TaskRegistry
-from copilotd.sdk.bridge import CopilotBridge, ManagedAwarePermissionHandler
+from copilotd.sdk.bridge import (
+    BRIDGE_ACCEPTANCE_LANES,
+    CopilotBridge,
+    ManagedAwarePermissionHandler,
+)
 from copilotd.sdk.capabilities import (
     CAPABILITY_SCHEMA_VERSION,
     MAIN_BRANCH_ONLY_EVENTS,
@@ -81,6 +76,14 @@ class EventRecorder:
                     return event
 
 
+async def _disposable_owner_is_valid() -> bool:
+    return True
+
+
+def _disposable_permission_handler() -> ManagedAwarePermissionHandler:
+    return ManagedAwarePermissionHandler(approval_validator=_disposable_owner_is_valid)
+
+
 class SdkProbe:
     def __init__(self, settings: Settings) -> None:
         self._settings = settings
@@ -92,6 +95,9 @@ class SdkProbe:
         matrix["event_count"] = matrix["generated_events"]["count"]
         matrix["event_types"] = sorted(item.value for item in SessionEventType)
         matrix["main_branch_only_events"] = matrix["generated_events"]["main_branch_only"]
+        matrix["bridge_acceptance_lanes"] = {
+            operation: list(lanes) for operation, lanes in sorted(BRIDGE_ACCEPTANCE_LANES.items())
+        }
         return matrix
 
     async def run_live(
@@ -133,6 +139,16 @@ class SdkProbe:
                 await bridge.start()
                 bridge_started = True
                 live["runtime"] = await bridge.runtime_identity()
+                live["healthcheck"] = await self._probe_call(
+                    "bridge.healthcheck",
+                    bridge.healthcheck,
+                    transform=lambda _result: {"completed": True},
+                )
+                live["transport_ping"] = await self._probe_call(
+                    "bridge.transport_ping",
+                    bridge.transport_ping,
+                    transform=lambda result: result,
+                )
                 live["sessions_check_in_use"] = await self._probe_call(
                     "sessions.check_in_use",
                     lambda: bridge.check_session_in_use(session_id),
@@ -141,8 +157,8 @@ class SdkProbe:
                 live["transport_frames"] = await self._probe_transport_frames(bridge)
                 live["models"] = await self._probe_call(
                     "models",
-                    bridge.client.list_models,
-                    transform=lambda models: [model.to_dict() for model in models],
+                    bridge.list_models,
+                    transform=lambda models: models,
                 )
 
                 recorder = EventRecorder(asyncio.get_running_loop())
@@ -150,74 +166,112 @@ class SdkProbe:
                     session_id=session_id,
                     working_directory=workspace,
                     on_event=recorder.callback,
-                    permission_handler=ManagedAwarePermissionHandler(),
+                    permission_handler=_disposable_permission_handler(),
                 )
                 live["actual_session_id"] = session.session_id
                 live["session_id_matches"] = session.session_id == session_id
+                live["session_exists_immediately_after_create"] = await bridge.session_exists(
+                    session_id
+                )
                 live["permission_posture"] = asdict(await bridge.ensure_allow_all(session))
 
                 live["mode_initial"] = await self._probe_call(
-                    "mode.get", session.rpc.mode.get, transform=lambda mode: mode.value
+                    "bridge.get_mode",
+                    lambda: bridge.get_mode(session),
+                    transform=lambda mode: mode,
                 )
-                live["mode_autopilot"] = await self._probe_mode_round_trip(session)
+                live["mode_autopilot"] = await self._probe_mode_round_trip(bridge, session)
                 live["model_current"] = await self._probe_call(
-                    "model.get_current",
-                    session.rpc.model.get_current,
-                    transform=_to_jsonable,
+                    "bridge.get_current_model",
+                    lambda: bridge.get_current_model(session),
+                    transform=lambda result: result,
                 )
                 live["activity"] = await self._probe_call(
-                    "metadata.activity", session.rpc.metadata.activity, transform=_to_jsonable
+                    "bridge.get_readiness.activity",
+                    lambda: bridge.get_readiness(session),
+                    transform=lambda result: {
+                        "hasActiveWork": result["hasActiveWork"],
+                        "abortable": result["abortable"],
+                    },
                 )
                 live["processing"] = await self._probe_call(
-                    "metadata.is_processing",
-                    session.rpc.metadata.is_processing,
-                    transform=_to_jsonable,
+                    "bridge.get_readiness.processing",
+                    lambda: bridge.get_readiness(session),
+                    transform=lambda result: {"processing": result["processing"]},
                 )
                 live["tasks"] = await self._probe_call(
-                    "tasks.refresh",
-                    session.rpc.tasks.refresh,
-                    transform=_to_jsonable,
+                    "bridge.refresh_tasks",
+                    lambda: bridge.refresh_tasks(session),
+                    transform=lambda _result: {"completed": True},
                 )
                 live["task_list"] = await self._probe_call(
-                    "tasks.list",
-                    session.rpc.tasks.list,
-                    transform=_to_jsonable,
+                    "bridge.list_tasks",
+                    lambda: bridge.list_tasks(session),
+                    transform=lambda tasks: {"tasks": tasks},
+                )
+                live["task_snapshot"] = await self._probe_call(
+                    "bridge.get_tasks",
+                    lambda: bridge.get_tasks(session),
+                    transform=lambda tasks: {"tasks": tasks},
                 )
                 live["agents"] = await self._probe_call(
-                    "agent.list",
-                    session.rpc.agent.list,
-                    transform=_to_jsonable,
+                    "bridge.get_agents",
+                    lambda: bridge.get_agents(session),
+                    transform=lambda result: result,
                 )
                 live["agent_current"] = await self._probe_call(
-                    "agent.get_current",
-                    session.rpc.agent.get_current,
-                    transform=_to_jsonable,
+                    "bridge.get_current_agent_info",
+                    lambda: bridge.get_current_agent_info(session),
+                    transform=lambda result: result,
+                )
+                live["agent_current_name"] = await self._probe_call(
+                    "bridge.get_current_agent",
+                    lambda: bridge.get_current_agent(session),
+                    transform=lambda result: {"name": result},
                 )
                 live["queue"] = await self._probe_call(
-                    "queue.pending_items",
-                    session.rpc.queue.pending_items,
-                    transform=_to_jsonable,
+                    "bridge.get_readiness.queue",
+                    lambda: bridge.get_readiness(session),
+                    transform=lambda result: {
+                        "items": result["pendingItems"],
+                        "steeringMessages": result["steeringMessages"],
+                    },
                 )
                 live["schedule"] = await self._probe_call(
-                    "schedule.list", session.rpc.schedule.list, transform=_to_jsonable
+                    "bridge.get_native_schedules",
+                    lambda: bridge.get_native_schedules(session),
+                    transform=lambda entries: {"entries": entries},
                 )
                 live["commands"] = await self._probe_call(
-                    "commands.list",
-                    lambda: session.rpc.commands.list(
-                        CommandsListRequest(
-                            include_builtins=True,
-                            include_client_commands=False,
-                            include_skills=False,
-                        ),
-                        timeout=10,
-                    ),
-                    transform=_to_jsonable,
+                    "bridge.list_commands",
+                    lambda: bridge.list_commands(session, include_builtins=True),
+                    transform=lambda commands: [command.to_dict() for command in commands],
+                )
+                live["mcp_servers"] = await self._probe_call(
+                    "bridge.get_mcp_servers",
+                    lambda: bridge.get_mcp_servers(session),
+                    transform=lambda result: result,
+                )
+                live["skills"] = await self._probe_call(
+                    "bridge.get_skills",
+                    lambda: bridge.get_skills(session),
+                    transform=lambda result: result,
+                )
+                live["session_auth"] = await self._probe_call(
+                    "bridge.get_session_auth",
+                    lambda: bridge.get_session_auth(session),
+                    transform=lambda result: result,
                 )
 
                 recorder.drain()
-                accepted_message_id = await session.send(prompt, agent_mode="interactive")
+                accepted_message_id = await bridge.send(
+                    session,
+                    prompt,
+                    agent_mode="interactive",
+                )
                 live["accepted_message_id"] = accepted_message_id
                 await recorder.wait_for(SessionEventType.SESSION_IDLE, wait_seconds)
+                live["session_exists_after_activity"] = await bridge.session_exists(session_id)
                 live["first_generation_event_count"] = len(recorder.events)
                 if expected_response is not None:
                     live["expected_response"] = expected_response
@@ -231,7 +285,8 @@ class SdkProbe:
                         )
 
                 recorder.drain()
-                followup_message_id = await session.send(
+                followup_message_id = await bridge.send(
+                    session,
                     "Reply with exactly COPILOTD_STREAM_STILL_ALIVE and do not use tools.",
                     agent_mode="interactive",
                 )
@@ -240,48 +295,59 @@ class SdkProbe:
                 live["callback_survived_idle"] = (
                     len(recorder.events) > live["first_generation_event_count"]
                 )
+                live["abort_round_trip"] = await self._probe_abort_round_trip(
+                    bridge,
+                    session,
+                    recorder,
+                    wait_seconds=wait_seconds,
+                )
+                _require_supported_probe(
+                    live["abort_round_trip"],
+                    "abort and post-abort recovery acceptance",
+                )
+                live["native_queue_clear"] = await self._probe_call(
+                    "bridge.clear_native_queue",
+                    lambda: bridge.clear_native_queue(session),
+                    transform=lambda _result: {"completed": True},
+                )
                 live["metadata_snapshot"] = await self._probe_call(
-                    "metadata.snapshot",
-                    session.rpc.metadata.snapshot,
-                    transform=_to_jsonable,
+                    "bridge.get_remote_state",
+                    lambda: bridge.get_remote_state(session),
+                    transform=lambda result: result,
                 )
                 live["usage_metrics"] = await self._probe_call(
-                    "usage.get_metrics",
-                    session.rpc.usage.get_metrics,
-                    transform=_to_jsonable,
+                    "bridge.get_usage",
+                    lambda: bridge.get_usage(session),
+                    transform=lambda result: result,
                 )
                 live["context_info"] = await self._probe_call(
-                    "metadata.context_info",
-                    lambda: session.rpc.metadata.context_info(
-                        MetadataContextInfoRequest(
-                            output_token_limit=0,
-                            prompt_token_limit=0,
-                            selected_model=None,
-                        ),
-                        timeout=10,
-                    ),
-                    transform=_to_jsonable,
+                    "bridge.get_context",
+                    lambda: bridge.get_context(session),
+                    transform=lambda result: result,
                 )
                 live["plan_read"] = await self._probe_call(
-                    "plan.read",
-                    session.rpc.plan.read,
-                    transform=_to_jsonable,
+                    "bridge.read_plan",
+                    lambda: bridge.read_plan(session),
+                    transform=lambda result: result,
                 )
                 live["event_log_tail"] = await self._probe_call(
-                    "event_log.tail",
-                    session.rpc.event_log.tail,
-                    transform=_to_jsonable,
+                    "bridge.tail_event_log",
+                    lambda: bridge.tail_event_log(session),
+                    transform=lambda cursor: {"cursor_present": bool(cursor)},
                 )
                 live["event_log_read"] = await self._probe_call(
-                    "event_log.read",
-                    lambda: session.rpc.event_log.read(
-                        EventLogReadRequest(max=100, wait_ms=0),
-                        timeout=10,
-                    ),
-                    transform=_summarize_event_log,
+                    "bridge.read_event_log",
+                    lambda: bridge.read_event_log(session, cursor=None, max_events=100),
+                    transform=lambda batch: {
+                        "cursor_status": batch.cursor_status,
+                        "event_count": len(batch.events),
+                        "has_more": batch.has_more,
+                        "filtered_ephemeral": batch.filtered_ephemeral,
+                    },
                 )
                 if probe_native_schedule:
                     live["native_schedule_direct"] = await self._probe_native_schedule(
+                        bridge,
                         session,
                         recorder,
                         wait_seconds=wait_seconds,
@@ -291,8 +357,8 @@ class SdkProbe:
                         wait_seconds=wait_seconds
                     )
                 all_events.extend(recorder.events)
-                live["history_before_disconnect"] = len(await session.get_events())
-                await session.disconnect()
+                live["history_before_disconnect"] = len(await bridge.get_events(session))
+                await bridge.disconnect(session)
                 session = None
 
                 resume_recorder = EventRecorder(asyncio.get_running_loop())
@@ -301,30 +367,25 @@ class SdkProbe:
                     working_directory=workspace,
                     on_event=resume_recorder.callback,
                     continue_pending_work=True,
-                    permission_handler=ManagedAwarePermissionHandler(),
+                    permission_handler=_disposable_permission_handler(),
                 )
                 live["resume_session_id_matches"] = resumed.session_id == session_id
                 await bridge.ensure_allow_all(resumed)
-                history = await resumed.get_events()
+                history = await bridge.get_events(resumed)
                 live["history_after_resume"] = len(history)
                 live["durable_history_recovered"] = len(history) > 0
                 all_events.extend(resume_recorder.events)
-                await resumed.disconnect()
+                await bridge.disconnect(resumed)
                 resumed = None
             finally:
-                if resumed is not None:
-                    await resumed.disconnect()
-                if session is not None:
-                    await session.disconnect()
-                if bridge_started and not keep_session:
-                    try:
-                        await bridge.client.delete_session(session_id)
-                        live["session_deleted"] = True
-                    except Exception as error:
-                        live["session_deleted"] = False
-                        live["delete_error"] = _error_detail(error)
-                if bridge_started:
-                    await bridge.stop()
+                await self._cleanup_live_resources(
+                    bridge,
+                    session_id=session_id,
+                    active_sessions=(("resumed", resumed), ("session", session)),
+                    bridge_started=bridge_started,
+                    keep_session=keep_session,
+                    live=live,
+                )
 
         fixture_path = self._write_fixture(session_id, all_events)
         fixture_sha256 = _sha256_file(fixture_path)
@@ -365,6 +426,15 @@ class SdkProbe:
         event_log_read = live.get("event_log_read")
         event_log_tail = live.get("event_log_tail")
         capabilities = {
+            "abort_recovery": _evidence(
+                (
+                    None
+                    if "abort_round_trip" not in live
+                    else _supported(live.get("abort_round_trip"))
+                ),
+                ("unprobed" if "abort_round_trip" not in live else "live-abort-recovery-probe"),
+                live.get("abort_round_trip"),
+            ),
             "accepted_user_event_id_mapping": _evidence(
                 live.get("accepted_user_event_id_mapping") is True,
                 "live-callback-probe",
@@ -476,6 +546,22 @@ class SdkProbe:
                     "create_id_matches": live.get("session_id_matches"),
                     "resume_id_matches": live.get("resume_session_id_matches"),
                     "callback_survived_idle": live.get("callback_survived_idle"),
+                },
+            ),
+            "session_lifecycle_wrappers": _evidence(
+                live.get("session_id_matches") is True
+                and live.get("session_exists_after_activity") is True
+                and live.get("resume_session_id_matches") is True
+                and live.get("session_deleted") is True,
+                "live-bridge-wrapper-probe",
+                {
+                    "create_id_matches": live.get("session_id_matches"),
+                    "exists_immediately_after_create": live.get(
+                        "session_exists_immediately_after_create"
+                    ),
+                    "exists_after_activity": live.get("session_exists_after_activity"),
+                    "resume_id_matches": live.get("resume_session_id_matches"),
+                    "deleted_and_absent": live.get("session_deleted"),
                 },
             ),
             "protocol_elicitation": _evidence(
@@ -708,6 +794,13 @@ class SdkProbe:
                 "live-command-probe",
                 {"observed_result_kind": invocation_kind},
             )
+        for size_mib in (1, 5, 10):
+            frame = (live.get("transport_frames") or {}).get(str(size_mib))
+            capabilities[f"transport_frame_{size_mib}mib"] = _evidence(
+                _supported(frame),
+                "live-transport-frame-probe",
+                frame,
+            )
         checked_capabilities = CapabilityRegistry(self._settings).load_checked().capabilities
         for name in checked_capabilities:
             capabilities.setdefault(
@@ -733,6 +826,10 @@ class SdkProbe:
                 "sha256": PINNED_GENERATED_EVENT_SHA256,
                 "main_branch_only": list(MAIN_BRANCH_ONLY_EVENTS),
             },
+            "bridge_acceptance_lanes": {
+                operation: list(lanes)
+                for operation, lanes in sorted(BRIDGE_ACCEPTANCE_LANES.items())
+            },
             "capabilities": capabilities,
             "fixture": {
                 "path": str(fixture_path),
@@ -740,52 +837,103 @@ class SdkProbe:
             },
         }
 
-    async def _probe_mode_round_trip(self, session: CopilotSession) -> CapabilityResult:
-        try:
-            await session.rpc.mode.set(
-                ModeSetRequest(mode=SessionMode.AUTOPILOT),
-                timeout=10,
-            )
-            autopilot = await session.rpc.mode.get(timeout=10)
-            await session.rpc.mode.set(
-                ModeSetRequest(mode=SessionMode.INTERACTIVE),
-                timeout=10,
-            )
-            interactive = await session.rpc.mode.get(timeout=10)
-            return CapabilityResult(
-                autopilot == SessionMode.AUTOPILOT and interactive == SessionMode.INTERACTIVE,
-                {
-                    "autopilot": autopilot.value,
-                    "restored": interactive.value,
-                    "prompt_sent": False,
-                },
-            )
-        except Exception as error:
-            return CapabilityResult(False, _error_detail(error))
-
-    async def _probe_transport_frames(self, bridge: CopilotBridge) -> dict[str, Any]:
-        results: dict[str, Any] = {}
-        for size_mib in (1, 5, 10):
-            payload = "x" * (size_mib * 1024 * 1024)
-            started_at = time.perf_counter()
-            try:
-                response = await bridge.client.ping(payload)
-            except Exception as error:
-                results[str(size_mib)] = CapabilityResult(False, _error_detail(error))
-                continue
-            expected_size = len(payload) + len("pong: ")
-            results[str(size_mib)] = CapabilityResult(
-                len(response.message) == expected_size,
-                {
-                    "request_bytes": len(payload),
-                    "response_bytes": len(response.message),
-                    "elapsed_seconds": round(time.perf_counter() - started_at, 3),
-                },
-            )
-        return results
-
-    async def _probe_native_schedule(
+    async def _probe_mode_round_trip(
         self,
+        bridge: CopilotBridge,
+        session: CopilotSession,
+    ) -> CapabilityResult:
+        initial: str | None = None
+        autopilot: str | None = None
+        restored: str | None = None
+        operation_error: Exception | None = None
+        restore_error: Exception | None = None
+        try:
+            initial = await bridge.get_mode(session)
+            await bridge.set_mode(session, "autopilot")
+            autopilot = await bridge.get_mode(session)
+        except Exception as error:
+            operation_error = error
+        finally:
+            if initial is not None:
+                try:
+                    await bridge.set_mode(session, initial)
+                    restored = await bridge.get_mode(session)
+                except Exception as error:
+                    restore_error = error
+        if operation_error is not None or restore_error is not None:
+            detail: dict[str, Any] = {
+                "autopilot": autopilot,
+                "restored": restored,
+                "prompt_sent": False,
+            }
+            if operation_error is not None:
+                detail["error"] = _error_detail(operation_error)
+            if restore_error is not None:
+                detail["restore_error"] = _error_detail(restore_error)
+            return CapabilityResult(False, detail)
+        return CapabilityResult(
+            autopilot == "autopilot" and restored == initial,
+            {
+                "autopilot": autopilot,
+                "restored": restored,
+                "prompt_sent": False,
+            },
+        )
+
+    async def _cleanup_live_resources(
+        self,
+        bridge: CopilotBridge,
+        *,
+        session_id: str,
+        active_sessions: tuple[tuple[str, CopilotSession | None], ...],
+        bridge_started: bool,
+        keep_session: bool,
+        live: dict[str, Any],
+    ) -> None:
+        cleanup_errors: list[Exception] = []
+        for label, active_session in active_sessions:
+            if active_session is None:
+                continue
+            try:
+                await bridge.disconnect(active_session)
+            except Exception as error:
+                cleanup_errors.append(error)
+                live[f"{label}_disconnect_error"] = _error_detail(error)
+        if bridge_started and not keep_session:
+            delete_error: Exception | None = None
+            try:
+                await bridge.delete_session(session_id)
+            except Exception as error:
+                delete_error = error
+                live["delete_error"] = _error_detail(error)
+            try:
+                session_deleted = not await bridge.session_exists(session_id)
+            except Exception as error:
+                cleanup_errors.append(error)
+                live["delete_reconcile_error"] = _error_detail(error)
+                session_deleted = False
+            else:
+                live["session_absence_confirmed"] = session_deleted
+                if not session_deleted:
+                    cleanup_errors.append(
+                        delete_error
+                        or RuntimeError("disposable session still exists after delete response")
+                    )
+            live["session_deleted"] = session_deleted
+        if bridge_started:
+            try:
+                await bridge.stop()
+            except Exception as error:
+                cleanup_errors.append(error)
+                live["bridge_stop_error"] = _error_detail(error)
+        if cleanup_errors:
+            live["cleanup_errors"] = [_error_detail(error) for error in cleanup_errors]
+            names = ", ".join(type(error).__name__ for error in cleanup_errors)
+            raise RuntimeError(f"live probe cleanup failed: {names}")
+
+    async def _probe_abort_round_trip(
+        self,
+        bridge: CopilotBridge,
         session: CopilotSession,
         recorder: EventRecorder,
         *,
@@ -793,52 +941,171 @@ class SdkProbe:
     ) -> CapabilityResult:
         recorder.drain()
         event_start = len(recorder.events)
+        abort_message_id: str | None = None
         try:
-            initial = _to_jsonable(await session.rpc.schedule.list(timeout=10))
-            result = await session.rpc.commands.invoke(
-                CommandsInvokeRequest(
-                    name="after",
-                    input=("30m Reply with exactly COPILOTD_AFTER_OK and do not use tools."),
-                ),
-                timeout=10,
+            abort_message_id = await bridge.send(
+                session,
+                "Use the shell tool to run `sleep 60`; do not reply until it finishes.",
+                agent_mode="interactive",
             )
-            invocation = _to_jsonable(result)
+            await recorder.wait_for(
+                SessionEventType.ASSISTANT_TURN_START,
+                min(wait_seconds, 30),
+            )
+            await bridge.abort(session)
+            await recorder.wait_for(SessionEventType.ABORT, min(wait_seconds, 30))
+            idle = await recorder.wait_for(
+                SessionEventType.SESSION_IDLE,
+                min(wait_seconds, 30),
+            )
+            recovery_text = "COPILOTD_ABORT_RECOVERY_OK"
+            recovery_message_id = await bridge.send(
+                session,
+                f"Reply with exactly {recovery_text} and do not use tools.",
+                agent_mode="interactive",
+            )
+            await recorder.wait_for(SessionEventType.SESSION_IDLE, wait_seconds)
+        except Exception as error:
+            detail: dict[str, Any] = _error_detail(error)
+            try:
+                await bridge.abort(session)
+                await recorder.wait_for(
+                    SessionEventType.SESSION_IDLE,
+                    min(wait_seconds, 30),
+                )
+            except Exception as cleanup_error:
+                detail["cleanup_error"] = _error_detail(cleanup_error)
+            return CapabilityResult(False, detail)
+
+        observed = recorder.events[event_start:]
+        idle_payload = idle.data.to_dict()
+        recovered = _response_matches(observed, recovery_text)
+        return CapabilityResult(
+            idle_payload.get("aborted") is True and recovered,
+            {
+                "abort_message_id_present": bool(abort_message_id),
+                "idle_aborted": idle_payload.get("aborted"),
+                "recovery_message_id_present": bool(recovery_message_id),
+                "recovered_after_abort": recovered,
+            },
+        )
+
+    async def _probe_transport_frames(self, bridge: CopilotBridge) -> dict[str, Any]:
+        results: dict[str, Any] = {}
+        for size_mib in (1, 5, 10):
+            payload = "x" * (size_mib * 1024 * 1024)
+            started_at = time.perf_counter()
+            try:
+                response = await bridge.transport_ping(payload)
+            except Exception as error:
+                results[str(size_mib)] = CapabilityResult(False, _error_detail(error))
+                continue
+            response_message = str(response["message"])
+            expected_size = len(payload) + len("pong: ")
+            results[str(size_mib)] = CapabilityResult(
+                len(response_message) == expected_size,
+                {
+                    "request_bytes": len(payload),
+                    "response_bytes": len(response_message),
+                    "elapsed_seconds": round(time.perf_counter() - started_at, 3),
+                },
+            )
+        return results
+
+    async def _probe_native_schedule(
+        self,
+        bridge: CopilotBridge,
+        session: CopilotSession,
+        recorder: EventRecorder,
+        *,
+        wait_seconds: float,
+    ) -> CapabilityResult:
+        recorder.drain()
+        event_start = len(recorder.events)
+        initial: dict[str, Any] = {"entries": []}
+        created: dict[str, Any] = {"entries": []}
+        invocation: dict[str, Any] | None = None
+        operation_error: Exception | None = None
+        stopped: list[dict[str, Any]] = []
+        new_entries: list[dict[str, Any]] = []
+        try:
+            initial = {"entries": await bridge.get_native_schedules(session)}
+        except Exception as error:
+            return CapabilityResult(False, _error_detail(error))
+        try:
+            result = await bridge.invoke_command(
+                session,
+                name="after",
+                input_text="30m Reply with exactly COPILOTD_AFTER_OK and do not use tools.",
+            )
+            invocation = result.to_dict()
             await recorder.wait_for(
                 SessionEventType.SESSION_SCHEDULE_CREATED,
                 min(wait_seconds, 30),
             )
-            created = _to_jsonable(await session.rpc.schedule.list(timeout=10))
-            initial_ids = {int(item["id"]) for item in initial.get("entries", [])}
+        except Exception as error:
+            operation_error = error
+
+        cleanup_errors: list[Exception] = []
+        try:
+            created = {"entries": await bridge.get_native_schedules(session)}
+            initial_ids = {int(item["id"]) for item in initial["entries"]}
             new_entries = [
-                item for item in created.get("entries", []) if int(item["id"]) not in initial_ids
+                item for item in created["entries"] if int(item["id"]) not in initial_ids
             ]
-            stopped = []
             for entry in new_entries:
-                stopped.append(
-                    _to_jsonable(
-                        await session.rpc.schedule.stop(
-                            ScheduleStopRequest(id=int(entry["id"])),
-                            timeout=10,
-                        )
+                schedule_id = int(entry["id"])
+                try:
+                    stop_result = await bridge.stop_native_schedule(
+                        session,
+                        schedule_id=schedule_id,
                     )
+                    if stop_result is None:
+                        raise RuntimeError(f"schedule {schedule_id} stop returned no stopped entry")
+                    stopped_id = int(stop_result.get("id", stop_result.get("schedule_id", -1)))
+                    if stopped_id != schedule_id:
+                        raise RuntimeError(
+                            f"schedule stop returned id {stopped_id}, expected {schedule_id}"
+                        )
+                    stopped.append(stop_result)
+                except Exception as error:
+                    cleanup_errors.append(error)
+            remaining = {"entries": await bridge.get_native_schedules(session)}
+            remaining_ids = {int(item["id"]) for item in remaining["entries"]}
+            leaked_ids = sorted({int(item["id"]) for item in new_entries} & remaining_ids)
+            if leaked_ids:
+                cleanup_errors.append(
+                    RuntimeError(f"runtime schedules remain after cleanup: {leaked_ids}")
                 )
         except Exception as error:
-            return CapabilityResult(False, _error_detail(error))
+            cleanup_errors.append(error)
+            remaining = {"error": _error_detail(error)}
+        if cleanup_errors:
+            names = ", ".join(type(error).__name__ for error in cleanup_errors)
+            raise RuntimeError(f"native schedule cleanup failed: {names}")
 
         observed = recorder.events[event_start:]
         observed_types = [event["type"] for event in observed]
         supported = (
-            invocation.get("kind") == "completed" and len(new_entries) == 1 and len(stopped) == 1
+            operation_error is None
+            and invocation is not None
+            and invocation.get("kind") == "completed"
+            and len(new_entries) == 1
+            and len(stopped) == 1
         )
+        detail: dict[str, Any] = {
+            "invocation": invocation,
+            "initial": initial,
+            "created": created,
+            "stopped": stopped,
+            "remaining": remaining,
+            "observed_event_types": observed_types,
+        }
+        if operation_error is not None:
+            detail["operation_error"] = _error_detail(operation_error)
         return CapabilityResult(
             supported,
-            {
-                "invocation": invocation,
-                "initial": initial,
-                "created": created,
-                "stopped": stopped,
-                "observed_event_types": observed_types,
-            },
+            detail,
         )
 
     async def _probe_sidecar_replay(self, *, wait_seconds: float) -> CapabilityResult:
@@ -852,7 +1119,7 @@ class SdkProbe:
         session: CopilotSession | None = None
         resumed: CopilotSession | None = None
         session_id = f"copilotd-sidecar-{uuid.uuid4()}"
-        detail: dict[str, Any] = {"session_id": session_id}
+        detail: dict[str, Any] = {"session_id_preallocated": True}
         probe_tasks = TaskRegistry()
 
         try:
@@ -875,8 +1142,8 @@ class SdkProbe:
                 env=environment,
             )
             port = await _read_sidecar_port(sidecar, stdout_tail)
-            detail["port"] = port
-            detail["runtime_path"] = runtime_path
+            detail["port_assigned"] = port > 0
+            detail["runtime_source"] = "bundled"
             assert sidecar.stdout is not None
             assert sidecar.stderr is not None
             stdout_task = probe_tasks.create(
@@ -918,28 +1185,26 @@ class SdkProbe:
                     session_id=session_id,
                     working_directory=workspace,
                     on_event=recorder.callback,
-                    permission_handler=ManagedAwarePermissionHandler(),
+                    permission_handler=_disposable_permission_handler(),
                 )
-                detail["actual_session_id"] = session.session_id
-                detail["sessions_before_disconnect"] = [
-                    item.session_id for item in await bridge.client.list_sessions()
-                ]
+                detail["actual_session_id_matches"] = session.session_id == session_id
+                sessions_before_disconnect = set(await bridge.list_sessions())
+                detail["sessions_before_disconnect_count"] = len(sessions_before_disconnect)
+                detail["target_listed_before_disconnect"] = session_id in sessions_before_disconnect
                 await bridge.ensure_allow_all(session)
-                invocation = await session.rpc.commands.invoke(
-                    CommandsInvokeRequest(
-                        name="after",
-                        input=("10s Reply with exactly COPILOTD_SIDECAR_OK and do not use tools."),
-                    ),
-                    timeout=10,
+                invocation = await bridge.invoke_command(
+                    session,
+                    name="after",
+                    input_text=("10s Reply with exactly COPILOTD_SIDECAR_OK and do not use tools."),
                 )
-                detail["invocation"] = _to_jsonable(invocation)
+                detail["invocation"] = invocation.to_dict()
                 await recorder.wait_for(
                     SessionEventType.SESSION_SCHEDULE_CREATED,
                     min(wait_seconds, 30),
                 )
-                detail["schedule_before_disconnect"] = _to_jsonable(
-                    await session.rpc.schedule.list(timeout=10)
-                )
+                detail["schedule_before_disconnect"] = {
+                    "entries": await bridge.get_native_schedules(session)
+                }
                 session = None
                 await bridge.force_stop()
                 bridge = None
@@ -957,10 +1222,10 @@ class SdkProbe:
 
                 resumed_bridge = CopilotBridge(sidecar_settings)
                 await resumed_bridge.start()
-                detail["sessions_after_reconnect"] = [
-                    item.session_id for item in await resumed_bridge.client.list_sessions()
-                ]
-                if session_id not in detail["sessions_after_reconnect"]:
+                sessions_after_reconnect = set(await resumed_bridge.list_sessions())
+                detail["sessions_after_reconnect_count"] = len(sessions_after_reconnect)
+                detail["target_listed_after_reconnect"] = session_id in sessions_after_reconnect
+                if not detail["target_listed_after_reconnect"]:
                     raise RuntimeError(
                         "sidecar did not retain the session after the client transport closed"
                     )
@@ -970,9 +1235,9 @@ class SdkProbe:
                     working_directory=workspace,
                     on_event=resume_recorder.callback,
                     continue_pending_work=True,
-                    permission_handler=ManagedAwarePermissionHandler(),
+                    permission_handler=_disposable_permission_handler(),
                 )
-                history = await resumed.get_events()
+                history = await resumed_bridge.get_events(resumed)
                 detail["history_event_count"] = len(history)
                 scheduled_user_events = [
                     event
@@ -994,30 +1259,30 @@ class SdkProbe:
                     ]
                 )
                 detail["assistant_events_before_reconnect"] = len(assistant_events)
-                detail["schedule_after_reconnect"] = _to_jsonable(
-                    await resumed.rpc.schedule.list(timeout=10)
-                )
-                await resumed.disconnect()
+                detail["schedule_after_reconnect"] = {
+                    "entries": await resumed_bridge.get_native_schedules(resumed)
+                }
+                await resumed_bridge.disconnect(resumed)
                 resumed = None
-                await resumed_bridge.client.delete_session(session_id)
+                await resumed_bridge.delete_session(session_id)
                 await resumed_bridge.stop()
                 resumed_bridge = None
         except Exception as error:
             detail["error"] = _error_detail(error)
         finally:
-            if resumed is not None:
-                await resumed.disconnect()
+            if resumed is not None and resumed_bridge is not None:
+                await resumed_bridge.disconnect(resumed)
             if resumed_bridge is not None:
                 try:
-                    await resumed_bridge.client.delete_session(session_id)
+                    await resumed_bridge.delete_session(session_id)
                 except Exception as error:
                     detail["cleanup_delete_error"] = _error_detail(error)
                 await resumed_bridge.stop()
-            if session is not None:
-                await session.disconnect()
+            if session is not None and bridge is not None:
+                await bridge.disconnect(session)
             if bridge is not None:
                 try:
-                    await bridge.client.delete_session(session_id)
+                    await bridge.delete_session(session_id)
                 except Exception as error:
                     detail["cleanup_delete_error"] = _error_detail(error)
                 await bridge.stop()
@@ -1031,8 +1296,8 @@ class SdkProbe:
             for task in (stdout_task, stderr_task):
                 if task is not None:
                     await task
-            detail["stdout_tail"] = list(stdout_tail)
-            detail["stderr_tail"] = list(stderr_tail)
+            detail["stdout_line_count"] = len(stdout_tail)
+            detail["stderr_line_count"] = len(stderr_tail)
 
         supported = (
             detail.get("process_survived_disconnect") is True
@@ -1125,24 +1390,17 @@ def _response_matches(
     return False
 
 
-def _summarize_event_log(value: Any) -> dict[str, Any]:
-    payload = _to_jsonable(value)
-    events = payload.get("events", [])
-    return {
-        "event_count": len(events),
-        "event_types": [event.get("type") for event in events],
-        "cursor": payload.get("cursor"),
-        "has_more": payload.get("hasMore"),
-        "cursor_expired": payload.get("cursorExpired"),
-    }
-
-
 def _supported(value: Any) -> bool:
     if isinstance(value, CapabilityResult):
         return value.supported
     if isinstance(value, dict):
         return value.get("supported") is True
     return False
+
+
+def _require_supported_probe(result: CapabilityResult, name: str) -> None:
+    if not result.supported:
+        raise RuntimeError(f"{name} failed")
 
 
 def _evidence(

@@ -775,8 +775,9 @@ copilotD 扩展</a></li>
 <h1 id="copilotd-详细设计与实施计划">copilotD 详细设计与实施计划</h1>
 <blockquote>
 <p>当前阶段：详细设计 v2.5 已批准，设计承诺的 repository implementation
-已完成对齐； 当前按顺序执行完整 deterministic/package gate、真实 Copilot
-Bridge 功能矩阵、 真实 Discord 消息 gallery 与平台实机验收。</p>
+已完成对齐； 完整 deterministic gate 与真实 Copilot Bridge
+功能矩阵已通过，剩余顺序为真实 Discord 消息 gallery、macOS
+长时/服务验收和 Windows 实机验收。</p>
 <p>本版固定前提：单用户、私有部署、Copilot runtime 全程
 <code>--yolo</code>，不设计多用户共享、
 工具确认流程、安全沙箱或租户隔离。</p>
@@ -5460,9 +5461,9 @@ model、<code>/mode</code>、<code>/goal</code>、<code>/bare</code>、<code>/to
 <code>$HOME</code> 行为固定启用。</li>
 </ul>
 <h3 id="当前实现快照2026-08-06">当前实现快照（2026-08-06）</h3>
-<p>repository implementation 已按本设计完成对齐；剩余工作是 credentialed
-Bridge、真实 Discord、 macOS/Windows 实机与长时稳定性验收，不再以
-mock/fixture 结果替代真实 gate：</p>
+<p>repository implementation 已按本设计完成对齐，credentialed Bridge
+全矩阵已完成； 剩余工作是真实 Discord、macOS/Windows
+实机与长时稳定性验收，不再以 mock/fixture 结果替代真实 gate：</p>
 <table>
 <thead>
 <tr>
@@ -5474,7 +5475,10 @@ mock/fixture 结果替代真实 gate：</p>
 <tr>
 <td>官方 <code>github-copilot-sdk==1.0.8</code> + bundled runtime
 1.0.73，stdio <code>--yolo</code>，create/resume 后 full allow-all
-对账</td>
+对账；client 默认
+<code>enable_remote_sessions=false</code>，create/resume 显式
+<code>RemoteSessionMode.OFF</code>，attach 再确认 disable；空 session
+在首次 activity 前不会出现在 metadata/list，首次 prompt 后可 resume</td>
 <td>sidecar client transport 断开后 session retention
 实测失败，因此不声明 detached continuation；crash window 保守标 outcome
 unknown</td>
@@ -5498,8 +5502,7 @@ resume；attach 时按 current state 结算 pending agent、强制 uncertain
 remote off；force restart 使用 producer/journal dual epoch、loss
 watermark admission fence 与 owner handoff</td>
 <td>bundled runtime 进程死亡后的 in-flight execution 仍只能标 outcome
-unknown；真实 fixture 无 current-promotable task，task promote 保持
-gated</td>
+unknown</td>
 </tr>
 <tr>
 <td>eventLog <code>read/tail</code> durable backfill（固定过滤
@@ -5525,9 +5528,15 @@ opaque key 诊断；transport ambiguity 不自动重放</td>
 </tr>
 <tr>
 <td>Discord core 命令；strict dynamic builtin manifest；Native-Gated
-<code>/ask</code>、<code>/session compact</code>、<code>/fleet</code>、<code>/tasks</code>、`/agent
-list</td>
-<td>current<code>、</code>/after</td>
+<code>/ask</code>、<code>/session compact</code>、<code>/fleet</code>、<code>/tasks</code>（含真实
+promote）、<code>/agent list</code>、<code>/agent current</code>、<code>/after list</code>、<code>/after cancel</code>、<code>/every list</code>、<code>/every cancel</code>、<code>/remote status</code>、<code>/remote off</code>、<code>/review</code>、<code>/security-review</code>、<code>/research</code>、<code>/rubber-duck</code>；thread-first
+<code>/session delete session-id?</code>；JSON-Schema elicitation 与 MCP
+OAuth typed/exactly-once response plane；全部 action 由 exact capability
+决定</td>
+<td>current-runtime fork 仍 capability-gated
+且不注册；<code>/after create</code> 与 <code>/every create</code> 因
+real invoke 返回 <code>text</code> 而非 required <code>completed</code>
+不注册；agent select/deselect、remote on/export 的 real gate 未通过</td>
 </tr>
 <tr>
 <td>durable input attachment manifest、hash/size 复验、图片 blob
@@ -5548,11 +5557,10 @@ recovery 保持原位 edit；reasoning delta/coalesced thinking 与 configured
 final concise reasoning summary
 已实现，<code>assistant.streaming_delta</code> 不进入 Discord
 UI；structured tool diff 与 local workspace diff artifact lane；typed
-task list/show/progress/message/cancel-all/remove/wait 与 Fleet
+task list/show/progress/message/promote/cancel-all/remove/wait 与 Fleet
 projection；&gt;=8000 字符 tool result/error 逐字附件化；零 child-thread
 路径</td>
-<td>real current-promotable fixture 未通过，promote action
-不注册；Discord 上的 diff 附件/图片 delivery 仍受 upload limit 与
+<td>Discord 上的 diff 附件/图片 delivery 仍受 upload limit 与
 archived/locked thread 约束</td>
 </tr>
 <tr>
@@ -5587,20 +5595,85 @@ install、sleep/wake、macOS soak 与 Windows 实机未在 deterministic suite
 </tr>
 </tbody>
 </table>
-<p>当前 deterministic 验证基线为 793 个 pytest
+<p><code>CopilotBridge</code> 是生产与 acceptance 唯一 SDK facade；公开
+<code>.client</code> escape hatch 已删除， core
+send/abort/disconnect/history、transport、Native、protocol/extension 与
+scheduler/worktree 调用全部走 typed wrapper。67 个 public operation 均在
+<code>BRIDGE_ACCEPTANCE_LANES</code> 中分档， 新增未分类 operation 会令
+deterministic gate 失败。</p>
+<p>当前 deterministic 验证基线为 812 个 pytest
 case、<code>ruff check .</code>、<code>ruff format --check .</code>、
 <code>compileall</code>、ops/design audit、CLI JSON/error
 contract、service definition/effective-state simulations，以及
-wheel/sdist 的 isolated build/install。<code>copilotd doctor</code>
-已真实启动 bundled runtime 并确认 SDK 1.0.8 / runtime 1.0.73 / protocol
-3、authentication 与 migration 46。 仓库内 hash-checked fixture 固定
-114-event inventory 与 capability evidence；
-<code>copilotd native-acceptance --real</code> 仍要求 exact 环境确认，按
-suite 创建 disposable repo/session、执行 supported mutation（包括 model
-set/readback/restore）、清理 remote/schedule/session，并生成 sanitized
-JSON evidence；unsupported action 保存 real discovery/gate，不由
-deterministic fixture 冒充。这个快照用于区分“已验证实现”和后续设计，
-不降低以下章节对最终产品的契约要求。</p>
+wheel/sdist 的 isolated build/install；全量 pytest 还把
+<code>PytestUnhandledThreadExceptionWarning</code> 升级为 error，已修复
+failure-path test 遗留的 aiosqlite worker。<code>copilotd doctor</code>
+已真实启动 bundled runtime并确认 SDK 1.0.8 / runtime 1.0.73 / protocol
+3、authentication 与 migration 46。</p>
+<p>真实 Copilot phase-2 evidence 使用同一 pinned identity，均为
+disposable workspace/session 且 cleanup 已确认：</p>
+<table>
+<thead>
+<tr>
+<th>acceptance lane</th>
+<th>真实结果</th>
+<th>关键结论</th>
+<th>evidence SHA-256</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Broad Bridge</td>
+<td>passed；77 gates = 26 supported / 6 unsupported / 45 unprobed；67
+wrappers classified</td>
+<td>callback 跨 idle、abort + <code>idle(aborted=true)</code> +
+后续恢复、1/5/10 MiB、mode restore、create 后首次 activity 才可
+list/resume 均通过；accepted message ID 与 <code>user.message</code>
+event ID 不相等；sidecar detach retention 失败</td>
+<td><code>c257969f8ffa541619060afde50132ca3244a016cc8eb837dfc289a162ced6ec</code></td>
+</tr>
+<tr>
+<td>Native RPC</td>
+<td>passed；45 exact gates = 33 supported / 12 unsupported</td>
+<td>model/effort/context 改写、readback 与完整恢复通过；同一显式 model
+的 optional fields 需经 <code>Auto</code> 中转清理；专用
+synchronous-agent fixture 连续两次真实 promote 通过；after/every create
+返回 <code>text</code>，agent select/deselect 与 remote on/export 保持
+unsupported</td>
+<td><code>fca1b96b4f1e823f458fe3ec52983f62cf078dc59d7e98e24d1b048135002e07</code></td>
+</tr>
+<tr>
+<td>Protocol/extensions</td>
+<td>passed；11 features = 8 passed / 3 unprobed</td>
+<td>permission、registered external tool、MCP/config reattach、isolated
+missing-auth fail-closed 等只走 Bridge；无双响应；session/workspace
+cleanup 完成</td>
+<td><code>57f69511525274051d6d34c9bdbdb24fff129314978713d1febc707fb1eddac7</code></td>
+</tr>
+<tr>
+<td>App scheduler/worktree</td>
+<td>passed；6 product features passed / 1 history-fork
+gated；authentication 与 cleanup 通过</td>
+<td>scheduled message、closed-session resume、crash recovery、new
+session、blank worktree 全部通过；真正 history fork 继续按 capability
+fail closed</td>
+<td><code>497059e7472f8878b446c8edb631dad58e480328dbcc2df5e42722e83863f2bc</code></td>
+</tr>
+<tr>
+<td>Checked capability fixture</td>
+<td>exact supported flags 与本次 45-gate Native evidence 零差异</td>
+<td>固定 114-event inventory；<code>tasks_promote=true</code></td>
+<td><code>3120c690ea9e8a1943d4ad17871b2d1c48db54eb87b50bb244d910090af7699a</code></td>
+</tr>
+</tbody>
+</table>
+<p>Broad event fixture SHA-256 为
+<code>f12a52fb3057318f4e0ef18e64086c580268a922184ed9ceb6a42ab3643d261d</code>。
+67-operation Bridge wrapper coverage manifest SHA-256 为
+<code>7dd858027bcb17ac77311e31073ae8dab89917ff8d32986fe360ab35cac713a4</code>，
+其中 unclassified/uncovered 均为 0。 unsupported/unprobed action
+保存真实 discovery/gate，不由 deterministic fixture 冒充。
+这个快照用于区分“已验证实现”和后续设计，不降低以下章节对最终产品的契约要求。</p>
 <h3 id="html-交付要求">HTML 交付要求</h3>
 <ul>
 <li>以本文件“目标、调研结论、详细设计、实施阶段、风险和官方依据”为唯一内容源。</li>
@@ -5727,11 +5800,11 @@ restart-storm alert。</li>
 </ul>
 <h2 id="待办">待办</h2>
 <ol type="1">
-<li>运行完整 Ruff/pytest/compile/package/ops/design gate，提交唯一
-phase-1 implementation commit。</li>
-<li>对真实 Copilot 逐项执行 Bridge 功能矩阵和负能力门禁，保存脱敏
-evidence；未执行、skip、 mock 或未观测结果继续标
-unsupported/unprobed。</li>
+<li>[完成] 运行完整 Ruff/pytest/compile/ops/design deterministic
+gate。</li>
+<li>[完成] 对真实 Copilot 逐项执行 Bridge
+broad/Native/protocol/scheduler-worktree 功能矩阵和 负能力门禁，保存脱敏
+evidence；未执行或未观测结果继续标 unsupported/unprobed。</li>
 <li>向真实 Discord 发送
 text/stream/reasoning/tool/diff/table/image/file/interaction/TaskDeck/
 error/usage 等完整 gallery，保留消息供人工 review，并记录稳定 Discord

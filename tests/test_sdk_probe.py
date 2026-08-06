@@ -12,7 +12,12 @@ from copilotd.sdk.capabilities import (
     CapabilityRegistry,
     RuntimeIdentityMismatch,
 )
-from copilotd.sdk.probe import CapabilityResult, SdkProbe, _response_matches
+from copilotd.sdk.probe import (
+    CapabilityResult,
+    SdkProbe,
+    _require_supported_probe,
+    _response_matches,
+)
 from copilotd.storage.database import Database
 
 
@@ -30,6 +35,203 @@ def test_static_sdk_matrix_tracks_released_contract(tmp_path) -> None:
     assert matrix["capabilities"]["pre_registered_on_event"]["supported"]
     assert "audited_main_event_count" not in matrix
     assert len(matrix["event_types"]) == 114
+    assert matrix["bridge_acceptance_lanes"]["send"] == [
+        "broad",
+        "native",
+        "extensions",
+        "scheduler-worktree",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_mode_probe_restores_initial_mode_after_readback_failure(tmp_path: Path) -> None:
+    class FailingModeBridge:
+        def __init__(self) -> None:
+            self.mode = "interactive"
+            self.failed = False
+            self.set_calls: list[str] = []
+
+        async def get_mode(self, _session: object) -> str:
+            if self.mode == "autopilot" and not self.failed:
+                self.failed = True
+                raise RuntimeError("readback failed")
+            return self.mode
+
+        async def set_mode(self, _session: object, mode: str) -> None:
+            self.mode = mode
+            self.set_calls.append(mode)
+
+    bridge = FailingModeBridge()
+    probe = SdkProbe(Settings(_env_file=None, data_dir=tmp_path))
+
+    result = await probe._probe_mode_round_trip(bridge, object())
+
+    assert not result.supported
+    assert bridge.mode == "interactive"
+    assert bridge.set_calls == ["autopilot", "interactive"]
+
+
+@pytest.mark.asyncio
+async def test_native_schedule_probe_uses_bridge_invoke_contract(tmp_path: Path) -> None:
+    class InvokeResult:
+        def to_dict(self) -> dict[str, str]:
+            return {"kind": "completed"}
+
+    class FakeBridge:
+        def __init__(self) -> None:
+            self.list_calls = 0
+            self.invocation: tuple[str, str] | None = None
+            self.entries: list[dict[str, object]] = []
+
+        async def get_native_schedules(self, _session: object) -> list[dict[str, object]]:
+            self.list_calls += 1
+            return list(self.entries)
+
+        async def invoke_command(
+            self,
+            _session: object,
+            *,
+            name: str,
+            input_text: str,
+        ) -> InvokeResult:
+            self.invocation = (name, input_text)
+            self.entries = [{"id": 41, "recurring": False}]
+            return InvokeResult()
+
+        async def stop_native_schedule(
+            self,
+            _session: object,
+            *,
+            schedule_id: int,
+        ) -> dict[str, int]:
+            self.entries = [entry for entry in self.entries if int(entry["id"]) != schedule_id]
+            return {"id": schedule_id}
+
+    class FakeRecorder:
+        def __init__(self) -> None:
+            self.events: list[dict[str, str]] = []
+
+        def drain(self) -> None:
+            return None
+
+        async def wait_for(self, _event_type: object, _wait_seconds: float) -> None:
+            return None
+
+    bridge = FakeBridge()
+    probe = SdkProbe(Settings(_env_file=None, data_dir=tmp_path))
+
+    result = await probe._probe_native_schedule(
+        bridge,
+        object(),
+        FakeRecorder(),
+        wait_seconds=1,
+    )
+
+    assert result.supported
+    assert bridge.invocation == (
+        "after",
+        "30m Reply with exactly COPILOTD_AFTER_OK and do not use tools.",
+    )
+    assert bridge.entries == []
+
+
+@pytest.mark.asyncio
+async def test_native_schedule_probe_rejects_unconfirmed_stop(tmp_path: Path) -> None:
+    class InvokeResult:
+        def to_dict(self) -> dict[str, str]:
+            return {"kind": "completed"}
+
+    class FakeBridge:
+        def __init__(self) -> None:
+            self.entries: list[dict[str, object]] = []
+
+        async def get_native_schedules(self, _session: object) -> list[dict[str, object]]:
+            return list(self.entries)
+
+        async def invoke_command(
+            self,
+            _session: object,
+            *,
+            name: str,
+            input_text: str,
+        ) -> InvokeResult:
+            del name, input_text
+            self.entries = [{"id": 42, "recurring": False}]
+            return InvokeResult()
+
+        async def stop_native_schedule(
+            self,
+            _session: object,
+            *,
+            schedule_id: int,
+        ) -> None:
+            self.entries = [entry for entry in self.entries if int(entry["id"]) != schedule_id]
+            return None
+
+    class FakeRecorder:
+        def __init__(self) -> None:
+            self.events: list[dict[str, str]] = []
+
+        def drain(self) -> None:
+            return None
+
+        async def wait_for(self, _event_type: object, _wait_seconds: float) -> None:
+            return None
+
+    with pytest.raises(RuntimeError, match="native schedule cleanup failed"):
+        await SdkProbe(Settings(_env_file=None, data_dir=tmp_path))._probe_native_schedule(
+            FakeBridge(),
+            object(),
+            FakeRecorder(),
+            wait_seconds=1,
+        )
+
+
+def test_abort_recovery_is_a_required_live_invariant() -> None:
+    with pytest.raises(RuntimeError, match="abort recovery failed"):
+        _require_supported_probe(
+            CapabilityResult(False, {"recovered_after_abort": False}),
+            "abort recovery",
+        )
+
+
+@pytest.mark.asyncio
+async def test_broad_cleanup_fails_closed_and_still_stops_bridge(tmp_path: Path) -> None:
+    class FakeBridge:
+        def __init__(self) -> None:
+            self.disconnected = False
+            self.stopped = False
+
+        async def disconnect(self, _session: object) -> None:
+            self.disconnected = True
+
+        async def delete_session(self, _session_id: str) -> None:
+            raise RuntimeError("delete response lost")
+
+        async def session_exists(self, _session_id: str) -> bool:
+            return True
+
+        async def stop(self) -> None:
+            self.stopped = True
+
+    bridge = FakeBridge()
+    live: dict[str, object] = {}
+    probe = SdkProbe(Settings(_env_file=None, data_dir=tmp_path))
+
+    with pytest.raises(RuntimeError, match="live probe cleanup failed"):
+        await probe._cleanup_live_resources(
+            bridge,
+            session_id="session-1",
+            active_sessions=(("session", object()),),
+            bridge_started=True,
+            keep_session=False,
+            live=live,
+        )
+
+    assert bridge.disconnected
+    assert bridge.stopped
+    assert live["session_deleted"] is False
+    assert live["session_absence_confirmed"] is False
 
 
 def test_checked_fixture_hash_and_identity_are_valid(tmp_path: Path) -> None:

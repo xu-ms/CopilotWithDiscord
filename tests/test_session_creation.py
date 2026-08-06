@@ -79,6 +79,17 @@ class FakeBridge:
     async def ensure_allow_all(self, _session: FakeHandle) -> object:
         return object()
 
+    async def send(
+        self,
+        session: FakeHandle,
+        prompt: str,
+        **kwargs: Any,
+    ) -> str:
+        return await session.send(prompt, **kwargs)
+
+    async def disconnect(self, session: FakeHandle) -> None:
+        await session.disconnect()
+
     async def get_mode(self, _session: FakeHandle) -> str:
         return self.mode
 

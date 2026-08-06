@@ -158,8 +158,9 @@ class DisposableThreadGateway:
         source_id: str,
         name: str,
         creation_token: str,
+        layout: str,
     ) -> ThreadReference:
-        del name
+        del name, layout
         self.create_calls += 1
         reference = ThreadReference(
             thread_id=str(
@@ -277,15 +278,59 @@ class LiveSchedulerWorktreeHarness:
                             detail=detail,
                         )
             finally:
+                cleanup_started = datetime.now(UTC)
+                cleanup_errors: list[tuple[str, Exception]] = []
                 if worker is not None:
-                    await worker.stop()
+                    try:
+                        await worker.stop()
+                    except Exception as error:
+                        cleanup_errors.append(("worker_stop", error))
                 if sessions is not None:
-                    await sessions.shutdown()
-                await self._cleanup_sessions(database, bridge)
+                    try:
+                        await sessions.shutdown()
+                    except Exception as error:
+                        cleanup_errors.append(("sessions_shutdown", error))
+                try:
+                    await self._cleanup_sessions(database, bridge)
+                except Exception as error:
+                    cleanup_errors.append(("session_cleanup", error))
                 try:
                     await bridge.stop()
-                finally:
+                except Exception as error:
+                    cleanup_errors.append(("bridge_stop", error))
+                try:
                     await database.close()
+                except Exception as error:
+                    cleanup_errors.append(("database_close", error))
+                self.archive.record(
+                    "cleanup",
+                    outcome="failed" if cleanup_errors else "passed",
+                    started_at=cleanup_started,
+                    detail={
+                        "all_steps_attempted": True,
+                        "worker_stopped": not any(
+                            stage == "worker_stop" for stage, _error in cleanup_errors
+                        ),
+                        "sessions_shutdown": not any(
+                            stage == "sessions_shutdown" for stage, _error in cleanup_errors
+                        ),
+                        "sessions_absent": not any(
+                            stage == "session_cleanup" for stage, _error in cleanup_errors
+                        ),
+                        "bridge_stopped": not any(
+                            stage == "bridge_stop" for stage, _error in cleanup_errors
+                        ),
+                        "database_closed": not any(
+                            stage == "database_close" for stage, _error in cleanup_errors
+                        ),
+                        "errors": [
+                            {"stage": stage, "error_type": type(error).__name__}
+                            for stage, error in cleanup_errors
+                        ],
+                    },
+                )
+                if cleanup_errors:
+                    failures.append("cleanup")
         summary = self.archive.finalize()
         if failures:
             raise LiveAcceptanceError("live acceptance failed: " + ", ".join(failures))
@@ -399,6 +444,24 @@ class LiveSchedulerWorktreeHarness:
 
     async def _feature_resume(self, context: dict[str, Any]) -> dict[str, Any]:
         runtime: SessionRuntime = context["base_runtime"]
+        persistence_seeded = False
+        if not await context["bridge"].session_exists(runtime.binding.sdk_session_id):
+            seed_token = f"LIVE_RESUME_SEED_{uuid.uuid4().hex[:10].upper()}"
+            seed_definition = await context["commands"].create_message(
+                thread_id=runtime.binding.thread_id,
+                expression="at:2099-01-01T00:00:00Z",
+                text=f"Reply with exactly {seed_token} and no other text.",
+                timezone="UTC",
+                created_by=self.namespace,
+            )
+            self._schedule_ids.append(seed_definition.id)
+            seed_run = await context["repository"].run_now(seed_definition.id)
+            await self._wait_for_run(context, seed_run.run_id, token=seed_token)
+            if not await context["bridge"].session_exists(runtime.binding.sdk_session_id):
+                raise LiveAcceptanceError(
+                    "session was not persisted after the resume seed activity"
+                )
+            persistence_seeded = True
         if runtime.state == RuntimeState.READY:
             await runtime.close(idempotency_key=f"{self.namespace}:resume-close")
         token = f"LIVE_RESUME_{uuid.uuid4().hex[:10].upper()}"
@@ -422,6 +485,7 @@ class LiveSchedulerWorktreeHarness:
                     binding.binding_intent.value == "closed"
                     and binding.attachment_state.value == "absent"
                 ),
+                "empty_session_persistence_seeded": persistence_seeded,
             }
         )
         if not detail["temporary_attachment_released"]:
@@ -511,10 +575,10 @@ class LiveSchedulerWorktreeHarness:
             )
         finally:
             await crash_database.close()
-        try:
-            await context["bridge"].client.delete_session(str(child["session_id"]))
-        except Exception:
-            pass
+        await _delete_session_and_confirm_absent(
+            context["bridge"],
+            str(child["session_id"]),
+        )
         if recovered.status not in {
             ScheduleRunState.OUTCOME_UNKNOWN,
             ScheduleRunState.DISPATCH_UNKNOWN,
@@ -810,16 +874,16 @@ class LiveSchedulerWorktreeHarness:
         database: Database,
         bridge: CopilotBridge,
     ) -> None:
-        try:
-            client = bridge.client
-            rows = await database.fetchall("SELECT sdk_session_id FROM session_bindings")
-        except RuntimeError:
-            return
-        for row in rows:
+        rows = await database.fetchall("SELECT sdk_session_id FROM session_bindings")
+        errors: list[Exception] = []
+        for session_id in {str(row["sdk_session_id"]) for row in rows}:
             try:
-                await client.delete_session(str(row["sdk_session_id"]))
-            except Exception:
-                pass
+                await _delete_session_and_confirm_absent(bridge, session_id)
+            except Exception as error:
+                errors.append(error)
+        if errors:
+            names = ", ".join(type(error).__name__ for error in errors)
+            raise LiveAcceptanceError(f"session cleanup failed: {names}")
 
 
 async def _run_crash_child(config_path: Path, *, parent_nonce: str) -> None:
@@ -918,6 +982,29 @@ async def _run_crash_child(config_path: Path, *, parent_nonce: str) -> None:
             await bridge.stop()
         finally:
             await database.close()
+
+
+async def _delete_session_and_confirm_absent(
+    bridge: CopilotBridge,
+    session_id: str,
+) -> None:
+    delete_error: Exception | None = None
+    try:
+        await bridge.delete_session(session_id)
+    except Exception as error:
+        delete_error = error
+    try:
+        exists = await bridge.session_exists(session_id)
+    except Exception as error:
+        if delete_error is not None:
+            raise LiveAcceptanceError(
+                "session deletion failed and absence reconciliation was unavailable"
+            ) from error
+        raise LiveAcceptanceError("session absence reconciliation failed") from error
+    if exists:
+        raise LiveAcceptanceError(
+            f"session {session_id} still exists after cleanup"
+        ) from delete_error
 
 
 async def _assistant_content(

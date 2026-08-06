@@ -1032,17 +1032,20 @@ async def test_run_aggregates_original_cleanup_restore_and_write_errors(
 
     monkeypatch.setattr(harness_module, "write_evidence", flaky_write)
 
-    with pytest.raises(Exception) as exc_info:
-        await harness.run()
+    try:
+        with pytest.raises(Exception) as exc_info:
+            await harness.run()
 
-    error = exc_info.value
-    collected = getattr(error, "exceptions", getattr(error, "errors", [error]))
-    messages = " | ".join(str(item) for item in collected)
-    assert "original failure" in messages
-    assert "restore manifest" in messages
-    assert "close failed" in messages
-    assert "write failed" in messages
-    assert (tmp_path / "evidence.json").is_file()
+        error = exc_info.value
+        collected = getattr(error, "exceptions", getattr(error, "errors", [error]))
+        messages = " | ".join(str(item) for item in collected)
+        assert "original failure" in messages
+        assert "restore manifest" in messages
+        assert "close failed" in messages
+        assert "write failed" in messages
+        assert (tmp_path / "evidence.json").is_file()
+    finally:
+        await database.close()
 
 
 @pytest.mark.asyncio
