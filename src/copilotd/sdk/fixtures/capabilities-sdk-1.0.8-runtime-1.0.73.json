@@ -1,5 +1,5 @@
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "source": "checked-live-summary",
   "generated_at": "2026-08-05T00:00:00+00:00",
   "identity": {
@@ -27,10 +27,90 @@
       "evidence_kind": "live-rpc-fixture",
       "detail": "metadata.isProcessing and metadata.activity returned typed snapshots"
     },
+    "agents_current": {
+      "supported": true,
+      "evidence_kind": "live-rpc-fixture",
+      "detail": "agent.getCurrent returned a typed result"
+    },
+    "agents_deselect": {
+      "supported": false,
+      "evidence_kind": "real-acceptance-gate",
+      "detail": "agent.list returned no user-invocable agent, so deselect mutation was not registered"
+    },
+    "agents_list": {
+      "supported": true,
+      "evidence_kind": "live-rpc-fixture",
+      "detail": "agent.list returned a typed result"
+    },
+    "agents_select": {
+      "supported": false,
+      "evidence_kind": "real-acceptance-gate",
+      "detail": "agent.list returned no user-invocable agent"
+    },
+    "builtin_after": {
+      "supported": false,
+      "evidence_kind": "real-acceptance-gate",
+      "detail": "after created and stopped one schedule but returned text instead of required completed"
+    },
     "builtin_commands": {
       "supported": true,
       "evidence_kind": "live-rpc-fixture",
       "detail": "commands.list returned typed builtin inventory and disposable invoke completed"
+    },
+    "builtin_every": {
+      "supported": false,
+      "evidence_kind": "real-acceptance-gate",
+      "detail": "every created and stopped one schedule but returned text instead of required completed"
+    },
+    "builtin_research": {
+      "supported": true,
+      "evidence_kind": "real-acceptance-fixture",
+      "detail": "research returned a runtime agent-prompt that was submitted in a disposable session"
+    },
+    "builtin_review": {
+      "supported": true,
+      "evidence_kind": "real-acceptance-fixture",
+      "detail": "review returned a runtime agent-prompt and completed in a disposable repository"
+    },
+    "builtin_rubber_duck": {
+      "supported": true,
+      "evidence_kind": "real-acceptance-fixture",
+      "detail": "rubber-duck returned a runtime agent-prompt and completed in a disposable repository"
+    },
+    "builtin_security_review": {
+      "supported": true,
+      "evidence_kind": "real-acceptance-fixture",
+      "detail": "security-review returned a runtime agent-prompt and completed in a disposable repository"
+    },
+    "commands_invoke": {
+      "supported": true,
+      "evidence_kind": "real-acceptance-fixture",
+      "detail": "commands.invoke returned typed agent-prompt and text variants"
+    },
+    "commands_list": {
+      "supported": true,
+      "evidence_kind": "live-rpc-fixture",
+      "detail": "commands.list(includeBuiltins=true) returned typed builtin metadata"
+    },
+    "commands_result_agent_prompt": {
+      "supported": true,
+      "evidence_kind": "real-acceptance-fixture",
+      "detail": "review, security-review, research, and rubber-duck returned agent-prompt"
+    },
+    "commands_result_completed": {
+      "supported": false,
+      "evidence_kind": "real-acceptance-gate",
+      "detail": "no real native builtin invocation returned completed"
+    },
+    "commands_result_select_subcommand": {
+      "supported": false,
+      "evidence_kind": "checked-unverified",
+      "detail": "no real invocation fixture has observed select-subcommand"
+    },
+    "commands_result_text": {
+      "supported": true,
+      "evidence_kind": "real-acceptance-fixture",
+      "detail": "after and every returned typed text results"
     },
     "context_info": {
       "supported": true,
@@ -42,10 +122,25 @@
       "evidence_kind": "live-sidecar-fixture",
       "detail": "runtime did not retain the session after client transport disconnect"
     },
+    "ephemeral_query": {
+      "supported": true,
+      "evidence_kind": "real-acceptance-fixture",
+      "detail": "ephemeral query returned an answer with unchanged history and zero tool events"
+    },
     "event_log": {
       "supported": true,
       "evidence_kind": "live-rpc-fixture",
       "detail": "eventLog.tail/read returned opaque cursors, cursor status, and event batches"
+    },
+    "fleet_start": {
+      "supported": true,
+      "evidence_kind": "real-acceptance-fixture",
+      "detail": "fleet.start returned started=true and exposed typed worker tasks"
+    },
+    "history_compact": {
+      "supported": true,
+      "evidence_kind": "real-acceptance-fixture",
+      "detail": "history.compact returned success and durable event-log backfill remained readable"
     },
     "model_config": {
       "supported": true,
@@ -63,9 +158,9 @@
       "detail": "queue.pendingItems returned items and steering messages"
     },
     "native_schedule": {
-      "supported": true,
-      "evidence_kind": "live-command-fixture",
-      "detail": "disposable after invocation emitted schedule-created, root user-message, and idle"
+      "supported": false,
+      "evidence_kind": "real-acceptance-gate",
+      "detail": "schedule list/stop work, but after/every fail the required completed-result gate"
     },
     "permission_allow_all": {
       "supported": true,
@@ -88,9 +183,39 @@
       "detail": "no exact durable readback fixture exists for reasoning-summary"
     },
     "remote": {
+      "supported": false,
+      "evidence_kind": "real-acceptance-gate",
+      "detail": "status and off work, but on was not steerable and export setup failed"
+    },
+    "remote_disable": {
       "supported": true,
       "evidence_kind": "live-rpc-fixture",
-      "detail": "remote enable/disable and metadata reconciliation returned typed results"
+      "detail": "remote.disable completed in a disposable session"
+    },
+    "remote_enable": {
+      "supported": false,
+      "evidence_kind": "real-acceptance-gate",
+      "detail": "remote on returned remoteSteerable=false under the authenticated repository fixture"
+    },
+    "remote_export_detach_safe": {
+      "supported": false,
+      "evidence_kind": "real-acceptance-gate",
+      "detail": "remote export setup failed and detach safety could not be confirmed"
+    },
+    "remote_status": {
+      "supported": true,
+      "evidence_kind": "live-rpc-fixture",
+      "detail": "session auth and metadata snapshots returned typed results"
+    },
+    "schedules_list": {
+      "supported": true,
+      "evidence_kind": "live-rpc-fixture",
+      "detail": "schedule.list returned a typed runtime-owned registry"
+    },
+    "schedules_stop": {
+      "supported": true,
+      "evidence_kind": "real-acceptance-fixture",
+      "detail": "schedule.stop returned both disposable after and every entries"
     },
     "selected_agent": {
       "supported": true,
@@ -111,6 +236,41 @@
       "supported": true,
       "evidence_kind": "live-rpc-fixture",
       "detail": "tasks.refresh followed by tasks.list returned a typed snapshot"
+    },
+    "tasks_cancel": {
+      "supported": true,
+      "evidence_kind": "real-acceptance-fixture",
+      "detail": "tasks.cancel returned cancelled=true for a disposable Fleet task"
+    },
+    "tasks_list": {
+      "supported": true,
+      "evidence_kind": "live-rpc-fixture",
+      "detail": "tasks.refresh followed by tasks.list returned a typed snapshot"
+    },
+    "tasks_message": {
+      "supported": true,
+      "evidence_kind": "real-acceptance-fixture",
+      "detail": "tasks.sendMessage returned sent=true for a disposable Fleet task"
+    },
+    "tasks_progress": {
+      "supported": true,
+      "evidence_kind": "real-acceptance-fixture",
+      "detail": "tasks.getProgress returned typed progress for a disposable Fleet task"
+    },
+    "tasks_promote": {
+      "supported": false,
+      "evidence_kind": "real-acceptance-gate",
+      "detail": "current-promotable lookup did not yield a promotable task in repeated Fleet fixtures"
+    },
+    "tasks_remove": {
+      "supported": true,
+      "evidence_kind": "real-acceptance-fixture",
+      "detail": "tasks.remove returned removed=true after terminal cancellation"
+    },
+    "tasks_wait": {
+      "supported": true,
+      "evidence_kind": "real-acceptance-fixture",
+      "detail": "tasks.waitForPending completed after disposable task cancellation"
     },
     "usage": {
       "supported": true,

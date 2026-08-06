@@ -28,6 +28,7 @@ from copilotd.core.sessions import (
 )
 from copilotd.core.supervisor import ExecutionStallMonitor
 from copilotd.core.task_registry import TaskRegistry
+from copilotd.discord_native import NativeDiscordRegistrar
 from copilotd.ops.heartbeat import HeartbeatWriter
 from copilotd.render.markdown import MarkdownAssembler, TableBlock, TextBlock
 from copilotd.render.outbox import (
@@ -251,13 +252,8 @@ class CopilotDiscordBot(commands.Bot):
 
     async def on_interaction(self, interaction: discord.Interaction) -> None:
         data = interaction.data
-        custom_id = (
-            str(data.get("custom_id", "")) if isinstance(data, dict) else ""
-        )
-        if (
-            interaction.type == discord.InteractionType.component
-            and custom_id.startswith("cdi:")
-        ):
+        custom_id = str(data.get("custom_id", "")) if isinstance(data, dict) else ""
+        if interaction.type == discord.InteractionType.component and custom_id.startswith("cdi:"):
             await self._handle_direct_interaction(interaction, custom_id)
             return
         if (
@@ -289,9 +285,7 @@ class CopilotDiscordBot(commands.Bot):
             return
         values = data.get("values")
         card_token = (
-            str(values[0])
-            if action == "select" and isinstance(values, list) and values
-            else None
+            str(values[0]) if action == "select" and isinstance(values, list) and values else None
         )
         await interaction.response.defer()
         runtime = await self._interaction_runtime(interaction)
@@ -331,9 +325,7 @@ class CopilotDiscordBot(commands.Bot):
             return
         _, interaction_id, action = parts
         if action == "freeform":
-            await interaction.response.send_modal(
-                InteractionResponseModal(self, interaction_id)
-            )
+            await interaction.response.send_modal(InteractionResponseModal(self, interaction_id))
             return
         data = interaction.data
         values = data.get("values") if isinstance(data, dict) else None
@@ -386,9 +378,7 @@ class CopilotDiscordBot(commands.Bot):
                     prompt or "Please inspect the attached files.",
                     idempotency_key=f"discord-message:{message.id}",
                     attachments=sdk_attachments,
-                    attachment_manifest_id=(
-                        None if prepared is None else prepared.manifest_id
-                    ),
+                    attachment_manifest_id=(None if prepared is None else prepared.manifest_id),
                 )
             except AttachmentError as error:
                 await message.reply(f"copilotD could not prepare the attachments: `{error}`")
@@ -734,9 +724,7 @@ class CopilotDiscordBot(commands.Bot):
                 ]
                 multiplier = billing.get("multiplier")
                 suffix = (
-                    f"; multiplier {multiplier:g}"
-                    if isinstance(multiplier, int | float)
-                    else ""
+                    f"; multiplier {multiplier:g}" if isinstance(multiplier, int | float) else ""
                 )
                 lines.append(
                     f"- `{item['id']}` — {item['name']}"
@@ -922,6 +910,7 @@ class CopilotDiscordBot(commands.Bot):
                 error=str(cause),
             )
 
+        NativeDiscordRegistrar(self, self.capabilities).register(session)
         manifest = self.command_manifest()
         self.tree.add_command(session)
         self.tree.add_command(project)
@@ -1161,8 +1150,7 @@ def _interaction_view(metadata: dict[str, Any]) -> discord.ui.View:
             )
         )
     if metadata.get("kind") == "user_input" and (
-        metadata.get("allowFreeform")
-        or (isinstance(choices, list) and len(choices) > 25)
+        metadata.get("allowFreeform") or (isinstance(choices, list) and len(choices) > 25)
     ):
         view.add_item(
             discord.ui.Button(
@@ -1243,10 +1231,7 @@ def _interaction_result_text(result: str) -> str:
 
 
 def _discord_files(assets: list[TableAsset]) -> list[discord.File]:
-    return [
-        discord.File(io.BytesIO(asset.content), filename=asset.filename)
-        for asset in assets
-    ]
+    return [discord.File(io.BytesIO(asset.content), filename=asset.filename) for asset in assets]
 
 
 def _prepare_discord_assets(
@@ -1274,9 +1259,7 @@ def _prepare_discord_assets(
             start = part_index * max_bytes
             prepared.append(
                 TableAsset(
-                    filename=(
-                        f"{stem}.part-{part_index + 1:03d}-of-{part_count:03d}{suffix}"
-                    ),
+                    filename=(f"{stem}.part-{part_index + 1:03d}-of-{part_count:03d}{suffix}"),
                     media_type=asset.media_type,
                     content=asset.content[start : start + max_bytes],
                 )

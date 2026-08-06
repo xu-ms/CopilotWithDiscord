@@ -38,7 +38,15 @@ async def test_initial_migration_creates_full_schema(tmp_path: Path) -> None:
         "render_outbox",
         "render_streams",
         "runtime_incidents",
+        "runtime_agent_manifest",
+        "runtime_agent_transitions",
+        "runtime_command_invocations",
+        "runtime_command_manifest",
+        "runtime_command_refreshes",
+        "runtime_remote_transitions",
+        "runtime_schedule_actions",
         "runtime_schedules",
+        "runtime_task_actions",
         "schedule_runs",
         "schedules",
         "schema_migrations",
@@ -52,6 +60,9 @@ async def test_initial_migration_creates_full_schema(tmp_path: Path) -> None:
         "submissions",
         "submission_segments",
         "submission_task_links",
+        "compaction_runs",
+        "ephemeral_queries",
+        "fleet_runs",
         "task_card_projections",
         "taskdeck_panel_state",
         "usage_samples",
@@ -82,7 +93,7 @@ async def test_migrations_are_idempotent(tmp_path: Path) -> None:
     async with Database(database_path) as database:
         rows = await database.fetchall("SELECT version FROM schema_migrations")
 
-    assert [row["version"] for row in rows] == list(range(1, 10))
+    assert [row["version"] for row in rows] == list(range(1, 15))
 
 
 @pytest.mark.asyncio
@@ -123,7 +134,7 @@ async def test_foundation_migration_upgrades_existing_v7_database(tmp_path: Path
             "SELECT name FROM sqlite_master WHERE type = 'table'"
         )
 
-    assert [row["version"] for row in versions] == list(range(1, 10))
+    assert [row["version"] for row in versions] == list(range(1, 15))
     assert "protocol_version" in {row["name"] for row in capability_columns}
     assert {
         "schema_version",
@@ -133,7 +144,11 @@ async def test_foundation_migration_upgrades_existing_v7_database(tmp_path: Path
         "correlation_id",
     } <= {row["name"] for row in event_columns}
     assert {
+        "compaction_runs",
         "execution_health",
+        "runtime_command_manifest",
+        "runtime_remote_transitions",
+        "runtime_task_actions",
         "snapshot_observations",
         "startup_recovery_runs",
         "submission_segments",

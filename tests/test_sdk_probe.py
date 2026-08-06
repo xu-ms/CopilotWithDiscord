@@ -84,6 +84,28 @@ def test_local_evidence_requires_valid_referenced_fixture(tmp_path: Path) -> Non
         CapabilityRegistry(settings).load_local()
 
 
+def test_schema_one_local_evidence_is_ignored_for_checked_fallback(
+    tmp_path: Path,
+) -> None:
+    settings = Settings(_env_file=None, data_dir=tmp_path)
+    settings.capability_path.parent.mkdir(parents=True)
+    settings.capability_path.write_text(
+        json.dumps({"schema_version": 1}),
+        encoding="utf-8",
+    )
+
+    registry = CapabilityRegistry(settings)
+
+    assert registry.load_local() is None
+    assert registry.resolve(
+        {
+            "runtime_version": "1.0.73",
+            "protocol_version": 3,
+            "ping_protocol_version": 3,
+        }
+    ).supports("commands_list")
+
+
 def test_discord_manifest_is_derived_from_capability_evidence(tmp_path: Path) -> None:
     manifest = CapabilityRegistry(Settings(_env_file=None, data_dir=tmp_path)).load_checked()
     capabilities = dict(manifest.capabilities)
@@ -179,12 +201,10 @@ def test_unprobed_live_capabilities_merge_checked_facts_without_erasing_support(
     assert local.capabilities["remote"].supported is None
 
     merged = CapabilityRegistry(settings).resolve(live["runtime"])
-    assert merged.supports("native_schedule")
     assert merged.supports("model_config")
-    assert merged.supports("remote")
-    assert merged.capabilities["native_schedule"].evidence_kind.startswith(
-        "checked-fallback:"
-    )
+    assert not merged.supports("native_schedule")
+    assert not merged.supports("remote")
+    assert merged.capabilities["native_schedule"].evidence_kind.startswith("checked-fallback:")
 
     live["native_schedule_direct"] = CapabilityResult(
         False,
@@ -193,10 +213,7 @@ def test_unprobed_live_capabilities_merge_checked_facts_without_erasing_support(
     probe._write_matrix(probe._live_matrix(live, fixture, fixture_hash))
     explicit_negative = CapabilityRegistry(settings).resolve(live["runtime"])
     assert not explicit_negative.supports("native_schedule")
-    assert (
-        explicit_negative.capabilities["native_schedule"].evidence_kind
-        == "live-command-probe"
-    )
+    assert explicit_negative.capabilities["native_schedule"].evidence_kind == "live-command-probe"
 
     live.pop("native_schedule_direct")
     unknown_error = probe._live_matrix(live, fixture, fixture_hash)
@@ -208,7 +225,60 @@ def test_unprobed_live_capabilities_merge_checked_facts_without_erasing_support(
     probe._write_matrix(unknown_error)
     preserved_unknown = CapabilityRegistry(settings).resolve(live["runtime"])
     assert not preserved_unknown.supports("remote")
-    assert (
-        preserved_unknown.capabilities["remote"].evidence_kind
-        == "live-rpc-error"
-    )
+    assert preserved_unknown.capabilities["remote"].evidence_kind == "live-rpc-error"
+
+
+def test_failed_broad_live_probe_blocks_exact_capability_fallback(
+    tmp_path: Path,
+) -> None:
+    settings = Settings(_env_file=None, data_dir=tmp_path)
+    probe = SdkProbe(settings)
+    fixture = tmp_path / "failed-live.events.jsonl"
+    fixture.write_text("{}\n", encoding="utf-8")
+    fixture_hash = hashlib.sha256(fixture.read_bytes()).hexdigest()
+    supported = CapabilityResult(True, {})
+    failed = CapabilityResult(False, {"error_type": "MethodNotFound"})
+    live = {
+        "runtime": {
+            "runtime_version": "1.0.73",
+            "protocol_version": 3,
+            "ping_protocol_version": 3,
+        },
+        "accepted_user_event_id_mapping": True,
+        "activity": supported,
+        "processing": supported,
+        "commands": failed,
+        "context_info": supported,
+        "event_log_read": supported,
+        "event_log_tail": supported,
+        "models": supported,
+        "queue": supported,
+        "permission_posture": {"enabled": True, "mode": "on"},
+        "durable_history_recovered": True,
+        "session_id_matches": True,
+        "resume_session_id_matches": True,
+        "callback_survived_idle": True,
+        "agents": supported,
+        "agent_current": supported,
+        "mode_initial": supported,
+        "mode_autopilot": supported,
+        "sessions_check_in_use": supported,
+        "tasks": supported,
+        "task_list": supported,
+        "schedule": supported,
+        "metadata_snapshot": supported,
+        "model_current": failed,
+        "native_schedule_direct": CapabilityResult(
+            True,
+            {"invocation": {"kind": "completed"}},
+        ),
+        "usage_metrics": supported,
+    }
+    probe._write_matrix(probe._live_matrix(live, fixture, fixture_hash))
+
+    resolved = CapabilityRegistry(settings).resolve(live["runtime"])
+
+    assert not resolved.supports("commands_list")
+    assert not resolved.supports("builtin_review")
+    assert not resolved.supports("model_config")
+    assert resolved.capabilities["builtin_review"].evidence_kind == "live-prerequisite-failed"

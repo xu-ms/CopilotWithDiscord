@@ -26,10 +26,22 @@ from copilotd.core.mailbox import (
     OperationState,
     OperationStore,
 )
+from copilotd.core.native import (
+    TERMINAL_TASK_STATES,
+    NativeCapabilityError,
+    NativeManifestController,
+    NativeRemoteMode,
+    NativeTaskAction,
+    RemotePreflightController,
+    TaskDeckAdapter,
+    json_payload,
+    stable_hash,
+)
 from copilotd.core.reducer import EventReducerWorker, JournalReducer
 from copilotd.core.task_registry import TaskRegistry
 from copilotd.sdk.bridge import EventLogBatch, PermissionPostureError
 from copilotd.sdk.capabilities import CapabilityManifest
+from copilotd.sdk.native import NativeCommandResultKind
 from copilotd.storage.database import Database
 from copilotd.storage.leases import (
     MUTATION_HEADROOM_SECONDS,
@@ -60,6 +72,8 @@ class SessionHandle(Protocol):
     async def abort(self) -> None: ...
 
     async def disconnect(self) -> None: ...
+
+    async def get_events(self) -> list[Any]: ...
 
 
 class RuntimeBridge(Protocol):
@@ -123,6 +137,104 @@ class RuntimeBridge(Protocol):
     async def get_remote_state(self, session: SessionHandle) -> dict[str, Any]: ...
 
     async def get_current_agent(self, session: SessionHandle) -> str: ...
+
+    async def list_agents(self, session: SessionHandle) -> list[dict[str, Any]]: ...
+
+    async def get_current_agent_info(
+        self,
+        session: SessionHandle,
+    ) -> dict[str, Any] | None: ...
+
+    async def select_agent(
+        self,
+        session: SessionHandle,
+        name: str,
+    ) -> dict[str, Any]: ...
+
+    async def deselect_agent(self, session: SessionHandle) -> None: ...
+
+    async def list_commands(
+        self,
+        session: SessionHandle,
+        *,
+        include_builtins: bool,
+    ) -> tuple[Any, ...]: ...
+
+    async def invoke_command(
+        self,
+        session: SessionHandle,
+        *,
+        name: str,
+        input_text: str | None,
+    ) -> Any: ...
+
+    async def ephemeral_query(self, session: SessionHandle, question: str) -> str: ...
+
+    async def compact_history(
+        self,
+        session: SessionHandle,
+        *,
+        focus: str | None,
+    ) -> dict[str, Any]: ...
+
+    async def start_fleet(
+        self,
+        session: SessionHandle,
+        prompt: str,
+        *,
+        timeout_seconds: float = 120,
+    ) -> bool: ...
+
+    async def refresh_tasks(self, session: SessionHandle) -> None: ...
+
+    async def list_tasks(self, session: SessionHandle) -> list[dict[str, Any]]: ...
+
+    async def get_task_progress(
+        self,
+        session: SessionHandle,
+        task_id: str,
+    ) -> dict[str, Any] | None: ...
+
+    async def send_task_message(
+        self,
+        session: SessionHandle,
+        task_id: str,
+        message: str,
+    ) -> dict[str, Any]: ...
+
+    async def get_current_promotable_task(
+        self,
+        session: SessionHandle,
+    ) -> dict[str, Any] | None: ...
+
+    async def promote_task(self, session: SessionHandle, task_id: str) -> bool: ...
+
+    async def cancel_task(self, session: SessionHandle, task_id: str) -> bool: ...
+
+    async def remove_task(self, session: SessionHandle, task_id: str) -> bool: ...
+
+    async def wait_for_tasks(
+        self,
+        session: SessionHandle,
+        *,
+        wait_seconds: float,
+    ) -> None: ...
+
+    async def stop_native_schedule(
+        self,
+        session: SessionHandle,
+        schedule_id: int,
+    ) -> dict[str, Any] | None: ...
+
+    async def get_session_auth(self, session: SessionHandle) -> dict[str, Any]: ...
+
+    async def enable_remote(
+        self,
+        session: SessionHandle,
+        mode: Literal["on", "export"],
+    ) -> dict[str, Any]: ...
+
+    async def disable_remote(self, session: SessionHandle) -> None: ...
 
     async def tail_event_log(self, session: SessionHandle) -> str: ...
 
@@ -204,6 +316,9 @@ class SessionRuntime:
         self._sdk_operation_timeout_seconds = sdk_operation_timeout_seconds
         self._shutdown_timeout_seconds = shutdown_timeout_seconds
         self._capabilities = capabilities
+        self._native_manifest = NativeManifestController(database, capabilities)
+        self._taskdeck = TaskDeckAdapter(database)
+        self._remote_preflight = RemotePreflightController(bridge)
 
         self.state = RuntimeState.DETACHED
         self._lease: OwnerLease | None = None
@@ -223,6 +338,7 @@ class SessionRuntime:
         self._task_reconcile_task: asyncio.Task[None] | None = None
         self._snapshot_topics: set[str] = set()
         self._snapshot_query_lock = asyncio.Lock()
+        self._native_schedule_lock = asyncio.Lock()
         self._permission_reconcile_requested = asyncio.Event()
         self._permission_reconcile_stop = asyncio.Event()
         self._permission_reconcile_task: asyncio.Task[None] | None = None
@@ -233,6 +349,9 @@ class SessionRuntime:
         self._interaction_futures: dict[str, asyncio.Future[dict[str, Any] | str]] = {}
         self._lifecycle_lock = asyncio.Lock()
         self._admission_lock = asyncio.Lock()
+        self._active_send_admissions = 0
+        self._send_admissions_drained = asyncio.Event()
+        self._send_admissions_drained.set()
         self._accepting_sends = False
 
     @property
@@ -314,9 +433,7 @@ class SessionRuntime:
                         "attachment_manifest_id": attachment_manifest_id,
                         "attachment_count": len(attachments or []),
                         "requested_mode": effective_agent_mode,
-                        "requested_model_config": json.loads(
-                            model_row["desired_model_config"]
-                        ),
+                        "requested_model_config": json.loads(model_row["desired_model_config"]),
                         "requested_agent": model_row["desired_agent"],
                         "requested_session_config_version": model_row[
                             "desired_session_config_version"
@@ -328,28 +445,36 @@ class SessionRuntime:
                 internal_event_id=f"submission:{submission_id}:queued",
             )
             self._volatile_attachments[submission_id] = attachments
+            self._active_send_admissions += 1
+            self._send_admissions_drained.clear()
 
-        if mode == "immediate":
-            return await self._dispatch_submission(
-                submission_id=submission_id,
-                idempotency_key=idempotency_key,
-                prompt=prompt,
-                prompt_hash=prompt_hash,
-                attachment_manifest_id=attachment_manifest_id,
-                attachments=attachments,
-                mode=mode,
-                agent_mode=effective_agent_mode,
+        try:
+            if mode == "immediate":
+                return await self._dispatch_submission(
+                    submission_id=submission_id,
+                    idempotency_key=idempotency_key,
+                    prompt=prompt,
+                    prompt_hash=prompt_hash,
+                    attachment_manifest_id=attachment_manifest_id,
+                    attachments=attachments,
+                    mode=mode,
+                    agent_mode=effective_agent_mode,
+                )
+            dispatched = await self._dispatch_next_queued()
+            if dispatched is not None and dispatched[0] == submission_id:
+                return dispatched[1]
+            accepted = await self._database.fetchone(
+                "SELECT accepted_message_id FROM submissions WHERE submission_id = ?",
+                (submission_id,),
             )
-        dispatched = await self._dispatch_next_queued()
-        if dispatched is not None and dispatched[0] == submission_id:
-            return dispatched[1]
-        accepted = await self._database.fetchone(
-            "SELECT accepted_message_id FROM submissions WHERE submission_id = ?",
-            (submission_id,),
-        )
-        if accepted is not None and accepted["accepted_message_id"] is not None:
-            return str(accepted["accepted_message_id"])
-        return submission_id
+            if accepted is not None and accepted["accepted_message_id"] is not None:
+                return str(accepted["accepted_message_id"])
+            return submission_id
+        finally:
+            async with self._admission_lock:
+                self._active_send_admissions -= 1
+                if self._active_send_admissions == 0:
+                    self._send_admissions_drained.set()
 
     async def _dispatch_next_queued(self) -> tuple[str, str] | None:
         async with self._queue_dispatch_lock:
@@ -435,9 +560,7 @@ class SessionRuntime:
                 idempotency_key=f"queue:{row['id']}",
                 prompt=str(row["prompt"]),
                 prompt_hash=str(row["prompt_hash"]),
-                attachment_manifest_id=(
-                    None if manifest_id is None else str(manifest_id)
-                ),
+                attachment_manifest_id=(None if manifest_id is None else str(manifest_id)),
                 attachments=attachments,
                 mode=cast(DeliveryMode, str(row["requested_delivery"])),
                 agent_mode=cast(AgentMode, str(row["requested_mode_snapshot"])),
@@ -466,15 +589,13 @@ class SessionRuntime:
         elif attachments:
             raise SessionNotReady("attachments require a durable manifest")
 
-        async def dispatch() -> str:
+        async def dispatch() -> dict[str, Any]:
             claimed = await self._claim_submission(
                 submission_id,
                 operation_idempotency_key=f"send:{idempotency_key}",
             )
             if not claimed:
-                raise OperationRejected(
-                    f"submission {submission_id} was cancelled before dispatch"
-                )
+                raise OperationRejected(f"submission {submission_id} was cancelled before dispatch")
             await self._assert_dispatchable()
             return await self._sdk_call(
                 self._require_handle().send(
@@ -790,9 +911,7 @@ class SessionRuntime:
                 """,
                 (self.binding.sdk_session_id, topic),
             )
-            if state is None or int(state["requested_epoch"]) <= int(
-                state["applied_epoch"]
-            ):
+            if state is None or int(state["requested_epoch"]) <= int(state["applied_epoch"]):
                 epoch = await self._request_snapshot(topic)
             else:
                 epoch = int(state["requested_epoch"])
@@ -800,17 +919,54 @@ class SessionRuntime:
             query_start = inbox.last_sdk_receive_seq
             try:
                 if topic == "tasks":
+                    payload = {"tasks": await self._bridge.get_tasks(self._require_handle())}
+                elif topic == "commands":
+                    commands = self._native_manifest.validate(
+                        await self._bridge.list_commands(
+                            self._require_handle(),
+                            include_builtins=True,
+                        )
+                    )
                     payload = {
-                        "tasks": await self._bridge.get_tasks(self._require_handle())
+                        "commands": [command.to_dict() for command in commands],
+                        "manifest_generation": epoch,
+                    }
+                elif topic == "agents":
+                    agents, current = await asyncio.gather(
+                        self._bridge.list_agents(self._require_handle()),
+                        self._bridge.get_current_agent_info(self._require_handle()),
+                    )
+                    payload = {
+                        "agents": agents,
+                        "current": current,
+                        "manifest_generation": epoch,
                     }
                 elif topic == "schedules":
                     payload = {
-                        "schedules": await self._bridge.get_native_schedules(
-                            self._require_handle()
-                        )
+                        "schedules": await self._bridge.get_native_schedules(self._require_handle())
                     }
                 elif topic == "remote":
-                    payload = await self._bridge.get_remote_state(self._require_handle())
+                    snapshot = await self._bridge.get_remote_state(self._require_handle())
+                    remote = await self._database.fetchone(
+                        """
+                        SELECT runtime_remote_mode, remote_url, remote_steerable
+                        FROM session_bindings WHERE sdk_session_id = ?
+                        """,
+                        (self.binding.sdk_session_id,),
+                    )
+                    mode = "unknown" if remote is None else str(remote["runtime_remote_mode"])
+                    payload = {
+                        "mode": mode,
+                        "url": None if remote is None else remote["remote_url"],
+                        "steerable": (
+                            False
+                            if mode == "off"
+                            else None
+                            if remote is None or remote["remote_steerable"] is None
+                            else bool(remote["remote_steerable"])
+                        ),
+                        "metadata": snapshot,
+                    }
                 else:
                     raise ValueError(f"unsupported snapshot topic: {topic}")
             except asyncio.CancelledError:
@@ -839,9 +995,7 @@ class SessionRuntime:
                 """,
                 (self.binding.sdk_session_id, topic),
             )
-            if latest is not None and int(latest["applied_epoch"]) < int(
-                latest["requested_epoch"]
-            ):
+            if latest is not None and int(latest["applied_epoch"]) < int(latest["requested_epoch"]):
                 self._snapshot_topics.add(topic)
                 self._task_reconcile_requested.set()
 
@@ -866,11 +1020,17 @@ class SessionRuntime:
         if self._capabilities is None:
             topics.add("tasks")
         else:
-            if self._capabilities.supports("task_snapshot"):
+            if self._capabilities.supports("tasks_list"):
                 topics.add("tasks")
-            if self._capabilities.supports("native_schedule"):
+            if self._capabilities.supports("commands_list"):
+                topics.add("commands")
+            if self._capabilities.supports("agents_list") and self._capabilities.supports(
+                "agents_current"
+            ):
+                topics.add("agents")
+            if self._capabilities.supports("schedules_list"):
                 topics.add("schedules")
-            if self._capabilities.supports("remote"):
+            if self._capabilities.supports("remote_status"):
                 topics.add("remote")
         return topics
 
@@ -882,9 +1042,7 @@ class SessionRuntime:
         blockers = await self._readiness_blockers(require_quiet=False)
         if blockers:
             self.state = RuntimeState.DEGRADED
-            raise SessionNotReady(
-                "session readiness reconciliation failed: " + ", ".join(blockers)
-            )
+            raise SessionNotReady("session readiness reconciliation failed: " + ", ".join(blockers))
 
     async def _readiness_blockers(self, *, require_quiet: bool) -> list[str]:
         blockers: list[str] = []
@@ -918,7 +1076,7 @@ class SessionRuntime:
                 blockers.append(f"snapshot_{topic}_stale")
 
         if self._capabilities is not None:
-            if self._capabilities.supports("selected_agent"):
+            if self._capabilities.supports("agents_current"):
                 if binding["pending_agent"] is not None:
                     blockers.append("agent_transition_pending")
                 if binding["runtime_agent"] == "unknown":
@@ -933,13 +1091,13 @@ class SessionRuntime:
                 binding["desired_session_config_version"]
             ):
                 blockers.append("runtime_session_config_drift")
-            if self._capabilities.supports("remote"):
+            if self._capabilities.supports("remote_status"):
                 if binding["pending_remote_transition_id"] is not None:
                     blockers.append("remote_transition_pending")
                 if binding["runtime_remote_mode"] == "unknown":
                     blockers.append("runtime_remote_unknown")
 
-            if self._capabilities.supports("task_snapshot"):
+            if self._capabilities.supports("tasks_list"):
                 unknown_tasks = await self._database.fetchone(
                     """
                     SELECT COUNT(*) FROM background_observations
@@ -948,10 +1106,8 @@ class SessionRuntime:
                     (self.binding.sdk_session_id,),
                 )
                 if unknown_tasks is not None and int(unknown_tasks[0]) > 0:
-                    blockers.append(
-                        f"background_tasks_unknown:{int(unknown_tasks[0])}"
-                    )
-            if self._capabilities.supports("native_schedule"):
+                    blockers.append(f"background_tasks_unknown:{int(unknown_tasks[0])}")
+            if self._capabilities.supports("schedules_list"):
                 unknown_schedules = await self._database.fetchone(
                     """
                     SELECT COUNT(*) FROM runtime_schedules
@@ -960,9 +1116,7 @@ class SessionRuntime:
                     (self.binding.sdk_session_id,),
                 )
                 if unknown_schedules is not None and int(unknown_schedules[0]) > 0:
-                    blockers.append(
-                        f"runtime_schedules_unknown:{int(unknown_schedules[0])}"
-                    )
+                    blockers.append(f"runtime_schedules_unknown:{int(unknown_schedules[0])}")
 
         if require_quiet:
             if binding["runtime_processing"]:
@@ -972,13 +1126,8 @@ class SessionRuntime:
             if int(binding["native_queue_count"] or 0) > 0:
                 blockers.append(f"native_queue:{int(binding['native_queue_count'])}")
             if int(binding["native_steering_count"] or 0) > 0:
-                blockers.append(
-                    f"native_steering:{int(binding['native_steering_count'])}"
-                )
-            if (
-                self._capabilities is None
-                or self._capabilities.supports("task_snapshot")
-            ):
+                blockers.append(f"native_steering:{int(binding['native_steering_count'])}")
+            if self._capabilities is None or self._capabilities.supports("tasks_list"):
                 active_tasks = await self._database.fetchone(
                     """
                     SELECT COUNT(*) FROM background_observations
@@ -988,13 +1137,17 @@ class SessionRuntime:
                     (self.binding.sdk_session_id,),
                 )
                 if active_tasks is not None and int(active_tasks[0]) > 0:
-                    blockers.append(
-                        f"background_tasks_active:{int(active_tasks[0])}"
-                    )
+                    blockers.append(f"background_tasks_active:{int(active_tasks[0])}")
             if (
                 self._capabilities is not None
-                and self._capabilities.supports("remote")
-                and binding["runtime_remote_mode"] in {"on", "unknown"}
+                and self._capabilities.supports("remote_status")
+                and (
+                    binding["runtime_remote_mode"] in {"on", "unknown"}
+                    or (
+                        binding["runtime_remote_mode"] == "export"
+                        and not self._capabilities.supports("remote_export_detach_safe")
+                    )
+                )
             ):
                 blockers.append(f"remote_mode:{binding['runtime_remote_mode']}")
         return blockers
@@ -1016,9 +1169,7 @@ class SessionRuntime:
             error_type: str | None = None
             try:
                 await self._assert_owned_handle()
-                await self._sdk_call(
-                    self._bridge.ensure_allow_all(self._require_handle())
-                )
+                await self._sdk_call(self._bridge.ensure_allow_all(self._require_handle()))
             except asyncio.CancelledError:
                 raise
             except PermissionPostureError as error:
@@ -1057,9 +1208,7 @@ class SessionRuntime:
                     },
                 },
                 source="snapshot",
-                internal_event_id=(
-                    f"permissions:{self.binding.runtime_generation}:{epoch}"
-                ),
+                internal_event_id=(f"permissions:{self.binding.runtime_generation}:{epoch}"),
             )
 
     def _on_sdk_event_accepted(self, event: Any) -> None:
@@ -1079,6 +1228,14 @@ class SessionRuntime:
             topics.update({"activity", "queue"})
         if raw_type == "session.remote_steerable_changed":
             topics.add("remote")
+        if raw_type in {"commands.changed", "capabilities.changed"}:
+            topics.add("commands")
+        if raw_type in {
+            "session.custom_agents_updated",
+            "subagent.selected",
+            "subagent.deselected",
+        }:
+            topics.add("agents")
         if raw_type in {
             "session.schedule_created",
             "session.schedule_cancelled",
@@ -1088,7 +1245,7 @@ class SessionRuntime:
         if raw_type == "session.idle":
             topics.update({"activity", "queue", "tasks"})
         if loop is not None:
-            for topic in topics:
+            for topic in topics.intersection(self._supported_snapshot_topics()):
                 loop.call_soon_threadsafe(
                     self._enqueue_snapshot_request,
                     topic,
@@ -1128,9 +1285,7 @@ class SessionRuntime:
             await self._bridge.set_mode(handle, mode)
             observed = await self._bridge.get_mode(handle)
             if observed != mode:
-                raise RuntimeError(
-                    f"mode reconciliation returned {observed}; expected {mode}"
-                )
+                raise RuntimeError(f"mode reconciliation returned {observed}; expected {mode}")
             return observed
 
         try:
@@ -1235,17 +1390,12 @@ class SessionRuntime:
                     context_tier=context_tier,
                 )
             )
-            observed = await self._sdk_call(
-                self._bridge.get_current_model(handle)
-            )
+            observed = await self._sdk_call(self._bridge.get_current_model(handle))
             if observed.get("modelId") != model:
                 raise RuntimeError(
                     f"model reconciliation returned {observed.get('modelId')}; expected {model}"
                 )
-            if (
-                reasoning_effort is not None
-                and observed.get("reasoningEffort") != reasoning_effort
-            ):
+            if reasoning_effort is not None and observed.get("reasoningEffort") != reasoning_effort:
                 raise RuntimeError("model reasoning effort could not be confirmed")
             observed_tier = observed.get("contextTier")
             if context_tier is not None and observed_tier != context_tier:
@@ -1299,6 +1449,1532 @@ class SessionRuntime:
         await self._assert_owned_handle()
         return await self._bridge.get_usage(self._require_handle())
 
+    async def refresh_native_commands(self) -> tuple[dict[str, Any], ...]:
+        self._require_capability("commands_list")
+        await self._assert_owned_handle()
+        await self._query_snapshot_topic("commands")
+        await self._require_inbox().join()
+        return await self._native_manifest.available_builtins(self.binding.sdk_session_id)
+
+    async def invoke_native_command(
+        self,
+        command_name: str,
+        input_text: str | None,
+        *,
+        idempotency_key: str,
+    ) -> dict[str, Any]:
+        result = await self._invoke_command_operation(
+            command_name,
+            input_text,
+            idempotency_key=idempotency_key,
+            require_manifest=True,
+            require_quiet=True,
+        )
+        if result["kind"] != NativeCommandResultKind.AGENT_PROMPT.value:
+            return result
+        prompt = result.get("prompt")
+        if not isinstance(prompt, str) or not prompt:
+            raise NativeCapabilityError("runtime returned agent-prompt without a generated prompt")
+        invocation_id = self._native_id("command", idempotency_key)
+        submission_key = f"native-command:{invocation_id}:agent-prompt"
+        await self.send(
+            prompt,
+            idempotency_key=submission_key,
+            agent_mode=cast(AgentMode | None, result.get("mode")),
+            origin=f"builtin:{command_name}",
+        )
+        submission_id = self._native_id("submission", submission_key)
+        await self._require_inbox().commit_internal(
+            {
+                "type": "copilotd.native_command.settled",
+                "data": {
+                    "invocation_id": invocation_id,
+                    "state": "confirmed",
+                    "result_kind": result["kind"],
+                    "result": result,
+                    "agent_submission_id": submission_id,
+                    "settled_at": time.time(),
+                },
+            },
+            internal_event_id=f"native-command:{invocation_id}:agent-submission",
+        )
+        return {**result, "agent_submission_id": submission_id}
+
+    async def continue_native_command(
+        self,
+        selection_token: str,
+        selection: str,
+        *,
+        idempotency_key: str,
+    ) -> dict[str, Any]:
+        self._require_capability("commands_result_select_subcommand")
+        row = await self._database.fetchone(
+            """
+            SELECT command_name, result_json
+            FROM runtime_command_invocations
+            WHERE sdk_session_id = ? AND selection_token = ?
+              AND state = 'confirmed' AND result_kind = 'select-subcommand'
+            """,
+            (self.binding.sdk_session_id, selection_token),
+        )
+        if row is None or row["result_json"] is None:
+            raise NativeCapabilityError("native command selection is stale or invalid")
+        previous = json.loads(row["result_json"])
+        options = {
+            str(option["name"])
+            for option in previous.get("options", [])
+            if isinstance(option, dict) and option.get("name") is not None
+        }
+        if selection not in options:
+            raise ValueError("selection is not one of the runtime-provided options")
+        command = previous.get("command")
+        if not isinstance(command, str) or not command:
+            raise NativeCapabilityError("runtime selection result omitted its command")
+        await self._native_manifest.require_builtin(
+            self.binding.sdk_session_id,
+            str(row["command_name"]),
+        )
+        if command != str(row["command_name"]):
+            await self._native_manifest.require_builtin(
+                self.binding.sdk_session_id,
+                command,
+            )
+        return await self._invoke_command_operation(
+            command,
+            selection,
+            idempotency_key=idempotency_key,
+            require_manifest=True,
+            require_quiet=True,
+        )
+
+    async def _invoke_command_operation(
+        self,
+        command_name: str,
+        input_text: str | None,
+        *,
+        idempotency_key: str,
+        require_manifest: bool,
+        require_quiet: bool,
+    ) -> dict[str, Any]:
+        self._require_capability("commands_invoke")
+        await self._assert_dispatchable()
+        if require_quiet:
+            blockers = await self.operational_blockers()
+            if blockers:
+                raise DetachBlocked(blockers)
+        manifest_entry = (
+            await self._native_manifest.require_builtin(
+                self.binding.sdk_session_id,
+                command_name,
+            )
+            if require_manifest
+            else None
+        )
+        invocation_id = self._native_id("command", idempotency_key)
+        operation_key = f"native-command:{idempotency_key}"
+        input_hash = stable_hash(input_text) or hashlib.sha256(b"").hexdigest()
+
+        async def dispatch() -> dict[str, Any]:
+            await self._assert_owned_handle()
+            if manifest_entry is not None:
+                current_entry = await self._native_manifest.require_builtin(
+                    self.binding.sdk_session_id,
+                    command_name,
+                )
+                if current_entry["manifest_generation"] != manifest_entry["manifest_generation"]:
+                    raise OperationRejected("native command manifest changed before invocation")
+            operation_id = await self._operation_id(operation_key)
+            await self._require_inbox().commit_internal(
+                {
+                    "type": "copilotd.native_command.pending",
+                    "data": {
+                        "invocation_id": invocation_id,
+                        "operation_id": operation_id,
+                        "command_name": command_name,
+                        "input_hash": input_hash,
+                        "created_at": time.time(),
+                    },
+                },
+                internal_event_id=f"native-command:{invocation_id}:pending",
+            )
+            result = await self._sdk_call(
+                self._bridge.invoke_command(
+                    self._require_handle(),
+                    name=command_name,
+                    input_text=input_text,
+                )
+            )
+            payload = cast(dict[str, Any], result.to_dict())
+            result_kind = str(payload["kind"])
+            self._require_capability(f"commands_result_{result_kind.replace('-', '_')}")
+            selection_token = (
+                self._native_id("selection", invocation_id)
+                if payload["kind"] == NativeCommandResultKind.SELECT_SUBCOMMAND.value
+                else None
+            )
+            if selection_token is not None:
+                payload["selection_token"] = selection_token
+            return payload
+
+        try:
+            payload = cast(
+                dict[str, Any],
+                await self._require_mailbox().submit(
+                    kind="native-command",
+                    idempotency_key=operation_key,
+                    input_payload={
+                        "command_name": command_name,
+                        "input_hash": input_hash,
+                    },
+                    operation=dispatch,
+                ),
+            )
+        except OperationRejected:
+            await self._settle_native_command_failure(
+                invocation_id,
+                state="rejected",
+            )
+            raise
+        except OperationAmbiguous:
+            await self._settle_native_command_failure(
+                invocation_id,
+                state="unknown",
+            )
+            raise
+        await self._require_inbox().commit_internal(
+            {
+                "type": "copilotd.native_command.settled",
+                "data": {
+                    "invocation_id": invocation_id,
+                    "state": "confirmed",
+                    "result_kind": payload["kind"],
+                    "result": payload,
+                    "selection_token": payload.get("selection_token"),
+                    "settled_at": time.time(),
+                },
+            },
+            internal_event_id=f"native-command:{invocation_id}:confirmed",
+        )
+        return payload
+
+    async def _settle_native_command_failure(
+        self,
+        invocation_id: str,
+        *,
+        state: Literal["rejected", "unknown"],
+    ) -> None:
+        await self._require_inbox().commit_internal(
+            {
+                "type": "copilotd.native_command.settled",
+                "data": {
+                    "invocation_id": invocation_id,
+                    "state": state,
+                    "settled_at": time.time(),
+                },
+            },
+            internal_event_id=f"native-command:{invocation_id}:{state}",
+        )
+
+    async def ask_ephemeral(
+        self,
+        question: str,
+        *,
+        idempotency_key: str,
+    ) -> str:
+        self._require_capability("ephemeral_query")
+        if not question.strip():
+            raise ValueError("question cannot be empty")
+        blockers = await self.operational_blockers()
+        if blockers:
+            raise DetachBlocked(blockers)
+        query_id = self._native_id("ephemeral-query", idempotency_key)
+        operation_key = f"ephemeral-query:{idempotency_key}"
+        question_hash = stable_hash(question)
+
+        async def dispatch() -> str:
+            await self._assert_owned_handle()
+            handle = self._require_handle()
+            history_before = len(await handle.get_events())
+            receive_before = self._require_inbox().last_sdk_receive_seq
+            operation_id = await self._operation_id(operation_key)
+            await self._require_inbox().commit_internal(
+                {
+                    "type": "copilotd.ephemeral_query.pending",
+                    "data": {
+                        "query_id": query_id,
+                        "operation_id": operation_id,
+                        "question_hash": question_hash,
+                        "history_count_before": history_before,
+                        "sdk_receive_seq_before": receive_before,
+                        "created_at": time.time(),
+                    },
+                },
+                internal_event_id=f"ephemeral-query:{query_id}:pending",
+            )
+            answer = await self._sdk_call(self._bridge.ephemeral_query(handle, question))
+            await self._require_inbox().join()
+            history_after = len(await handle.get_events())
+            receive_after = self._require_inbox().last_sdk_receive_seq
+            tool_event = await self._database.fetchone(
+                """
+                SELECT 1 FROM event_journal
+                WHERE sdk_session_id = ?
+                  AND sdk_receive_seq > ? AND sdk_receive_seq <= ?
+                  AND raw_type LIKE 'tool.%'
+                LIMIT 1
+                """,
+                (
+                    self.binding.sdk_session_id,
+                    receive_before,
+                    receive_after,
+                ),
+            )
+            if history_after != history_before or tool_event is not None:
+                raise NativeCapabilityError(
+                    "ephemeral query violated its no-tools/no-history contract"
+                )
+            return {
+                "answer": answer,
+                "answer_hash": stable_hash(answer),
+                "history_count_after": history_after,
+                "sdk_receive_seq_after": receive_after,
+            }
+
+        try:
+            result = cast(
+                dict[str, Any],
+                await self._require_mailbox().submit(
+                    kind="ephemeral-query",
+                    idempotency_key=operation_key,
+                    input_payload={"question_hash": question_hash},
+                    operation=dispatch,
+                    result_persistence=lambda value: {
+                        "answer_hash": value["answer_hash"],
+                        "confirmed": True,
+                    },
+                ),
+            )
+            if "answer" not in result:
+                raise NativeCapabilityError(
+                    "ephemeral query already completed; its answer was not retained"
+                )
+            await self._require_inbox().commit_internal(
+                {
+                    "type": "copilotd.ephemeral_query.settled",
+                    "data": {
+                        "query_id": query_id,
+                        "history_count_after": result["history_count_after"],
+                        "sdk_receive_seq_after": result["sdk_receive_seq_after"],
+                        "answer_hash": result["answer_hash"],
+                        "state": "confirmed",
+                        "settled_at": time.time(),
+                    },
+                },
+                internal_event_id=f"ephemeral-query:{query_id}:confirmed",
+            )
+            return str(result["answer"])
+        except OperationRejected:
+            state = "rejected"
+            raise
+        except OperationAmbiguous:
+            state = "unknown"
+            raise
+        finally:
+            if "state" in locals():
+                await self._require_inbox().commit_internal(
+                    {
+                        "type": "copilotd.ephemeral_query.settled",
+                        "data": {
+                            "query_id": query_id,
+                            "state": state,
+                            "settled_at": time.time(),
+                        },
+                    },
+                    internal_event_id=f"ephemeral-query:{query_id}:{state}",
+                )
+
+    async def compact(
+        self,
+        focus: str | None,
+        *,
+        idempotency_key: str,
+    ) -> dict[str, Any]:
+        self._require_capability("history_compact")
+        blockers = await self.operational_blockers()
+        if blockers:
+            raise DetachBlocked(blockers)
+        compaction_id = self._native_id("compaction", idempotency_key)
+        operation_key = f"compact:{idempotency_key}"
+        unresolved = await self._database.fetchone(
+            """
+            SELECT compaction_id FROM compaction_runs
+            WHERE sdk_session_id = ?
+              AND state IN ('pending', 'started', 'unknown')
+            ORDER BY created_at DESC LIMIT 1
+            """,
+            (self.binding.sdk_session_id,),
+        )
+        if unresolved is not None and unresolved["compaction_id"] != compaction_id:
+            raise SessionNotReady(
+                "a prior compaction is unresolved; reconcile it before compacting again"
+            )
+
+        async def dispatch() -> dict[str, Any]:
+            await self._assert_owned_handle()
+            handle = self._require_handle()
+            operation_id = await self._operation_id(operation_key)
+            cursor = await self._database.fetchone(
+                "SELECT event_cursor FROM session_bindings WHERE sdk_session_id = ?",
+                (self.binding.sdk_session_id,),
+            )
+            context_before = await self._bridge.get_context(handle)
+            await self._require_inbox().commit_internal(
+                {
+                    "type": "copilotd.compaction.pending",
+                    "data": {
+                        "compaction_id": compaction_id,
+                        "operation_id": operation_id,
+                        "focus_hash": stable_hash(focus),
+                        "event_cursor_before": (None if cursor is None else cursor["event_cursor"]),
+                        "sdk_receive_seq_before": (self._require_inbox().last_sdk_receive_seq),
+                        "context_before": context_before,
+                        "created_at": time.time(),
+                    },
+                },
+                internal_event_id=f"compaction:{compaction_id}:pending",
+            )
+            result = await self._sdk_call(self._bridge.compact_history(handle, focus=focus))
+            if not result.get("success"):
+                raise OperationRejected(str(result.get("error") or "runtime rejected compaction"))
+            await self._require_inbox().join()
+            await self._recover_event_log(handle, initialize=False)
+            await self._require_inbox().join()
+            context_after = await self._bridge.get_context(handle)
+            return {
+                "compaction_id": compaction_id,
+                "result": result,
+                "context": context_after,
+            }
+
+        failure_state: Literal["rejected", "unknown"] | None = None
+        try:
+            compacted = cast(
+                dict[str, Any],
+                await self._require_mailbox().submit(
+                    kind="compact",
+                    idempotency_key=operation_key,
+                    input_payload={"focus_hash": stable_hash(focus)},
+                    operation=dispatch,
+                ),
+            )
+        except OperationRejected:
+            failure_state = "rejected"
+            raise
+        except OperationAmbiguous:
+            failure_state = "unknown"
+            raise
+        finally:
+            if failure_state is not None:
+                await self._require_inbox().commit_internal(
+                    {
+                        "type": "copilotd.compaction.settled",
+                        "data": {
+                            "compaction_id": compaction_id,
+                            "state": failure_state,
+                            "settled_at": time.time(),
+                        },
+                    },
+                    internal_event_id=(f"compaction:{compaction_id}:{failure_state}"),
+                )
+        await self._require_inbox().commit_internal(
+            {
+                "type": "copilotd.compaction.settled",
+                "data": {
+                    "compaction_id": compaction_id,
+                    "result": compacted["result"],
+                    "context_after": compacted["context"],
+                    "state": "confirmed",
+                    "settled_at": time.time(),
+                },
+            },
+            internal_event_id=f"compaction:{compaction_id}:confirmed",
+        )
+        return compacted
+
+    async def reconcile_compaction(self, compaction_id: str) -> str:
+        self._require_capability("history_compact")
+        await self._assert_owned_handle()
+        await self._recover_event_log(self._require_handle(), initialize=False)
+        await self._require_inbox().join()
+        row = await self._database.fetchone(
+            """
+            SELECT state FROM compaction_runs
+            WHERE compaction_id = ? AND sdk_session_id = ?
+            """,
+            (compaction_id, self.binding.sdk_session_id),
+        )
+        if row is None:
+            raise ValueError("compaction intent does not exist")
+        return str(row["state"])
+
+    async def start_fleet(
+        self,
+        prompt: str,
+        *,
+        idempotency_key: str,
+    ) -> dict[str, str]:
+        self._require_capability("fleet_start")
+        if not prompt.strip():
+            raise ValueError("Fleet prompt cannot be empty")
+        blockers = await self.operational_blockers()
+        if blockers:
+            raise DetachBlocked(blockers)
+        fleet_run_id = self._native_id("fleet", idempotency_key)
+        submission_id = self._native_id(
+            "submission",
+            f"fleet:{idempotency_key}",
+        )
+        operation_key = f"fleet:{idempotency_key}"
+        config = await self._database.fetchone(
+            """
+            SELECT runtime_mode, runtime_agent, runtime_session_config_version
+            FROM session_bindings WHERE sdk_session_id = ?
+            """,
+            (self.binding.sdk_session_id,),
+        )
+        if config is None:
+            raise SessionNotReady("Fleet execution configuration is unavailable")
+
+        async def dispatch() -> dict[str, str]:
+            await self._assert_owned_handle()
+            operation_id = await self._operation_id(operation_key)
+            await self._require_inbox().commit_internal(
+                {
+                    "type": "copilotd.fleet.pending",
+                    "data": {
+                        "fleet_run_id": fleet_run_id,
+                        "submission_id": submission_id,
+                        "operation_id": operation_id,
+                        "prompt_hash": stable_hash(prompt),
+                        "requested_mode": config["runtime_mode"],
+                        "requested_agent": config["runtime_agent"],
+                        "requested_session_config_version": config[
+                            "runtime_session_config_version"
+                        ],
+                        "created_at": time.time(),
+                    },
+                },
+                internal_event_id=f"fleet:{fleet_run_id}:pending",
+            )
+            if not await self._sdk_call(
+                self._bridge.start_fleet(self._require_handle(), prompt),
+                timeout_seconds=120,
+            ):
+                raise OperationRejected("runtime did not start Fleet")
+            result = {
+                "fleet_run_id": fleet_run_id,
+                "submission_id": submission_id,
+            }
+            return result
+
+        failure_state: Literal["rejected", "unknown"] | None = None
+        try:
+            result = cast(
+                dict[str, str],
+                await self._require_mailbox().submit(
+                    kind="fleet",
+                    idempotency_key=operation_key,
+                    input_payload={"prompt_hash": stable_hash(prompt)},
+                    operation=dispatch,
+                ),
+            )
+        except OperationRejected:
+            failure_state = "rejected"
+            raise
+        except OperationAmbiguous:
+            failure_state = "unknown"
+            raise
+        finally:
+            if failure_state is not None:
+                await self._require_inbox().commit_internal(
+                    {
+                        "type": "copilotd.fleet.settled",
+                        "data": {
+                            "fleet_run_id": fleet_run_id,
+                            "submission_id": submission_id,
+                            "state": failure_state,
+                            "settled_at": time.time(),
+                        },
+                    },
+                    internal_event_id=f"fleet:{fleet_run_id}:{failure_state}",
+                )
+        await self._require_inbox().commit_internal(
+            {
+                "type": "copilotd.fleet.settled",
+                "data": {
+                    **result,
+                    "state": "confirmed",
+                    "result": {"started": True},
+                    "settled_at": time.time(),
+                },
+            },
+            internal_event_id=f"fleet:{fleet_run_id}:confirmed",
+        )
+        return result
+
+    async def task_action(
+        self,
+        action: NativeTaskAction | str,
+        *,
+        task_id: str | None = None,
+        message: str | None = None,
+        wait_seconds: float = 30,
+        idempotency_key: str,
+    ) -> dict[str, Any]:
+        selected = NativeTaskAction(action)
+        capability = {
+            NativeTaskAction.LIST: "tasks_list",
+            NativeTaskAction.SHOW: "tasks_progress",
+            NativeTaskAction.PROGRESS: "tasks_progress",
+            NativeTaskAction.MESSAGE: "tasks_message",
+            NativeTaskAction.PROMOTE: "tasks_promote",
+            NativeTaskAction.CANCEL: "tasks_cancel",
+            NativeTaskAction.ALL: "tasks_cancel",
+            NativeTaskAction.REMOVE: "tasks_remove",
+            NativeTaskAction.WAIT: "tasks_wait",
+        }[selected]
+        self._require_capability(capability)
+        await self._assert_dispatchable()
+        if (
+            selected
+            in {
+                NativeTaskAction.SHOW,
+                NativeTaskAction.PROGRESS,
+                NativeTaskAction.MESSAGE,
+                NativeTaskAction.CANCEL,
+                NativeTaskAction.REMOVE,
+            }
+            and not task_id
+        ):
+            raise ValueError(f"task id is required for {selected.value}")
+        if selected == NativeTaskAction.MESSAGE and not (message or "").strip():
+            raise ValueError("task message cannot be empty")
+        if wait_seconds <= 0:
+            raise ValueError("task wait timeout must be positive")
+        action_id = self._native_id("task-action", idempotency_key)
+        operation_key = f"task:{idempotency_key}"
+        input_payload = {
+            "action": selected.value,
+            "task_id": task_id,
+            "message_hash": stable_hash(message),
+            "wait_seconds": wait_seconds if selected == NativeTaskAction.WAIT else None,
+        }
+
+        async def dispatch() -> dict[str, Any]:
+            await self._assert_owned_handle()
+            handle = self._require_handle()
+            operation_id = await self._operation_id(operation_key)
+            await self._require_inbox().commit_internal(
+                {
+                    "type": "copilotd.task_action.pending",
+                    "data": {
+                        "action_id": action_id,
+                        "operation_id": operation_id,
+                        "task_id": task_id,
+                        "action": selected.value,
+                        "input_hash": stable_hash(json_payload(input_payload)),
+                        "created_at": time.time(),
+                    },
+                },
+                internal_event_id=f"task-action:{action_id}:pending",
+            )
+            await self._bridge.refresh_tasks(handle)
+            tasks = await self._bridge.list_tasks(handle)
+            action_result: Any
+            if selected == NativeTaskAction.LIST:
+                action_result = {"listed": len(tasks)}
+            elif selected in {NativeTaskAction.SHOW, NativeTaskAction.PROGRESS}:
+                task = _task_by_id(tasks, cast(str, task_id))
+                progress = await self._bridge.get_task_progress(
+                    handle,
+                    cast(str, task_id),
+                )
+                action_result = {"task": task, "progress": progress}
+            elif selected == NativeTaskAction.MESSAGE:
+                action_result = await self._bridge.send_task_message(
+                    handle,
+                    cast(str, task_id),
+                    cast(str, message),
+                )
+                if not action_result.get("sent"):
+                    raise OperationRejected(
+                        str(action_result.get("error") or "task message was rejected")
+                    )
+            elif selected == NativeTaskAction.PROMOTE:
+                effective_id = task_id
+                if effective_id is None:
+                    current = await self._bridge.get_current_promotable_task(handle)
+                    if current is None:
+                        raise OperationRejected(
+                            "runtime has no current task eligible for promotion"
+                        )
+                    effective_id = str(current["id"])
+                _task_by_id(tasks, effective_id)
+                if not await self._bridge.promote_task(handle, effective_id):
+                    raise OperationRejected("runtime rejected task promotion")
+                action_result = {"promoted": True, "task_id": effective_id}
+            elif selected == NativeTaskAction.CANCEL:
+                _task_by_id(tasks, cast(str, task_id))
+                if not await self._bridge.cancel_task(handle, cast(str, task_id)):
+                    raise OperationRejected("runtime rejected task cancellation")
+                action_result = {"cancelled": [task_id]}
+            elif selected == NativeTaskAction.ALL:
+                cancellable = [
+                    str(task["id"])
+                    for task in tasks
+                    if str(task.get("status", "")).lower() not in TERMINAL_TASK_STATES
+                ]
+                cancelled: list[str] = []
+                rejected: list[str] = []
+                for candidate in cancellable:
+                    if await self._bridge.cancel_task(handle, candidate):
+                        cancelled.append(candidate)
+                    else:
+                        rejected.append(candidate)
+                if rejected and not cancelled:
+                    raise OperationRejected(
+                        "runtime rejected cancellation for: " + ", ".join(rejected)
+                    )
+                action_result = {
+                    "cancelled": cancelled,
+                    "rejected": rejected,
+                    "partial": bool(cancelled and rejected),
+                }
+            elif selected == NativeTaskAction.REMOVE:
+                task = _task_by_id(tasks, cast(str, task_id))
+                if str(task.get("status", "")).lower() not in TERMINAL_TASK_STATES:
+                    raise OperationRejected("only terminal tasks can be removed")
+                if not await self._bridge.remove_task(handle, cast(str, task_id)):
+                    raise OperationRejected("runtime rejected task removal")
+                action_result = {"removed": True, "task_id": task_id}
+            else:
+                await self._bridge.wait_for_tasks(
+                    handle,
+                    wait_seconds=wait_seconds,
+                )
+                action_result = {"waited": True}
+            await self._bridge.refresh_tasks(handle)
+            tasks = await self._bridge.list_tasks(handle)
+            await self._require_inbox().commit_internal(
+                {
+                    "type": "copilotd.tasks.snapshot",
+                    "data": {
+                        "tasks": tasks,
+                        "observed_at": time.time(),
+                    },
+                },
+                source="snapshot",
+                internal_event_id=f"task-action:{action_id}:snapshot",
+            )
+            if selected == NativeTaskAction.SHOW and task_id is not None:
+                card = await self._taskdeck.task(
+                    self.binding.sdk_session_id,
+                    task_id,
+                )
+                if card is not None:
+                    panel_id = str(
+                        uuid.uuid5(
+                            uuid.NAMESPACE_URL,
+                            f"copilotd:{self.binding.sdk_session_id}:taskdeck",
+                        )
+                    )[:16]
+                    await self._require_inbox().commit_internal(
+                        {
+                            "type": "copilotd.taskdeck.view_changed",
+                            "data": {
+                                "panel_id": panel_id,
+                                "selected_card_token": card.card_token,
+                                "page": 0,
+                                "expanded": True,
+                            },
+                        },
+                        internal_event_id=f"task-action:{action_id}:focus",
+                    )
+            return {"action": selected.value, "result": action_result, "tasks": tasks}
+
+        failure_state: Literal["rejected", "unknown"] | None = None
+        try:
+            result = cast(
+                dict[str, Any],
+                await self._require_mailbox().submit(
+                    kind=f"task-{selected.value}",
+                    idempotency_key=operation_key,
+                    input_payload=input_payload,
+                    operation=dispatch,
+                ),
+            )
+        except OperationRejected:
+            failure_state = "rejected"
+            raise
+        except OperationAmbiguous:
+            failure_state = "unknown"
+            raise
+        finally:
+            if failure_state is not None:
+                await self._require_inbox().commit_internal(
+                    {
+                        "type": "copilotd.task_action.settled",
+                        "data": {
+                            "action_id": action_id,
+                            "state": failure_state,
+                            "settled_at": time.time(),
+                        },
+                    },
+                    internal_event_id=f"task-action:{action_id}:{failure_state}",
+                )
+        await self._require_inbox().commit_internal(
+            {
+                "type": "copilotd.task_action.settled",
+                "data": {
+                    "action_id": action_id,
+                    "state": "confirmed",
+                    "result": result["result"],
+                    "settled_at": time.time(),
+                },
+            },
+            internal_event_id=f"task-action:{action_id}:confirmed",
+        )
+        cards = await self._taskdeck.cards(self.binding.sdk_session_id)
+        result["taskdeck"] = [
+            {
+                "card_token": card.card_token,
+                "task_id": card.task_id,
+                "agent_id": card.agent_id,
+                "kind": card.kind,
+                "title": card.title,
+                "state": card.state,
+                "progress_summary": card.progress_summary,
+                "terminal_at": card.terminal_at,
+            }
+            for card in cards
+        ]
+        return result
+
+    async def list_agents(self) -> dict[str, Any]:
+        self._require_capability("agents_list")
+        self._require_capability("agents_current")
+        await self._assert_owned_handle()
+        await self._query_snapshot_topic("agents")
+        await self._require_inbox().join()
+        refresh = await self._database.fetchone(
+            """
+            SELECT applied_epoch FROM reconciliation_state
+            WHERE sdk_session_id = ? AND topic = 'agents'
+            """,
+            (self.binding.sdk_session_id,),
+        )
+        rows = await self._database.fetchall(
+            """
+            SELECT agent_name, agent_id, display_name, description, source,
+                   user_invocable, metadata_json, manifest_generation
+            FROM runtime_agent_manifest
+            WHERE sdk_session_id = ? AND state = 'available'
+            ORDER BY agent_name
+            """,
+            (self.binding.sdk_session_id,),
+        )
+        current = await self._database.fetchone(
+            "SELECT runtime_agent FROM session_bindings WHERE sdk_session_id = ?",
+            (self.binding.sdk_session_id,),
+        )
+        return {
+            "generation": 0 if refresh is None else int(refresh["applied_epoch"]),
+            "agents": [
+                {
+                    **dict(row),
+                    "metadata": json.loads(row["metadata_json"]),
+                }
+                for row in rows
+            ],
+            "current": "unknown" if current is None else str(current["runtime_agent"]),
+        }
+
+    async def current_agent(self) -> dict[str, Any]:
+        listing = await self.list_agents()
+        current = next(
+            (agent for agent in listing["agents"] if agent["agent_name"] == listing["current"]),
+            None,
+        )
+        return {
+            "generation": listing["generation"],
+            "name": listing["current"],
+            "agent": current,
+        }
+
+    async def select_agent(
+        self,
+        name: str,
+        *,
+        idempotency_key: str,
+    ) -> str:
+        self._require_capability("agents_select")
+        if not name.strip():
+            raise ValueError("agent name cannot be empty")
+        listing = await self.list_agents()
+        candidate = next(
+            (agent for agent in listing["agents"] if agent["agent_name"] == name),
+            None,
+        )
+        if candidate is None:
+            raise ValueError(f"runtime agent is unavailable: {name}")
+        if candidate["user_invocable"] == 0:
+            raise NativeCapabilityError(f"runtime agent is not user-invocable: {name}")
+        return await self._change_agent(
+            name,
+            idempotency_key=idempotency_key,
+        )
+
+    async def deselect_agent(self, *, idempotency_key: str) -> str:
+        self._require_capability("agents_deselect")
+        return await self._change_agent(
+            "default",
+            idempotency_key=idempotency_key,
+        )
+
+    async def _change_agent(
+        self,
+        target: str,
+        *,
+        idempotency_key: str,
+    ) -> str:
+        blockers = await self.operational_blockers()
+        if blockers:
+            raise DetachBlocked(blockers)
+        transition_id = self._native_id("agent-transition", idempotency_key)
+        operation_key = f"agent:{idempotency_key}"
+        state = await self._database.fetchone(
+            "SELECT runtime_agent FROM session_bindings WHERE sdk_session_id = ?",
+            (self.binding.sdk_session_id,),
+        )
+        if state is None:
+            raise SessionNotReady("selected-agent projection is unavailable")
+        previous = str(state["runtime_agent"])
+
+        async def dispatch() -> str:
+            await self._assert_owned_handle()
+            operation_id = await self._operation_id(operation_key)
+            await self._require_inbox().commit_internal(
+                {
+                    "type": "copilotd.agent_transition.pending",
+                    "data": {
+                        "transition_id": transition_id,
+                        "operation_id": operation_id,
+                        "previous_agent": previous,
+                        "target_agent": target,
+                        "created_at": time.time(),
+                    },
+                },
+                internal_event_id=f"agent-transition:{transition_id}:pending",
+            )
+            claim = await self._database.fetchone(
+                """
+                SELECT runtime_agent, pending_agent, pending_agent_transition_id
+                FROM session_bindings WHERE sdk_session_id = ?
+                """,
+                (self.binding.sdk_session_id,),
+            )
+            if (
+                claim is None
+                or claim["runtime_agent"] != previous
+                or claim["pending_agent"] != target
+                or claim["pending_agent_transition_id"] != transition_id
+            ):
+                raise OperationRejected(
+                    "selected-agent transition lost its durable admission claim"
+                )
+            handle = self._require_handle()
+            if target == "default":
+                await self._sdk_call(self._bridge.deselect_agent(handle))
+            else:
+                await self._sdk_call(self._bridge.select_agent(handle, target))
+            observed = await self._sdk_call(self._bridge.get_current_agent(handle))
+            if observed != target:
+                raise RuntimeError(f"agent reconciliation returned {observed}; expected {target}")
+            return observed
+
+        failure_state: Literal["rejected", "unknown"] | None = None
+        try:
+            observed = await self._require_mailbox().submit(
+                kind="agent",
+                idempotency_key=operation_key,
+                input_payload={"target": target},
+                operation=dispatch,
+            )
+        except OperationRejected:
+            failure_state = "rejected"
+            raise
+        except OperationAmbiguous:
+            failure_state = "unknown"
+            raise
+        finally:
+            if failure_state is not None:
+                await self._require_inbox().commit_internal(
+                    {
+                        "type": "copilotd.agent_transition.settled",
+                        "data": {
+                            "transition_id": transition_id,
+                            "target_agent": target,
+                            "state": failure_state,
+                            "settled_at": time.time(),
+                        },
+                    },
+                    internal_event_id=(f"agent-transition:{transition_id}:{failure_state}"),
+                )
+        await self._require_inbox().commit_internal(
+            {
+                "type": "copilotd.agent_transition.settled",
+                "data": {
+                    "transition_id": transition_id,
+                    "target_agent": target,
+                    "state": "confirmed",
+                    "result": {"agent": observed},
+                    "settled_at": time.time(),
+                },
+            },
+            internal_event_id=f"agent-transition:{transition_id}:confirmed",
+        )
+        latest = await self._bindings.by_thread(self.binding.thread_id)
+        if latest is not None:
+            self.binding = latest
+        return str(observed)
+
+    async def runtime_schedules(
+        self,
+        *,
+        kind: Literal["after", "every"] | None = None,
+    ) -> list[dict[str, Any]]:
+        self._require_capability("schedules_list")
+        await self._assert_owned_handle()
+        await self._query_snapshot_topic("schedules")
+        await self._require_inbox().join()
+        parameters: tuple[Any, ...] = (self.binding.sdk_session_id,)
+        filter_sql = ""
+        if kind is not None:
+            filter_sql = " AND schedule_kind = ?"
+            parameters += (kind,)
+        rows = await self._database.fetchall(
+            f"""
+            SELECT * FROM runtime_schedules
+            WHERE sdk_session_id = ?{filter_sql}
+            ORDER BY CASE WHEN state IN ('active', 'unknown') THEN 0 ELSE 1 END,
+                     next_run_at, runtime_schedule_id
+            """,
+            parameters,
+        )
+        return [dict(row) for row in rows]
+
+    async def create_runtime_schedule(
+        self,
+        kind: Literal["after", "every"],
+        expression: str,
+        prompt: str,
+        *,
+        idempotency_key: str,
+    ) -> dict[str, Any]:
+        self._require_capability(f"builtin_{kind}")
+        self._require_capability("schedules_list")
+        if not expression.strip() or not prompt.strip():
+            raise ValueError("schedule expression and prompt are required")
+        action_id = self._native_id(
+            "schedule-action",
+            f"{kind}:{idempotency_key}",
+        )
+        invocation_key = f"schedule:{kind}:{idempotency_key}"
+        invocation_id = self._native_id("command", invocation_key)
+        invocation_input = f"{expression.strip()} {prompt.strip()}"
+        input_hash = stable_hash(f"{kind}:{invocation_input}")
+
+        async with self._native_schedule_lock:
+            existing = await self._database.fetchone(
+                """
+                SELECT state, runtime_schedule_id, input_hash, baseline_json,
+                       builtin_name
+                FROM runtime_schedule_actions
+                WHERE action_id = ? AND sdk_session_id = ?
+                """,
+                (action_id, self.binding.sdk_session_id),
+            )
+            if existing is not None and existing["input_hash"] != input_hash:
+                raise ValueError("schedule idempotency key was reused with different input")
+            if existing is not None and existing["builtin_name"] != kind:
+                raise ValueError("schedule idempotency key was reused for another kind")
+            if existing is None:
+                before = {
+                    str(item["runtime_schedule_id"])
+                    for item in await self.runtime_schedules()
+                    if item["state"] in {"active", "unknown"}
+                }
+                await self._require_inbox().commit_internal(
+                    {
+                        "type": "copilotd.schedule_action.pending",
+                        "data": {
+                            "action_id": action_id,
+                            "builtin_name": kind,
+                            "action": "create",
+                            "input_hash": input_hash,
+                            "baseline_ids": sorted(before),
+                            "created_at": time.time(),
+                        },
+                    },
+                    internal_event_id=f"schedule-action:{action_id}:pending",
+                )
+            else:
+                before = set(json.loads(existing["baseline_json"] or "[]"))
+                if existing["runtime_schedule_id"] is not None:
+                    schedules = await self.runtime_schedules(kind=kind)
+                    confirmed = next(
+                        (
+                            item
+                            for item in schedules
+                            if str(item["runtime_schedule_id"])
+                            == str(existing["runtime_schedule_id"])
+                        ),
+                        None,
+                    )
+                    if confirmed is not None:
+                        return confirmed
+
+            async def find_created() -> list[dict[str, Any]]:
+                deadline = asyncio.get_running_loop().time() + 10
+                while True:
+                    schedules = await self.runtime_schedules(kind=kind)
+                    created = [
+                        item
+                        for item in schedules
+                        if str(item["runtime_schedule_id"]) not in before
+                        and item["state"] == "active"
+                    ]
+                    if created or asyncio.get_running_loop().time() >= deadline:
+                        return created
+                    await asyncio.sleep(0.25)
+
+            if existing is not None:
+                created = await find_created()
+                if len(created) == 1:
+                    await self._confirm_schedule_create(
+                        action_id,
+                        invocation_id,
+                        kind,
+                        created[0],
+                    )
+                    return created[0]
+                if len(created) > 1:
+                    raise NativeCapabilityError(f"{kind} schedule reconciliation is ambiguous")
+
+            try:
+                result = await self._invoke_command_operation(
+                    kind,
+                    invocation_input,
+                    idempotency_key=invocation_key,
+                    require_manifest=True,
+                    require_quiet=True,
+                )
+            except OperationAmbiguous:
+                created = await find_created()
+                if len(created) == 1:
+                    await self._confirm_schedule_create(
+                        action_id,
+                        invocation_id,
+                        kind,
+                        created[0],
+                    )
+                    return created[0]
+                await self._settle_schedule_create_unknown(action_id)
+                raise
+            if result["kind"] != NativeCommandResultKind.COMPLETED.value:
+                await self._settle_schedule_create_unknown(action_id)
+                raise NativeCapabilityError(f"{kind} did not complete schedule creation directly")
+            created = await find_created()
+            if len(created) != 1:
+                await self._settle_schedule_create_unknown(action_id)
+                raise NativeCapabilityError(
+                    f"{kind} invocation did not produce one identifiable runtime schedule"
+                )
+            await self._confirm_schedule_create(
+                action_id,
+                invocation_id,
+                kind,
+                created[0],
+            )
+            return created[0]
+
+    async def _confirm_schedule_create(
+        self,
+        action_id: str,
+        invocation_id: str,
+        kind: Literal["after", "every"],
+        schedule: dict[str, Any],
+    ) -> None:
+        await self._require_inbox().commit_internal(
+            {
+                "type": "copilotd.schedule_action.settled",
+                "data": {
+                    "action_id": action_id,
+                    "runtime_schedule_id": schedule["runtime_schedule_id"],
+                    "invocation_id": invocation_id,
+                    "action": "create",
+                    "state": "confirmed",
+                    "result": {
+                        "kind": kind,
+                        "runtime_schedule_id": schedule["runtime_schedule_id"],
+                    },
+                    "settled_at": time.time(),
+                },
+            },
+            internal_event_id=f"schedule-action:{action_id}:confirmed",
+        )
+
+    async def _settle_schedule_create_unknown(self, action_id: str) -> None:
+        await self._require_inbox().commit_internal(
+            {
+                "type": "copilotd.schedule_action.settled",
+                "data": {
+                    "action_id": action_id,
+                    "action": "create",
+                    "state": "unknown",
+                    "settled_at": time.time(),
+                },
+            },
+            internal_event_id=f"schedule-action:{action_id}:unknown",
+        )
+
+    async def cancel_runtime_schedule(
+        self,
+        kind: Literal["after", "every"],
+        schedule_id: str,
+        *,
+        idempotency_key: str,
+    ) -> dict[str, Any]:
+        self._require_capability("schedules_stop")
+        schedules = await self.runtime_schedules(kind=kind)
+        schedule = next(
+            (item for item in schedules if str(item["runtime_schedule_id"]) == schedule_id),
+            None,
+        )
+        if schedule is None:
+            raise ValueError(f"{kind} schedule does not exist: {schedule_id}")
+        if schedule["state"] not in {"active", "unknown"}:
+            return schedule
+        action_id = self._native_id(
+            "schedule-action",
+            f"{kind}:{idempotency_key}",
+        )
+        operation_key = f"schedule-stop:{idempotency_key}"
+
+        async def dispatch() -> dict[str, Any]:
+            await self._assert_owned_handle()
+            operation_id = await self._operation_id(operation_key)
+            await self._require_inbox().commit_internal(
+                {
+                    "type": "copilotd.schedule_action.pending",
+                    "data": {
+                        "action_id": action_id,
+                        "operation_id": operation_id,
+                        "runtime_schedule_id": schedule_id,
+                        "builtin_name": kind,
+                        "action": "cancel",
+                        "input_hash": stable_hash(schedule_id),
+                        "created_at": time.time(),
+                    },
+                },
+                internal_event_id=f"schedule-action:{action_id}:pending",
+            )
+            stopped = await self._sdk_call(
+                self._bridge.stop_native_schedule(
+                    self._require_handle(),
+                    int(schedule_id),
+                )
+            )
+            if stopped is None:
+                raise OperationRejected(
+                    f"runtime did not confirm cancellation of schedule {schedule_id}"
+                )
+            if str(stopped.get("id")) != schedule_id:
+                raise RuntimeError("schedule.stop returned a different runtime schedule")
+            remaining = await self._bridge.get_native_schedules(self._require_handle())
+            if any(str(item.get("id")) == schedule_id for item in remaining):
+                raise RuntimeError("schedule remained active after schedule.stop")
+            return stopped
+
+        failure_state: Literal["rejected", "unknown"] | None = None
+        try:
+            stopped = await self._require_mailbox().submit(
+                kind="schedule-stop",
+                idempotency_key=operation_key,
+                input_payload={"kind": kind, "schedule_id": schedule_id},
+                operation=dispatch,
+            )
+        except OperationRejected:
+            failure_state = "rejected"
+            raise
+        except OperationAmbiguous:
+            failure_state = "unknown"
+            raise
+        finally:
+            if failure_state is not None:
+                await self._require_inbox().commit_internal(
+                    {
+                        "type": "copilotd.schedule_action.settled",
+                        "data": {
+                            "action_id": action_id,
+                            "runtime_schedule_id": schedule_id,
+                            "action": "cancel",
+                            "state": failure_state,
+                            "settled_at": time.time(),
+                        },
+                    },
+                    internal_event_id=(f"schedule-action:{action_id}:{failure_state}"),
+                )
+        await self._require_inbox().commit_internal(
+            {
+                "type": "copilotd.schedule_action.settled",
+                "data": {
+                    "action_id": action_id,
+                    "runtime_schedule_id": schedule_id,
+                    "action": "cancel",
+                    "state": "confirmed",
+                    "result": stopped,
+                    "settled_at": time.time(),
+                },
+            },
+            internal_event_id=f"schedule-action:{action_id}:confirmed",
+        )
+        await self._query_snapshot_topic("schedules")
+        await self._require_inbox().join()
+        row = await self._database.fetchone(
+            """
+            SELECT * FROM runtime_schedules
+            WHERE sdk_session_id = ? AND runtime_schedule_id = ?
+            """,
+            (self.binding.sdk_session_id, schedule_id),
+        )
+        if row is None:
+            raise NativeCapabilityError("cancelled schedule projection disappeared")
+        return dict(row)
+
+    async def remote_status(self) -> dict[str, Any]:
+        self._require_capability("remote_status")
+        await self._assert_owned_handle()
+        prerequisites = await self._remote_preflight.status(
+            self._require_handle(),
+            str(self.binding.cwd_snapshot),
+        )
+        await self._query_snapshot_topic("remote")
+        await self._require_inbox().join()
+        row = await self._database.fetchone(
+            """
+            SELECT runtime_remote_mode, remote_url, remote_steerable,
+                   remote_observed_at, pending_remote_target,
+                   pending_remote_transition_id, remote_snapshot_json
+            FROM session_bindings WHERE sdk_session_id = ?
+            """,
+            (self.binding.sdk_session_id,),
+        )
+        if row is None:
+            raise SessionNotReady("remote session projection is unavailable")
+        return {
+            "mode": str(row["runtime_remote_mode"]),
+            "url": row["remote_url"],
+            "steerable": (
+                None if row["remote_steerable"] is None else bool(row["remote_steerable"])
+            ),
+            "observed_at": row["remote_observed_at"],
+            "pending_target": row["pending_remote_target"],
+            "pending_transition_id": row["pending_remote_transition_id"],
+            "snapshot": (
+                {}
+                if row["remote_snapshot_json"] is None
+                else json.loads(row["remote_snapshot_json"])
+            ),
+            "auth": {
+                "authenticated": prerequisites.authenticated,
+                "type": prerequisites.auth_type,
+                "host": prerequisites.auth_host,
+            },
+            "repository": {
+                "root": prerequisites.repository_root,
+                "host": prerequisites.repository_host,
+                "has_origin": prerequisites.has_origin,
+            },
+        }
+
+    async def set_remote(
+        self,
+        mode: NativeRemoteMode | Literal["off", "export", "on"],
+        *,
+        idempotency_key: str,
+    ) -> dict[str, Any]:
+        target = NativeRemoteMode(mode)
+        if target == NativeRemoteMode.UNKNOWN:
+            raise ValueError("remote mode cannot be set to unknown")
+        self._require_capability(
+            "remote_disable" if target == NativeRemoteMode.OFF else "remote_enable"
+        )
+        await self._assert_owned_handle()
+        prerequisites = await self._remote_preflight.status(
+            self._require_handle(),
+            str(self.binding.cwd_snapshot),
+        )
+        current_row = await self._database.fetchone(
+            """
+            SELECT runtime_remote_mode, pending_remote_transition_id
+            FROM session_bindings WHERE sdk_session_id = ?
+            """,
+            (self.binding.sdk_session_id,),
+        )
+        if current_row is None:
+            raise SessionNotReady("remote session projection is unavailable")
+        current = str(current_row["runtime_remote_mode"])
+        if (
+            current_row["pending_remote_transition_id"] is not None
+            and target != NativeRemoteMode.OFF
+        ):
+            raise SessionNotReady("remote transition is already pending")
+        if current == target.value:
+            return await self.remote_status()
+        if target in {NativeRemoteMode.ON, NativeRemoteMode.EXPORT}:
+            if current != NativeRemoteMode.OFF.value:
+                raise ValueError(f"remote {target.value} requires confirmed off state first")
+            blockers = await self.operational_blockers()
+        else:
+            blockers = await self.runtime_drained_blockers()
+        if blockers:
+            raise DetachBlocked(blockers)
+        transition_id = self._native_id("remote-transition", idempotency_key)
+        operation_key = f"remote:{idempotency_key}"
+
+        async def dispatch() -> dict[str, Any]:
+            await self._assert_owned_handle()
+            effective_prerequisites = (
+                prerequisites
+                if target == NativeRemoteMode.OFF
+                else await self._remote_preflight.inspect(
+                    self._require_handle(),
+                    str(self.binding.cwd_snapshot),
+                )
+            )
+            operation_id = await self._operation_id(operation_key)
+            preflight = effective_prerequisites.to_dict()
+            await self._require_inbox().commit_internal(
+                {
+                    "type": "copilotd.remote_transition.pending",
+                    "data": {
+                        "transition_id": transition_id,
+                        "operation_id": operation_id,
+                        "previous_mode": current,
+                        "target_mode": target.value,
+                        "auth": {
+                            "authenticated": preflight["authenticated"],
+                            "auth_type": preflight["auth_type"],
+                            "auth_host": preflight["auth_host"],
+                        },
+                        "repository": {
+                            "root": preflight["repository_root"],
+                            "host": preflight["repository_host"],
+                            "has_origin": preflight["has_origin"],
+                        },
+                        "snapshot": preflight["snapshot"],
+                        "created_at": time.time(),
+                    },
+                },
+                internal_event_id=f"remote-transition:{transition_id}:pending",
+            )
+            claim = await self._database.fetchone(
+                """
+                SELECT runtime_remote_mode, pending_remote_target,
+                       pending_remote_transition_id
+                FROM session_bindings WHERE sdk_session_id = ?
+                """,
+                (self.binding.sdk_session_id,),
+            )
+            if (
+                claim is None
+                or claim["runtime_remote_mode"] != current
+                or claim["pending_remote_target"] != target.value
+                or claim["pending_remote_transition_id"] != transition_id
+            ):
+                raise OperationRejected("remote transition lost its durable admission claim")
+            handle = self._require_handle()
+            url: str | None = None
+            if target == NativeRemoteMode.OFF:
+                await self._sdk_call(self._bridge.disable_remote(handle))
+            else:
+                result = await self._sdk_call(
+                    self._bridge.enable_remote(
+                        handle,
+                        cast(Literal["on", "export"], target.value),
+                    )
+                )
+                steerable = bool(result.get("remoteSteerable"))
+                if steerable != (target == NativeRemoteMode.ON):
+                    raise RuntimeError(
+                        "remote enable result contradicted the requested steerability"
+                    )
+                url = None if result.get("url") is None else str(result.get("url"))
+            snapshot = await self._bridge.get_remote_state(handle)
+            return {"mode": target.value, "url": url, "snapshot": snapshot}
+
+        failure_state: Literal["rejected", "unknown"] | None = None
+        try:
+            transition = cast(
+                dict[str, Any],
+                await self._require_mailbox().submit(
+                    kind="remote",
+                    idempotency_key=operation_key,
+                    input_payload={"target": target.value},
+                    operation=dispatch,
+                ),
+            )
+        except OperationRejected:
+            failure_state = "rejected"
+            raise
+        except OperationAmbiguous:
+            failure_state = "unknown"
+            raise
+        finally:
+            if failure_state is not None:
+                await self._require_inbox().commit_internal(
+                    {
+                        "type": "copilotd.remote_transition.settled",
+                        "data": {
+                            "transition_id": transition_id,
+                            "target_mode": target.value,
+                            "state": failure_state,
+                            "snapshot": {},
+                            "settled_at": time.time(),
+                        },
+                    },
+                    internal_event_id=(f"remote-transition:{transition_id}:{failure_state}"),
+                )
+        await self._require_inbox().commit_internal(
+            {
+                "type": "copilotd.remote_transition.settled",
+                "data": {
+                    "transition_id": transition_id,
+                    "target_mode": target.value,
+                    "state": "confirmed",
+                    "url": transition.get("url"),
+                    "snapshot": transition["snapshot"],
+                    "settled_at": time.time(),
+                },
+            },
+            internal_event_id=f"remote-transition:{transition_id}:confirmed",
+        )
+        latest = await self._bindings.by_thread(self.binding.thread_id)
+        if latest is not None:
+            self.binding = latest
+        return await self.remote_status()
+
     async def _handle_user_input_request(
         self,
         request: dict[str, Any],
@@ -1347,12 +3023,9 @@ class SessionRuntime:
             retry_after = request.get("retryAfterSeconds")
             suffix = "" if retry_after is None else f" Retry after {retry_after} seconds."
             payload["question"] = (
-                "Copilot reached an eligible rate limit. Switch to Auto mode?"
-                f"{suffix}"
+                f"Copilot reached an eligible rate limit. Switch to Auto mode?{suffix}"
             )
-        future: asyncio.Future[dict[str, Any] | str] = (
-            asyncio.get_running_loop().create_future()
-        )
+        future: asyncio.Future[dict[str, Any] | str] = asyncio.get_running_loop().create_future()
         self._interaction_futures[interaction_id] = future
         await self._require_inbox().commit_internal(
             {"type": "copilotd.interaction.requested", "data": payload},
@@ -1780,27 +3453,37 @@ class SessionRuntime:
     ) -> None:
         async with self._lifecycle_lock:
             await self._assert_owned_handle()
+            mailbox = self._require_mailbox()
             async with self._admission_lock:
                 self._accepting_sends = False
-                try:
-                    blockers = await self.detach_blockers()
-                except BaseException:
+            if not force:
+                await self._send_admissions_drained.wait()
+            try:
+                if not force:
+                    await mailbox.freeze_and_drain()
+                blockers = await self.detach_blockers()
+            except BaseException:
+                async with self._admission_lock:
                     self._accepting_sends = True
-                    raise
-                if blockers and not force:
+                if not force:
+                    mailbox.thaw()
+                raise
+            if blockers and not force:
+                async with self._admission_lock:
                     self._accepting_sends = True
-                    raise DetachBlocked(blockers)
+                mailbox.thaw()
+                raise DetachBlocked(blockers)
             if force and blockers:
                 await self.clear_queue()
-                await self.cancel_pending_interactions(
-                    reason="Cancelled by forced session close."
-                )
+                await self.cancel_pending_interactions(reason="Cancelled by forced session close.")
                 if self._inbox is not None and self._reducer is not None:
                     await self._force_active_unknown()
                 try:
                     await self.abort(idempotency_key=f"{idempotency_key}:force")
                 except (OperationAmbiguous, OperationRejected):
                     pass
+            if force:
+                await mailbox.freeze_and_drain()
 
             inbox = self._require_inbox()
             await inbox.join()
@@ -1809,7 +3492,6 @@ class SessionRuntime:
                 raise SessionNotReady("session binding disappeared before close")
             self.binding = await self._bindings.begin_close(current)
             self.state = RuntimeState.CLOSING
-            mailbox = self._require_mailbox()
 
             async def disconnect() -> None:
                 await self._assert_owned_handle(allow_closing=True)
@@ -1822,6 +3504,7 @@ class SessionRuntime:
                     idempotency_key=f"close:{idempotency_key}",
                     input_payload={"force": force},
                     operation=disconnect,
+                    allow_when_frozen=True,
                 )
                 succeeded = True
             finally:
@@ -1893,6 +3576,49 @@ class SessionRuntime:
                 blockers.append(blocker)
         return blockers
 
+    async def operational_blockers(self) -> list[str]:
+        return [
+            blocker
+            for blocker in await self.detach_blockers()
+            if not blocker.startswith("runtime_schedules:")
+        ]
+
+    async def runtime_drained_blockers(self) -> list[str]:
+        return [
+            blocker
+            for blocker in await self.operational_blockers()
+            if not blocker.startswith("remote_mode:")
+            and blocker
+            not in {
+                "remote_transition_pending",
+                "runtime_remote_unknown",
+            }
+        ]
+
+    def _require_capability(self, capability: str) -> None:
+        if self._capabilities is not None and not self._capabilities.supports(capability):
+            raise NativeCapabilityError(f"runtime capability is not verified: {capability}")
+
+    async def _operation_id(self, idempotency_key: str) -> str:
+        row = await self._database.fetchone(
+            """
+            SELECT operation_id FROM session_operations
+            WHERE sdk_session_id = ? AND idempotency_key = ?
+            """,
+            (self.binding.sdk_session_id, idempotency_key),
+        )
+        if row is None:
+            raise RuntimeError(f"native operation has no durable envelope: {idempotency_key}")
+        return str(row["operation_id"])
+
+    def _native_id(self, kind: str, key: str) -> str:
+        return str(
+            uuid.uuid5(
+                uuid.NAMESPACE_URL,
+                f"copilotd:{self.binding.sdk_session_id}:{kind}:{key}",
+            )
+        )
+
     async def _refresh_all_snapshots(self) -> None:
         # Flush callback-scheduled snapshot requests before selecting the latest epochs.
         await asyncio.sleep(0)
@@ -1955,9 +3681,7 @@ class SessionRuntime:
                 and self._capabilities.supports("sessions_check_in_use")
             ):
                 try:
-                    in_use = await self._bridge.check_session_in_use(
-                        self.binding.sdk_session_id
-                    )
+                    in_use = await self._bridge.check_session_in_use(self.binding.sdk_session_id)
                 except Exception as error:
                     self.binding = await self._bindings.mark_attach_unknown(self.binding)
                     lease = self._lease
@@ -2056,6 +3780,15 @@ class SessionRuntime:
                 raise
 
             self.binding = await self._bindings.mark_attached(self.binding)
+            self._mailbox = CommandMailbox(
+                store=OperationStore(self._database, self._require_inbox()),
+                sdk_session_id=self.binding.sdk_session_id,
+                runtime_generation=self.binding.runtime_generation,
+                owner_fence_token=self._require_fence_token(),
+                fence_validator=self._is_mutation_safe_owner,
+                task_registry=self._tasks,
+            )
+            self._mailbox.start()
             try:
                 observed_mode = await self._sdk_call(self._bridge.get_mode(handle))
             except Exception:
@@ -2099,20 +3832,14 @@ class SessionRuntime:
                             "data": {"observed": observed_model},
                         },
                         internal_event_id=(
-                            f"model:{self.binding.runtime_generation}:"
-                            f"initial:{observed_hash}"
+                            f"model:{self.binding.runtime_generation}:initial:{observed_hash}"
                         ),
                     )
             elif desired_model:
                 self.state = RuntimeState.DEGRADED
                 raise SessionNotReady("runtime model reconciliation is unavailable")
-            if (
-                self._capabilities is not None
-                and self._capabilities.supports("selected_agent")
-            ):
-                observed_agent = await self._sdk_call(
-                    self._bridge.get_current_agent(handle)
-                )
+            if self._capabilities is not None and self._capabilities.supports("agents_current"):
+                observed_agent = await self._sdk_call(self._bridge.get_current_agent(handle))
                 await self._require_inbox().commit_internal(
                     {
                         "type": "copilotd.agent.observed",
@@ -2135,29 +3862,64 @@ class SessionRuntime:
             await self._require_inbox().commit_internal(
                 {
                     "type": "copilotd.config.observed",
-                    "data": {
-                        "version": int(config_row["desired_session_config_version"])
-                    },
+                    "data": {"version": int(config_row["desired_session_config_version"])},
                 },
                 internal_event_id=(
                     f"config:{self.binding.runtime_generation}:"
                     f"{int(config_row['desired_session_config_version'])}"
                 ),
             )
+            remote_status_supported = (
+                self._capabilities is not None and self._capabilities.supports("remote_status")
+            )
+            remote_basis: str | None = None
+            if create and remote_status_supported:
+                remote_basis = "fresh_create"
+            elif (
+                not create
+                and remote_status_supported
+                and self._capabilities is not None
+                and self._capabilities.supports("remote_disable")
+            ):
+                remote_row = await self._database.fetchone(
+                    """
+                    SELECT runtime_remote_mode FROM session_bindings
+                    WHERE sdk_session_id = ?
+                    """,
+                    (self.binding.sdk_session_id,),
+                )
+                if remote_row is not None and remote_row["runtime_remote_mode"] == "unknown":
+
+                    async def disable_unknown_remote() -> None:
+                        await self._assert_owned_handle(allow_attaching=True)
+                        await self._sdk_call(self._bridge.disable_remote(handle))
+
+                    await self._require_mailbox().submit(
+                        kind="remote-reconcile-off",
+                        idempotency_key=(f"remote-reconcile-off:{self.binding.runtime_generation}"),
+                        input_payload={"target": "off", "basis": "resume_unknown"},
+                        operation=disable_unknown_remote,
+                    )
+                    remote_basis = "resume_disable_confirmed"
+            if remote_basis is not None:
+                await self._require_inbox().commit_internal(
+                    {
+                        "type": "copilotd.remote.observed",
+                        "data": {
+                            "mode": "off",
+                            "steerable": False,
+                            "snapshot": {"basis": remote_basis},
+                            "clear_pending": (remote_basis == "resume_disable_confirmed"),
+                            "observed_at": time.time(),
+                        },
+                    },
+                    internal_event_id=(f"remote:{self.binding.runtime_generation}:{remote_basis}"),
+                )
             await self._prime_readiness()
             observed_binding = await self._bindings.by_thread(self.binding.thread_id)
             if observed_binding is None:
                 raise SessionNotReady("session binding disappeared during mode reconciliation")
             self.binding = observed_binding
-            self._mailbox = CommandMailbox(
-                store=OperationStore(self._database, self._require_inbox()),
-                sdk_session_id=self.binding.sdk_session_id,
-                runtime_generation=self.binding.runtime_generation,
-                owner_fence_token=self._require_fence_token(),
-                fence_validator=self._is_mutation_safe_owner,
-                task_registry=self._tasks,
-            )
-            self._mailbox.start()
             self.state = RuntimeState.READY
             async with self._admission_lock:
                 self._accepting_sends = True
@@ -2210,7 +3972,10 @@ class SessionRuntime:
 
         self._reducer = EventReducerWorker(
             inbox=self._inbox,
-            reducer=JournalReducer(self._database),
+            reducer=JournalReducer(
+                self._database,
+                require_binding_fence=True,
+            ),
             batch_size=self._reducer_batch_size,
             fence_validator=validate,
             task_registry=self._tasks,
@@ -2248,12 +4013,8 @@ class SessionRuntime:
             (self.binding.sdk_session_id,),
         )
         cursor = None if cursor_state is None else cursor_state["event_cursor"]
-        cursor_epoch = (
-            0 if cursor_state is None else int(cursor_state["event_cursor_epoch"])
-        )
-        predecessor_id = (
-            None if cursor_state is None else cursor_state["event_predecessor_id"]
-        )
+        cursor_epoch = 0 if cursor_state is None else int(cursor_state["event_cursor_epoch"])
+        predecessor_id = None if cursor_state is None else cursor_state["event_predecessor_id"]
         if initialize:
             tail = await self._bridge.tail_event_log(handle)
             await self._advance_event_cursor(
@@ -2351,8 +4112,7 @@ class SessionRuntime:
             },
             source="snapshot",
             internal_event_id=(
-                f"event-cursor:{self.binding.runtime_generation}:"
-                f"{cursor_epoch}:{cursor_hash}"
+                f"event-cursor:{self.binding.runtime_generation}:{cursor_epoch}:{cursor_hash}"
             ),
         )
 
@@ -2394,9 +4154,7 @@ class SessionRuntime:
                     "ingress_overflow",
                     {
                         "first_lost_inbox_seq": incident.first_lost_inbox_seq,
-                        "first_lost_sdk_receive_seq": (
-                            incident.first_lost_sdk_receive_seq
-                        ),
+                        "first_lost_sdk_receive_seq": (incident.first_lost_sdk_receive_seq),
                         "lost_count": incident.lost_count,
                     },
                 )
@@ -2451,9 +4209,7 @@ class SessionRuntime:
             runtime_generation=self.binding.runtime_generation,
             owner_fence_token=self._require_fence_token(),
             kind="recovery_disconnect",
-            idempotency_key=(
-                f"{reason}:{self.binding.runtime_generation}:disconnect"
-            ),
+            idempotency_key=(f"{reason}:{self.binding.runtime_generation}:disconnect"),
             input_payload={},
         )
         if not created:
@@ -2647,8 +4403,15 @@ class SessionRuntime:
             internal_event_id=f"submissions:{receipt_id}:active-unknown",
         )
 
-    async def _sdk_call(self, operation: Awaitable[T]) -> T:
-        async with asyncio.timeout(self._sdk_operation_timeout_seconds):
+    async def _sdk_call(
+        self,
+        operation: Awaitable[T],
+        *,
+        timeout_seconds: float | None = None,
+    ) -> T:
+        async with asyncio.timeout(
+            self._sdk_operation_timeout_seconds if timeout_seconds is None else timeout_seconds
+        ):
             return await operation
 
     async def _cancel_component_task(
@@ -2687,9 +4450,7 @@ class SessionRuntime:
             self._permission_reconcile_task = None
         if self._mailbox is not None:
             try:
-                await self._mailbox.stop(
-                    timeout_seconds=self._shutdown_timeout_seconds
-                )
+                await self._mailbox.stop(timeout_seconds=self._shutdown_timeout_seconds)
             except Exception as error:
                 errors.append(error)
             self._mailbox = None
@@ -2699,9 +4460,7 @@ class SessionRuntime:
             self._renewal_task = None
         if self._reducer is not None:
             try:
-                await self._reducer.stop(
-                    timeout_seconds=self._shutdown_timeout_seconds
-                )
+                await self._reducer.stop(timeout_seconds=self._shutdown_timeout_seconds)
             except Exception as error:
                 errors.append(error)
             self._reducer = None
@@ -2743,6 +4502,13 @@ class SessionRuntime:
 def _consume_task_result(task: asyncio.Task[Any]) -> None:
     if not task.cancelled():
         task.exception()
+
+
+def _task_by_id(tasks: list[dict[str, Any]], task_id: str) -> dict[str, Any]:
+    task = next((item for item in tasks if str(item.get("id")) == task_id), None)
+    if task is None:
+        raise ValueError(f"runtime task does not exist: {task_id}")
+    return task
 
 
 def _model_config_matches(

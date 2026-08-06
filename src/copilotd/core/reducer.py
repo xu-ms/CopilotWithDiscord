@@ -12,6 +12,7 @@ from copilotd.core.event_adapter import EventAdapter, InvalidSdkEvent
 from copilotd.core.inbox import ReducerInbox
 from copilotd.core.interactions import interaction_target_mode
 from copilotd.core.models import AdaptedEvent, InboxEnvelope, RenderIntent
+from copilotd.core.native import stable_hash, timestamp_seconds
 from copilotd.core.task_registry import TaskRegistry
 from copilotd.storage.database import Database
 
@@ -174,15 +175,39 @@ class RenderPlanner:
 class JournalReducer:
     """Atomically persists event journal rows and their render intents."""
 
-    def __init__(self, database: Database, planner: RenderPlanner | None = None) -> None:
+    def __init__(
+        self,
+        database: Database,
+        planner: RenderPlanner | None = None,
+        *,
+        require_binding_fence: bool = False,
+    ) -> None:
         self._database = database
         self._planner = planner or RenderPlanner()
+        self._require_binding_fence = require_binding_fence
 
     async def persist(self, events: list[AdaptedEvent]) -> int:
         inserted = 0
         now = time.time()
         async with self._database.transaction() as connection:
             for event in events:
+                if self._require_binding_fence:
+                    cursor = await connection.execute(
+                        """
+                        SELECT 1 FROM session_bindings
+                        WHERE sdk_session_id = ? AND runtime_generation = ?
+                          AND owner_fence_token = ?
+                        """,
+                        (
+                            event.sdk_session_id,
+                            event.generation,
+                            event.fence_token,
+                        ),
+                    )
+                    owns_generation = await cursor.fetchone()
+                    await cursor.close()
+                    if owns_generation is None:
+                        continue
                 cursor = await connection.execute(
                     """
                     INSERT INTO event_journal(
@@ -327,6 +352,23 @@ class JournalReducer:
             "raw_parent_id": repr(getattr(event, "parent_id", None)),
         }
         async with self._database.transaction() as connection:
+            if self._require_binding_fence:
+                cursor = await connection.execute(
+                    """
+                    SELECT 1 FROM session_bindings
+                    WHERE sdk_session_id = ? AND runtime_generation = ?
+                      AND owner_fence_token = ?
+                    """,
+                    (
+                        envelope.sdk_session_id,
+                        envelope.generation,
+                        envelope.fence_token,
+                    ),
+                )
+                owns_generation = await cursor.fetchone()
+                await cursor.close()
+                if owns_generation is None:
+                    return
             await connection.execute(
                 """
                 INSERT INTO runtime_incidents(
@@ -421,13 +463,9 @@ class JournalReducer:
             return {
                 "type": event.raw_type,
                 "content": f"**{title}**\n{_bounded_text(detail, 1600)}",
-                "finalized": event.raw_type
-                not in {"assistant.intent", "session.compaction_start"},
+                "finalized": event.raw_type not in {"assistant.intent", "session.compaction_start"},
             }
-        if (
-            _is_task_projection_event(event)
-            or event.raw_type in RenderPlanner._TASK_VIEW_TYPES
-        ):
+        if _is_task_projection_event(event) or event.raw_type in RenderPlanner._TASK_VIEW_TYPES:
             rows = await connection.execute(
                 """
                 SELECT panel_id, card_token, card_key, kind, title, state,
@@ -464,11 +502,7 @@ class JournalReducer:
             state_row = await state_cursor.fetchone()
             await state_cursor.close()
             page_count = max(1, (len(cards) + 7) // 8)
-            page = (
-                0
-                if state_row is None
-                else min(max(int(state_row["page"]), 0), page_count - 1)
-            )
+            page = 0 if state_row is None else min(max(int(state_row["page"]), 0), page_count - 1)
             visible = cards[page * 8 : (page + 1) * 8]
             selected = None if state_row is None else state_row["selected_card_token"]
             if selected not in {card["card_token"] for card in cards}:
@@ -704,9 +738,7 @@ class JournalReducer:
             changed = cursor.rowcount
             await cursor.close()
             if changed != 1:
-                raise RuntimeError(
-                    f"operation state changed concurrently: {data['operation_id']}"
-                )
+                raise RuntimeError(f"operation state changed concurrently: {data['operation_id']}")
         elif event.raw_type == "copilotd.operation.unsettled_unknown":
             await connection.execute(
                 """
@@ -818,6 +850,122 @@ class JournalReducer:
             )
         elif event.raw_type == "copilotd.tasks.snapshot":
             await self._apply_task_snapshot(connection, event, data=data, now=now)
+        elif event.raw_type.startswith("copilotd.native_command."):
+            await self._apply_native_command_event(
+                connection,
+                event,
+                data=data,
+                now=now,
+            )
+        elif event.raw_type.startswith("copilotd.ephemeral_query."):
+            await self._apply_ephemeral_query_event(
+                connection,
+                event,
+                data=data,
+                now=now,
+            )
+        elif event.raw_type.startswith("copilotd.compaction."):
+            await self._apply_compaction_event(
+                connection,
+                event,
+                data=data,
+                now=now,
+            )
+        elif event.raw_type.startswith("copilotd.fleet."):
+            await self._apply_fleet_event(connection, event, data=data, now=now)
+        elif event.raw_type.startswith("copilotd.task_action."):
+            await self._apply_task_action_event(
+                connection,
+                event,
+                data=data,
+                now=now,
+            )
+        elif event.raw_type.startswith("copilotd.agent_transition."):
+            await self._apply_agent_transition_event(
+                connection,
+                event,
+                data=data,
+                now=now,
+            )
+        elif event.raw_type.startswith("copilotd.remote_transition."):
+            await self._apply_remote_transition_event(
+                connection,
+                event,
+                data=data,
+                now=now,
+            )
+        elif event.raw_type == "copilotd.remote.observed":
+            await connection.execute(
+                """
+                UPDATE session_bindings
+                SET runtime_remote_mode = ?, remote_url = ?,
+                    remote_steerable = ?, remote_observed_at = ?,
+                    remote_snapshot_json = ?,
+                    remote_observed_sdk_timestamp = MAX(
+                        COALESCE(remote_observed_sdk_timestamp, -1), ?
+                    ),
+                    pending_remote_target = CASE
+                        WHEN ? THEN NULL ELSE pending_remote_target
+                    END,
+                    pending_remote_transition_id = CASE
+                        WHEN ? THEN NULL ELSE pending_remote_transition_id
+                    END,
+                    updated_at = ?, row_version = row_version + 1
+                WHERE sdk_session_id = ? AND runtime_generation = ?
+                  AND owner_fence_token = ?
+                """,
+                (
+                    str(data["mode"]),
+                    data.get("url"),
+                    (None if data.get("steerable") is None else int(bool(data["steerable"]))),
+                    float(data.get("observed_at", now)),
+                    _json_or_none(data.get("snapshot", {})),
+                    float(data.get("observed_at", now)),
+                    int(bool(data.get("clear_pending"))),
+                    int(bool(data.get("clear_pending"))),
+                    now,
+                    event.sdk_session_id,
+                    event.generation,
+                    event.fence_token,
+                ),
+            )
+        elif event.raw_type.startswith("copilotd.schedule_action."):
+            await self._apply_schedule_action_event(
+                connection,
+                event,
+                data=data,
+                now=now,
+            )
+        elif event.raw_type in {
+            "session.schedule_created",
+            "session.schedule_cancelled",
+            "session.schedule_rearmed",
+        }:
+            await self._apply_runtime_schedule_event(
+                connection,
+                event,
+                data=data,
+                now=now,
+            )
+        elif event.raw_type == "session.remote_steerable_changed":
+            await self._apply_remote_event(connection, event, data=data, now=now)
+        elif event.raw_type in {"subagent.selected", "subagent.deselected"}:
+            await self._apply_selected_agent_event(
+                connection,
+                event,
+                data=data,
+                now=now,
+            )
+        elif event.raw_type in {
+            "session.compaction_start",
+            "session.compaction_complete",
+        }:
+            await self._apply_compaction_sdk_event(
+                connection,
+                event,
+                data=data,
+                now=now,
+            )
         elif _is_task_projection_event(event):
             await self._update_task_projection(connection, event, data=data, now=now)
         if event.raw_type == "copilotd.interaction.requested":
@@ -874,9 +1022,7 @@ class JournalReducer:
         }:
             interaction_id = str(data["interaction_id"])
             state = str(data["state"])
-            target_mode = data.get("target_mode") or interaction_target_mode(
-                data.get("response")
-            )
+            target_mode = data.get("target_mode") or interaction_target_mode(data.get("response"))
             await connection.execute(
                 """
                 UPDATE pending_interactions
@@ -1128,9 +1274,7 @@ class JournalReducer:
                     event,
                     submission_id=submission_id,
                     app_state="submitted",
-                    runtime_correlation_basis=(
-                        "acceptance_id_mismatch_runtime_observed"
-                    ),
+                    runtime_correlation_basis=("acceptance_id_mismatch_runtime_observed"),
                     incident_kind="provisional_user_event_acceptance_mismatch",
                     now=now,
                 )
@@ -1309,9 +1453,7 @@ class JournalReducer:
                         kind="submission_rejection_after_acceptance",
                         detail={
                             "submission_id": submission_id,
-                            "accepted_message_id": str(
-                                rejected["accepted_message_id"]
-                            ),
+                            "accepted_message_id": str(rejected["accepted_message_id"]),
                         },
                     )
                     await connection.execute(
@@ -1769,6 +1911,9 @@ class JournalReducer:
                         WHEN pending_agent = ? THEN NULL
                         ELSE pending_agent_transition_id
                     END,
+                    agent_observed_sdk_timestamp = MAX(
+                        COALESCE(agent_observed_sdk_timestamp, -1), ?
+                    ),
                     updated_at = ?, row_version = row_version + 1
                 WHERE sdk_session_id = ? AND runtime_generation = ?
                   AND owner_fence_token = ?
@@ -1779,6 +1924,7 @@ class JournalReducer:
                     agent,
                     agent,
                     agent,
+                    float(data.get("observed_at", now)),
                     now,
                     event.sdk_session_id,
                     event.generation,
@@ -1856,7 +2002,7 @@ class JournalReducer:
                     ),
                 )
                 await connection.execute(
-                   """
+                    """
                    UPDATE pending_interactions
                    SET consumed_at = ?
                    WHERE interaction_id = (
@@ -1870,14 +2016,14 @@ class JournalReducer:
                        LIMIT 1
                    )
                    """,
-                   (
-                       now,
-                       event.sdk_session_id,
-                       event.generation,
-                       event.fence_token,
-                       mode,
-                       now - 60,
-                   ),
+                    (
+                        now,
+                        event.sdk_session_id,
+                        event.generation,
+                        event.fence_token,
+                        mode,
+                        now - 60,
+                    ),
                 )
         elif event.raw_type == "session.shutdown":
             await connection.execute(
@@ -1944,10 +2090,11 @@ class JournalReducer:
         await cursor.close()
         reducer_watermark = 0 if binding is None else int(binding[0])
         caught_up = reducer_watermark >= query_end
-        fresh = epoch == int(reconciliation["requested_epoch"])
+        crossed_scalar_event = topic in {"agents", "commands", "remote"} and query_end > query_start
+        fresh = epoch == int(reconciliation["requested_epoch"]) and not crossed_scalar_event
         positive = _snapshot_has_positive_evidence(topic, values)
         negative_applied = fresh and caught_up and not positive
-        may_merge = positive or negative_applied
+        may_merge = not crossed_scalar_event and (positive or negative_applied)
 
         if topic == "activity" and may_merge:
             await connection.execute(
@@ -2056,11 +2203,243 @@ class JournalReducer:
                 now=now,
                 allow_negative=fresh and caught_up,
             )
+        elif topic == "commands" and (positive or (fresh and caught_up)):
+            commands = [item for item in values.get("commands", []) if isinstance(item, dict)]
+            manifest_generation = int(values.get("manifest_generation", epoch))
+            seen_commands: list[str] = []
+            for item in commands:
+                name = str(item.get("name", "")).strip()
+                kind = str(item.get("kind", "")).strip()
+                if not name or kind != "builtin":
+                    continue
+                seen_commands.append(name)
+                await connection.execute(
+                    """
+                    INSERT INTO runtime_command_manifest(
+                        sdk_session_id, command_name, kind, description,
+                        aliases_json, allow_during_agent_execution,
+                        experimental, schedulable, input_schema_json,
+                        manifest_generation, state, last_seen_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'available', ?)
+                    ON CONFLICT(sdk_session_id, command_name) DO UPDATE SET
+                        kind = excluded.kind,
+                        description = excluded.description,
+                        aliases_json = excluded.aliases_json,
+                        allow_during_agent_execution =
+                            excluded.allow_during_agent_execution,
+                        experimental = excluded.experimental,
+                        schedulable = excluded.schedulable,
+                        input_schema_json = excluded.input_schema_json,
+                        manifest_generation = excluded.manifest_generation,
+                        state = 'available',
+                        last_seen_at = excluded.last_seen_at
+                    """,
+                    (
+                        event.sdk_session_id,
+                        name,
+                        kind,
+                        str(item.get("description", "")),
+                        json.dumps(
+                            item.get("aliases", []),
+                            ensure_ascii=False,
+                            sort_keys=True,
+                        ),
+                        int(bool(item.get("allow_during_agent_execution"))),
+                        int(bool(item.get("experimental"))),
+                        int(bool(item.get("schedulable"))),
+                        (
+                            None
+                            if item.get("input") is None
+                            else json.dumps(
+                                item["input"],
+                                ensure_ascii=False,
+                                sort_keys=True,
+                            )
+                        ),
+                        manifest_generation,
+                        observed_at,
+                    ),
+                )
+            if fresh and caught_up:
+                if seen_commands:
+                    placeholders = ", ".join("?" for _ in seen_commands)
+                    await connection.execute(
+                        f"""
+                        UPDATE runtime_command_manifest
+                        SET state = 'unavailable',
+                            manifest_generation = ?,
+                            last_seen_at = ?
+                        WHERE sdk_session_id = ?
+                          AND command_name NOT IN ({placeholders})
+                        """,
+                        (
+                            manifest_generation,
+                            observed_at,
+                            event.sdk_session_id,
+                            *seen_commands,
+                        ),
+                    )
+                else:
+                    await connection.execute(
+                        """
+                        UPDATE runtime_command_manifest
+                        SET state = 'unavailable',
+                            manifest_generation = ?,
+                            last_seen_at = ?
+                        WHERE sdk_session_id = ?
+                        """,
+                        (manifest_generation, observed_at, event.sdk_session_id),
+                    )
+            await connection.execute(
+                """
+                INSERT INTO runtime_command_refreshes(
+                    sdk_session_id, manifest_generation, runtime_generation,
+                    owner_fence_token, status, source_event_id, refreshed_at
+                ) VALUES (?, ?, ?, ?, 'ready', ?, ?)
+                ON CONFLICT(sdk_session_id) DO UPDATE SET
+                    manifest_generation = excluded.manifest_generation,
+                    runtime_generation = excluded.runtime_generation,
+                    owner_fence_token = excluded.owner_fence_token,
+                    status = 'ready',
+                    source_event_id = excluded.source_event_id,
+                    error_code = NULL,
+                    refreshed_at = excluded.refreshed_at
+                """,
+                (
+                    event.sdk_session_id,
+                    manifest_generation,
+                    event.generation,
+                    event.fence_token,
+                    values.get("source_event_id"),
+                    observed_at,
+                ),
+            )
+        elif topic == "agents" and (positive or (fresh and caught_up)):
+            agents = [item for item in values.get("agents", []) if isinstance(item, dict)]
+            current = values.get("current")
+            manifest_generation = int(values.get("manifest_generation", epoch))
+            seen_agents: list[str] = []
+            for item in agents:
+                name = str(item.get("name", "")).strip()
+                agent_id = str(item.get("id", "")).strip()
+                if not name or not agent_id:
+                    continue
+                seen_agents.append(name)
+                await connection.execute(
+                    """
+                    INSERT INTO runtime_agent_manifest(
+                        sdk_session_id, agent_name, agent_id, display_name,
+                        description, source, user_invocable, metadata_json,
+                        manifest_generation, state, last_seen_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'available', ?)
+                    ON CONFLICT(sdk_session_id, agent_name) DO UPDATE SET
+                        agent_id = excluded.agent_id,
+                        display_name = excluded.display_name,
+                        description = excluded.description,
+                        source = excluded.source,
+                        user_invocable = excluded.user_invocable,
+                        metadata_json = excluded.metadata_json,
+                        manifest_generation = excluded.manifest_generation,
+                        state = 'available',
+                        last_seen_at = excluded.last_seen_at
+                    """,
+                    (
+                        event.sdk_session_id,
+                        name,
+                        agent_id,
+                        str(item.get("displayName") or name),
+                        str(item.get("description") or ""),
+                        item.get("source"),
+                        (
+                            None
+                            if item.get("userInvocable") is None
+                            else int(bool(item.get("userInvocable")))
+                        ),
+                        json.dumps(
+                            _safe_agent_metadata(item),
+                            ensure_ascii=False,
+                            sort_keys=True,
+                        ),
+                        manifest_generation,
+                        observed_at,
+                    ),
+                )
+            if fresh and caught_up:
+                if seen_agents:
+                    placeholders = ", ".join("?" for _ in seen_agents)
+                    await connection.execute(
+                        f"""
+                        UPDATE runtime_agent_manifest
+                        SET state = 'unavailable',
+                            manifest_generation = ?,
+                            last_seen_at = ?
+                        WHERE sdk_session_id = ?
+                          AND agent_name NOT IN ({placeholders})
+                        """,
+                        (
+                            manifest_generation,
+                            observed_at,
+                            event.sdk_session_id,
+                            *seen_agents,
+                        ),
+                    )
+                else:
+                    await connection.execute(
+                        """
+                        UPDATE runtime_agent_manifest
+                        SET state = 'unavailable',
+                            manifest_generation = ?,
+                            last_seen_at = ?
+                        WHERE sdk_session_id = ?
+                        """,
+                        (manifest_generation, observed_at, event.sdk_session_id),
+                    )
+            current_name = (
+                "default"
+                if not isinstance(current, dict)
+                else str(current.get("name") or current.get("displayName") or "default")
+            )
+            await connection.execute(
+                """
+                UPDATE session_bindings
+                SET runtime_agent = ?,
+                    desired_agent = CASE
+                        WHEN pending_agent = ? THEN ? ELSE desired_agent
+                    END,
+                    pending_agent = CASE
+                        WHEN pending_agent = ? THEN NULL ELSE pending_agent
+                    END,
+                    pending_agent_transition_id = CASE
+                        WHEN pending_agent = ? THEN NULL
+                        ELSE pending_agent_transition_id
+                    END,
+                    agent_observed_sdk_timestamp = MAX(
+                        COALESCE(agent_observed_sdk_timestamp, -1), ?
+                    ),
+                    updated_at = ?, row_version = row_version + 1
+                WHERE sdk_session_id = ? AND runtime_generation = ?
+                  AND owner_fence_token = ?
+                """,
+                (
+                    current_name,
+                    current_name,
+                    current_name,
+                    current_name,
+                    current_name,
+                    observed_at,
+                    now,
+                    event.sdk_session_id,
+                    event.generation,
+                    event.fence_token,
+                ),
+            )
         elif topic == "remote" and may_merge:
             await connection.execute(
                 """
                 UPDATE session_bindings
                 SET runtime_remote_mode = ?, remote_url = ?,
+                    remote_steerable = ?, remote_observed_at = ?,
+                    remote_snapshot_json = ?,
                     updated_at = ?, row_version = row_version + 1
                 WHERE sdk_session_id = ? AND runtime_generation = ?
                   AND owner_fence_token = ?
@@ -2068,6 +2447,17 @@ class JournalReducer:
                 (
                     str(values.get("mode", "unknown")),
                     values.get("url"),
+                    (
+                        None
+                        if values.get("steerable") is None
+                        else int(bool(values.get("steerable")))
+                    ),
+                    observed_at,
+                    json.dumps(
+                        values.get("metadata", {}),
+                        ensure_ascii=False,
+                        sort_keys=True,
+                    ),
                     now,
                     event.sdk_session_id,
                     event.generation,
@@ -2075,9 +2465,7 @@ class JournalReducer:
                 ),
             )
         elif topic == "schedules" and (positive or (fresh and caught_up)):
-            schedules = [
-                item for item in values.get("schedules", []) if isinstance(item, dict)
-            ]
+            schedules = [item for item in values.get("schedules", []) if isinstance(item, dict)]
             seen_schedule_ids: list[str] = []
             for item in schedules:
                 schedule_id = str(item.get("id") or item.get("scheduleId") or "").strip()
@@ -2085,14 +2473,24 @@ class JournalReducer:
                     continue
                 seen_schedule_ids.append(schedule_id)
                 state = str(item.get("state") or item.get("status") or "active").lower()
+                recurring = bool(item.get("recurring"))
+                schedule_kind = "every" if recurring else "after"
+                prompt = str(item.get("prompt") or "")
                 await connection.execute(
                     """
                     INSERT INTO runtime_schedules(
                         sdk_session_id, runtime_schedule_id, builtin_name,
                         invocation_input, recurrence, next_run_at, state,
-                        updated_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                        updated_at, recurring, schedule_kind, display_prompt,
+                        prompt_hash, snapshot_id, observed_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     ON CONFLICT(sdk_session_id, runtime_schedule_id) DO UPDATE SET
+                        builtin_name = excluded.builtin_name,
+                        invocation_input = CASE
+                            WHEN runtime_schedules.invocation_input = ''
+                            THEN excluded.invocation_input
+                            ELSE runtime_schedules.invocation_input
+                        END,
                         recurrence = excluded.recurrence,
                         next_run_at = excluded.next_run_at,
                         state = CASE
@@ -2101,16 +2499,33 @@ class JournalReducer:
                             ) THEN runtime_schedules.state
                             ELSE excluded.state
                         END,
+                        recurring = excluded.recurring,
+                        schedule_kind = excluded.schedule_kind,
+                        display_prompt = excluded.display_prompt,
+                        prompt_hash = excluded.prompt_hash,
+                        snapshot_id = excluded.snapshot_id,
+                        observed_at = excluded.observed_at,
                         updated_at = excluded.updated_at
                     """,
                     (
                         event.sdk_session_id,
                         schedule_id,
-                        str(item.get("builtinName") or item.get("kind") or "unknown"),
-                        str(item.get("input") or ""),
-                        item.get("recurrence"),
-                        item.get("nextRunAt"),
+                        schedule_kind,
+                        prompt,
+                        (
+                            item.get("cron")
+                            or item.get("intervalMs")
+                            or item.get("at")
+                            or item.get("recurrence")
+                        ),
+                        timestamp_seconds(item.get("nextRunAt")),
                         state,
+                        observed_at,
+                        int(recurring),
+                        schedule_kind,
+                        item.get("displayPrompt"),
+                        stable_hash(prompt),
+                        snapshot_id,
                         observed_at,
                     ),
                 )
@@ -2207,6 +2622,946 @@ class JournalReducer:
                 event,
                 now=now,
             )
+
+    async def _apply_native_command_event(
+        self,
+        connection: Any,
+        event: AdaptedEvent,
+        *,
+        data: dict[str, Any],
+        now: float,
+    ) -> None:
+        if event.raw_type == "copilotd.native_command.pending":
+            await connection.execute(
+                """
+                INSERT INTO runtime_command_invocations(
+                    invocation_id, sdk_session_id, operation_id, command_name,
+                    input_hash, state, created_at
+                ) VALUES (?, ?, ?, ?, ?, 'pending', ?)
+                ON CONFLICT(invocation_id) DO NOTHING
+                """,
+                (
+                    str(data["invocation_id"]),
+                    event.sdk_session_id,
+                    str(data["operation_id"]),
+                    str(data["command_name"]),
+                    str(data["input_hash"]),
+                    float(data.get("created_at", now)),
+                ),
+            )
+            return
+        await connection.execute(
+            """
+            UPDATE runtime_command_invocations
+            SET result_kind = ?, result_json = ?, state = ?,
+                agent_submission_id = ?, selection_token = ?, settled_at = ?
+            WHERE invocation_id = ? AND sdk_session_id = ?
+            """,
+            (
+                data.get("result_kind"),
+                _json_or_none(data.get("result")),
+                str(data["state"]),
+                data.get("agent_submission_id"),
+                data.get("selection_token"),
+                float(data.get("settled_at", now)),
+                str(data["invocation_id"]),
+                event.sdk_session_id,
+            ),
+        )
+
+    async def _apply_ephemeral_query_event(
+        self,
+        connection: Any,
+        event: AdaptedEvent,
+        *,
+        data: dict[str, Any],
+        now: float,
+    ) -> None:
+        if event.raw_type == "copilotd.ephemeral_query.pending":
+            await connection.execute(
+                """
+                INSERT INTO ephemeral_queries(
+                    query_id, sdk_session_id, operation_id, question_hash,
+                    history_count_before, sdk_receive_seq_before,
+                    state, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, 'pending', ?)
+                ON CONFLICT(query_id) DO NOTHING
+                """,
+                (
+                    str(data["query_id"]),
+                    event.sdk_session_id,
+                    str(data["operation_id"]),
+                    str(data["question_hash"]),
+                    data.get("history_count_before"),
+                    data.get("sdk_receive_seq_before"),
+                    float(data.get("created_at", now)),
+                ),
+            )
+            return
+        await connection.execute(
+            """
+            UPDATE ephemeral_queries
+            SET history_count_after = ?, sdk_receive_seq_after = ?,
+                answer_hash = ?, state = ?, settled_at = ?
+            WHERE query_id = ? AND sdk_session_id = ?
+            """,
+            (
+                data.get("history_count_after"),
+                data.get("sdk_receive_seq_after"),
+                data.get("answer_hash"),
+                str(data["state"]),
+                float(data.get("settled_at", now)),
+                str(data["query_id"]),
+                event.sdk_session_id,
+            ),
+        )
+
+    async def _apply_compaction_event(
+        self,
+        connection: Any,
+        event: AdaptedEvent,
+        *,
+        data: dict[str, Any],
+        now: float,
+    ) -> None:
+        if event.raw_type == "copilotd.compaction.pending":
+            await connection.execute(
+                """
+                INSERT INTO compaction_runs(
+                    compaction_id, sdk_session_id, operation_id, focus_hash,
+                    event_cursor_before, sdk_receive_seq_before,
+                    context_before_json, state, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?)
+                ON CONFLICT(compaction_id) DO NOTHING
+                """,
+                (
+                    str(data["compaction_id"]),
+                    event.sdk_session_id,
+                    str(data["operation_id"]),
+                    data.get("focus_hash"),
+                    data.get("event_cursor_before"),
+                    int(data["sdk_receive_seq_before"]),
+                    _json_or_none(data.get("context_before")),
+                    float(data.get("created_at", now)),
+                ),
+            )
+            return
+        await connection.execute(
+            """
+            UPDATE compaction_runs
+            SET result_json = CASE
+                    WHEN state IN ('confirmed', 'rejected') THEN result_json
+                    ELSE COALESCE(?, result_json)
+                END,
+                context_after_json = CASE
+                    WHEN state IN ('confirmed', 'rejected') THEN context_after_json
+                    ELSE COALESCE(?, context_after_json)
+                END,
+                completion_event_id = CASE
+                    WHEN state IN ('confirmed', 'rejected') THEN completion_event_id
+                    ELSE COALESCE(?, completion_event_id)
+                END,
+                state = CASE
+                    WHEN state IN ('confirmed', 'rejected') THEN state
+                    ELSE ?
+                END,
+                settled_at = CASE
+                    WHEN state IN ('confirmed', 'rejected') THEN settled_at
+                    ELSE ?
+                END
+            WHERE compaction_id = ? AND sdk_session_id = ?
+            """,
+            (
+                _json_or_none(data.get("result")),
+                _json_or_none(data.get("context_after")),
+                data.get("completion_event_id"),
+                str(data["state"]),
+                float(data.get("settled_at", now)),
+                str(data["compaction_id"]),
+                event.sdk_session_id,
+            ),
+        )
+
+    async def _apply_compaction_sdk_event(
+        self,
+        connection: Any,
+        event: AdaptedEvent,
+        *,
+        data: dict[str, Any],
+        now: float,
+    ) -> None:
+        if event.raw_type == "session.compaction_start":
+            if event.sdk_receive_seq is None:
+                return
+            await connection.execute(
+                """
+                UPDATE compaction_runs
+                SET state = 'started', start_event_id = ?,
+                    start_sdk_receive_seq = ?
+                WHERE compaction_id = (
+                    SELECT compaction_id FROM compaction_runs
+                    WHERE sdk_session_id = ?
+                      AND state IN ('pending', 'unknown')
+                      AND sdk_receive_seq_before < ?
+                    ORDER BY created_at DESC LIMIT 1
+                )
+                """,
+                (
+                    event.event_id,
+                    event.sdk_receive_seq,
+                    event.sdk_session_id,
+                    event.sdk_receive_seq,
+                ),
+            )
+            return
+        if event.sdk_receive_seq is None:
+            return
+        success = bool(data.get("success"))
+        await connection.execute(
+            """
+            UPDATE compaction_runs
+            SET result_json = ?, completion_event_id = ?,
+                completion_sdk_receive_seq = ?, state = ?, settled_at = ?
+            WHERE compaction_id = (
+                SELECT compaction_id FROM compaction_runs
+                WHERE sdk_session_id = ?
+                  AND state IN ('pending', 'started', 'unknown')
+                  AND sdk_receive_seq_before < ?
+                  AND (
+                      start_sdk_receive_seq IS NULL
+                      OR start_sdk_receive_seq <= ?
+                  )
+                ORDER BY CASE WHEN start_event_id IS NULL THEN 1 ELSE 0 END,
+                         created_at DESC LIMIT 1
+            )
+            """,
+            (
+                _json_or_none(data),
+                event.event_id,
+                event.sdk_receive_seq,
+                "confirmed" if success else "rejected",
+                now,
+                event.sdk_session_id,
+                event.sdk_receive_seq,
+                event.sdk_receive_seq,
+            ),
+        )
+
+    async def _apply_fleet_event(
+        self,
+        connection: Any,
+        event: AdaptedEvent,
+        *,
+        data: dict[str, Any],
+        now: float,
+    ) -> None:
+        submission_id = str(data["submission_id"])
+        fleet_run_id = str(data["fleet_run_id"])
+        if event.raw_type == "copilotd.fleet.pending":
+            await connection.execute(
+                """
+                INSERT INTO submissions(
+                    submission_id, sdk_session_id, origin, source_operation_id,
+                    prompt_hash, requested_mode, requested_agent,
+                    requested_session_config_version, requested_delivery,
+                    state, correlation_id, created_at
+                ) VALUES (?, ?, 'fleet', ?, ?, ?, ?, ?, 'fleet', 'submitting', ?, ?)
+                ON CONFLICT(submission_id) DO NOTHING
+                """,
+                (
+                    submission_id,
+                    event.sdk_session_id,
+                    str(data["operation_id"]),
+                    str(data["prompt_hash"]),
+                    data.get("requested_mode"),
+                    data.get("requested_agent"),
+                    data.get("requested_session_config_version"),
+                    fleet_run_id,
+                    float(data.get("created_at", now)),
+                ),
+            )
+            await connection.execute(
+                """
+                INSERT INTO fleet_runs(
+                    fleet_run_id, sdk_session_id, operation_id, submission_id,
+                    prompt_hash, state, created_at
+                ) VALUES (?, ?, ?, ?, ?, 'pending', ?)
+                ON CONFLICT(fleet_run_id) DO NOTHING
+                """,
+                (
+                    fleet_run_id,
+                    event.sdk_session_id,
+                    str(data["operation_id"]),
+                    submission_id,
+                    str(data["prompt_hash"]),
+                    float(data.get("created_at", now)),
+                ),
+            )
+            return
+        state = str(data["state"])
+        await connection.execute(
+            """
+            UPDATE fleet_runs SET state = ?, result_json = ?, settled_at = ?
+            WHERE fleet_run_id = ? AND sdk_session_id = ?
+            """,
+            (
+                state,
+                _json_or_none(data.get("result")),
+                float(data.get("settled_at", now)),
+                fleet_run_id,
+                event.sdk_session_id,
+            ),
+        )
+        submission_state = {
+            "confirmed": "observed_active",
+            "rejected": "rejected",
+            "unknown": "outcome_unknown",
+        }.get(state, state)
+        await connection.execute(
+            """
+            UPDATE submissions SET state = ?,
+                terminal_at = CASE WHEN ? IN ('rejected', 'outcome_unknown')
+                                   THEN ? ELSE terminal_at END
+            WHERE submission_id = ? AND sdk_session_id = ?
+            """,
+            (
+                submission_state,
+                submission_state,
+                float(data.get("settled_at", now)),
+                submission_id,
+                event.sdk_session_id,
+            ),
+        )
+        if state == "confirmed":
+            await connection.execute(
+                """
+                INSERT INTO liveness_leases(
+                    sdk_session_id, lease_id, kind, source_id,
+                    runtime_generation, owner_fence_token, state,
+                    acquired_at, refreshed_at
+                ) VALUES (?, ?, 'submission', ?, ?, ?, 'active', ?, ?)
+                ON CONFLICT(sdk_session_id, lease_id) DO UPDATE SET
+                    state = 'active', refreshed_at = excluded.refreshed_at,
+                    released_at = NULL
+                """,
+                (
+                    event.sdk_session_id,
+                    f"submission:{submission_id}",
+                    submission_id,
+                    event.generation,
+                    event.fence_token,
+                    now,
+                    now,
+                ),
+            )
+
+    async def _apply_task_action_event(
+        self,
+        connection: Any,
+        event: AdaptedEvent,
+        *,
+        data: dict[str, Any],
+        now: float,
+    ) -> None:
+        if event.raw_type == "copilotd.task_action.pending":
+            await connection.execute(
+                """
+                INSERT INTO runtime_task_actions(
+                    action_id, sdk_session_id, operation_id, task_id,
+                    action, input_hash, state, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, 'pending', ?)
+                ON CONFLICT(action_id) DO NOTHING
+                """,
+                (
+                    str(data["action_id"]),
+                    event.sdk_session_id,
+                    str(data["operation_id"]),
+                    data.get("task_id"),
+                    str(data["action"]),
+                    str(data["input_hash"]),
+                    float(data.get("created_at", now)),
+                ),
+            )
+            return
+        await connection.execute(
+            """
+            UPDATE runtime_task_actions
+            SET state = ?, result_json = ?, settled_at = ?
+            WHERE action_id = ? AND sdk_session_id = ?
+            """,
+            (
+                str(data["state"]),
+                _json_or_none(data.get("result")),
+                float(data.get("settled_at", now)),
+                str(data["action_id"]),
+                event.sdk_session_id,
+            ),
+        )
+
+    async def _apply_agent_transition_event(
+        self,
+        connection: Any,
+        event: AdaptedEvent,
+        *,
+        data: dict[str, Any],
+        now: float,
+    ) -> None:
+        transition_id = str(data["transition_id"])
+        if event.raw_type == "copilotd.agent_transition.pending":
+            await connection.execute(
+                """
+                INSERT INTO runtime_agent_transitions(
+                    transition_id, sdk_session_id, operation_id,
+                    previous_agent, target_agent, state, created_at
+                ) VALUES (?, ?, ?, ?, ?, 'pending', ?)
+                ON CONFLICT(transition_id) DO NOTHING
+                """,
+                (
+                    transition_id,
+                    event.sdk_session_id,
+                    str(data["operation_id"]),
+                    str(data["previous_agent"]),
+                    str(data["target_agent"]),
+                    float(data.get("created_at", now)),
+                ),
+            )
+            await connection.execute(
+                """
+                UPDATE session_bindings
+                SET pending_agent = ?, pending_agent_transition_id = ?,
+                    updated_at = ?, row_version = row_version + 1
+                WHERE sdk_session_id = ? AND runtime_generation = ?
+                  AND owner_fence_token = ? AND pending_agent IS NULL
+                """,
+                (
+                    str(data["target_agent"]),
+                    transition_id,
+                    now,
+                    event.sdk_session_id,
+                    event.generation,
+                    event.fence_token,
+                ),
+            )
+            return
+        state = str(data["state"])
+        await connection.execute(
+            """
+            UPDATE runtime_agent_transitions
+            SET state = ?, result_json = ?, settled_at = ?
+            WHERE transition_id = ? AND sdk_session_id = ?
+            """,
+            (
+                state,
+                _json_or_none(data.get("result")),
+                float(data.get("settled_at", now)),
+                transition_id,
+                event.sdk_session_id,
+            ),
+        )
+        target = str(data["target_agent"])
+        if state == "confirmed":
+            await connection.execute(
+                """
+                UPDATE session_bindings
+                SET desired_agent = ?, runtime_agent = ?,
+                    pending_agent = NULL, pending_agent_transition_id = NULL,
+                    updated_at = ?, row_version = row_version + 1
+                WHERE sdk_session_id = ? AND runtime_generation = ?
+                  AND owner_fence_token = ?
+                  AND pending_agent_transition_id = ?
+                """,
+                (
+                    target,
+                    target,
+                    now,
+                    event.sdk_session_id,
+                    event.generation,
+                    event.fence_token,
+                    transition_id,
+                ),
+            )
+        elif state == "unknown":
+            await connection.execute(
+                """
+                UPDATE session_bindings
+                SET runtime_agent = 'unknown',
+                    updated_at = ?, row_version = row_version + 1
+                WHERE sdk_session_id = ? AND runtime_generation = ?
+                  AND owner_fence_token = ?
+                  AND pending_agent_transition_id = ?
+                """,
+                (
+                    now,
+                    event.sdk_session_id,
+                    event.generation,
+                    event.fence_token,
+                    transition_id,
+                ),
+            )
+        elif state == "rejected":
+            await connection.execute(
+                """
+                UPDATE session_bindings
+                SET pending_agent = NULL, pending_agent_transition_id = NULL,
+                    updated_at = ?, row_version = row_version + 1
+                WHERE sdk_session_id = ? AND runtime_generation = ?
+                  AND owner_fence_token = ?
+                  AND pending_agent_transition_id = ?
+                """,
+                (
+                    now,
+                    event.sdk_session_id,
+                    event.generation,
+                    event.fence_token,
+                    transition_id,
+                ),
+            )
+
+    async def _apply_remote_transition_event(
+        self,
+        connection: Any,
+        event: AdaptedEvent,
+        *,
+        data: dict[str, Any],
+        now: float,
+    ) -> None:
+        transition_id = str(data["transition_id"])
+        if event.raw_type == "copilotd.remote_transition.pending":
+            await connection.execute(
+                """
+                INSERT INTO runtime_remote_transitions(
+                    transition_id, sdk_session_id, operation_id,
+                    previous_mode, target_mode, state, auth_json,
+                    repository_json, snapshot_json, created_at
+                ) VALUES (?, ?, ?, ?, ?, 'pending', ?, ?, ?, ?)
+                ON CONFLICT(transition_id) DO NOTHING
+                """,
+                (
+                    transition_id,
+                    event.sdk_session_id,
+                    str(data["operation_id"]),
+                    str(data["previous_mode"]),
+                    str(data["target_mode"]),
+                    _json_or_none(data["auth"]),
+                    _json_or_none(data["repository"]),
+                    _json_or_none(data.get("snapshot", {})),
+                    float(data.get("created_at", now)),
+                ),
+            )
+            await connection.execute(
+                """
+                UPDATE session_bindings
+                SET pending_remote_target = ?,
+                    pending_remote_transition_id = ?,
+                    updated_at = ?, row_version = row_version + 1
+                WHERE sdk_session_id = ? AND runtime_generation = ?
+                  AND owner_fence_token = ?
+                  AND (
+                      pending_remote_transition_id IS NULL
+                      OR (
+                          ? = 'off'
+                          AND runtime_remote_mode = 'unknown'
+                      )
+                  )
+                """,
+                (
+                    str(data["target_mode"]),
+                    transition_id,
+                    now,
+                    event.sdk_session_id,
+                    event.generation,
+                    event.fence_token,
+                    str(data["target_mode"]),
+                ),
+            )
+            return
+        state = str(data["state"])
+        snapshot = data.get("snapshot", {})
+        await connection.execute(
+            """
+            UPDATE runtime_remote_transitions
+            SET state = ?, url = ?, snapshot_json = ?,
+                event_id = COALESCE(?, event_id), settled_at = ?
+            WHERE transition_id = ? AND sdk_session_id = ?
+            """,
+            (
+                state,
+                data.get("url"),
+                _json_or_none(snapshot),
+                data.get("event_id"),
+                float(data.get("settled_at", now)),
+                transition_id,
+                event.sdk_session_id,
+            ),
+        )
+        target = str(data["target_mode"])
+        if state == "confirmed":
+            await connection.execute(
+                """
+                UPDATE session_bindings
+                SET runtime_remote_mode = ?, remote_url = ?,
+                    remote_steerable = ?, remote_observed_at = ?,
+                    remote_snapshot_json = ?,
+                    pending_remote_target = NULL,
+                    pending_remote_transition_id = NULL,
+                    updated_at = ?, row_version = row_version + 1
+                WHERE sdk_session_id = ? AND runtime_generation = ?
+                  AND owner_fence_token = ?
+                  AND pending_remote_transition_id = ?
+                """,
+                (
+                    target,
+                    data.get("url"),
+                    int(target == "on"),
+                    float(data.get("settled_at", now)),
+                    _json_or_none(snapshot),
+                    now,
+                    event.sdk_session_id,
+                    event.generation,
+                    event.fence_token,
+                    transition_id,
+                ),
+            )
+        elif state == "unknown":
+            await connection.execute(
+                """
+                UPDATE session_bindings
+                SET runtime_remote_mode = 'unknown',
+                    remote_steerable = NULL, remote_observed_at = ?,
+                    updated_at = ?, row_version = row_version + 1
+                WHERE sdk_session_id = ? AND runtime_generation = ?
+                  AND owner_fence_token = ?
+                  AND pending_remote_transition_id = ?
+                """,
+                (
+                    float(data.get("settled_at", now)),
+                    now,
+                    event.sdk_session_id,
+                    event.generation,
+                    event.fence_token,
+                    transition_id,
+                ),
+            )
+        elif state == "rejected":
+            await connection.execute(
+                """
+                UPDATE session_bindings
+                SET pending_remote_target = NULL,
+                    pending_remote_transition_id = NULL,
+                    updated_at = ?, row_version = row_version + 1
+                WHERE sdk_session_id = ? AND runtime_generation = ?
+                  AND owner_fence_token = ?
+                  AND pending_remote_transition_id = ?
+                """,
+                (
+                    now,
+                    event.sdk_session_id,
+                    event.generation,
+                    event.fence_token,
+                    transition_id,
+                ),
+            )
+
+    async def _apply_schedule_action_event(
+        self,
+        connection: Any,
+        event: AdaptedEvent,
+        *,
+        data: dict[str, Any],
+        now: float,
+    ) -> None:
+        if event.raw_type == "copilotd.schedule_action.pending":
+            await connection.execute(
+                """
+                INSERT INTO runtime_schedule_actions(
+                    action_id, sdk_session_id, operation_id, invocation_id,
+                    runtime_schedule_id, builtin_name, action, input_hash,
+                    baseline_json, state, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?)
+                ON CONFLICT(action_id) DO NOTHING
+                """,
+                (
+                    str(data["action_id"]),
+                    event.sdk_session_id,
+                    data.get("operation_id"),
+                    data.get("invocation_id"),
+                    data.get("runtime_schedule_id"),
+                    str(data["builtin_name"]),
+                    str(data["action"]),
+                    str(data["input_hash"]),
+                    _json_or_none(data.get("baseline_ids")),
+                    float(data.get("created_at", now)),
+                ),
+            )
+            return
+        await connection.execute(
+            """
+            UPDATE runtime_schedule_actions
+            SET runtime_schedule_id = COALESCE(?, runtime_schedule_id),
+                invocation_id = COALESCE(?, invocation_id),
+                state = ?, result_json = ?, settled_at = ?
+            WHERE action_id = ? AND sdk_session_id = ?
+            """,
+            (
+                data.get("runtime_schedule_id"),
+                data.get("invocation_id"),
+                str(data["state"]),
+                _json_or_none(data.get("result")),
+                float(data.get("settled_at", now)),
+                str(data["action_id"]),
+                event.sdk_session_id,
+            ),
+        )
+        if str(data["state"]) == "confirmed" and data.get("runtime_schedule_id") is not None:
+            action = str(data.get("action") or "")
+            await connection.execute(
+                """
+                UPDATE runtime_schedules
+                SET invocation_id = COALESCE(?, invocation_id),
+                    state = CASE
+                        WHEN ? = 'cancel' AND state != 'triggered'
+                        THEN 'cancelled'
+                        ELSE state
+                    END,
+                    terminal_at = CASE
+                        WHEN ? = 'cancel' AND state != 'triggered'
+                        THEN COALESCE(terminal_at, ?)
+                        ELSE terminal_at
+                    END,
+                    updated_at = ?
+                WHERE sdk_session_id = ? AND runtime_schedule_id = ?
+                """,
+                (
+                    data.get("invocation_id"),
+                    action,
+                    action,
+                    float(data.get("settled_at", now)),
+                    now,
+                    event.sdk_session_id,
+                    str(data["runtime_schedule_id"]),
+                ),
+            )
+
+    async def _apply_runtime_schedule_event(
+        self,
+        connection: Any,
+        event: AdaptedEvent,
+        *,
+        data: dict[str, Any],
+        now: float,
+    ) -> None:
+        schedule_id = str(data.get("id") or data.get("scheduleId") or "").strip()
+        if not schedule_id:
+            return
+        if event.raw_type == "session.schedule_cancelled":
+            await connection.execute(
+                """
+                UPDATE runtime_schedules
+                SET state = CASE WHEN state = 'triggered' THEN state ELSE 'cancelled' END,
+                    last_event_id = ?, terminal_at = COALESCE(terminal_at, ?),
+                    observed_at = ?, updated_at = ?
+                WHERE sdk_session_id = ? AND runtime_schedule_id = ?
+                """,
+                (
+                    event.event_id,
+                    now,
+                    now,
+                    now,
+                    event.sdk_session_id,
+                    schedule_id,
+                ),
+            )
+            return
+        if event.raw_type == "session.schedule_rearmed":
+            await connection.execute(
+                """
+                UPDATE runtime_schedules
+                SET state = CASE
+                        WHEN state IN ('cancelled', 'triggered') THEN state
+                        ELSE 'active'
+                    END,
+                    next_run_at = ?, last_event_id = ?,
+                    observed_at = ?, updated_at = ?
+                WHERE sdk_session_id = ? AND runtime_schedule_id = ?
+                """,
+                (
+                    timestamp_seconds(data.get("nextRunAt") or data.get("next_run_at")),
+                    event.event_id,
+                    now,
+                    now,
+                    event.sdk_session_id,
+                    schedule_id,
+                ),
+            )
+            return
+        recurring = bool(
+            data.get("recurring")
+            or data.get("cron")
+            or data.get("interval")
+            or data.get("selfPaced")
+        )
+        schedule_kind = "every" if recurring else "after"
+        prompt = str(data.get("prompt") or "")
+        recurrence = data.get("cron") or data.get("interval") or data.get("at") or data.get("tz")
+        await connection.execute(
+            """
+            INSERT INTO runtime_schedules(
+                sdk_session_id, runtime_schedule_id, builtin_name,
+                invocation_input, recurrence, state, last_event_id,
+                updated_at, recurring, schedule_kind, display_prompt,
+                prompt_hash, observed_at
+            ) VALUES (?, ?, ?, ?, ?, 'active', ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(sdk_session_id, runtime_schedule_id) DO UPDATE SET
+                builtin_name = excluded.builtin_name,
+                invocation_input = excluded.invocation_input,
+                recurrence = excluded.recurrence,
+                state = CASE
+                    WHEN runtime_schedules.state IN ('cancelled', 'triggered')
+                    THEN runtime_schedules.state
+                    ELSE 'active'
+                END,
+                last_event_id = excluded.last_event_id,
+                recurring = excluded.recurring,
+                schedule_kind = excluded.schedule_kind,
+                display_prompt = excluded.display_prompt,
+                prompt_hash = excluded.prompt_hash,
+                observed_at = excluded.observed_at,
+                updated_at = excluded.updated_at
+            """,
+            (
+                event.sdk_session_id,
+                schedule_id,
+                schedule_kind,
+                prompt,
+                None if recurrence is None else str(recurrence),
+                event.event_id,
+                now,
+                int(recurring),
+                schedule_kind,
+                data.get("displayPrompt") or data.get("display_prompt"),
+                stable_hash(prompt),
+                now,
+            ),
+        )
+
+    async def _apply_remote_event(
+        self,
+        connection: Any,
+        event: AdaptedEvent,
+        *,
+        data: dict[str, Any],
+        now: float,
+    ) -> None:
+        if event.sdk_timestamp is None:
+            return
+        steerable = bool(
+            data.get("remoteSteerable")
+            if "remoteSteerable" in data
+            else data.get("remote_steerable")
+        )
+        cursor = await connection.execute(
+            """
+            SELECT pending_remote_target, pending_remote_transition_id
+            FROM session_bindings WHERE sdk_session_id = ?
+            """,
+            (event.sdk_session_id,),
+        )
+        binding = await cursor.fetchone()
+        await cursor.close()
+        pending_target = None if binding is None else binding["pending_remote_target"]
+        mode = (
+            "on"
+            if steerable
+            else str(pending_target)
+            if pending_target in {"off", "export"}
+            else "unknown"
+        )
+        cursor = await connection.execute(
+            """
+            UPDATE session_bindings
+            SET runtime_remote_mode = ?, remote_steerable = ?,
+                remote_observed_at = ?,
+                remote_observed_sdk_timestamp = ?,
+                updated_at = ?,
+                row_version = row_version + 1
+            WHERE sdk_session_id = ? AND runtime_generation = ?
+              AND owner_fence_token = ?
+              AND COALESCE(remote_observed_sdk_timestamp, -1) <= ?
+            """,
+            (
+                mode,
+                int(steerable),
+                now,
+                event.sdk_timestamp,
+                now,
+                event.sdk_session_id,
+                event.generation,
+                event.fence_token,
+                event.sdk_timestamp,
+            ),
+        )
+        applied = cursor.rowcount == 1
+        await cursor.close()
+        if not applied:
+            return
+        if binding is not None and binding["pending_remote_transition_id"] is not None:
+            await connection.execute(
+                """
+                UPDATE runtime_remote_transitions
+                SET event_id = ?
+                WHERE transition_id = ? AND sdk_session_id = ?
+                """,
+                (
+                    event.event_id,
+                    str(binding["pending_remote_transition_id"]),
+                    event.sdk_session_id,
+                ),
+            )
+
+    async def _apply_selected_agent_event(
+        self,
+        connection: Any,
+        event: AdaptedEvent,
+        *,
+        data: dict[str, Any],
+        now: float,
+    ) -> None:
+        if event.agent_id is not None or event.sdk_timestamp is None:
+            return
+        agent = (
+            "default"
+            if event.raw_type == "subagent.deselected"
+            else str(data.get("agentName") or data.get("agent_name") or "default")
+        )
+        await connection.execute(
+            """
+            UPDATE session_bindings
+            SET runtime_agent = ?,
+                desired_agent = CASE WHEN pending_agent = ? THEN ? ELSE desired_agent END,
+                pending_agent = CASE WHEN pending_agent = ? THEN NULL ELSE pending_agent END,
+                pending_agent_transition_id = CASE
+                    WHEN pending_agent = ? THEN NULL ELSE pending_agent_transition_id
+                END,
+                agent_observed_sdk_timestamp = ?,
+                updated_at = ?, row_version = row_version + 1
+            WHERE sdk_session_id = ? AND runtime_generation = ?
+              AND owner_fence_token = ?
+              AND COALESCE(agent_observed_sdk_timestamp, -1) <= ?
+            """,
+            (
+                agent,
+                agent,
+                agent,
+                agent,
+                agent,
+                event.sdk_timestamp,
+                now,
+                event.sdk_session_id,
+                event.generation,
+                event.fence_token,
+                event.sdk_timestamp,
+            ),
+        )
 
     async def _split_observed_submission(
         self,
@@ -2439,9 +3794,7 @@ class JournalReducer:
                 else None
             )
             raw_attachments = data.get("attachments")
-            attachment_count = (
-                len(raw_attachments) if isinstance(raw_attachments, list) else None
-            )
+            attachment_count = len(raw_attachments) if isinstance(raw_attachments, list) else None
             candidates = [
                 candidate
                 for candidate in raw_candidates
@@ -2655,6 +4008,29 @@ class JournalReducer:
                 int(continuation),
             ),
         )
+        if runtime_schedule_id is not None:
+            await connection.execute(
+                """
+                UPDATE runtime_schedules
+                SET state = 'triggered', last_event_id = ?,
+                    terminal_at = COALESCE(terminal_at, ?),
+                    observed_at = ?, updated_at = ?
+                WHERE sdk_session_id = ? AND runtime_schedule_id = ?
+                  AND state IN ('active', 'unknown')
+                  AND (
+                      recurring = 0
+                      OR schedule_kind = 'after'
+                  )
+                """,
+                (
+                    event.event_id,
+                    event.received_at,
+                    event.received_at,
+                    now,
+                    event.sdk_session_id,
+                    runtime_schedule_id,
+                ),
+            )
         await self._observe_submission(
             connection,
             event,
@@ -3196,11 +4572,8 @@ class JournalReducer:
         row = await cursor.fetchone()
         await cursor.close()
         return (
-            row is not None
-            and int(row["supported"]) == 1
-            and row["evidence_status"] != "unknown"
+            row is not None and int(row["supported"]) == 1 and row["evidence_status"] != "unknown"
         )
-
 
     async def _update_task_projection(
         self,
@@ -3350,10 +4723,7 @@ class JournalReducer:
             return False
         if submission["state"] != "semantic_complete":
             return True
-        if (
-            submission["terminal_at"] is None
-            or float(submission["terminal_at"]) > evidence_time
-        ):
+        if submission["terminal_at"] is None or float(submission["terminal_at"]) > evidence_time:
             await self._record_runtime_incident_once(
                 connection,
                 event,
@@ -3454,10 +4824,11 @@ class JournalReducer:
             correlation_basis = str(existing["correlation_basis"])
             if existing["terminal_at"] is not None:
                 incoming_state = str(task.get("status", "")).lower()
-                if (
-                    incoming_state not in {"completed", "failed", "cancelled"}
-                    and evidence_time > float(existing["terminal_at"])
-                ):
+                if incoming_state not in {
+                    "completed",
+                    "failed",
+                    "cancelled",
+                } and evidence_time > float(existing["terminal_at"]):
                     await self._record_runtime_incident_once(
                         connection,
                         event,
@@ -3479,19 +4850,15 @@ class JournalReducer:
                 correlation_basis=correlation_basis,
                 evidence_time=evidence_time,
             ):
-                return None, None, (
-                    None
-                    if existing["objective_id"] is None
-                    else str(existing["objective_id"])
+                return (
+                    None,
+                    None,
+                    (None if existing["objective_id"] is None else str(existing["objective_id"])),
                 )
             return (
                 submission_id,
                 correlation_basis,
-                (
-                    None
-                    if existing["objective_id"] is None
-                    else str(existing["objective_id"])
-                ),
+                (None if existing["objective_id"] is None else str(existing["objective_id"])),
             )
 
         explicit_submission_id = _value(task, "submissionId") or _value(
@@ -3701,8 +5068,7 @@ class JournalReducer:
             ):
                 continue
             settled_at = max(
-                float(snapshots[topic]["observed_at"])
-                for topic in ("activity", "queue", "tasks")
+                float(snapshots[topic]["observed_at"]) for topic in ("activity", "queue", "tasks")
             )
             cursor = await connection.execute(
                 """
@@ -3823,14 +5189,12 @@ class JournalReducer:
                 None,
             )
             card_key = f"task:{task_id}"
-            submission_id, correlation_basis, objective_id = (
-                await self._resolve_task_submission(
-                    connection,
-                    event,
-                    task=task,
-                    task_id=task_id,
-                    evidence_time=evidence_time,
-                )
+            submission_id, correlation_basis, objective_id = await self._resolve_task_submission(
+                connection,
+                event,
+                task=task,
+                task_id=task_id,
+                evidence_time=evidence_time,
             )
             card_token = str(
                 uuid.uuid5(
@@ -4184,10 +5548,7 @@ def _consume_task_result(task: asyncio.Task[Any]) -> None:
 
 def _snapshot_has_positive_evidence(topic: str, values: dict[str, Any]) -> bool:
     if topic == "activity":
-        return any(
-            bool(values.get(key))
-            for key in ("processing", "has_active_work", "abortable")
-        )
+        return any(bool(values.get(key)) for key in ("processing", "has_active_work", "abortable"))
     if topic == "queue":
         return bool(values.get("items") or values.get("steering_messages"))
     if topic == "tasks":
@@ -4197,6 +5558,25 @@ def _snapshot_has_positive_evidence(topic: str, values: dict[str, Any]) -> bool:
     if topic == "schedules":
         return bool(values.get("schedules"))
     return bool(values)
+
+
+def _json_or_none(value: Any) -> str | None:
+    return None if value is None else json.dumps(value, ensure_ascii=False, sort_keys=True)
+
+
+def _safe_agent_metadata(value: dict[str, Any]) -> dict[str, Any]:
+    safe_fields = {
+        "description",
+        "displayName",
+        "id",
+        "model",
+        "name",
+        "skills",
+        "source",
+        "tools",
+        "userInvocable",
+    }
+    return {key: item for key, item in value.items() if key in safe_fields}
 
 
 def _value(data: Any, key: str) -> str | None:
@@ -4230,11 +5610,7 @@ def _task_projection_facts(
         card_id = tool_call_id or event.agent_id or event.event_id
         if card_id is None:
             return None
-        title = (
-            _value(data, "agentDisplayName")
-            or _value(data, "agentName")
-            or "Copilot subagent"
-        )
+        title = _value(data, "agentDisplayName") or _value(data, "agentName") or "Copilot subagent"
         if raw_type == "subagent.started":
             return (
                 f"agent:{card_id}",
@@ -4484,16 +5860,10 @@ def _tool_output_artifact(event: AdaptedEvent) -> dict[str, Any] | None:
         return None
     tool_call_id = str(data.get("toolCallId", "tool"))
     filename = (
-        f"tool-output-{tool_call_id[:12]}.txt"
-        if success
-        else f"tool-error-{tool_call_id[:12]}.txt"
+        f"tool-output-{tool_call_id[:12]}.txt" if success else f"tool-error-{tool_call_id[:12]}.txt"
     )
     line_count = text.count("\n") + 1
-    caveat = (
-        " Runtime fallback content may be truncated."
-        if source == "content"
-        else ""
-    )
+    caveat = " Runtime fallback content may be truncated." if source == "content" else ""
     status = "completed" if success else "failed"
     return {
         "type": "tool_output_artifact",

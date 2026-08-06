@@ -32,16 +32,22 @@ The implementation follows [`docs/copilotD-detailed-design.md`](docs/copilotD-de
 - Background task `refresh/list` reconciliation, disappearance-to-unknown handling,
   usage/status rendering, and lossless attachment delivery for tool output at or above
   8000 characters; oversized Discord uploads are split into ordered lossless parts.
-- Capability-backed registration for core `/session`, `/project`, `/model`,
-  `/autopilot`, `/plan`, `/steer`, `/context`, `/usage`, and `/queue` commands.
+- Capability-backed registration for core commands plus exact native `/ask`,
+  `/session compact`, `/fleet`, `/tasks`, `/agent`, `/after`, `/every`, `/remote`,
+  `/review`, `/security-review`, `/research`, and `/rubber-duck` surfaces. Each native
+  root or action remains absent until its exact runtime method or builtin invocation is
+  verified.
+- Runtime command-manifest refresh through `commands.list(include_builtins=true)` and
+  `commands.changed`, full typed `commands.invoke` result-union handling, fenced
+  idempotent task/agent/remote transitions, and reducer-owned native schedule/TaskDeck
+  projections.
 - Default always-on definitions for macOS LaunchAgents and Windows Scheduled Tasks,
   plus a protected-work-aware watchdog, shared task-failure supervision, and a
   non-destructive active-execution SUSPECT monitor.
 
-Native-gated commands such as Fleet, Tasks, quick ask, runtime schedules, and remote
-sessions are intentionally not registered until their pinned-runtime fixtures are
-implemented. The verified sidecar does not retain sessions after client transport
-disconnect, so the current topology is bundled-runtime rather than detached execution.
+Unsupported native capabilities fail closed and remain unregistered. The verified
+sidecar does not retain sessions after client transport disconnect, so the current
+topology is bundled-runtime rather than detached execution.
 
 ## Setup
 
@@ -82,11 +88,20 @@ python3.11 -m venv .venv
 ```
 
 Deterministic tests consume the bundled hash-checked fixture. Live acceptance is
-separate: the SDK probe uses the currently logged-in Copilot account and creates a
-disposable persistent session:
+separate. The broad SDK probe creates a disposable persistent session:
 
 ```bash
 .venv/bin/copilotd sdk-probe --live
+```
+
+The complete native acceptance additionally executes supported RPC mutations and
+builtins in a disposable Git repository, cleans up schedules/remote exposure/session
+state, and writes sanitized JSON evidence. It requires both the CLI flag and an exact
+environment confirmation:
+
+```bash
+export COPILOTD_REAL_ACCEPTANCE='I_UNDERSTAND_THIS_USES_REAL_COPILOT'
+.venv/bin/copilotd native-acceptance --real --evidence /tmp/copilotd-native-evidence.json
 ```
 
 Runtime data, cache, and logs use platform-specific user directories. Override them

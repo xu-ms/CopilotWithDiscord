@@ -2350,25 +2350,26 @@ claudeD issue 回归门禁：
   `/limits`、`/pr`、`/delegate` 不进入命令面；`/unbound-fallback` 不存在，因为 `$HOME`
   行为固定启用。
 
-### 当前实现快照（2026-08-05）
+### 当前实现快照（2026-08-06）
 
 首个可运行 slice 已按本设计开始落地，当前不是“全部能力完成”：
 
 | 已实现 | 当前边界 |
 |---|---|
 | 官方 `github-copilot-sdk==1.0.8` + bundled runtime 1.0.73，stdio `--yolo`，create/resume 后 full allow-all 对账 | sidecar client transport 断开后 session retention 实测失败，因此不声明 detached continuation；crash window 保守标 outcome unknown |
-| 9 个 SQLite migration、project `$HOME` fallback/cwd snapshot、owner fence、creation saga、strict-UUID event journal、reducer-owned operation/submission receipts、submission-task links、liveness leases、startup recovery inventory 与 eager resume | bundled runtime 进程死亡后的 in-flight execution 仍只能标 outcome unknown；experimental task action RPC 继续 gated |
+| 14 个 SQLite migration、project `$HOME` fallback/cwd snapshot、owner fence、creation saga、strict-UUID event journal、reducer-owned operation/submission/native-command receipts、submission-task links、liveness leases、startup recovery inventory 与 eager resume | bundled runtime 进程死亡后的 in-flight execution 仍只能标 outcome unknown；真实 fixture 无 current-promotable task，task promote 保持 gated |
 | eventLog `read/tail` durable backfill（固定过滤 ephemeral）、cursor epoch/rebase/predecessor-gap diagnostics、overflow freeze/backfill/generation replacement；activity/queue/task/remote/schedule snapshot requested/applied epoch 与 query watermark | ephemeral idle/delta 离开 live window 后不可恢复，不从 transcript 猜 terminal |
 | durable app FIFO；fresh readiness snapshot、reducer caught-up、config/agent/remote/schedule/task known gate 后只派发队首；attachment manifest READY + hash/size 复验，无 attachment-free fallback；`/queue add/list/remove/clear` | native queue entry 没有 stable opaque ID 时只以 snapshot-local opaque key 诊断；transport ambiguity 不自动重放 |
-| Discord core `/session`、`/project`、`/model`、bare `/autopilot`、bare/optional-prompt `/plan`、`/steer`、`/context`、`/usage`；user-input/Plan-exit/auto-mode-switch 使用 durable exactly-once interaction + select/modal 原位结算；Plan 退出 mode 精确关联并消费 | `/session delete`、compact/fork 和 Native-Gated commands 尚未实现，因而不注册；elicitation/MCP OAuth 仍待接入 |
+| Discord core 命令；strict dynamic builtin manifest；Native-Gated `/ask`、`/session compact`、`/fleet`、`/tasks`、`/agent list|current`、`/after|every list|cancel`、`/remote status|off`、`/review`、`/security-review`、`/research`、`/rubber-duck`；全部 action 由 exact capability 决定 | `/session delete|fork` 按本次范围不实现；`/after|every create` 因 real invoke 返回 `text` 而非 required `completed` 不注册；agent select/deselect、task promote、remote on/export 的 real gate 未通过；elicitation/MCP OAuth 仍待接入 |
 | durable input attachment manifest、hash/size 复验、图片 blob 压缩；stream/final RenderOutbox；table hold 与 code/PNG/MD/CSV assets；Discord HTTP/rate-limit 错误分类，超上限 artifact 按序无损分片 | Discord archived/locked thread、attachment edit、exact 429 retry-after 仍需真实 gateway fixture |
-| tool/subagent/agent-scoped output 归并为原 thread 的单条 TaskDeck；4 秒 cadence、pending coalescing、terminal flush、select/expand/collapse/prev/next；>=8000 字符 tool result/error 逐字附件化；usage、warning/error、intent、workspace change 与 compaction 状态有非空 lane；raw chain-of-thought 永不展示；零 child-thread 路径 | typed Tasks/Fleet action buttons、完整 reasoning summary/diff artifact lane 尚未实现 |
+| tool/subagent/agent-scoped output 归并为原 thread 的单条 TaskDeck；4 秒 cadence、pending coalescing、terminal flush、select/expand/collapse/prev/next；typed task list/show/progress/message/cancel-all/remove/wait 与 Fleet projection；>=8000 字符 tool result/error 逐字附件化；零 child-thread 路径 | real current-promotable fixture 未通过，promote action 不注册；完整 reasoning summary/diff artifact lane 尚未实现 |
 | 共享 TaskRegistry、failure consumer、10 分钟 active-execution SUSPECT + non-destructive ping、结构化 heartbeat、protected-work watchdog、macOS bot/watchdog LaunchAgent 与 Windows Scheduled Task definitions | 当前拓扑没有独立 runtime service；真实 service 安装、sleep/wake 和 Windows 实机仍待验证 |
 
-当前 deterministic 验证基线：`ruff check .`、259 个 pytest 全部通过。仓库内 hash-checked
+当前 deterministic 验证基线：`ruff check .`、282 个 pytest 全部通过。仓库内 hash-checked
 fixture 固定 SDK 1.0.8 / runtime 1.0.73 / protocol 3、114-event inventory 与 capability
-evidence；`copilotd sdk-probe --live` 使用当前登录账号创建 disposable session，属于独立的
-release/live acceptance，不由 deterministic fixture 冒充。这个快照用于区分“已验证实现”和后续
+evidence；`copilotd native-acceptance --real` 还要求 exact 环境确认，按 suite 创建 disposable
+repo/session、执行 supported mutation、清理 remote/schedule/session，并生成 sanitized JSON
+evidence；unsupported action 保存 real discovery/gate，不由 deterministic fixture 冒充。这个快照用于区分“已验证实现”和后续
 设计，不降低以下章节对最终产品的契约要求。
 
 ### HTML 交付要求

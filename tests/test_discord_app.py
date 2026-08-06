@@ -31,6 +31,11 @@ def test_discord_command_manifest_has_core_modes_and_no_deleted_roots(tmp_path: 
     roots = {command.name for command in bot.tree.get_commands()}
 
     assert {
+        "agent",
+        "after",
+        "ask",
+        "every",
+        "fleet",
         "session",
         "project",
         "model",
@@ -39,22 +44,53 @@ def test_discord_command_manifest_has_core_modes_and_no_deleted_roots(tmp_path: 
         "autopilot",
         "plan",
         "steer",
+        "remote",
+        "research",
+        "review",
+        "rubber-duck",
+        "security-review",
+        "tasks",
         "queue",
     } <= roots
-    assert not {
-        "copilot",
-        "workflow",
-        "max-turns",
-        "mode",
-        "goal",
-        "bare",
-        "tools",
-        "cost",
-        "budget",
-        "limits",
-        "pr",
-        "delegate",
-    } & roots
+    session = next(command for command in bot.tree.get_commands() if command.name == "session")
+    assert "compact" in {command.name for command in session.commands}
+    expected_actions = {
+        "agent": {"current", "list"},
+        "after": {"cancel", "list"},
+        "every": {"cancel", "list"},
+        "remote": {"off", "status"},
+        "tasks": {
+            "all",
+            "cancel",
+            "list",
+            "message",
+            "progress",
+            "remove",
+            "show",
+            "wait",
+        },
+    }
+    for root, actions in expected_actions.items():
+        command = next(item for item in bot.tree.get_commands() if item.name == root)
+        action = next(parameter for parameter in command.parameters if parameter.name == "action")
+        assert {choice.value for choice in action.choices} == actions
+    assert (
+        not {
+            "copilot",
+            "workflow",
+            "max-turns",
+            "mode",
+            "goal",
+            "bare",
+            "tools",
+            "cost",
+            "budget",
+            "limits",
+            "pr",
+            "delegate",
+        }
+        & roots
+    )
 
 
 def test_discord_registration_omits_commands_without_capability_evidence(
@@ -63,7 +99,27 @@ def test_discord_registration_omits_commands_without_capability_evidence(
     bot = CopilotDiscordBot(Settings(data_dir=tmp_path))
     manifest = CapabilityRegistry(bot.settings).load_checked()
     capabilities = dict(manifest.capabilities)
-    for capability in ("context_info", "model_config", "models", "session_mode", "usage"):
+    for capability in (
+        "agents_current",
+        "agents_list",
+        "builtin_research",
+        "builtin_review",
+        "builtin_rubber_duck",
+        "builtin_security_review",
+        "context_info",
+        "ephemeral_query",
+        "fleet_start",
+        "model_config",
+        "models",
+        "remote_disable",
+        "remote_enable",
+        "remote_status",
+        "schedules_list",
+        "schedules_stop",
+        "session_mode",
+        "tasks_list",
+        "usage",
+    ):
         capabilities[capability] = replace(
             capabilities[capability],
             supported=False,
@@ -74,6 +130,65 @@ def test_discord_registration_omits_commands_without_capability_evidence(
     roots = {command.name for command in bot.tree.get_commands()}
 
     assert roots == {"project", "queue", "session", "steer"}
+
+
+def test_native_discord_adapter_registers_only_exact_supported_actions(
+    tmp_path: Path,
+) -> None:
+    bot = CopilotDiscordBot(Settings(data_dir=tmp_path))
+    manifest = CapabilityRegistry(bot.settings).load_checked()
+    capabilities = dict(manifest.capabilities)
+    supported = {
+        "agents_current",
+        "agents_deselect",
+        "agents_list",
+        "agents_select",
+        "builtin_after",
+        "builtin_every",
+        "builtin_research",
+        "builtin_review",
+        "builtin_rubber_duck",
+        "builtin_security_review",
+        "commands_invoke",
+        "commands_list",
+        "ephemeral_query",
+        "fleet_start",
+        "history_compact",
+        "remote_disable",
+        "remote_enable",
+        "remote_status",
+        "schedules_list",
+        "schedules_stop",
+        "tasks_cancel",
+        "tasks_list",
+        "tasks_message",
+        "tasks_progress",
+        "tasks_promote",
+        "tasks_remove",
+        "tasks_wait",
+    }
+    for name in supported:
+        capabilities[name] = replace(capabilities[name], supported=True)
+    bot.capabilities = replace(manifest, capabilities=capabilities)
+
+    bot._register_application_commands()
+
+    roots = {command.name for command in bot.tree.get_commands()}
+    assert {
+        "agent",
+        "after",
+        "ask",
+        "every",
+        "fleet",
+        "remote",
+        "research",
+        "review",
+        "rubber-duck",
+        "security-review",
+        "tasks",
+    } <= roots
+    session = next(command for command in bot.tree.get_commands() if command.name == "session")
+    assert "compact" in {command.name for command in session.commands}
 
 
 def test_streaming_table_is_held_before_discord_edit() -> None:
@@ -99,9 +214,7 @@ before
 after
 """.strip()
 
-    rendered, assets = await _discord_render(
-        {"content": content, "finalized": True}
-    )
+    rendered, assets = await _discord_render({"content": content, "finalized": True})
 
     assert "before" in rendered
     assert "alpha" in rendered
@@ -197,9 +310,7 @@ def test_taskdeck_view_uses_short_in_place_controls() -> None:
                 "page_count": 2,
                 "selected_card_token": "card-a",
                 "expanded": False,
-                "options": [
-                    {"label": "Worker A", "value": "card-a", "state": "running"}
-                ],
+                "options": [{"label": "Worker A", "value": "card-a", "state": "running"}],
             }
         }
     )

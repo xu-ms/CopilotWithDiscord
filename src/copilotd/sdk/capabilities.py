@@ -13,30 +13,47 @@ from copilot.session_events import SessionEventType
 from copilotd.config import Settings
 from copilotd.storage.database import Database
 
-CAPABILITY_SCHEMA_VERSION = 1
+CAPABILITY_SCHEMA_VERSION = 2
 PINNED_SDK_VERSION = "1.0.8"
 PINNED_RUNTIME_VERSION = "1.0.73"
 PINNED_PROTOCOL_VERSION = 3
 PINNED_GENERATED_EVENT_COUNT = 114
-PINNED_GENERATED_EVENT_SHA256 = (
-    "b7aed29d812cf032a5f68343b95b15c5f1c6735bde5140670692e6fa5fd0d1a2"
-)
+PINNED_GENERATED_EVENT_SHA256 = "b7aed29d812cf032a5f68343b95b15c5f1c6735bde5140670692e6fa5fd0d1a2"
 MAIN_BRANCH_ONLY_EVENTS = (
     "factory.run_updated",
     "session.context_cleared",
 )
 CHECKED_CAPABILITY_FIXTURE_SHA256 = (
-    "9761fd6239d5c02c5d9b85a25c80a241b2da445c55e2258a8d48d3a47b0cc813"
+    "7403b5b57f4f6d1339b5b6c24c75bfd6b2f87ffda065e71e9dc9c79395a26945"
 )
 
 _REQUIRED_CAPABILITIES = frozenset(
     {
         "accepted_user_event_id_mapping",
         "activity_snapshot",
+        "agents_current",
+        "agents_deselect",
+        "agents_list",
+        "agents_select",
+        "builtin_after",
         "builtin_commands",
+        "builtin_every",
+        "builtin_research",
+        "builtin_review",
+        "builtin_rubber_duck",
+        "builtin_security_review",
+        "commands_invoke",
+        "commands_list",
+        "commands_result_agent_prompt",
+        "commands_result_completed",
+        "commands_result_select_subcommand",
+        "commands_result_text",
         "context_info",
         "detached_continuation",
+        "ephemeral_query",
         "event_log",
+        "fleet_start",
+        "history_compact",
         "model_config",
         "models",
         "native_queue_snapshot",
@@ -46,10 +63,23 @@ _REQUIRED_CAPABILITIES = frozenset(
         "pre_registered_on_event",
         "reasoning_summary_readback",
         "remote",
+        "remote_disable",
+        "remote_enable",
+        "remote_export_detach_safe",
+        "remote_status",
+        "schedules_list",
+        "schedules_stop",
         "selected_agent",
         "session_mode",
         "sessions_check_in_use",
         "task_snapshot",
+        "tasks_cancel",
+        "tasks_list",
+        "tasks_message",
+        "tasks_progress",
+        "tasks_promote",
+        "tasks_remove",
+        "tasks_wait",
         "usage",
     }
 )
@@ -65,11 +95,48 @@ _REQUIRED_STARTUP_CAPABILITIES = frozenset(
 )
 _CORE_DISCORD_ROOTS = frozenset({"project", "queue", "session", "steer"})
 _GATED_DISCORD_ROOTS: dict[str, frozenset[str]] = {
+    "agent": frozenset({"agents_current", "agents_list"}),
+    "after": frozenset({"schedules_list"}),
+    "ask": frozenset({"ephemeral_query"}),
     "autopilot": frozenset({"session_mode"}),
     "context": frozenset({"context_info"}),
+    "every": frozenset({"schedules_list"}),
+    "fleet": frozenset({"fleet_start"}),
     "model": frozenset({"model_config", "models"}),
     "plan": frozenset({"session_mode"}),
+    "remote": frozenset({"remote_status"}),
+    "research": frozenset({"builtin_research"}),
+    "review": frozenset({"builtin_review"}),
+    "rubber-duck": frozenset({"builtin_rubber_duck"}),
+    "security-review": frozenset({"builtin_security_review"}),
+    "tasks": frozenset({"tasks_list"}),
     "usage": frozenset({"usage"}),
+}
+
+_TASK_ACTION_CAPABILITIES = {
+    "all": "tasks_cancel",
+    "cancel": "tasks_cancel",
+    "list": "tasks_list",
+    "message": "tasks_message",
+    "progress": "tasks_progress",
+    "promote": "tasks_promote",
+    "remove": "tasks_remove",
+    "show": "tasks_progress",
+    "wait": "tasks_wait",
+}
+
+_AGENT_ACTION_CAPABILITIES = {
+    "current": "agents_current",
+    "deselect": "agents_deselect",
+    "list": "agents_list",
+    "select": "agents_select",
+}
+
+_REMOTE_ACTION_CAPABILITIES = {
+    "export": "remote_enable",
+    "off": "remote_disable",
+    "on": "remote_enable",
+    "status": "remote_status",
 }
 
 
@@ -169,9 +236,7 @@ class CapabilityManifest:
                     str(name): CapabilityEvidence(
                         name=str(name),
                         supported=(
-                            None
-                            if evidence["supported"] is None
-                            else bool(evidence["supported"])
+                            None if evidence["supported"] is None else bool(evidence["supported"])
                         ),
                         evidence_kind=str(evidence["evidence_kind"]),
                         detail=evidence["detail"],
@@ -190,9 +255,7 @@ class CapabilityManifest:
 
     def validate(self) -> None:
         if self.schema_version != CAPABILITY_SCHEMA_VERSION:
-            raise CapabilityFixtureError(
-                f"unsupported capability schema {self.schema_version}"
-            )
+            raise CapabilityFixtureError(f"unsupported capability schema {self.schema_version}")
         if self.identity.protocol_version != self.identity.ping_protocol_version:
             raise CapabilityFixtureError("fixture protocol versions disagree")
         installed_events = sorted(item.value for item in SessionEventType)
@@ -204,12 +267,9 @@ class CapabilityManifest:
                 )
             if self.generated_event_sha256 != PINNED_GENERATED_EVENT_SHA256:
                 raise CapabilityFixtureError("SDK 1.0.8 event inventory hash is invalid")
-        if (
-            self.identity.sdk_version == version("github-copilot-sdk")
-            and (
-                self.generated_event_count != len(installed_events)
-                or self.generated_event_sha256 != installed_hash
-            )
+        if self.identity.sdk_version == version("github-copilot-sdk") and (
+            self.generated_event_count != len(installed_events)
+            or self.generated_event_sha256 != installed_hash
         ):
             raise CapabilityFixtureError(
                 "fixture generated-event inventory does not match the installed SDK"
@@ -280,9 +340,7 @@ class CapabilityManifest:
         return manifest
 
     def require_startup_capabilities(self) -> None:
-        missing = sorted(
-            name for name in _REQUIRED_STARTUP_CAPABILITIES if not self.supports(name)
-        )
+        missing = sorted(name for name in _REQUIRED_STARTUP_CAPABILITIES if not self.supports(name))
         if missing:
             raise RequiredCapabilityMissing(
                 f"required runtime capabilities are not evidenced: {', '.join(missing)}"
@@ -294,6 +352,37 @@ class CapabilityManifest:
             if all(self.supports(capability) for capability in requirements):
                 roots.add(root)
         return frozenset(roots)
+
+    def task_actions(self) -> frozenset[str]:
+        return frozenset(
+            action
+            for action, capability in _TASK_ACTION_CAPABILITIES.items()
+            if self.supports(capability)
+        )
+
+    def agent_actions(self) -> frozenset[str]:
+        return frozenset(
+            action
+            for action, capability in _AGENT_ACTION_CAPABILITIES.items()
+            if self.supports(capability)
+        )
+
+    def remote_actions(self) -> frozenset[str]:
+        return frozenset(
+            action
+            for action, capability in _REMOTE_ACTION_CAPABILITIES.items()
+            if self.supports(capability)
+        )
+
+    def schedule_actions(self, kind: str) -> frozenset[str]:
+        actions: set[str] = set()
+        if self.supports("schedules_list"):
+            actions.add("list")
+        if self.supports("schedules_stop"):
+            actions.add("cancel")
+        if self.supports(f"builtin_{kind}"):
+            actions.add("create")
+        return frozenset(actions)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -312,8 +401,7 @@ class CapabilityManifest:
                 "main_branch_only": list(self.main_branch_only_events),
             },
             "capabilities": {
-                name: evidence.to_dict()
-                for name, evidence in sorted(self.capabilities.items())
+                name: evidence.to_dict() for name, evidence in sorted(self.capabilities.items())
             },
             "fixture": {
                 "path": str(self.fixture_path),
@@ -332,9 +420,7 @@ class CapabilityRegistry:
     ) -> None:
         self._settings = settings
         self._checked_fixture_path = checked_fixture_path or (
-            Path(__file__).parent
-            / "fixtures"
-            / "capabilities-sdk-1.0.8-runtime-1.0.73.json"
+            Path(__file__).parent / "fixtures" / "capabilities-sdk-1.0.8-runtime-1.0.73.json"
         )
         self._checked_fixture_sha256 = checked_fixture_sha256
 
@@ -350,6 +436,13 @@ class CapabilityRegistry:
             return None
         try:
             payload = json.loads(path.read_text(encoding="utf-8"))
+            schema_version = int(payload["schema_version"])
+            if schema_version < CAPABILITY_SCHEMA_VERSION:
+                return None
+            if schema_version > CAPABILITY_SCHEMA_VERSION:
+                raise CapabilityFixtureError(
+                    f"unsupported local capability schema {schema_version}"
+                )
             fixture = payload["fixture"]
             fixture_path = Path(str(fixture["path"]))
             if not fixture_path.is_absolute():
@@ -370,11 +463,7 @@ class CapabilityRegistry:
         checked = self.load_checked()
         candidates = [manifest for manifest in (local, checked) if manifest is not None]
         if local is not None and local.matches(identity):
-            manifest = (
-                local.with_checked_fallback(checked)
-                if checked.matches(identity)
-                else local
-            )
+            manifest = local.with_checked_fallback(checked) if checked.matches(identity) else local
             manifest.require_startup_capabilities()
             return manifest
         if checked.matches(identity):
@@ -388,9 +477,7 @@ class CapabilityRegistry:
             )
             for item in candidates
         )
-        actual = (
-            f"{identity.sdk_version}/{identity.runtime_version}/{identity.protocol_version}"
-        )
+        actual = f"{identity.sdk_version}/{identity.runtime_version}/{identity.protocol_version}"
         raise RuntimeIdentityMismatch(
             f"runtime identity {actual} has no checked capability evidence; expected {expected}"
         )

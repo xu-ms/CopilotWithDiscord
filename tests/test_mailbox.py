@@ -232,3 +232,147 @@ async def test_mailbox_stop_cancels_hung_operation_and_marks_it_unknown(
 
     assert row is not None and row["state"] == "unknown"
     assert row["error_code"] in {"mailbox_cancelled", "mailbox_stopped"}
+
+
+@pytest.mark.asyncio
+async def test_inflight_idempotency_rejects_different_kind_or_input(
+    tmp_path: Path,
+) -> None:
+    async with Database(tmp_path / "inflight-input.sqlite3") as database:
+        started = asyncio.Event()
+        release = asyncio.Event()
+
+        async def validate() -> bool:
+            return True
+
+        async def operation() -> str:
+            started.set()
+            await release.wait()
+            return "first"
+
+        mailbox, reducer = _start_mailbox(database, validate)
+        first = asyncio.create_task(
+            mailbox.submit(
+                kind="agent",
+                idempotency_key="same-key",
+                input_payload={"target": "reviewer"},
+                operation=operation,
+            )
+        )
+        await started.wait()
+
+        with pytest.raises(ValueError, match="different input"):
+            await mailbox.submit(
+                kind="remote",
+                idempotency_key="same-key",
+                input_payload={"target": "off"},
+                operation=operation,
+            )
+
+        release.set()
+        assert await first == "first"
+        await mailbox.stop()
+        await reducer.stop()
+
+
+@pytest.mark.asyncio
+async def test_cancelled_waiter_does_not_cache_raw_ephemeral_result(
+    tmp_path: Path,
+) -> None:
+    async with Database(tmp_path / "ephemeral-cache.sqlite3") as database:
+        started = asyncio.Event()
+        release = asyncio.Event()
+        calls = 0
+
+        async def validate() -> bool:
+            return True
+
+        async def operation() -> str:
+            nonlocal calls
+            calls += 1
+            started.set()
+            await release.wait()
+            return "private answer"
+
+        mailbox, reducer = _start_mailbox(database, validate)
+        waiter = asyncio.create_task(
+            mailbox.submit(
+                kind="ephemeral-query",
+                idempotency_key="ask",
+                input_payload={"question_hash": "hash"},
+                operation=operation,
+                result_persistence=lambda value: {"answer_hash": f"hash:{len(value)}"},
+            )
+        )
+        await started.wait()
+        waiter.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await waiter
+        release.set()
+        await mailbox.drain()
+
+        replay = await mailbox.submit(
+            kind="ephemeral-query",
+            idempotency_key="ask",
+            input_payload={"question_hash": "hash"},
+            operation=operation,
+        )
+
+        assert replay == {"answer_hash": "hash:14"}
+        assert calls == 1
+        assert "ask" not in mailbox._futures
+        await mailbox.stop()
+        await reducer.stop()
+
+
+@pytest.mark.asyncio
+async def test_frozen_mailbox_drains_native_work_before_close_operation(
+    tmp_path: Path,
+) -> None:
+    async with Database(tmp_path / "freeze-drain.sqlite3") as database:
+        started = asyncio.Event()
+        release = asyncio.Event()
+
+        async def validate() -> bool:
+            return True
+
+        async def native_operation() -> str:
+            started.set()
+            await release.wait()
+            return "native-complete"
+
+        mailbox, reducer = _start_mailbox(database, validate)
+        native = asyncio.create_task(
+            mailbox.submit(
+                kind="native-command",
+                idempotency_key="native",
+                input_payload={},
+                operation=native_operation,
+            )
+        )
+        await started.wait()
+        draining = asyncio.create_task(mailbox.freeze_and_drain())
+        await asyncio.sleep(0)
+        assert not draining.done()
+        with pytest.raises(RuntimeError, match="not accepting"):
+            await mailbox.submit(
+                kind="remote",
+                idempotency_key="late",
+                input_payload={},
+                operation=native_operation,
+            )
+        release.set()
+        assert await native == "native-complete"
+        await draining
+
+        closed = await mailbox.submit(
+            kind="close",
+            idempotency_key="close",
+            input_payload={},
+            operation=lambda: asyncio.sleep(0, result="closed"),
+            allow_when_frozen=True,
+        )
+
+        assert closed == "closed"
+        await mailbox.stop()
+        await reducer.stop()

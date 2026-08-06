@@ -634,8 +634,8 @@ id="toc-会话存活保证与边界">会话存活保证与边界</a></li>
 <li><a href="#测试契约" id="toc-测试契约">测试契约</a></li>
 <li><a href="#已固定的关键默认"
 id="toc-已固定的关键默认">已固定的关键默认</a></li>
-<li><a href="#当前实现快照2026-08-05"
-id="toc-当前实现快照2026-08-05">当前实现快照（2026-08-05）</a></li>
+<li><a href="#当前实现快照2026-08-06"
+id="toc-当前实现快照2026-08-06">当前实现快照（2026-08-06）</a></li>
 <li><a href="#html-交付要求" id="toc-html-交付要求">HTML
 交付要求</a></li>
 </ul></li>
@@ -5269,7 +5269,7 @@ model、<code>/mode</code>、<code>/goal</code>、<code>/bare</code>、<code>/to
 不进入命令面；<code>/unbound-fallback</code> 不存在，因为
 <code>$HOME</code> 行为固定启用。</li>
 </ul>
-<h3 id="当前实现快照2026-08-05">当前实现快照（2026-08-05）</h3>
+<h3 id="当前实现快照2026-08-06">当前实现快照（2026-08-06）</h3>
 <p>首个可运行 slice 已按本设计开始落地，当前不是“全部能力完成”：</p>
 <table>
 <thead>
@@ -5288,13 +5288,13 @@ model、<code>/mode</code>、<code>/goal</code>、<code>/bare</code>、<code>/to
 unknown</td>
 </tr>
 <tr>
-<td>9 个 SQLite migration、project <code>$HOME</code> fallback/cwd
+<td>14 个 SQLite migration、project <code>$HOME</code> fallback/cwd
 snapshot、owner fence、creation saga、strict-UUID event
-journal、reducer-owned operation/submission receipts、submission-task
+journal、reducer-owned operation/submission/native-command receipts、submission-task
 links、liveness leases、startup
 recovery inventory 与 eager resume</td>
 <td>bundled runtime 进程死亡后的 in-flight execution 仍只能标 outcome
-unknown；experimental task action RPC 继续 gated</td>
+unknown；真实 fixture 无 current-promotable task，task promote 保持 gated</td>
 </tr>
 <tr>
 <td>eventLog <code>read/tail</code> durable backfill（固定过滤
@@ -5314,14 +5314,13 @@ fallback；<code>/queue add/list/remove/clear</code></td>
 ambiguity 不自动重放</td>
 </tr>
 <tr>
-<td>Discord core
-<code>/session</code>、<code>/project</code>、<code>/model</code>、bare
-<code>/autopilot</code>、bare/optional-prompt
-<code>/plan</code>、<code>/steer</code>、<code>/context</code>、<code>/usage</code>；user-input/Plan-exit/auto-mode-switch
-使用 durable exactly-once interaction + select/modal 原位结算；Plan 退出
-mode 精确关联并消费</td>
-<td><code>/session delete</code>、compact/fork 和 Native-Gated commands
-尚未实现，因而不注册；elicitation/MCP OAuth 仍待接入</td>
+<td>Discord core 命令；strict dynamic builtin manifest；Native-Gated
+<code>/ask</code>、<code>/session compact</code>、<code>/fleet</code>、<code>/tasks</code>、<code>/agent list|current</code>、<code>/after|every list|cancel</code>、<code>/remote status|off</code>、<code>/review</code>、<code>/security-review</code>、<code>/research</code>、<code>/rubber-duck</code>；全部
+action 由 exact capability 决定</td>
+<td><code>/session delete|fork</code> 按本次范围不实现；<code>/after|every create</code>
+因 real invoke 返回 <code>text</code> 而非 required <code>completed</code>
+不注册；agent select/deselect、task promote、remote on/export 的 real gate
+未通过；elicitation/MCP OAuth 仍待接入</td>
 </tr>
 <tr>
 <td>durable input attachment manifest、hash/size 复验、图片 blob
@@ -5334,12 +5333,11 @@ retry-after 仍需真实 gateway fixture</td>
 <tr>
 <td>tool/subagent/agent-scoped output 归并为原 thread 的单条 TaskDeck；4
 秒 cadence、pending coalescing、terminal
-flush、select/expand/collapse/prev/next；&gt;=8000 字符 tool
-result/error 逐字附件化；usage、warning/error、intent、workspace change
-与 compaction 状态有非空 lane；raw chain-of-thought 永不展示；零
-child-thread 路径</td>
-<td>typed Tasks/Fleet action buttons、完整 reasoning summary/diff
-artifact lane 尚未实现</td>
+flush、select/expand/collapse/prev/next；typed task
+list/show/progress/message/cancel-all/remove/wait 与 Fleet
+projection；&gt;=8000 字符 tool result/error 逐字附件化；零 child-thread 路径</td>
+<td>real current-promotable fixture 未通过，promote action
+不注册；完整 reasoning summary/diff artifact lane 尚未实现</td>
 </tr>
 <tr>
 <td>共享 TaskRegistry、failure consumer、10 分钟 active-execution SUSPECT +
@@ -5350,11 +5348,12 @@ Windows 实机仍待验证</td>
 </tr>
 </tbody>
 </table>
-<p>当前 deterministic 验证基线：<code>ruff check .</code>、259 个 pytest
+<p>当前 deterministic 验证基线：<code>ruff check .</code>、282 个 pytest
 全部通过。仓库内 hash-checked fixture 固定 SDK 1.0.8 / runtime 1.0.73 /
 protocol 3、114-event inventory 与 capability evidence；<code>copilotd
-sdk-probe --live</code> 使用当前登录账号创建 disposable session，属于独立的
-release/live acceptance，不由 deterministic fixture
+native-acceptance --real</code> 还要求 exact 环境确认，按 suite 创建 disposable
+repo/session、执行 supported mutation、清理 remote/schedule/session，并生成 sanitized JSON
+evidence；unsupported action 保存 real discovery/gate，不由 deterministic fixture
 冒充。这个快照用于区分“已验证实现”和后续设计，不降低以下章节对最终产品的契约要求。</p>
 <h3 id="html-交付要求">HTML 交付要求</h3>
 <ul>

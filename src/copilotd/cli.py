@@ -6,12 +6,14 @@ import json
 import platform
 import sys
 from importlib.metadata import version
+from pathlib import Path
 from typing import Any
 
 from copilotd.config import Settings
 from copilotd.discord_app import run_discord_bot
 from copilotd.logging import configure_logging
 from copilotd.ops.service import ServiceManager, status_dict
+from copilotd.sdk.acceptance import ACCEPTANCE_SUITES, RealNativeAcceptance
 from copilotd.sdk.bridge import CopilotBridge
 from copilotd.sdk.capabilities import CapabilityRegistry
 from copilotd.sdk.probe import SdkProbe, _to_jsonable
@@ -58,6 +60,35 @@ def build_parser() -> argparse.ArgumentParser:
         "--probe-sidecar",
         action="store_true",
         help="test detached execution and replay against a TCP sidecar",
+    )
+    acceptance = subparsers.add_parser(
+        "native-acceptance",
+        help="run opt-in real disposable acceptance for native RPC capabilities",
+    )
+    acceptance.add_argument(
+        "--real",
+        action="store_true",
+        help="confirm this command may consume real Copilot quota and mutate disposable sessions",
+    )
+    acceptance.add_argument(
+        "--evidence",
+        type=Path,
+        required=True,
+        help="write sanitized machine-readable evidence to this path",
+    )
+    acceptance.add_argument("--timeout", type=float, default=180)
+    acceptance.add_argument(
+        "--suite",
+        action="append",
+        choices=sorted(ACCEPTANCE_SUITES),
+        help="run only this suite; repeat to select multiple suites",
+    )
+    acceptance.add_argument(
+        "--resume-evidence",
+        action="append",
+        type=Path,
+        default=[],
+        help="merge exact-capability results from a prior sanitized real run",
     )
     return parser
 
@@ -173,6 +204,19 @@ async def run_command(args: argparse.Namespace) -> int:
             )
         else:
             result = probe.static_matrix()
+        _print_json(result)
+        return 0
+
+    if args.command == "native-acceptance":
+        if not args.real:
+            raise ValueError("native acceptance requires --real")
+        result = await RealNativeAcceptance(
+            settings,
+            evidence_path=args.evidence,
+            timeout_seconds=args.timeout,
+            suites=None if args.suite is None else set(args.suite),
+            resume_evidence=tuple(args.resume_evidence),
+        ).run()
         _print_json(result)
         return 0
 

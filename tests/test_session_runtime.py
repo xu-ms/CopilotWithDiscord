@@ -38,6 +38,7 @@ from copilotd.core.session_runtime import (
 )
 from copilotd.sdk.bridge import EventLogBatch, PermissionPostureError
 from copilotd.sdk.capabilities import CapabilityRegistry
+from copilotd.sdk.native import NativeCommandDefinition
 from copilotd.storage.database import Database
 from copilotd.storage.leases import OwnerConflict, OwnerLeaseStore
 
@@ -49,6 +50,7 @@ class FakeHandle:
         self.sent: list[tuple[str, dict[str, Any]]] = []
         self.abort_calls = 0
         self.disconnect_calls = 0
+        self.events: list[Any] = []
 
     async def send(self, prompt: str, **kwargs: Any) -> str:
         self.sent.append((prompt, kwargs))
@@ -60,6 +62,9 @@ class FakeHandle:
 
     async def disconnect(self) -> None:
         self.disconnect_calls += 1
+
+    async def get_events(self) -> list[Any]:
+        return list(self.events)
 
 
 class FakeBridge:
@@ -204,8 +209,29 @@ class FakeBridge:
     async def get_remote_state(self, _session: FakeHandle) -> dict[str, Any]:
         return {"mode": "off", "url": None}
 
+    async def disable_remote(self, _session: FakeHandle) -> None:
+        return None
+
     async def get_current_agent(self, _session: FakeHandle) -> str:
         return "default"
+
+    async def list_agents(self, _session: FakeHandle) -> list[dict[str, Any]]:
+        return []
+
+    async def get_current_agent_info(
+        self,
+        _session: FakeHandle,
+    ) -> dict[str, Any] | None:
+        return None
+
+    async def list_commands(
+        self,
+        _session: FakeHandle,
+        *,
+        include_builtins: bool,
+    ) -> tuple[NativeCommandDefinition, ...]:
+        assert include_builtins
+        return ()
 
 
 def _event(
@@ -340,9 +366,7 @@ async def test_user_message_and_send_response_orderings_keep_one_submission(
     callback_before_response: bool,
 ) -> None:
     session_id = str(uuid4())
-    async with Database(
-        tmp_path / f"send-order-{callback_before_response}.sqlite3"
-    ) as database:
+    async with Database(tmp_path / f"send-order-{callback_before_response}.sqlite3") as database:
         bindings = SessionBindingRepository(database)
         binding = await bindings.create(
             thread_id="thread-send-order",
@@ -434,9 +458,7 @@ async def test_external_same_prompt_callback_before_acceptance_is_reclassified(
     external_event_id = str(uuid4())
     accepted_id = str(uuid4())
     async with Database(tmp_path / "external-before-acceptance.sqlite3") as database:
-        await CapabilityRegistry(
-            Settings(_env_file=None, data_dir=tmp_path)
-        ).activate(
+        await CapabilityRegistry(Settings(_env_file=None, data_dir=tmp_path)).activate(
             database,
             {
                 "runtime_version": "1.0.73",
@@ -476,10 +498,7 @@ async def test_external_same_prompt_callback_before_acceptance_is_reclassified(
             return accepted_id
 
         bridge.handle.send = external_callback_first  # type: ignore[method-assign]
-        assert (
-            await runtime.send("same prompt", idempotency_key="same-prompt")
-            == accepted_id
-        )
+        assert await runtime.send("same prompt", idempotency_key="same-prompt") == accepted_id
         provisional = await database.fetchall(
             """
             SELECT origin, state, accepted_message_id, observed_user_event_id,
@@ -600,15 +619,9 @@ async def test_runtime_routes_user_input_through_durable_interaction(
         assert pending is not None
         interaction_id = str(pending["interaction_id"])
 
-        assert (
-            await runtime.respond_interaction(interaction_id, selection=1)
-            == "resolved"
-        )
+        assert await runtime.respond_interaction(interaction_id, selection=1) == "resolved"
         assert await response_task == {"answer": "second", "wasFreeform": False}
-        assert (
-            await runtime.respond_interaction(interaction_id, selection=0)
-            == "expired"
-        )
+        assert await runtime.respond_interaction(interaction_id, selection=0) == "expired"
 
         settled = await database.fetchone(
             "SELECT state, response FROM pending_interactions WHERE interaction_id = ?",
@@ -629,10 +642,7 @@ async def test_runtime_routes_user_input_through_durable_interaction(
         assert '"answer": "second"' in str(settled["response"])
         assert lease is not None and lease["state"] == "released"
         assert [row["lane"] for row in render_rows] == ["interaction", "interaction"]
-        assert all(
-            row["coalesce_key"] == f"interaction:{interaction_id}"
-            for row in render_rows
-        )
+        assert all(row["coalesce_key"] == f"interaction:{interaction_id}" for row in render_rows)
 
         assert await runtime.set_mode("plan", idempotency_key="enter-plan") == "plan"
         plan_task = asyncio.create_task(
@@ -754,9 +764,7 @@ async def test_runtime_times_out_plan_interaction_with_typed_decline(
             {},
         )
         assert result == {"approved": False}
-        interaction = await database.fetchone(
-            "SELECT state FROM pending_interactions"
-        )
+        interaction = await database.fetchone("SELECT state FROM pending_interactions")
         lease = await database.fetchone(
             "SELECT state FROM liveness_leases WHERE kind = 'interaction'"
         )
@@ -1091,13 +1099,9 @@ async def test_close_freezes_send_admission_before_checking_detach_blockers(
             )
 
         monkeypatch.setattr(runtime.inbox, "commit_internal", delayed_commit)
-        send_task = asyncio.create_task(
-            runtime.send("racing send", idempotency_key="racing-send")
-        )
+        send_task = asyncio.create_task(runtime.send("racing send", idempotency_key="racing-send"))
         await admission_started.wait()
-        close_task = asyncio.create_task(
-            runtime.close(idempotency_key="racing-close")
-        )
+        close_task = asyncio.create_task(runtime.close(idempotency_key="racing-close"))
         await asyncio.sleep(0)
         assert not close_task.done()
 
@@ -1506,11 +1510,20 @@ async def test_unsupported_optional_capabilities_do_not_create_unknown_gates(
             project_source="implicit-home",
         )
         bridge = FakeBridge(session_id)
-        manifest = CapabilityRegistry(
-            Settings(_env_file=None, data_dir=tmp_path)
-        ).load_checked()
+        manifest = CapabilityRegistry(Settings(_env_file=None, data_dir=tmp_path)).load_checked()
         capabilities = dict(manifest.capabilities)
-        for name in ("native_schedule", "remote", "selected_agent", "task_snapshot"):
+        for name in (
+            "agents_current",
+            "agents_list",
+            "commands_list",
+            "native_schedule",
+            "remote",
+            "remote_status",
+            "selected_agent",
+            "schedules_list",
+            "task_snapshot",
+            "tasks_list",
+        ):
             capabilities[name] = replace(capabilities[name], supported=False)
         runtime = SessionRuntime(
             database=database,
@@ -1980,8 +1993,7 @@ async def test_permission_change_event_reconciles_allow_all_before_next_send(
             if (
                 bridge.allow_all_calls >= 2
                 and reconciled is not None
-                and reconciled.permission_posture
-                == PermissionPosture.VERIFIED_ALLOW_ALL
+                and reconciled.permission_posture == PermissionPosture.VERIFIED_ALLOW_ALL
             ):
                 break
             await asyncio.sleep(0.005)
