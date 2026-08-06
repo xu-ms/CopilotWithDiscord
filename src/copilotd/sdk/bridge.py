@@ -7,20 +7,39 @@ from typing import Any, Literal, cast
 
 from copilot import CopilotClient, RuntimeConnection
 from copilot.generated.rpc import (
+    AgentSelectRequest,
+    CommandsInvokeRequest,
+    CommandsListRequest,
     EventLogReadRequest,
+    FleetStartRequest,
+    HistoryCompactRequest,
     MetadataContextInfoRequest,
     ModeSetRequest,
     PermissionsAllowAllMode,
     PermissionsSetAAllSource,
     PermissionsSetAllowAllRequest,
     PermissionsSetApproveAllRequest,
+    RemoteEnableRequest,
+    RemoteSessionMode,
+    ScheduleStopRequest,
     SessionMode,
     SessionsCheckInUseRequest,
+    TasksCancelRequest,
+    TasksGetProgressRequest,
+    TasksPromoteToBackgroundRequest,
+    TasksRemoveRequest,
+    TasksSendMessageRequest,
+    UIEphemeralQueryRequest,
 )
 from copilot.session import CopilotSession, PermissionHandler
 from copilot.session_events import SessionEvent
 
 from copilotd.config import Settings
+from copilotd.sdk.native import (
+    NativeCommandDefinition,
+    NativeCommandResult,
+    parse_command_result,
+)
 
 
 class PermissionPostureError(RuntimeError):
@@ -272,19 +291,97 @@ class CopilotBridge:
         }
 
     async def get_tasks(self, session: CopilotSession) -> list[dict[str, Any]]:
+        await self.refresh_tasks(session)
+        return await self.list_tasks(session)
+
+    async def refresh_tasks(self, session: CopilotSession) -> None:
         await session.rpc.tasks.refresh(timeout=10)
+
+    async def list_tasks(self, session: CopilotSession) -> list[dict[str, Any]]:
         tasks = await session.rpc.tasks.list(timeout=10)
         return [cast(dict[str, Any], task.to_dict()) for task in tasks.tasks]
+
+    async def get_task_progress(
+        self,
+        session: CopilotSession,
+        task_id: str,
+    ) -> dict[str, Any] | None:
+        result = await session.rpc.tasks.get_progress(
+            TasksGetProgressRequest(id=task_id),
+            timeout=10,
+        )
+        return None if result.progress is None else cast(dict[str, Any], result.progress.to_dict())
+
+    async def send_task_message(
+        self,
+        session: CopilotSession,
+        task_id: str,
+        message: str,
+    ) -> dict[str, Any]:
+        result = await session.rpc.tasks.send_message(
+            TasksSendMessageRequest(id=task_id, message=message),
+            timeout=10,
+        )
+        return cast(dict[str, Any], result.to_dict())
+
+    async def get_current_promotable_task(
+        self,
+        session: CopilotSession,
+    ) -> dict[str, Any] | None:
+        result = await session.rpc.tasks.get_current_promotable(timeout=10)
+        return None if result.task is None else cast(dict[str, Any], result.task.to_dict())
+
+    async def promote_task(self, session: CopilotSession, task_id: str) -> bool:
+        result = await session.rpc.tasks.promote_to_background(
+            TasksPromoteToBackgroundRequest(id=task_id),
+            timeout=10,
+        )
+        return result.promoted
+
+    async def cancel_task(self, session: CopilotSession, task_id: str) -> bool:
+        result = await session.rpc.tasks.cancel(
+            TasksCancelRequest(id=task_id),
+            timeout=10,
+        )
+        return result.cancelled
+
+    async def remove_task(self, session: CopilotSession, task_id: str) -> bool:
+        result = await session.rpc.tasks.remove(
+            TasksRemoveRequest(id=task_id),
+            timeout=10,
+        )
+        return result.removed
+
+    async def wait_for_tasks(
+        self,
+        session: CopilotSession,
+        *,
+        wait_seconds: float,
+    ) -> None:
+        await session.rpc.tasks.wait_for_pending(timeout=wait_seconds)
 
     async def get_native_schedules(self, session: CopilotSession) -> list[dict[str, Any]]:
         schedules = await session.rpc.schedule.list(timeout=10)
         return [cast(dict[str, Any], entry.to_dict()) for entry in schedules.entries]
 
+    async def stop_native_schedule(
+        self,
+        session: CopilotSession,
+        schedule_id: int,
+    ) -> dict[str, Any] | None:
+        result = await session.rpc.schedule.stop(
+            ScheduleStopRequest(id=schedule_id),
+            timeout=10,
+        )
+        return None if result.entry is None else cast(dict[str, Any], result.entry.to_dict())
+
     async def get_remote_state(self, session: CopilotSession) -> dict[str, Any]:
-        snapshot = cast(dict[str, Any], (await session.rpc.metadata.snapshot(timeout=10)).to_dict())
+        snapshot = cast(
+            dict[str, Any],
+            (await session.rpc.metadata.snapshot(timeout=10)).to_dict(),
+        )
         return {
-            "mode": "unknown" if snapshot.get("isRemote") else "off",
-            "url": snapshot.get("remoteUrl"),
+            "is_remote_session": bool(snapshot.get("isRemote")),
             "metadata": snapshot,
         }
 
@@ -294,6 +391,114 @@ class CopilotBridge:
             return "default"
         payload = cast(dict[str, Any], current.agent.to_dict())
         return str(payload.get("name") or payload.get("displayName") or "default")
+
+    async def list_agents(self, session: CopilotSession) -> list[dict[str, Any]]:
+        result = await session.rpc.agent.list(timeout=10)
+        return [_safe_agent_info(agent.to_dict()) for agent in result.agents]
+
+    async def get_current_agent_info(
+        self,
+        session: CopilotSession,
+    ) -> dict[str, Any] | None:
+        result = await session.rpc.agent.get_current(timeout=10)
+        return None if result.agent is None else _safe_agent_info(result.agent.to_dict())
+
+    async def select_agent(
+        self,
+        session: CopilotSession,
+        name: str,
+    ) -> dict[str, Any]:
+        result = await session.rpc.agent.select(
+            AgentSelectRequest(name=name),
+            timeout=10,
+        )
+        return _safe_agent_info(result.agent.to_dict())
+
+    async def deselect_agent(self, session: CopilotSession) -> None:
+        await session.rpc.agent.deselect(timeout=10)
+
+    async def list_commands(
+        self,
+        session: CopilotSession,
+        *,
+        include_builtins: bool,
+    ) -> tuple[NativeCommandDefinition, ...]:
+        result = await session.rpc.commands.list(
+            CommandsListRequest(
+                include_builtins=include_builtins,
+                include_client_commands=False,
+                include_skills=False,
+            ),
+            timeout=10,
+        )
+        return tuple(NativeCommandDefinition.from_sdk(command) for command in result.commands)
+
+    async def invoke_command(
+        self,
+        session: CopilotSession,
+        *,
+        name: str,
+        input_text: str | None,
+    ) -> NativeCommandResult:
+        result = await session.rpc.commands.invoke(
+            CommandsInvokeRequest(name=name, input=input_text),
+            timeout=10,
+        )
+        return parse_command_result(result)
+
+    async def ephemeral_query(
+        self,
+        session: CopilotSession,
+        question: str,
+    ) -> str:
+        result = await session.rpc.ui.ephemeral_query(
+            UIEphemeralQueryRequest(question=question),
+            timeout=30,
+        )
+        return result.answer
+
+    async def compact_history(
+        self,
+        session: CopilotSession,
+        *,
+        focus: str | None,
+    ) -> dict[str, Any]:
+        result = await session.rpc.history.compact(
+            HistoryCompactRequest(custom_instructions=focus),
+            timeout=30,
+        )
+        return cast(dict[str, Any], result.to_dict())
+
+    async def start_fleet(
+        self,
+        session: CopilotSession,
+        prompt: str,
+        *,
+        timeout_seconds: float = 120,
+    ) -> bool:
+        result = await session.rpc.fleet.start(
+            FleetStartRequest(prompt=prompt),
+            timeout=timeout_seconds,
+        )
+        return result.started
+
+    async def get_session_auth(self, session: CopilotSession) -> dict[str, Any]:
+        result = await session.rpc.git_hub_auth.get_status(timeout=10)
+        return cast(dict[str, Any], result.to_dict())
+
+    async def enable_remote(
+        self,
+        session: CopilotSession,
+        mode: Literal["on", "export"],
+    ) -> dict[str, Any]:
+        result = await session.rpc.remote.enable(
+            RemoteEnableRequest(mode=RemoteSessionMode(mode)),
+            timeout=30,
+        )
+        return cast(dict[str, Any], result.to_dict())
+
+    async def disable_remote(self, session: CopilotSession) -> None:
+        await session.rpc.remote.disable(timeout=30)
 
     async def tail_event_log(self, session: CopilotSession) -> str:
         return (await session.rpc.event_log.tail(timeout=10)).cursor
@@ -352,3 +557,18 @@ class CopilotBridge:
             "auth_type": auth.authType,
             "auth_host": auth.host,
         }
+
+
+def _safe_agent_info(payload: dict[str, Any]) -> dict[str, Any]:
+    safe_fields = (
+        "description",
+        "displayName",
+        "id",
+        "model",
+        "name",
+        "skills",
+        "source",
+        "tools",
+        "userInvocable",
+    )
+    return {field: payload[field] for field in safe_fields if field in payload}

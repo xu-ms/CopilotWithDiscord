@@ -40,6 +40,7 @@ from copilotd.core.session_runtime import (
 )
 from copilotd.sdk.bridge import EventLogBatch, PermissionPostureError
 from copilotd.sdk.capabilities import CapabilityRegistry
+from copilotd.sdk.native import NativeCommandDefinition
 from copilotd.storage.database import Database
 from copilotd.storage.leases import FenceLost, OwnerConflict, OwnerLeaseStore
 
@@ -51,6 +52,7 @@ class FakeHandle:
         self.sent: list[tuple[str, dict[str, Any]]] = []
         self.abort_calls = 0
         self.disconnect_calls = 0
+        self.events: list[Any] = []
 
     async def send(self, prompt: str, **kwargs: Any) -> str:
         self.sent.append((prompt, kwargs))
@@ -62,6 +64,9 @@ class FakeHandle:
 
     async def disconnect(self) -> None:
         self.disconnect_calls += 1
+
+    async def get_events(self) -> list[Any]:
+        return list(self.events)
 
 
 class FakeBridge:
@@ -209,8 +214,29 @@ class FakeBridge:
     async def get_remote_state(self, _session: FakeHandle) -> dict[str, Any]:
         return {"mode": "off", "url": None}
 
+    async def disable_remote(self, _session: FakeHandle) -> None:
+        return None
+
     async def get_current_agent(self, _session: FakeHandle) -> str:
         return "default"
+
+    async def list_agents(self, _session: FakeHandle) -> list[dict[str, Any]]:
+        return []
+
+    async def get_current_agent_info(
+        self,
+        _session: FakeHandle,
+    ) -> dict[str, Any] | None:
+        return None
+
+    async def list_commands(
+        self,
+        _session: FakeHandle,
+        *,
+        include_builtins: bool,
+    ) -> tuple[NativeCommandDefinition, ...]:
+        assert include_builtins
+        return ()
 
 
 class FakeSummaryAdapter:
@@ -1687,7 +1713,18 @@ async def test_unsupported_optional_capabilities_do_not_create_unknown_gates(
         bridge = FakeBridge(session_id)
         manifest = CapabilityRegistry(Settings(_env_file=None, data_dir=tmp_path)).load_checked()
         capabilities = dict(manifest.capabilities)
-        for name in ("native_schedule", "remote", "selected_agent", "task_snapshot"):
+        for name in (
+            "agents_current",
+            "agents_list",
+            "commands_list",
+            "native_schedule",
+            "remote",
+            "remote_status",
+            "selected_agent",
+            "schedules_list",
+            "task_snapshot",
+            "tasks_list",
+        ):
             capabilities[name] = replace(capabilities[name], supported=False)
         runtime = SessionRuntime(
             database=database,

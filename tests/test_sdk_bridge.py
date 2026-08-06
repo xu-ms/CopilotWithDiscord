@@ -3,9 +3,22 @@ from dataclasses import dataclass
 from types import SimpleNamespace
 
 import pytest
-from copilot.generated.rpc import PermissionsAllowAllMode
+from copilot.generated.rpc import (
+    PermissionsAllowAllMode,
+    SessionMode,
+    SlashCommandAgentPromptResult,
+    SlashCommandCompletedResult,
+    SlashCommandSelectSubcommandOption,
+    SlashCommandSelectSubcommandResult,
+    SlashCommandTextResult,
+)
 
 from copilotd.sdk.bridge import CopilotBridge, PermissionPostureError
+from copilotd.sdk.native import (
+    NativeCapabilityUnavailable,
+    NativeCommandResultKind,
+    parse_command_result,
+)
 
 
 @dataclass
@@ -237,3 +250,39 @@ async def test_check_session_in_use_uses_generated_server_rpc() -> None:
 
     assert await bridge.check_session_in_use("session-1")
     assert sessions.request.session_ids == ["session-1"]
+
+
+def test_commands_invoke_full_result_union_is_typed_and_unknown_fails_closed() -> None:
+    text = parse_command_result(SlashCommandTextResult("answer", markdown=True))
+    prompt = parse_command_result(
+        SlashCommandAgentPromptResult(
+            display_prompt="Display",
+            prompt="runtime prompt",
+            mode=SessionMode.PLAN,
+        )
+    )
+    completed = parse_command_result(SlashCommandCompletedResult(message="done"))
+    selection = parse_command_result(
+        SlashCommandSelectSubcommandResult(
+            command="research",
+            title="Choose",
+            options=[
+                SlashCommandSelectSubcommandOption(
+                    name="repo",
+                    description="Repository",
+                )
+            ],
+        )
+    )
+
+    assert text.kind == NativeCommandResultKind.TEXT
+    assert text.markdown
+    assert prompt.kind == NativeCommandResultKind.AGENT_PROMPT
+    assert prompt.prompt == "runtime prompt"
+    assert prompt.mode == "plan"
+    assert completed.kind == NativeCommandResultKind.COMPLETED
+    assert completed.message == "done"
+    assert selection.kind == NativeCommandResultKind.SELECT_SUBCOMMAND
+    assert selection.options[0].name == "repo"
+    with pytest.raises(NativeCapabilityUnavailable, match="unsupported"):
+        parse_command_result(object())

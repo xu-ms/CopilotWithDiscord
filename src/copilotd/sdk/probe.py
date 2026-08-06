@@ -24,6 +24,7 @@ from copilot.generated.rpc import (
     EventLogReadRequest,
     MetadataContextInfoRequest,
     ModeSetRequest,
+    ScheduleStopRequest,
     SessionMode,
 )
 from copilot.session import CopilotSession
@@ -34,6 +35,7 @@ from copilotd.config import Settings
 from copilotd.core.task_registry import TaskRegistry
 from copilotd.sdk.bridge import CopilotBridge
 from copilotd.sdk.capabilities import (
+    CAPABILITY_SCHEMA_VERSION,
     MAIN_BRANCH_ONLY_EVENTS,
     PINNED_GENERATED_EVENT_COUNT,
     PINNED_GENERATED_EVENT_SHA256,
@@ -449,8 +451,7 @@ class SdkProbe:
                 {"list": live.get("agents"), "current": live.get("agent_current")},
             ),
             "session_mode": _evidence(
-                _supported(live.get("mode_initial"))
-                and _supported(live.get("mode_autopilot")),
+                _supported(live.get("mode_initial")) and _supported(live.get("mode_autopilot")),
                 "live-rpc-probe",
                 {
                     "initial": live.get("mode_initial"),
@@ -473,8 +474,157 @@ class SdkProbe:
                 live.get("usage_metrics"),
             ),
         }
+        command_list_supported = None if "commands" not in live else _supported(commands)
+        agent_list_supported = None if "agents" not in live else _supported(live.get("agents"))
+        agent_current_supported = (
+            None if "agent_current" not in live else _supported(live.get("agent_current"))
+        )
+        task_list_supported = (
+            None
+            if "tasks" not in live or "task_list" not in live
+            else _supported(live.get("tasks")) and _supported(live.get("task_list"))
+        )
+        schedule_list_supported = (
+            None if "schedule" not in live else _supported(live.get("schedule"))
+        )
+        remote_status_supported = (
+            None if "metadata_snapshot" not in live else _supported(live.get("metadata_snapshot"))
+        )
+        capabilities.update(
+            {
+                "commands_list": _evidence(
+                    command_list_supported,
+                    ("unprobed" if command_list_supported is None else "live-rpc-probe"),
+                    commands,
+                ),
+                "agents_list": _evidence(
+                    agent_list_supported,
+                    "unprobed" if agent_list_supported is None else "live-rpc-probe",
+                    live.get("agents"),
+                ),
+                "agents_current": _evidence(
+                    agent_current_supported,
+                    ("unprobed" if agent_current_supported is None else "live-rpc-probe"),
+                    live.get("agent_current"),
+                ),
+                "tasks_list": _evidence(
+                    task_list_supported,
+                    "unprobed" if task_list_supported is None else "live-rpc-probe",
+                    {
+                        "refresh": live.get("tasks"),
+                        "list": live.get("task_list"),
+                    },
+                ),
+                "schedules_list": _evidence(
+                    schedule_list_supported,
+                    ("unprobed" if schedule_list_supported is None else "live-rpc-probe"),
+                    live.get("schedule"),
+                ),
+                "remote_status": _evidence(
+                    remote_status_supported,
+                    ("unprobed" if remote_status_supported is None else "live-rpc-probe"),
+                    live.get("metadata_snapshot"),
+                ),
+            }
+        )
+        if "model_config_round_trip" in live:
+            capabilities["model_config"] = _evidence(
+                _supported(live.get("model_config_round_trip")),
+                "live-model-mutation-probe",
+                live.get("model_config_round_trip"),
+            )
+        elif "model_current" in live and not _supported(live.get("model_current")):
+            capabilities["model_config"] = _evidence(
+                None,
+                "live-model-readback-unavailable",
+                {
+                    "reason": (
+                        "read-only model.getCurrent failed; mutation support was not exercised"
+                    ),
+                    "readback": live.get("model_current"),
+                },
+            )
+        if command_list_supported is False:
+            for name in (
+                "builtin_after",
+                "builtin_every",
+                "builtin_research",
+                "builtin_review",
+                "builtin_rubber_duck",
+                "builtin_security_review",
+                "commands_invoke",
+                "commands_result_agent_prompt",
+                "commands_result_completed",
+                "commands_result_select_subcommand",
+                "commands_result_text",
+            ):
+                capabilities[name] = _evidence(
+                    False,
+                    "live-prerequisite-failed",
+                    {"prerequisite": "commands_list"},
+                )
+        if agent_list_supported is False or agent_current_supported is False:
+            for name in ("agents_select", "agents_deselect"):
+                capabilities[name] = _evidence(
+                    False,
+                    "live-prerequisite-failed",
+                    {"prerequisite": "agents_list/current"},
+                )
+        if task_list_supported is False:
+            for name in (
+                "tasks_cancel",
+                "tasks_message",
+                "tasks_progress",
+                "tasks_promote",
+                "tasks_remove",
+                "tasks_wait",
+            ):
+                capabilities[name] = _evidence(
+                    False,
+                    "live-prerequisite-failed",
+                    {"prerequisite": "tasks_list"},
+                )
+        if schedule_list_supported is False:
+            capabilities["schedules_stop"] = _evidence(
+                False,
+                "live-prerequisite-failed",
+                {"prerequisite": "schedules_list"},
+            )
+        if native_schedule is not None and command_list_supported is not False:
+            invocation = (
+                native_schedule.detail.get("invocation")
+                if isinstance(native_schedule.detail, dict)
+                else None
+            )
+            invocation_kind = invocation.get("kind") if isinstance(invocation, dict) else None
+            capabilities["commands_invoke"] = _evidence(
+                invocation_kind is not None,
+                "live-command-probe",
+                {"result_kind": invocation_kind},
+            )
+            for kind in ("agent-prompt", "completed", "select-subcommand", "text"):
+                capabilities[f"commands_result_{kind.replace('-', '_')}"] = _evidence(
+                    invocation_kind == kind,
+                    "live-command-probe",
+                    {"observed_result_kind": invocation_kind},
+                )
+            capabilities["builtin_after"] = _evidence(
+                _supported(native_schedule),
+                "live-command-probe",
+                native_schedule,
+            )
+        checked_capabilities = CapabilityRegistry(self._settings).load_checked().capabilities
+        for name in checked_capabilities:
+            capabilities.setdefault(
+                name,
+                _evidence(
+                    None,
+                    "unprobed",
+                    {"reason": "this live probe did not exercise the exact capability"},
+                ),
+            )
         return {
-            "schema_version": 1,
+            "schema_version": CAPABILITY_SCHEMA_VERSION,
             "source": "live-probe",
             "generated_at": datetime.now(UTC).isoformat(),
             "identity": {
@@ -549,44 +699,49 @@ class SdkProbe:
         recorder.drain()
         event_start = len(recorder.events)
         try:
+            initial = _to_jsonable(await session.rpc.schedule.list(timeout=10))
             result = await session.rpc.commands.invoke(
                 CommandsInvokeRequest(
                     name="after",
-                    input=("10s Reply with exactly COPILOTD_AFTER_OK and do not use tools."),
+                    input=("30m Reply with exactly COPILOTD_AFTER_OK and do not use tools."),
                 ),
                 timeout=10,
             )
             invocation = _to_jsonable(result)
-            if invocation.get("kind") not in {"completed", "text"}:
-                return CapabilityResult(
-                    False,
-                    {
-                        "reason": "builtin did not complete scheduling directly",
-                        "invocation": invocation,
-                    },
-                )
             await recorder.wait_for(
                 SessionEventType.SESSION_SCHEDULE_CREATED,
                 min(wait_seconds, 30),
             )
-            before_trigger = _to_jsonable(await session.rpc.schedule.list(timeout=10))
-            await recorder.wait_for(SessionEventType.SESSION_IDLE, wait_seconds)
-            after_trigger = _to_jsonable(await session.rpc.schedule.list(timeout=10))
+            created = _to_jsonable(await session.rpc.schedule.list(timeout=10))
+            initial_ids = {int(item["id"]) for item in initial.get("entries", [])}
+            new_entries = [
+                item for item in created.get("entries", []) if int(item["id"]) not in initial_ids
+            ]
+            stopped = []
+            for entry in new_entries:
+                stopped.append(
+                    _to_jsonable(
+                        await session.rpc.schedule.stop(
+                            ScheduleStopRequest(id=int(entry["id"])),
+                            timeout=10,
+                        )
+                    )
+                )
         except Exception as error:
             return CapabilityResult(False, _error_detail(error))
 
         observed = recorder.events[event_start:]
         observed_types = [event["type"] for event in observed]
-        triggered = (
-            SessionEventType.USER_MESSAGE.value in observed_types
-            and SessionEventType.SESSION_IDLE.value in observed_types
+        supported = (
+            invocation.get("kind") == "completed" and len(new_entries) == 1 and len(stopped) == 1
         )
         return CapabilityResult(
-            triggered,
+            supported,
             {
                 "invocation": invocation,
-                "before_trigger": before_trigger,
-                "after_trigger": after_trigger,
+                "initial": initial,
+                "created": created,
+                "stopped": stopped,
                 "observed_event_types": observed_types,
             },
         )

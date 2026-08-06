@@ -18,6 +18,7 @@ from copilotd.storage.database import Database
 
 OperationCallable = Callable[[], Awaitable[Any]]
 FenceValidator = Callable[[], Awaitable[bool]]
+ResultPersistence = Callable[[Any], Any]
 
 
 class OperationState(StrEnum):
@@ -55,6 +56,7 @@ class _MailboxItem:
     record: OperationRecord
     operation: OperationCallable
     future: asyncio.Future[Any]
+    result_persistence: ResultPersistence | None
 
 
 class OperationStore:
@@ -206,6 +208,7 @@ class CommandMailbox:
         self._task_registry = task_registry or TaskRegistry()
         self._queue: asyncio.Queue[_MailboxItem | None] = asyncio.Queue(maxsize=capacity)
         self._futures: dict[str, asyncio.Future[Any]] = {}
+        self._future_inputs: dict[str, tuple[str, str]] = {}
         self._submission_lock = asyncio.Lock()
         self._worker: asyncio.Task[None] | None = None
         self._accepting = False
@@ -224,6 +227,19 @@ class CommandMailbox:
 
     def freeze(self) -> None:
         self._accepting = False
+
+    def thaw(self) -> None:
+        if self._worker is None:
+            raise RuntimeError("command mailbox is not running")
+        self._accepting = True
+
+    async def drain(self) -> None:
+        await self._queue.join()
+
+    async def freeze_and_drain(self) -> None:
+        async with self._submission_lock:
+            self._accepting = False
+        await self._queue.join()
 
     async def stop(self, *, timeout_seconds: float = 5) -> None:
         if self._worker is None:
@@ -249,9 +265,7 @@ class CommandMailbox:
                 break
             if item is not None and not item.future.done():
                 item.future.set_exception(
-                    OperationAmbiguous(
-                        f"operation {item.record.operation_id} was interrupted"
-                    )
+                    OperationAmbiguous(f"operation {item.record.operation_id} was interrupted")
                 )
             self._queue.task_done()
         await self._store.mark_unsettled_unknown(
@@ -260,12 +274,13 @@ class CommandMailbox:
             owner_fence_token=self._owner_fence_token,
             error_code="mailbox_stopped",
         )
-        for future in self._futures.values():
+        for future in list(self._futures.values()):
             if not future.done():
                 future.set_exception(
                     OperationAmbiguous("operation was interrupted by mailbox shutdown")
                 )
         self._futures.clear()
+        self._future_inputs.clear()
         self._worker = None
 
     async def submit(
@@ -275,11 +290,14 @@ class CommandMailbox:
         idempotency_key: str,
         input_payload: Any,
         operation: OperationCallable,
+        result_persistence: ResultPersistence | None = None,
+        allow_when_frozen: bool = False,
     ) -> Any:
-        if not self._accepting:
+        if not self._accepting and not allow_when_frozen:
             raise RuntimeError("command mailbox is not accepting operations")
+        input_hash = _input_hash(input_payload)
         async with self._submission_lock:
-            if not self._accepting:
+            if not self._accepting and not allow_when_frozen:
                 raise RuntimeError("command mailbox is not accepting operations")
             future = self._futures.get(idempotency_key)
             if future is None:
@@ -296,12 +314,22 @@ class CommandMailbox:
 
                 future = asyncio.get_running_loop().create_future()
                 self._futures[idempotency_key] = future
-                await self._queue.put(_MailboxItem(record, operation, future))
+                self._future_inputs[idempotency_key] = (kind, input_hash)
+                future.add_done_callback(
+                    lambda _future, key=idempotency_key: self._evict_future(key)
+                )
+                await self._queue.put(_MailboxItem(record, operation, future, result_persistence))
+            elif self._future_inputs.get(idempotency_key) != (kind, input_hash):
+                raise ValueError("idempotency key was reused with different input")
         try:
             return await asyncio.shield(future)
         finally:
             if future.done():
-                self._futures.pop(idempotency_key, None)
+                self._evict_future(idempotency_key)
+
+    def _evict_future(self, idempotency_key: str) -> None:
+        self._futures.pop(idempotency_key, None)
+        self._future_inputs.pop(idempotency_key, None)
 
     async def _run(self) -> None:
         while item := await self._queue.get():
@@ -361,16 +389,30 @@ class CommandMailbox:
                 error_code=type(error).__name__,
             )
             item.future.set_exception(
-                OperationAmbiguous(
-                    f"operation {record.operation_id} outcome is unknown: {error}"
-                )
+                OperationAmbiguous(f"operation {record.operation_id} outcome is unknown: {error}")
             )
         else:
+            if not await self._fence_validator():
+                await self._store.transition(
+                    record,
+                    state=OperationState.UNKNOWN,
+                    error_code="owner_fence_lost_after_dispatch",
+                )
+                item.future.set_exception(
+                    OperationAmbiguous(
+                        f"owner fence was lost after operation {record.operation_id}"
+                    )
+                )
+                return
             try:
                 await self._store.transition(
                     record,
                     state=OperationState.CONFIRMED,
-                    result=result,
+                    result=(
+                        result
+                        if item.result_persistence is None
+                        else item.result_persistence(result)
+                    ),
                 )
             except Exception as error:
                 await self._store.transition(

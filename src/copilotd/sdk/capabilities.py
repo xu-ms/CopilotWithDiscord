@@ -13,7 +13,7 @@ from copilot.session_events import SessionEventType
 from copilotd.config import Settings
 from copilotd.storage.database import Database
 
-CAPABILITY_SCHEMA_VERSION = 1
+CAPABILITY_SCHEMA_VERSION = 2
 PINNED_SDK_VERSION = "1.0.8"
 PINNED_RUNTIME_VERSION = "1.0.73"
 PINNED_PROTOCOL_VERSION = 3
@@ -24,17 +24,36 @@ MAIN_BRANCH_ONLY_EVENTS = (
     "session.context_cleared",
 )
 CHECKED_CAPABILITY_FIXTURE_SHA256 = (
-    "9761fd6239d5c02c5d9b85a25c80a241b2da445c55e2258a8d48d3a47b0cc813"
+    "8603dd11244cbb4f76760be835aca56135d3c2b35b1c1fb0caa979f0164d31b3"
 )
 
 _REQUIRED_CAPABILITIES = frozenset(
     {
         "accepted_user_event_id_mapping",
         "activity_snapshot",
+        "agents_current",
+        "agents_deselect",
+        "agents_list",
+        "agents_select",
+        "builtin_after",
         "builtin_commands",
+        "builtin_every",
+        "builtin_research",
+        "builtin_review",
+        "builtin_rubber_duck",
+        "builtin_security_review",
+        "commands_invoke",
+        "commands_list",
+        "commands_result_agent_prompt",
+        "commands_result_completed",
+        "commands_result_select_subcommand",
+        "commands_result_text",
         "context_info",
         "detached_continuation",
+        "ephemeral_query",
         "event_log",
+        "fleet_start",
+        "history_compact",
         "model_config",
         "models",
         "native_queue_snapshot",
@@ -44,10 +63,23 @@ _REQUIRED_CAPABILITIES = frozenset(
         "pre_registered_on_event",
         "reasoning_summary_readback",
         "remote",
+        "remote_disable",
+        "remote_enable",
+        "remote_export_detach_safe",
+        "remote_status",
+        "schedules_list",
+        "schedules_stop",
         "selected_agent",
         "session_mode",
         "sessions_check_in_use",
         "task_snapshot",
+        "tasks_cancel",
+        "tasks_list",
+        "tasks_message",
+        "tasks_progress",
+        "tasks_promote",
+        "tasks_remove",
+        "tasks_wait",
         "usage",
     }
 )
@@ -73,11 +105,93 @@ _CORE_DISCORD_ROOTS = frozenset(
     }
 )
 _GATED_DISCORD_ROOTS: dict[str, frozenset[str]] = {
+    "agent": frozenset({"agents_current", "agents_list"}),
+    "after": frozenset({"schedules_list"}),
+    "ask": frozenset({"ephemeral_query"}),
     "autopilot": frozenset({"session_mode"}),
     "context": frozenset({"context_info"}),
-    "model": frozenset({"model_config", "models"}),
+    "every": frozenset({"schedules_list"}),
+    "fleet": frozenset({"fleet_start"}),
+    "model": frozenset({"models"}),
     "plan": frozenset({"session_mode"}),
+    "remote": frozenset({"remote_status"}),
+    "research": frozenset({"builtin_research"}),
+    "review": frozenset({"builtin_review"}),
+    "rubber-duck": frozenset({"builtin_rubber_duck"}),
+    "security-review": frozenset({"builtin_security_review"}),
+    "tasks": frozenset({"tasks_list"}),
     "usage": frozenset({"usage"}),
+}
+
+_TASK_ACTION_CAPABILITIES = {
+    "all": "tasks_cancel",
+    "cancel": "tasks_cancel",
+    "list": "tasks_list",
+    "message": "tasks_message",
+    "progress": "tasks_progress",
+    "promote": "tasks_promote",
+    "remove": "tasks_remove",
+    "show": "tasks_progress",
+    "wait": "tasks_wait",
+}
+
+_AGENT_ACTION_CAPABILITIES = {
+    "current": "agents_current",
+    "deselect": "agents_deselect",
+    "list": "agents_list",
+    "select": "agents_select",
+}
+
+_REMOTE_ACTION_CAPABILITIES = {
+    "export": "remote_enable",
+    "off": "remote_disable",
+    "on": "remote_enable",
+    "status": "remote_status",
+}
+
+_DERIVED_CAPABILITY_REQUIREMENTS: dict[str, frozenset[str]] = {
+    "builtin_after": frozenset(
+        {
+            "commands_invoke",
+            "commands_list",
+            "commands_result_completed",
+        }
+    ),
+    "builtin_every": frozenset(
+        {
+            "commands_invoke",
+            "commands_list",
+            "commands_result_completed",
+        }
+    ),
+    "builtin_research": frozenset(
+        {
+            "commands_invoke",
+            "commands_list",
+            "commands_result_agent_prompt",
+        }
+    ),
+    "builtin_review": frozenset(
+        {
+            "commands_invoke",
+            "commands_list",
+            "commands_result_agent_prompt",
+        }
+    ),
+    "builtin_rubber_duck": frozenset(
+        {
+            "commands_invoke",
+            "commands_list",
+            "commands_result_agent_prompt",
+        }
+    ),
+    "builtin_security_review": frozenset(
+        {
+            "commands_invoke",
+            "commands_list",
+            "commands_result_agent_prompt",
+        }
+    ),
 }
 
 
@@ -233,7 +347,10 @@ class CapabilityManifest:
 
     def supports(self, capability: str) -> bool:
         evidence = self.capabilities.get(capability)
-        return evidence is not None and evidence.supported is True
+        if evidence is None or evidence.supported is not True:
+            return False
+        requirements = _DERIVED_CAPABILITY_REQUIREMENTS.get(capability, ())
+        return all(self.supports(requirement) for requirement in requirements)
 
     def with_checked_fallback(
         self,
@@ -294,6 +411,37 @@ class CapabilityManifest:
                 roots.add(root)
         return frozenset(roots)
 
+    def task_actions(self) -> frozenset[str]:
+        return frozenset(
+            action
+            for action, capability in _TASK_ACTION_CAPABILITIES.items()
+            if self.supports(capability)
+        )
+
+    def agent_actions(self) -> frozenset[str]:
+        return frozenset(
+            action
+            for action, capability in _AGENT_ACTION_CAPABILITIES.items()
+            if self.supports(capability)
+        )
+
+    def remote_actions(self) -> frozenset[str]:
+        return frozenset(
+            action
+            for action, capability in _REMOTE_ACTION_CAPABILITIES.items()
+            if self.supports(capability)
+        )
+
+    def schedule_actions(self, kind: str) -> frozenset[str]:
+        actions: set[str] = set()
+        if self.supports("schedules_list"):
+            actions.add("list")
+        if self.supports("schedules_stop"):
+            actions.add("cancel")
+        if self.supports(f"builtin_{kind}"):
+            actions.add("create")
+        return frozenset(actions)
+
     def to_dict(self) -> dict[str, Any]:
         return {
             "schema_version": self.schema_version,
@@ -346,6 +494,13 @@ class CapabilityRegistry:
             return None
         try:
             payload = json.loads(path.read_text(encoding="utf-8"))
+            schema_version = int(payload["schema_version"])
+            if schema_version < CAPABILITY_SCHEMA_VERSION:
+                return None
+            if schema_version > CAPABILITY_SCHEMA_VERSION:
+                raise CapabilityFixtureError(
+                    f"unsupported local capability schema {schema_version}"
+                )
             fixture = payload["fixture"]
             fixture_path = Path(str(fixture["path"]))
             if not fixture_path.is_absolute():

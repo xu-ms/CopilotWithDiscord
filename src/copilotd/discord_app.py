@@ -69,6 +69,7 @@ from copilotd.core.sessions import (
 from copilotd.core.spill_artifacts import garbage_collect_tool_spills
 from copilotd.core.supervisor import ExecutionStallMonitor
 from copilotd.core.task_registry import TaskRegistry
+from copilotd.discord_native import NativeDiscordRegistrar
 from copilotd.ops.heartbeat import HeartbeatWriter
 from copilotd.ops.surface import LocalOpsSurface
 from copilotd.render.diffs import render_diff
@@ -2574,7 +2575,14 @@ class CopilotDiscordBot(commands.Bot):
                 operation,
             )
 
+        NativeDiscordRegistrar(self, self.capabilities).register(session)
         manifest = self.command_manifest()
+        if not self.capabilities.supports("models"):
+            model.remove_command("list")
+        if not (
+            self.capabilities.supports("models") and self.capabilities.supports("model_config")
+        ):
+            model.remove_command("set")
         self.tree.add_command(session)
         self.tree.add_command(project)
         if "model" in manifest:
