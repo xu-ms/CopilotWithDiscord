@@ -9,13 +9,14 @@ from importlib.metadata import version
 from pathlib import Path
 from typing import Any
 
-from copilotd.config import Settings
+from copilotd.config import load_settings
 from copilotd.discord_app import run_discord_bot
 from copilotd.logging import configure_logging
 from copilotd.ops.service import ServiceManager, status_dict
 from copilotd.sdk.acceptance import ACCEPTANCE_SUITES, RealNativeAcceptance
 from copilotd.sdk.bridge import CopilotBridge
 from copilotd.sdk.capabilities import CapabilityRegistry
+from copilotd.sdk.extension_probe import ExtensionAcceptanceProbe
 from copilotd.sdk.probe import SdkProbe, _to_jsonable
 from copilotd.storage.database import Database
 
@@ -45,6 +46,11 @@ def build_parser() -> argparse.ArgumentParser:
 
     probe = subparsers.add_parser("sdk-probe", help="record the Copilot SDK capability matrix")
     probe.add_argument("--live", action="store_true", help="start the runtime and run a live turn")
+    probe.add_argument(
+        "--live-extensions",
+        action="store_true",
+        help="run secure disposable protocol/MCP/config acceptance",
+    )
     probe.add_argument(
         "--prompt",
         default="Reply with exactly COPILOTD_PROBE_OK and do not use tools.",
@@ -94,7 +100,12 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 async def run_command(args: argparse.Namespace) -> int:
-    settings = Settings()
+    settings = load_settings()
+    installing = args.command == "setup" or (
+        args.command == "service" and args.service_command == "install"
+    )
+    if installing and settings.discord_token is None:
+        raise ValueError("COPILOTD_DISCORD_TOKEN is required for service installation")
     settings.ensure_directories()
     configure_logging(settings.log_level)
 
@@ -140,8 +151,6 @@ async def run_command(args: argparse.Namespace) -> int:
         return 75 if restart_requested else 0
 
     if args.command == "setup":
-        if settings.discord_token is None:
-            raise ValueError("COPILOTD_DISCORD_TOKEN is required for setup")
         manager = ServiceManager(settings)
         await asyncio.to_thread(manager.install)
         deadline = asyncio.get_running_loop().time() + 45
@@ -164,8 +173,6 @@ async def run_command(args: argparse.Namespace) -> int:
     if args.command == "service":
         manager = ServiceManager(settings)
         if args.service_command == "install":
-            if settings.discord_token is None:
-                raise ValueError("COPILOTD_DISCORD_TOKEN is required for service install")
             await asyncio.to_thread(manager.install)
             _print_json(status_dict(await asyncio.to_thread(manager.status)))
         elif args.service_command == "status":
@@ -193,8 +200,21 @@ async def run_command(args: argparse.Namespace) -> int:
         return 0
 
     if args.command == "sdk-probe":
-        probe = SdkProbe(settings)
-        if args.live:
+        if args.live_extensions:
+            extension_probe = ExtensionAcceptanceProbe(
+                settings.model_copy(update={"sdk_no_auto_login": True})
+            )
+            result = await extension_probe.run_live(wait_seconds=args.timeout)
+            evidence_path, evidence_sha256 = extension_probe.write_evidence(result)
+            result = {
+                **result,
+                "evidence": {
+                    "path": str(evidence_path),
+                    "sha256": evidence_sha256,
+                },
+            }
+        elif args.live:
+            probe = SdkProbe(settings)
             result = await probe.run_live(
                 prompt=args.prompt,
                 wait_seconds=args.timeout,
@@ -203,7 +223,7 @@ async def run_command(args: argparse.Namespace) -> int:
                 probe_sidecar=args.probe_sidecar,
             )
         else:
-            result = probe.static_matrix()
+            result = SdkProbe(settings).static_matrix()
         _print_json(result)
         return 0
 

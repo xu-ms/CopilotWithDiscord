@@ -40,6 +40,7 @@ def test_discord_command_manifest_has_core_modes_and_no_deleted_roots(tmp_path: 
     bot = CopilotDiscordBot(Settings(data_dir=tmp_path))
     bot._register_application_commands()
     roots = {command.name for command in bot.tree.get_commands()}
+    project = bot.tree.get_command("project")
 
     assert {
         "agent",
@@ -105,7 +106,6 @@ def test_discord_command_manifest_has_core_modes_and_no_deleted_roots(tmp_path: 
         }
         & roots
     )
-
     project = bot.tree.get_command("project")
     ops = bot.tree.get_command("ops")
     assert isinstance(project, discord.app_commands.Group)
@@ -127,6 +127,7 @@ def test_discord_command_manifest_has_core_modes_and_no_deleted_roots(tmp_path: 
     mcp_add = mcp.get_command("add")
     assert mcp_add is not None
     assert "project_env_refs" in {parameter.name for parameter in mcp_add.parameters}
+    assert "config-reload" in {command.name for command in project.commands}
 
 
 class _SummaryCapability:
@@ -786,7 +787,7 @@ def test_taskdeck_view_uses_short_in_place_controls() -> None:
     assert all(len(custom_id) < 100 for custom_id in custom_ids)
 
 
-def test_interaction_view_uses_indexed_select_and_freeform_modal_button() -> None:
+def test_interaction_view_uses_bounded_buttons_and_freeform_modal_button() -> None:
     interaction_id = "4ed74879-92fb-47c5-9ee9-81dde5079ab1"
     view = _render_view(
         {
@@ -802,9 +803,9 @@ def test_interaction_view_uses_indexed_select_and_freeform_modal_button() -> Non
     )
 
     assert view is not None
-    select, button = view.children
-    assert select.custom_id == f"cdi:{interaction_id}:select"
-    assert [option.value for option in select.options] == ["0", "1"]
+    first, second, button = view.children
+    assert first.custom_id == f"cdi:{interaction_id}:choice-0"
+    assert second.custom_id == f"cdi:{interaction_id}:choice-1"
     assert button.custom_id == f"cdi:{interaction_id}:freeform"
     assert all(item.custom_id and len(item.custom_id) < 100 for item in view.children)
 
@@ -822,6 +823,47 @@ def test_resolved_interaction_removes_controls() -> None:
         )
         is None
     )
+
+
+def test_elicitation_view_exposes_bounded_form_decline_and_cancel_controls() -> None:
+    interaction_id = "93f3e059-3ec9-45e6-80a5-2df3ea3ca42f"
+    view = _render_view(
+        {
+            "interaction": {
+                "interaction_id": interaction_id,
+                "kind": "elicitation",
+                "state": "pending",
+                "form": {
+                    "fields": [
+                        {
+                            "name": "label",
+                            "value_type": "string",
+                            "required": True,
+                            "title": "Label",
+                            "description": None,
+                            "enum": [],
+                            "default": None,
+                            "minimum": None,
+                            "maximum": None,
+                            "min_length": 1,
+                            "max_length": 20,
+                            "min_items": None,
+                            "max_items": None,
+                            "item_enum": [],
+                        }
+                    ]
+                },
+            }
+        }
+    )
+
+    assert view is not None
+    assert [item.custom_id for item in view.children] == [
+        f"cdi:{interaction_id}:form",
+        f"cdi:{interaction_id}:decline",
+        f"cdi:{interaction_id}:cancel",
+    ]
+    assert all(item.custom_id and len(item.custom_id) < 100 for item in view.children)
 
 
 @pytest.mark.asyncio

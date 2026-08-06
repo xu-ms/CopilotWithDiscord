@@ -173,6 +173,15 @@ class NativeBridge:
     async def get_usage(self, _session: NativeHandle) -> dict[str, Any]:
         return {}
 
+    async def get_mcp_servers(self, _session: NativeHandle) -> dict[str, Any]:
+        return {"servers": []}
+
+    async def get_skills(self, _session: NativeHandle) -> dict[str, Any]:
+        return {"skills": []}
+
+    async def get_agents(self, _session: NativeHandle) -> dict[str, Any]:
+        return {"agents": []}
+
     async def get_readiness(self, _session: NativeHandle) -> dict[str, Any]:
         return {
             "processing": False,

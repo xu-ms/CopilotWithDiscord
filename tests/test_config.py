@@ -52,3 +52,22 @@ def test_owner_lease_timing_preserves_headroom_under_renewal_jitter() -> None:
             owner_lease_ttl_seconds=60,
             owner_lease_renew_seconds=16,
         )
+
+
+def test_github_token_uses_sdk_auth_precedence_without_exposing_value(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    for name in (
+        "COPILOTD_GITHUB_TOKEN",
+        "COPILOT_GITHUB_TOKEN",
+        "GH_TOKEN",
+        "GITHUB_TOKEN",
+    ):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("GH_TOKEN", "managed-session-token")
+
+    settings = Settings(_env_file=None)
+
+    assert settings.github_token is not None
+    assert settings.github_token.get_secret_value() == "managed-session-token"
+    assert "managed-session-token" not in repr(settings)

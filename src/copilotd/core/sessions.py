@@ -14,6 +14,11 @@ from typing import Protocol
 from aiosqlite import Row
 
 from copilotd.core.bindings import SessionBinding, SessionBindingRepository
+from copilotd.core.extensions import (
+    ExtensionConfigFileSource,
+    ExtensionConfigRepository,
+    ExtensionConfigSnapshot,
+)
 from copilotd.core.projects import (
     ProjectConfigSnapshot,
     ProjectRegistry,
@@ -21,7 +26,12 @@ from copilotd.core.projects import (
     ProjectSnapshot,
 )
 from copilotd.core.session_config import SessionConfigSnapshotError, SessionLaunchOptions
-from copilotd.core.session_runtime import RuntimeState, SessionAttachUnknown, SessionRuntime
+from copilotd.core.session_runtime import (
+    RuntimeState,
+    SessionAttachRejected,
+    SessionAttachUnknown,
+    SessionRuntime,
+)
 from copilotd.storage.database import Database
 
 RuntimeFactory = Callable[[SessionBinding], SessionRuntime]
@@ -56,6 +66,8 @@ class CreationIntent:
     project_config_version: int
     channel_config_version: int
     config_snapshot_state: str
+    desired_session_config_version: int
+    desired_session_config_hash: str | None
     state: CreationState
     project_snapshot_json: str | None
     session_config_snapshot_json: str | None
@@ -130,6 +142,7 @@ class CreationIntentRepository:
         config_snapshot: ProjectConfigSnapshot | None = None,
         sdk_session_id: str | None = None,
         worktree_intent_id: str | None = None,
+        extension_config: ExtensionConfigSnapshot | None = None,
         now: float | None = None,
     ) -> tuple[CreationIntent, bool]:
         timestamp = time.time() if now is None else now
@@ -197,6 +210,12 @@ class CreationIntentRepository:
                 ),
                 channel_config_version=(1 if config is None else config.channel_config_version),
                 config_snapshot_state="verified",
+                desired_session_config_version=(
+                    1 if extension_config is None else extension_config.version
+                ),
+                desired_session_config_hash=(
+                    None if extension_config is None else extension_config.config_hash
+                ),
                 state=CreationState.RESERVED,
                 project_snapshot_json=project_json,
                 session_config_snapshot_json=config_json,
@@ -212,8 +231,9 @@ class CreationIntentRepository:
                     config_snapshot_state, state,
                     project_snapshot_json, session_config_snapshot_json,
                     worktree_intent_id,
+                    desired_session_config_version, desired_session_config_hash,
                     created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     intent.creation_token,
@@ -233,6 +253,8 @@ class CreationIntentRepository:
                     intent.project_snapshot_json,
                     intent.session_config_snapshot_json,
                     intent.worktree_intent_id,
+                    intent.desired_session_config_version,
+                    intent.desired_session_config_hash,
                     timestamp,
                     timestamp,
                 ),
@@ -424,12 +446,16 @@ class SessionCreationService:
         bindings: SessionBindingRepository,
         sessions: SessionRegistry,
         threads: ThreadGateway,
+        extension_configs: ExtensionConfigRepository | None = None,
+        extension_config_source: ExtensionConfigFileSource | None = None,
     ) -> None:
         self._projects = projects
         self._intents = intents
         self._bindings = bindings
         self._sessions = sessions
         self._threads = threads
+        self._extension_configs = extension_configs
+        self._extension_config_source = extension_config_source
         self._source_locks: dict[tuple[str, str], _SourceCreationLock] = {}
         self._source_locks_guard = asyncio.Lock()
 
@@ -511,6 +537,16 @@ class SessionCreationService:
                 if config_snapshot is None
                 else config_snapshot
             )
+            extension_config = None
+            if self._extension_configs is not None:
+                extension_config = (
+                    await self._extension_configs.latest(project)
+                    if self._extension_config_source is None
+                    else await self._extension_configs.ingest(
+                        project,
+                        self._extension_config_source,
+                    )
+                )
             intent, _ = await self._intents.reserve(
                 source_kind=source_kind,
                 source_id=source_id,
@@ -519,6 +555,7 @@ class SessionCreationService:
                 config_snapshot=frozen_config,
                 sdk_session_id=preallocated_session_id,
                 worktree_intent_id=worktree_intent_id,
+                extension_config=extension_config,
             )
         elif intent.session_config_snapshot_json is not None:
             frozen_config = ProjectConfigSnapshot.from_dict(
@@ -578,6 +615,8 @@ class SessionCreationService:
                     if frozen_config is None
                     else frozen_config.config_version
                 ),
+                desired_session_config_version=intent.desired_session_config_version,
+                desired_session_config_hash=intent.desired_session_config_hash,
             )
 
         runtime = self._sessions.for_thread(intent.thread_id)
@@ -598,6 +637,9 @@ class SessionCreationService:
                     await runtime.attach_resume()
                 else:
                     await runtime.attach_create()
+            except SessionAttachRejected:
+                await self._intents.mark(intent, CreationState.FAILED)
+                raise
             except SessionAttachUnknown as error:
                 await self._intents.mark(intent, CreationState.UNKNOWN)
                 raise SessionCreationUnknown("SDK session creation is unknown") from error
@@ -660,6 +702,8 @@ def _row_to_intent(row: Row) -> CreationIntent:
         project_config_version=int(row["project_config_version"]),
         channel_config_version=int(row["channel_config_version"]),
         config_snapshot_state=str(row["config_snapshot_state"]),
+        desired_session_config_version=row["desired_session_config_version"],
+        desired_session_config_hash=row["desired_session_config_hash"],
         state=CreationState(row["state"]),
         project_snapshot_json=row["project_snapshot_json"],
         session_config_snapshot_json=row["session_config_snapshot_json"],

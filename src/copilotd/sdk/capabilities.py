@@ -24,7 +24,7 @@ MAIN_BRANCH_ONLY_EVENTS = (
     "session.context_cleared",
 )
 CHECKED_CAPABILITY_FIXTURE_SHA256 = (
-    "8603dd11244cbb4f76760be835aca56135d3c2b35b1c1fb0caa979f0164d31b3"
+    "1eb79b0db120e1c401e53b0176fbccc9fa927ba8f8b11486073e2242dbeffbdc"
 )
 
 _REQUIRED_CAPABILITIES = frozenset(
@@ -54,6 +54,12 @@ _REQUIRED_CAPABILITIES = frozenset(
         "event_log",
         "fleet_start",
         "history_compact",
+        "hook_agent_stop",
+        "hook_user_prompt_transformed",
+        "config_reattach",
+        "managed_permission_handler",
+        "mcp_http",
+        "mcp_stdio",
         "model_config",
         "models",
         "native_queue_snapshot",
@@ -61,6 +67,12 @@ _REQUIRED_CAPABILITIES = frozenset(
         "permission_allow_all",
         "persistent_history",
         "pre_registered_on_event",
+        "protocol_elicitation",
+        "protocol_external_tool",
+        "protocol_mcp_headers_response",
+        "protocol_mcp_oauth",
+        "protocol_sampling_response",
+        "protocol_session_limits_response",
         "reasoning_summary_readback",
         "remote",
         "remote_disable",
@@ -70,6 +82,8 @@ _REQUIRED_CAPABILITIES = frozenset(
         "schedules_list",
         "schedules_stop",
         "selected_agent",
+        "session_extension_config",
+        "session_hooks",
         "session_mode",
         "sessions_check_in_use",
         "task_snapshot",
@@ -90,6 +104,9 @@ _REQUIRED_STARTUP_CAPABILITIES = frozenset(
         "permission_allow_all",
         "persistent_history",
         "pre_registered_on_event",
+        "managed_permission_handler",
+        "session_extension_config",
+        "session_hooks",
         "session_mode",
     }
 )

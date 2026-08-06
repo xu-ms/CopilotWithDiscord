@@ -697,8 +697,9 @@ Claude 专属功能的一比一复刻；Agent 能力、
 <li>架构：Python SDK 通过 JSON-RPC 驱动 Copilot CLI Agent Runtime</li>
 <li>Runtime：Python wheel 对应的 CLI runtime 可自动下载，也可连接独立
 headless runtime</li>
-<li>鉴权：已登录的 Copilot 用户、GitHub token/OAuth、GitHub App 或
-BYOK</li>
+<li>鉴权：本地已登录的 Copilot CLI 用户即可；GitHub token/OAuth、GitHub App 或
+BYOK 是 SDK 可选路径。本产品仅把显式 GitHub token 用于启用 managed-settings
+session options。</li>
 <li>主要能力：流式输出、工具调用、文件编辑、持久会话、权限回调、MCP、Hooks、
 自定义
 Agent、Skills、Plugins、图片输入、模型切换、上下文压缩、用量指标</li>
@@ -1104,6 +1105,11 @@ exactly-once 与 TaskRegistry 管理。</li>
 后、首次 send 前验证 session 的 full allow-all/approve-all 已生效。普通
 typed permission request 自动批准，不生成 Discord
 审批卡，也不存在任何可切换配置。</li>
+<li><code>setup</code>、service install、session create/resume 和 Discord
+thread creation 都接受本地 Copilot CLI 登录态；<code>COPILOTD_GITHUB_TOKEN</code>
+可选。仅当显式 token 存在时才传递
+<code>github_token</code>/<code>enable_managed_settings</code>，缺失时省略这两个
+option，使用正常 runtime 登录态。</li>
 <li>不实现 guild/user/role allowlist、Owner/Admin
 区分、路径沙箱、URL/MCP policy、
 SecretStore、内容脱敏审计或多租户隔离。</li>
@@ -1496,8 +1502,8 @@ idle。</li>
 <p>这里没有权限层：没有配置对象、审批状态机、session/project
 级切换或相关命令。唯一行为 就是 runtime 启动时启用
 <code>--yolo</code>，并在每个 session attach 后证明有效权限 posture 确为
-full allow-all。SDK 若仍发送普通 typed permission request 则立即
-approve。</p>
+full allow-all。SDK 若仍发送普通 typed permission request 则返回 owner-fenced
+<code>ApproveOnce</code>。</p>
 <table>
 <thead>
 <tr>
@@ -1509,6 +1515,10 @@ approve。</p>
 <tr>
 <td>Runtime 启动</td>
 <td>传递 <code>--yolo</code>；技术原型记录实际 CLI 参数和版本</td>
+</tr>
+<tr>
+<td>Runtime 鉴权</td>
+<td>本地 Copilot CLI 登录态有效；显式 GitHub token 可选，仅存在时启用 managed settings</td>
 </tr>
 <tr>
 <td>Session attach</td>
@@ -4359,8 +4369,9 @@ permission posture 与 typed request</h4>
     end</code></pre>
 <p>该流程没有 Discord 按钮、timeout 或可选 permission
 profile。<code>--yolo</code>/allow-all 无法确认时 session 保持 degraded
-并拒绝 dispatch；不能偷偷退回逐次审批。<code>--yolo</code> 不等于能绕过
-GitHub 组织托管策略；managed request 只显示真实 platform limitation
+并拒绝 dispatch；不能偷偷退回逐次审批。<code>--yolo</code> 不等于能绕过 GitHub
+组织托管策略；runtime 报告的 managed policy/request 无论是否配置显式 token，都返回
+<code>UserNotAvailable</code>，只显示真实 platform limitation
 并确定性失败，不无限 pending。</p>
 <h4 id="后台-task-与-autopilot-continuation-evidence">后台 task 与
 Autopilot continuation evidence</h4>
@@ -5288,11 +5299,13 @@ model、<code>/mode</code>、<code>/goal</code>、<code>/bare</code>、<code>/to
 unknown</td>
 </tr>
 <tr>
-<td>22 个 SQLite migration（Foundation
+<td>37 个唯一版本 SQLite migration：Foundation
 <code>0001</code>–<code>0009</code>、Native RPC
-<code>0010</code>–<code>0014</code>、Discord surface
-<code>0030</code>–<code>0037</code>；<code>0015</code>–<code>0029</code>
-为后续 Protocol/Scheduler 预留 namespace）、project <code>$HOME</code>
+<code>0010</code>–<code>0014</code>、Protocol
+<code>0015</code>–<code>0019</code>、Scheduler
+<code>0020</code>–<code>0028</code>、Protocol compatibility
+<code>0029</code>、Discord surface <code>0030</code>–<code>0037</code>；project
+<code>$HOME</code>
 fallback/cwd snapshot、owner fence、creation saga、strict-UUID event
 journal、reducer-owned operation/submission/native-command
 receipts、submission-task links、liveness leases、startup recovery
@@ -5355,8 +5368,8 @@ Windows 实机仍待验证</td>
 </tr>
 </tbody>
 </table>
-<p>当前 deterministic 验证基线：<code>ruff check .</code>、295 个 pytest
-全部通过。仓库内 hash-checked fixture 固定 SDK 1.0.8 / runtime 1.0.73 /
+<p>当前 deterministic 验证基线包括 <code>ruff check .</code> 与完整 pytest。
+仓库内 hash-checked fixture 固定 SDK 1.0.8 / runtime 1.0.73 /
 protocol 3、114-event inventory 与 capability evidence；<code>copilotd
 native-acceptance --real</code> 还要求 exact 环境确认，按 suite 创建 disposable
 repo/session、执行 supported mutation（包括 model set/readback/restore）、清理

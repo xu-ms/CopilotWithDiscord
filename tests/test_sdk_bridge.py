@@ -12,13 +12,18 @@ from copilot.generated.rpc import (
     SlashCommandSelectSubcommandResult,
     SlashCommandTextResult,
 )
+from pydantic import SecretStr
 
-from copilotd.sdk.bridge import CopilotBridge, PermissionPostureError
+from copilotd.sdk.bridge import CopilotBridge, ManagedAwarePermissionHandler, PermissionPostureError
 from copilotd.sdk.native import (
     NativeCapabilityUnavailable,
     NativeCommandResultKind,
     parse_command_result,
 )
+
+
+async def _approval_allowed() -> bool:
+    return True
 
 
 @dataclass
@@ -42,18 +47,20 @@ class FakePermissions:
         _request: object,
         *,
         timeout: float,  # noqa: ASYNC109
-    ) -> None:
+    ) -> object:
         assert timeout == 10
         self.set_allow_all_calls += 1
+        return SimpleNamespace(success=True)
 
     async def set_approve_all(
         self,
         _request: object,
         *,
         timeout: float,  # noqa: ASYNC109
-    ) -> None:
+    ) -> object:
         assert timeout == 10
         self.set_approve_all_calls += 1
+        return SimpleNamespace(success=True)
 
 
 @dataclass
@@ -80,6 +87,7 @@ async def test_allow_all_is_reconciled_and_confirmed() -> None:
 
     assert posture.enabled
     assert posture.mode == "on"
+    assert posture.approve_all_confirmed
     assert permissions.set_allow_all_calls == 1
     assert permissions.set_approve_all_calls == 1
 
@@ -96,6 +104,121 @@ async def test_allow_all_failure_blocks_dispatch() -> None:
 
     with pytest.raises(PermissionPostureError):
         await bridge.ensure_allow_all(FakeSession(FakeRpc(permissions)))
+
+
+@pytest.mark.asyncio
+async def test_approve_all_is_verified_even_when_allow_all_is_already_on() -> None:
+    permissions = FakePermissions(
+        [
+            FakePermissionState(True, PermissionsAllowAllMode.ON),
+            FakePermissionState(True, PermissionsAllowAllMode.ON),
+        ]
+    )
+    bridge = object.__new__(CopilotBridge)
+
+    posture = await bridge.ensure_allow_all(FakeSession(FakeRpc(permissions)))
+
+    assert posture.approve_all_confirmed
+    assert permissions.set_allow_all_calls == 0
+    assert permissions.set_approve_all_calls == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("permission_kind", ["shell", "write", "mcp"])
+async def test_managed_aware_permission_handler_approves_ordinary_once(
+    permission_kind: str,
+) -> None:
+    audits: list[dict[str, object]] = []
+
+    async def audit(payload: dict[str, object]) -> None:
+        audits.append(payload)
+
+    request = SimpleNamespace(
+        kind=permission_kind,
+        managed_approval_required=False,
+        to_dict=lambda: {"kind": permission_kind},
+    )
+    result = await ManagedAwarePermissionHandler(audit, _approval_allowed)(
+        request,
+        {"managed_settings_enabled": False},
+    )
+
+    assert result.kind == "approve-once"
+    assert audits[0]["permission_kind"] == permission_kind
+    assert audits[0]["decision"] == "approve-once"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("managed_settings", "managed_request"),
+    [(True, False), (False, True)],
+)
+async def test_managed_aware_permission_handler_returns_user_not_available(
+    managed_settings: bool,
+    managed_request: bool,
+) -> None:
+    request = SimpleNamespace(
+        kind="write",
+        managed_approval_required=managed_request,
+        to_dict=lambda: {
+            "kind": "write",
+            "managedApprovalRequired": managed_request,
+        },
+    )
+
+    result = await ManagedAwarePermissionHandler()(
+        request,
+        {"managed_settings_enabled": managed_settings},
+    )
+
+    assert result.kind == "user-not-available"
+
+
+@pytest.mark.asyncio
+async def test_managed_permission_state_from_runtime_events_blocks_without_sdk_flags() -> None:
+    handler = ManagedAwarePermissionHandler(approval_validator=_approval_allowed)
+    request = SimpleNamespace(
+        kind="mcp",
+        to_dict=lambda: {"kind": "mcp"},
+    )
+
+    handler.set_managed_permissions_blocked(True)
+    blocked = await handler(request, {"session_id": "session-1"})
+    handler.set_managed_permissions_blocked(False)
+    ordinary = await handler(request, {"session_id": "session-1"})
+
+    assert blocked.kind == "user-not-available"
+    assert ordinary.kind == "approve-once"
+
+
+@pytest.mark.asyncio
+async def test_permission_handler_rechecks_fence_after_audit_before_approval() -> None:
+    order: list[str] = []
+    decisions: list[str] = []
+
+    async def audit(payload: dict[str, object]) -> None:
+        order.append("audit")
+        decisions.append(str(payload["decision"]))
+
+    async def lost_fence() -> bool:
+        order.append("fence")
+        return False
+
+    request = SimpleNamespace(
+        kind="write",
+        to_dict=lambda: {"kind": "write"},
+    )
+    result = await ManagedAwarePermissionHandler(audit, lost_fence)(
+        request,
+        {"session_id": "session-1"},
+    )
+
+    assert result.kind == "user-not-available"
+    assert order[:2] == ["audit", "fence"]
+    assert decisions == [
+        "approve-once",
+        "user-not-available-after-fence-check",
+    ]
 
 
 class FakeClient:
@@ -128,10 +251,57 @@ class HungStopClient:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("token", "expected_token"),
+    [(None, None), (SecretStr("explicit-token"), "explicit-token")],
+)
+async def test_bridge_start_omits_absent_token_and_uses_local_login(
+    monkeypatch: pytest.MonkeyPatch,
+    token: SecretStr | None,
+    expected_token: str | None,
+) -> None:
+    clients: list[object] = []
+
+    class RecordingClient:
+        def __init__(self, **kwargs: object) -> None:
+            self.kwargs = kwargs
+            clients.append(self)
+
+        async def start(self) -> None:
+            return None
+
+        async def stop(self) -> None:
+            return None
+
+    monkeypatch.setattr("copilotd.sdk.bridge.CopilotClient", RecordingClient)
+    bridge = CopilotBridge(
+        SimpleNamespace(
+            runtime_uri=None,
+            github_token=token,
+            sdk_log_level="info",
+            sdk_no_auto_login=True,
+            sdk_shutdown_timeout_seconds=1,
+        )
+    )
+
+    await bridge.start()
+
+    options = clients[0].kwargs
+    if expected_token is None:
+        assert "github_token" not in options
+        assert options["use_logged_in_user"] is True
+    else:
+        assert options["github_token"] == expected_token
+        assert options["use_logged_in_user"] is False
+    await bridge.stop()
+
+
+@pytest.mark.asyncio
 async def test_bridge_preregisters_event_handler_and_forces_runtime_options() -> None:
     client = FakeClient()
     bridge = object.__new__(CopilotBridge)
     bridge._client = client
+    bridge._settings = SimpleNamespace(github_token=SecretStr("session-token"))
 
     def callback(_event: object) -> None:
         return None
@@ -143,11 +313,13 @@ async def test_bridge_preregisters_event_handler_and_forces_runtime_options() ->
         "skill_directories": ["/tmp/skills"],
         "plugin_directories": ["/tmp/plugins"],
     }
+    permission_handler = ManagedAwarePermissionHandler(approval_validator=_approval_allowed)
     await bridge.create_session(
         session_id="session-1",
         working_directory="/tmp/project",
         on_event=callback,
         session_config=session_config,
+        permission_handler=permission_handler,
     )
     await bridge.resume_session(
         session_id="session-1",
@@ -155,9 +327,12 @@ async def test_bridge_preregisters_event_handler_and_forces_runtime_options() ->
         on_event=callback,
         continue_pending_work=False,
         session_config=session_config,
+        permission_handler=permission_handler,
     )
 
     assert client.create_kwargs["on_event"] is callback
+    assert client.create_kwargs["enable_managed_settings"] is True
+    assert client.create_kwargs["github_token"] == "session-token"
     assert client.create_kwargs["manage_schedule_enabled"] is False
     assert client.create_kwargs["streaming"] is True
     assert client.create_kwargs["mcp_servers"] == session_config["mcp_servers"]
@@ -167,6 +342,57 @@ async def test_bridge_preregisters_event_handler_and_forces_runtime_options() ->
     assert client.resume_id == "session-1"
     assert client.resume_kwargs["on_event"] is callback
     assert client.resume_kwargs["continue_pending_work"] is False
+
+
+@pytest.mark.asyncio
+async def test_bridge_enables_managed_settings_only_with_session_token() -> None:
+    client = FakeClient()
+    bridge = object.__new__(CopilotBridge)
+    bridge._client = client
+    bridge._settings = SimpleNamespace(github_token=SecretStr("managed-token"))
+
+    await bridge.create_session(
+        session_id="session-managed",
+        working_directory="/tmp/project",
+        on_event=lambda _event: None,
+        permission_handler=ManagedAwarePermissionHandler(approval_validator=_approval_allowed),
+    )
+
+    assert client.create_kwargs["enable_managed_settings"] is True
+    assert client.create_kwargs["github_token"] == "managed-token"
+
+
+@pytest.mark.asyncio
+async def test_bridge_rejects_implicit_unfenced_permission_handler() -> None:
+    bridge = object.__new__(CopilotBridge)
+    bridge._client = FakeClient()
+    bridge._settings = SimpleNamespace(github_token=SecretStr("managed-token"))
+
+    with pytest.raises(PermissionPostureError, match="fence-validating"):
+        await bridge.create_session(
+            session_id="session-unfenced",
+            working_directory="/tmp/project",
+            on_event=lambda _event: None,
+        )
+
+    assert bridge._client.create_kwargs == {}
+
+
+@pytest.mark.asyncio
+async def test_bridge_uses_logged_in_runtime_auth_without_explicit_token() -> None:
+    bridge = object.__new__(CopilotBridge)
+    bridge._client = FakeClient()
+    bridge._settings = SimpleNamespace(github_token=None)
+
+    await bridge.create_session(
+        session_id="session-no-managed-auth",
+        working_directory="/tmp/project",
+        on_event=lambda _event: None,
+        permission_handler=ManagedAwarePermissionHandler(approval_validator=_approval_allowed),
+    )
+
+    assert "enable_managed_settings" not in bridge._client.create_kwargs
+    assert "github_token" not in bridge._client.create_kwargs
 
 
 @pytest.mark.asyncio

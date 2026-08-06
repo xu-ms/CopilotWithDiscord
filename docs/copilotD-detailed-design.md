@@ -35,7 +35,8 @@ GitHub 已提供官方 Python SDK：
 - 许可证：MIT
 - 架构：Python SDK 通过 JSON-RPC 驱动 Copilot CLI Agent Runtime
 - Runtime：Python wheel 对应的 CLI runtime 可自动下载，也可连接独立 headless runtime
-- 鉴权：已登录的 Copilot 用户、GitHub token/OAuth、GitHub App 或 BYOK
+- 鉴权：本地已登录的 Copilot CLI 用户即可；GitHub token/OAuth、GitHub App 或 BYOK 是
+  SDK 可选路径。本产品仅把显式 GitHub token 用于启用 managed-settings session options。
 - 主要能力：流式输出、工具调用、文件编辑、持久会话、权限回调、MCP、Hooks、
   自定义 Agent、Skills、Plugins、图片输入、模型切换、上下文压缩、用量指标
 
@@ -168,6 +169,9 @@ Discord
 - runtime 固定以 `--yolo` 启动；每次 SDK create/resume 后、首次 send 前验证 session 的
   full allow-all/approve-all 已生效。普通 typed permission request 自动批准，不生成 Discord
   审批卡，也不存在任何可切换配置。
+- `setup`、service install、session create/resume 和 Discord thread creation 都接受本地
+  Copilot CLI 登录态；`COPILOTD_GITHUB_TOKEN` 可选。仅当显式 token 存在时才传递
+  `github_token`/`enable_managed_settings`，缺失时省略这两个 option，使用正常 runtime 登录态。
 - 不实现 guild/user/role allowlist、Owner/Admin 区分、路径沙箱、URL/MCP policy、
   SecretStore、内容脱敏审计或多租户隔离。
 - 宿主进程用户能访问的文件、命令、网络和凭据，Agent 都可能访问。这是明确产品前提，
@@ -433,11 +437,13 @@ copilotD extension。
 
 这里没有权限层：没有配置对象、审批状态机、session/project 级切换或相关命令。唯一行为
 就是 runtime 启动时启用 `--yolo`，并在每个 session attach 后证明有效权限 posture 确为
-full allow-all。SDK 若仍发送普通 typed permission request 则立即 approve。
+full allow-all。SDK 若仍发送普通 typed permission request 则返回 owner-fenced
+`ApproveOnce`。
 
 | 项目 | 固定行为 |
 |---|---|
 | Runtime 启动 | 传递 `--yolo`；技术原型记录实际 CLI 参数和版本 |
+| Runtime 鉴权 | 本地 Copilot CLI 登录态有效；显式 GitHub token 可选，仅存在时启用 managed settings |
 | Session attach | create/resume 后调用 gated `permissions.get_allow_all()` 对账；必要时 `set_allow_all(mode=on)` + `set_approve_all(enabled=true)`，确认成功前不 dispatch |
 | Permission handler | 普通 request 返回 `ApproveOnce`；`managed_settings_enabled` 或 `managedApprovalRequired` 不调用 stock `approve_all`，显式标 platform limitation 并返回 unavailable，避免抛错或无限 pending |
 | Discord 确认 UI | 不存在 |
@@ -1675,7 +1681,8 @@ sequenceDiagram
 
 该流程没有 Discord 按钮、timeout 或可选 permission profile。`--yolo`/allow-all 无法确认时
 session 保持 degraded 并拒绝 dispatch；不能偷偷退回逐次审批。`--yolo` 不等于能绕过 GitHub
-组织托管策略；managed request 只显示真实 platform limitation 并确定性失败，不无限 pending。
+组织托管策略；runtime 报告的 managed policy/request 无论是否配置显式 token，都返回
+`UserNotAvailable`，只显示真实 platform limitation 并确定性失败，不无限 pending。
 
 #### 后台 task 与 Autopilot continuation evidence
 
@@ -2357,7 +2364,7 @@ claudeD issue 回归门禁：
 | 已实现 | 当前边界 |
 |---|---|
 | 官方 `github-copilot-sdk==1.0.8` + bundled runtime 1.0.73，stdio `--yolo`，create/resume 后 full allow-all 对账 | sidecar client transport 断开后 session retention 实测失败，因此不声明 detached continuation；crash window 保守标 outcome unknown |
-| 22 个 SQLite migration（Foundation `0001`–`0009`、Native RPC `0010`–`0014`、Discord surface `0030`–`0037`；`0015`–`0029` 为后续 Protocol/Scheduler 预留 namespace）、project `$HOME` fallback/cwd snapshot、owner fence、creation saga、strict-UUID event journal、reducer-owned operation/submission/native-command receipts、submission-task links、liveness leases、startup recovery inventory 与 eager resume；attach 时按 current state 结算 pending agent、强制 uncertain remote off | bundled runtime 进程死亡后的 in-flight execution 仍只能标 outcome unknown；真实 fixture 无 current-promotable task，task promote 保持 gated |
+| 37 个唯一版本 SQLite migration：Foundation `0001`–`0009`、Native RPC `0010`–`0014`、Protocol `0015`–`0019`、Scheduler `0020`–`0028`、Protocol compatibility `0029`、Discord surface `0030`–`0037`；project `$HOME` fallback/cwd snapshot、owner fence、creation saga、strict-UUID event journal、reducer-owned operation/submission/native-command receipts、submission-task links、liveness leases、startup recovery inventory 与 eager resume；attach 时按 current state 结算 pending agent、强制 uncertain remote off | bundled runtime 进程死亡后的 in-flight execution 仍只能标 outcome unknown；真实 fixture 无 current-promotable task，task promote 保持 gated |
 | eventLog `read/tail` durable backfill（固定过滤 ephemeral）、cursor epoch/rebase/predecessor-gap diagnostics、overflow freeze/backfill/generation replacement；activity/queue/task/remote/schedule snapshot requested/applied epoch 与 query watermark；crossing command/agent snapshot 禁止 merge 并强制 requery | ephemeral idle/delta 离开 live window 后不可恢复，不从 transcript 猜 terminal；compaction 无 completion evidence 时保持 unknown 并阻塞普通 submission |
 | durable app FIFO；fresh readiness snapshot、reducer caught-up、config/agent/remote/schedule/task known gate 后只派发队首；attachment manifest READY + hash/size 复验，无 attachment-free fallback；`/queue add/list/remove/clear` | native queue entry 没有 stable opaque ID 时只以 snapshot-local opaque key 诊断；transport ambiguity 不自动重放 |
 | Discord core 命令；strict dynamic builtin manifest；Native-Gated `/ask`、`/session compact`、`/fleet`、`/tasks`、`/agent list|current`、`/after|every list|cancel`、`/remote status|off`、`/review`、`/security-review`、`/research`、`/rubber-duck`；全部 action 由 exact capability 决定 | `/session delete|fork` 按本次范围不实现；`/after|every create` 因 real invoke 返回 `text` 而非 required `completed` 不注册；agent select/deselect、task promote、remote on/export 的 real gate 未通过；elicitation/MCP OAuth 仍待接入 |
@@ -2365,7 +2372,7 @@ claudeD issue 回归门禁：
 | tool/subagent/agent-scoped output 归并为原 thread 的单条 TaskDeck；4 秒 cadence、pending coalescing、terminal flush、select/expand/collapse/prev/next；typed task list/show/progress/message/cancel-all/remove/wait 与 Fleet projection；>=8000 字符 tool result/error 逐字附件化；零 child-thread 路径 | real current-promotable fixture 未通过，promote action 不注册；完整 reasoning summary/diff artifact lane 尚未实现 |
 | 共享 TaskRegistry、failure consumer、10 分钟 active-execution SUSPECT + non-destructive ping、结构化 heartbeat、protected-work watchdog、macOS bot/watchdog LaunchAgent 与 Windows Scheduled Task definitions | 当前拓扑没有独立 runtime service；真实 service 安装、sleep/wake 和 Windows 实机仍待验证 |
 
-当前 deterministic 验证基线：`ruff check .`、295 个 pytest 全部通过。仓库内 hash-checked
+当前 deterministic 验证基线包括 `ruff check .` 与完整 pytest。仓库内 hash-checked
 fixture 固定 SDK 1.0.8 / runtime 1.0.73 / protocol 3、114-event inventory 与 capability
 evidence；`copilotd native-acceptance --real` 还要求 exact 环境确认，按 suite 创建 disposable
 repo/session、执行 supported mutation（包括 model set/readback/restore）、清理 remote/schedule/session，并生成 sanitized JSON

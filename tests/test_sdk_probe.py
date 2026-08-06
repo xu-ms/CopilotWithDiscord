@@ -42,6 +42,11 @@ def test_checked_fixture_hash_and_identity_are_valid(tmp_path: Path) -> None:
     assert manifest.generated_event_count == 114
     assert manifest.supports("event_log")
     assert not manifest.supports("detached_continuation")
+    assert not manifest.supports("hook_agent_stop")
+    assert not manifest.supports("hook_user_prompt_transformed")
+    assert not manifest.supports("protocol_sampling_response")
+    assert not manifest.supports("protocol_session_limits_response")
+    assert not manifest.supports("protocol_mcp_headers_response")
 
 
 def test_checked_fixture_rejects_tampering(tmp_path: Path) -> None:

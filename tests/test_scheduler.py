@@ -49,7 +49,7 @@ async def _insert_binding(
         INSERT INTO session_bindings(
             thread_id, project_id, project_source, cwd_snapshot, sdk_session_id,
             attachment_state, permission_posture, runtime_mode,
-            runtime_agent, runtime_session_config_version,
+            runtime_agent, runtime_project_config_version,
             runtime_generation, owner_fence_token, created_at, updated_at
         ) VALUES (?, ?, 'explicit', '/tmp', ?, 'attached', 'verified_allow_all',
                   'interactive', 'default', 1, 1, 1, 0, 0)

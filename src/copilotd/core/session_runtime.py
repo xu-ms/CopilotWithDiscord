@@ -30,8 +30,23 @@ from copilotd.core.commands import (
     ModelReasoningSummaryAdapter,
     TaskActionAdapter,
 )
+from copilotd.core.extensions import (
+    ConfigReloadClaim,
+    ConfigReloadClaimStore,
+    ConfigReloadState,
+    ExtensionConfigConflict,
+    ExtensionConfigRepository,
+    ExtensionConfigSnapshot,
+    ProjectExtensionConfig,
+    extension_scope_key,
+)
+from copilotd.core.hooks import HookSessionContext, SessionHookAudit
 from copilotd.core.inbox import ReducerInbox, SdkEventIngress
-from copilotd.core.interactions import interaction_target_mode
+from copilotd.core.interactions import (
+    InteractionGateway,
+    InteractionKind,
+    InteractionScope,
+)
 from copilotd.core.mailbox import (
     CommandMailbox,
     MailboxNotAccepting,
@@ -52,10 +67,16 @@ from copilotd.core.native import (
     json_payload,
     stable_hash,
 )
+from copilotd.core.projects import ProjectSnapshot, ProjectSource
+from copilotd.core.protocol import ProtocolResponseRepository
 from copilotd.core.reducer import EventReducerWorker, JournalReducer
 from copilotd.core.session_config import SessionLaunchOptions
 from copilotd.core.task_registry import TaskRegistry
-from copilotd.sdk.bridge import EventLogBatch, PermissionPostureError
+from copilotd.sdk.bridge import (
+    EventLogBatch,
+    ManagedAwarePermissionHandler,
+    PermissionPostureError,
+)
 from copilotd.sdk.capabilities import CapabilityManifest
 from copilotd.sdk.native import NativeCommandResultKind
 from copilotd.storage.database import Database
@@ -70,6 +91,10 @@ from copilotd.storage.leases import (
 AgentMode = Literal["interactive", "plan", "autopilot", "shell"]
 DeliveryMode = Literal["enqueue", "immediate"]
 AttachmentResolver = Callable[..., Awaitable[list[Any]]]
+OAuthAuthorizer = Callable[
+    [Mapping[str, Any]],
+    Awaitable[Mapping[str, Any]],
+]
 T = TypeVar("T")
 
 
@@ -93,6 +118,8 @@ class SessionHandle(Protocol):
 
 
 class RuntimeBridge(Protocol):
+    def managed_settings_available(self) -> bool: ...
+
     async def create_session(
         self,
         *,
@@ -104,6 +131,11 @@ class RuntimeBridge(Protocol):
         on_auto_mode_switch_request: Any,
         session_config: dict[str, Any] | None = None,
         launch_options: SessionLaunchOptions | None = None,
+        on_elicitation_request: Any,
+        on_mcp_auth_request: Any,
+        permission_handler: Any,
+        hooks: Mapping[str, Any],
+        session_options: Mapping[str, Any],
     ) -> SessionHandle: ...
 
     async def resume_session(
@@ -118,6 +150,11 @@ class RuntimeBridge(Protocol):
         on_auto_mode_switch_request: Any,
         session_config: dict[str, Any] | None = None,
         launch_options: SessionLaunchOptions | None = None,
+        on_elicitation_request: Any,
+        on_mcp_auth_request: Any,
+        permission_handler: Any,
+        hooks: Mapping[str, Any],
+        session_options: Mapping[str, Any],
     ) -> SessionHandle: ...
 
     async def ensure_allow_all(self, session: SessionHandle) -> Any: ...
@@ -134,11 +171,31 @@ class RuntimeBridge(Protocol):
         *,
         model: str,
         reasoning_effort: str | None,
+        reasoning_summary: str | None,
         context_tier: str | None,
-        reasoning_summary: str | None = None,
     ) -> None: ...
 
     async def get_current_model(self, session: SessionHandle) -> dict[str, Any]: ...
+
+    async def respond_session_limits(
+        self,
+        session: SessionHandle,
+        request_id: str,
+    ) -> bool: ...
+
+    async def respond_sampling(
+        self,
+        session: SessionHandle,
+        request_id: str,
+        response: dict[str, Any] | None,
+    ) -> bool: ...
+
+    async def respond_mcp_headers(
+        self,
+        session: SessionHandle,
+        request_id: str,
+        headers: dict[str, str] | None,
+    ) -> bool: ...
 
     async def get_context(self, session: SessionHandle) -> dict[str, Any] | None: ...
 
@@ -256,7 +313,11 @@ class RuntimeBridge(Protocol):
     ) -> dict[str, Any]: ...
 
     async def disable_remote(self, session: SessionHandle) -> None: ...
+    async def get_mcp_servers(self, session: SessionHandle) -> dict[str, Any]: ...
 
+    async def get_skills(self, session: SessionHandle) -> dict[str, Any]: ...
+
+    async def get_agents(self, session: SessionHandle) -> dict[str, Any]: ...
     async def tail_event_log(self, session: SessionHandle) -> str: ...
 
     async def read_event_log(
@@ -282,6 +343,10 @@ class RuntimeState(StrEnum):
 
 
 class SessionAttachUnknown(RuntimeError):
+    pass
+
+
+class SessionAttachRejected(RuntimeError):
     pass
 
 
@@ -328,6 +393,8 @@ class SessionRuntime:
         send_frame_max_bytes: int = 7 * 1024 * 1024,
         model_summary_adapter: ModelReasoningSummaryAdapter | None = None,
         task_action_adapter: TaskActionAdapter | None = None,
+        extension_configs: ExtensionConfigRepository | None = None,
+        oauth_authorizer: OAuthAuthorizer | None = None,
     ) -> None:
         self._database = database
         self._bridge = bridge
@@ -350,7 +417,8 @@ class SessionRuntime:
         self._native_manifest = NativeManifestController(database, capabilities)
         self._taskdeck = TaskDeckAdapter(database)
         self._remote_preflight = RemotePreflightController(bridge)
-
+        self._extension_configs = extension_configs
+        self._oauth_authorizer = oauth_authorizer
         self.state = RuntimeState.DETACHED
         self._lease: OwnerLease | None = None
         self._handle: SessionHandle | None = None
@@ -377,7 +445,13 @@ class SessionRuntime:
         self._loop: asyncio.AbstractEventLoop | None = None
         self._queue_dispatch_lock = asyncio.Lock()
         self._volatile_attachments: dict[str, list[Any] | None] = {}
-        self._interaction_futures: dict[str, asyncio.Future[dict[str, Any] | str]] = {}
+        self._interaction_gateway: InteractionGateway | None = None
+        self._hook_audit: SessionHookAudit | None = None
+        self._permission_handler: ManagedAwarePermissionHandler | None = None
+        self._extension_snapshot: ExtensionConfigSnapshot | None = None
+        self._protocol_responses = ProtocolResponseRepository(database)
+        self._deferred_protocol_events: list[Any] = []
+        self._protocol_tasks: set[asyncio.Task[Any]] = set()
         self._lifecycle_lock = asyncio.Lock()
         self._admission_lock = asyncio.Lock()
         self._active_send_admissions = 0
@@ -469,7 +543,7 @@ class SessionRuntime:
                 model_row = await self._database.fetchone(
                     """
                     SELECT desired_model_config, desired_agent,
-                           desired_session_config_version
+                           desired_project_config_version
                     FROM session_bindings WHERE thread_id = ?
                     """,
                     (self.binding.thread_id,),
@@ -492,7 +566,7 @@ class SessionRuntime:
                             "requested_model_config": json.loads(model_row["desired_model_config"]),
                             "requested_agent": model_row["desired_agent"],
                             "requested_session_config_version": model_row[
-                                "desired_session_config_version"
+                                "desired_project_config_version"
                             ],
                             "requested_delivery": mode,
                             "created_at": time.time(),
@@ -672,8 +746,8 @@ class SessionRuntime:
             runtime_model = await self._database.fetchone(
                 """
                 SELECT runtime_model_config, desired_agent, runtime_agent,
-                       desired_session_config_version,
-                       runtime_session_config_version
+                       desired_project_config_version,
+                       runtime_project_config_version
                 FROM session_bindings WHERE thread_id = ?
                 """,
                 (self.binding.thread_id,),
@@ -694,8 +768,8 @@ class SessionRuntime:
                 """
                 SELECT permission_posture, pending_mode, pending_model_config,
                        desired_agent, pending_agent, runtime_agent,
-                       desired_session_config_version, pending_session_config_version,
-                       runtime_session_config_version, pending_remote_transition_id,
+                       desired_project_config_version, pending_project_config_version,
+                       runtime_project_config_version, pending_remote_transition_id,
                        runtime_remote_mode
                 FROM session_bindings WHERE thread_id = ?
                 """,
@@ -709,7 +783,7 @@ class SessionRuntime:
                 or config_row["pending_mode"] is not None
                 or config_row["pending_model_config"] is not None
                 or config_row["pending_agent"] is not None
-                or config_row["pending_session_config_version"] is not None
+                or config_row["pending_project_config_version"] is not None
             ):
                 await self._block_queue_item(row["id"], "blocked_config_unknown")
                 return None
@@ -735,11 +809,11 @@ class SessionRuntime:
                 await self._block_queue_item(row["id"], "blocked_agent_drift")
                 return None
             requested_config_version = int(row["requested_session_config_version"])
-            desired_config_version = int(config_row["desired_session_config_version"])
+            desired_config_version = int(config_row["desired_project_config_version"])
             observed_config_version = (
                 desired_config_version
-                if config_row["runtime_session_config_version"] is None
-                else int(config_row["runtime_session_config_version"])
+                if config_row["runtime_project_config_version"] is None
+                else int(config_row["runtime_project_config_version"])
             )
             if (
                 requested_config_version != desired_config_version
@@ -1243,6 +1317,278 @@ class SessionRuntime:
             )
             return observed
 
+    async def reload_extension_config(
+        self,
+        *,
+        idempotency_key: str,
+        config: ProjectExtensionConfig | None = None,
+        expected_project_config_version: int | None = None,
+    ) -> ExtensionConfigSnapshot:
+        repository = self._extension_configs
+        if repository is None:
+            raise SessionNotReady("extension configuration repository is unavailable")
+        project = ProjectSnapshot(
+            project_id=self.binding.project_id,
+            channel_id=f"session:{self.binding.thread_id}",
+            source=(
+                ProjectSource.EXPLICIT
+                if self.binding.project_id is not None
+                else ProjectSource.IMPLICIT_HOME
+            ),
+            root_path=self.binding.cwd_snapshot,
+            cwd=self.binding.cwd_snapshot,
+            config_version=1,
+        )
+        existing_snapshot = await repository.latest(project) if config is None else None
+        normalized_config = (
+            existing_snapshot.config
+            if existing_snapshot is not None
+            else config.normalized(project.cwd)
+            if config is not None
+            else ProjectExtensionConfig()
+        )
+        config_hash = normalized_config.digest()
+        preflight = ExtensionConfigSnapshot(
+            scope_key=extension_scope_key(
+                self.binding.project_source,
+                self.binding.project_id,
+            ),
+            version=0,
+            project_id=self.binding.project_id,
+            project_source=self.binding.project_source,
+            cwd_snapshot=self.binding.cwd_snapshot,
+            config_hash=config_hash,
+            config=normalized_config,
+        )
+        preflight.sdk_session_options()
+        transition_id = str(
+            uuid.uuid5(
+                uuid.NAMESPACE_URL,
+                (f"copilotd:{self.binding.sdk_session_id}:config:{idempotency_key}"),
+            )
+        )
+        lease = self._lease
+        if lease is None:
+            raise SessionNotReady("config reload requires an active owner lease")
+        claim_store = ConfigReloadClaimStore(self._database)
+        existing_claim = await claim_store.find(
+            sdk_session_id=self.binding.sdk_session_id,
+            idempotency_key=idempotency_key,
+            config_hash=config_hash,
+        )
+        if existing_claim is None:
+            await self._assert_dispatchable()
+            blockers = await self.detach_blockers()
+            if blockers:
+                raise DetachBlocked(blockers)
+        elif self.state != RuntimeState.READY:
+            raise SessionNotReady(
+                f"config reload recovery requires a ready runtime, found {self.state}"
+            )
+        claim, snapshot, created = await claim_store.claim_and_publish(
+            sdk_session_id=self.binding.sdk_session_id,
+            idempotency_key=idempotency_key,
+            project=project,
+            config=normalized_config,
+            owner_id=lease.owner_id,
+            runtime_generation=self.binding.runtime_generation,
+            owner_fence_token=self._require_fence_token(),
+            transition_id=transition_id,
+            minimum_headroom_seconds=MUTATION_HEADROOM_SECONDS,
+            expected_current_version=expected_project_config_version,
+        )
+        current = await self._bindings.by_thread(self.binding.thread_id)
+        if current is None:
+            raise SessionNotReady("session binding disappeared during config publication")
+        self.binding = current
+        if not created:
+            replayed = await self._replay_config_reload_claim(
+                claim,
+                repository,
+                claim_store,
+            )
+            if replayed is not None:
+                return replayed
+        if (
+            snapshot.version == self.binding.desired_session_config_version
+            and snapshot.config_hash == self.binding.desired_session_config_hash
+            and snapshot.version == self.binding.runtime_session_config_version
+            and snapshot.config_hash == self.binding.runtime_session_config_hash
+        ):
+            await claim_store.transition(
+                claim,
+                ConfigReloadState.CONFIRMED,
+                config_version=snapshot.version,
+            )
+            return snapshot
+        inbox = self._require_inbox()
+        await inbox.commit_internal(
+            {
+                "type": "copilotd.config.pending",
+                "data": {
+                    "version": snapshot.version,
+                    "config_hash": snapshot.config_hash,
+                    "transition_id": transition_id,
+                },
+            },
+            internal_event_id=f"config:{transition_id}:pending",
+        )
+        current = await self._bindings.by_thread(self.binding.thread_id)
+        if current is None:
+            raise SessionNotReady("session binding disappeared before config reattach")
+        self.binding = current
+        async with self._lifecycle_lock:
+            await self._assert_owned_handle()
+            async with self._admission_lock:
+                self._accepting_sends = False
+            if self._mailbox is not None:
+                self._mailbox.freeze()
+            try:
+                await self._sdk_call(self._require_handle().disconnect())
+            except Exception as error:
+                await claim_store.transition(
+                    claim,
+                    ConfigReloadState.UNKNOWN,
+                    config_version=snapshot.version,
+                    error_code=type(error).__name__,
+                )
+                await inbox.commit_internal(
+                    {
+                        "type": "copilotd.config.unknown",
+                        "data": {
+                            "transition_id": transition_id,
+                            "error_type": type(error).__name__,
+                        },
+                    },
+                    internal_event_id=f"config:{transition_id}:unknown",
+                )
+                latest = await self._bindings.by_thread(self.binding.thread_id)
+                if latest is not None:
+                    self.binding = await self._bindings.mark_recovery_unknown(latest)
+                self.state = RuntimeState.RECOVERY_UNKNOWN
+                await self._stop_components(release_owner=True)
+                raise SessionAttachUnknown(
+                    "config reattach disconnect outcome is unknown"
+                ) from error
+            await inbox.join()
+            await self._stop_components(release_owner=False)
+            self.state = RuntimeState.DETACHED
+        try:
+            await self._attach(
+                create=False,
+                continue_pending_work=True,
+                reuse_owner=True,
+                target_config_version=snapshot.version,
+            )
+        except BaseException as error:
+            await claim_store.transition(
+                claim,
+                ConfigReloadState.UNKNOWN,
+                config_version=snapshot.version,
+                error_code=type(error).__name__,
+            )
+            await self._cleanup_failed_attach(error)
+            raise
+        current = await self._bindings.by_thread(self.binding.thread_id)
+        if current is None:
+            raise SessionNotReady("session binding disappeared after config reattach")
+        self.binding = current
+        if (
+            current.runtime_session_config_version != snapshot.version
+            or current.runtime_session_config_hash != snapshot.config_hash
+            or current.session_config_state != "synced"
+        ):
+            self.state = RuntimeState.DEGRADED
+            await claim_store.transition(
+                claim,
+                ConfigReloadState.UNKNOWN,
+                config_version=snapshot.version,
+                error_code="ConfigReadbackMismatch",
+            )
+            raise SessionAttachUnknown("config reattach could not be durably confirmed")
+        await claim_store.transition(
+            claim,
+            ConfigReloadState.CONFIRMED,
+            config_version=snapshot.version,
+        )
+        return snapshot
+
+    async def _replay_config_reload_claim(
+        self,
+        claim: ConfigReloadClaim,
+        repository: ExtensionConfigRepository,
+        claim_store: ConfigReloadClaimStore,
+    ) -> ExtensionConfigSnapshot | None:
+        if claim.state == ConfigReloadState.CONFIRMED and claim.config_version is not None:
+            snapshot = await repository.for_session(
+                project_source=self.binding.project_source,
+                project_id=self.binding.project_id,
+                cwd_snapshot=self.binding.cwd_snapshot,
+                version=claim.config_version,
+            )
+            if snapshot.config_hash != claim.config_hash:
+                raise ExtensionConfigConflict(
+                    "confirmed config reload claim no longer matches its generation"
+                )
+            return snapshot
+        if claim.state in {
+            ConfigReloadState.CLAIMED,
+            ConfigReloadState.STARTED,
+            ConfigReloadState.UNKNOWN,
+        }:
+            current = await self._bindings.by_thread(self.binding.thread_id)
+            if current is not None:
+                config_version = (
+                    claim.config_version
+                    if claim.config_version is not None
+                    else current.desired_session_config_version
+                )
+                durable_match = (
+                    current.session_config_state == "synced"
+                    and current.desired_session_config_version == config_version
+                    and current.runtime_session_config_version == config_version
+                    and current.desired_session_config_hash == claim.config_hash
+                    and current.runtime_session_config_hash == claim.config_hash
+                )
+                if durable_match:
+                    snapshot = await repository.for_session(
+                        project_source=current.project_source,
+                        project_id=current.project_id,
+                        cwd_snapshot=current.cwd_snapshot,
+                        version=config_version,
+                    )
+                    if snapshot.config_hash != claim.config_hash:
+                        raise ExtensionConfigConflict(
+                            "durable config readback does not match reload claim"
+                        )
+                    await claim_store.transition(
+                        claim,
+                        ConfigReloadState.CONFIRMED,
+                        config_version=config_version,
+                    )
+                    return snapshot
+                can_continue = (
+                    claim.state == ConfigReloadState.STARTED
+                    and current.attachment_state == AttachmentState.ATTACHED
+                    and current.owner_fence_token == self.binding.owner_fence_token
+                    and (
+                        (
+                            current.pending_session_config_version == claim.config_version
+                            and current.pending_session_config_hash == claim.config_hash
+                            and current.session_config_state == "pending"
+                        )
+                        or (
+                            current.pending_session_config_version is None
+                            and current.session_config_state == "synced"
+                        )
+                    )
+                )
+                if can_continue:
+                    return None
+        if claim.state == ConfigReloadState.REJECTED:
+            raise OperationRejected(f"config reload was rejected: {claim.error_code or 'unknown'}")
+        raise OperationAmbiguous(f"config reload outcome is {claim.state}: {claim.idempotency_key}")
+
     async def _request_snapshot(self, topic: str) -> int:
         request_id = str(uuid.uuid4())
         await self._require_inbox().commit_internal(
@@ -1447,6 +1793,14 @@ class SessionRuntime:
                         ),
                         "metadata": snapshot,
                     }
+                elif topic == "extensions":
+                    skills, agents = await asyncio.gather(
+                        self._bridge.get_skills(self._require_handle()),
+                        self._bridge.get_agents(self._require_handle()),
+                    )
+                    payload = {"skills": skills, "agents": agents}
+                elif topic == "mcp":
+                    payload = await self._bridge.get_mcp_servers(self._require_handle())
                 else:
                     raise ValueError(f"unsupported snapshot topic: {topic}")
             except asyncio.CancelledError:
@@ -1512,6 +1866,8 @@ class SessionRuntime:
                 topics.add("schedules")
             if self._capabilities.supports("remote_status"):
                 topics.add("remote")
+            if self._capabilities.supports("session_extension_config"):
+                topics.update({"extensions", "mcp"})
         return topics
 
     async def _prime_readiness(self) -> None:
@@ -1563,12 +1919,12 @@ class SessionRuntime:
                     blockers.append("runtime_agent_unknown")
                 elif binding["runtime_agent"] != binding["desired_agent"]:
                     blockers.append("runtime_agent_drift")
-            if binding["pending_session_config_version"] is not None:
+            if binding["pending_project_config_version"] is not None:
                 blockers.append("session_config_transition_pending")
-            if binding["runtime_session_config_version"] is None:
+            if binding["runtime_project_config_version"] is None:
                 blockers.append("runtime_session_config_unknown")
-            elif int(binding["runtime_session_config_version"]) != int(
-                binding["desired_session_config_version"]
+            elif int(binding["runtime_project_config_version"]) != int(
+                binding["desired_project_config_version"]
             ):
                 blockers.append("runtime_session_config_drift")
             if self._capabilities.supports("remote_status"):
@@ -1608,7 +1964,6 @@ class SessionRuntime:
                 )
                 if unresolved_compactions is not None and int(unresolved_compactions[0]) > 0:
                     blockers.append(f"compaction_outcome_unknown:{int(unresolved_compactions[0])}")
-
         if require_quiet:
             if binding["runtime_processing"]:
                 blockers.append("runtime_processing")
@@ -1666,17 +2021,22 @@ class SessionRuntime:
             epoch = self._permission_reconcile_epoch
             posture = PermissionPosture.VERIFIED_ALLOW_ALL
             error_type: str | None = None
-            try:
-                await self._assert_owned_handle()
-                await self._sdk_call(self._bridge.ensure_allow_all(self._require_handle()))
-            except asyncio.CancelledError:
-                raise
-            except PermissionPostureError as error:
+            managed = await self._bindings.by_thread(self.binding.thread_id)
+            if managed is not None and managed.managed_permissions_blocked:
                 posture = PermissionPosture.PLATFORM_BLOCKED
-                error_type = type(error).__name__
-            except Exception as error:
-                posture = PermissionPosture.UNKNOWN
-                error_type = type(error).__name__
+                error_type = "ManagedPermissionsBlocked"
+            else:
+                try:
+                    await self._assert_owned_handle()
+                    await self._sdk_call(self._bridge.ensure_allow_all(self._require_handle()))
+                except asyncio.CancelledError:
+                    raise
+                except PermissionPostureError as error:
+                    posture = PermissionPosture.PLATFORM_BLOCKED
+                    error_type = type(error).__name__
+                except Exception as error:
+                    posture = PermissionPosture.UNKNOWN
+                    error_type = type(error).__name__
             if self.state != RuntimeState.READY or not await self._is_current_owner():
                 continue
             latest = await self._bindings.by_thread(self.binding.thread_id)
@@ -1743,6 +2103,21 @@ class SessionRuntime:
             topics.add("schedules")
         if raw_type == "session.idle":
             topics.update({"activity", "queue", "tasks"})
+        if raw_type in {
+            "session.tools_updated",
+            "session.skills_loaded",
+            "session.custom_agents_updated",
+            "session.extensions_loaded",
+        }:
+            topics.add("extensions")
+        if raw_type in {
+            "session.mcp_servers_loaded",
+            "session.mcp_server_status_changed",
+            "mcp.tools.list_changed",
+            "mcp.resources.list_changed",
+            "mcp.prompts.list_changed",
+        }:
+            topics.add("mcp")
         if loop is not None:
             for topic in topics.intersection(self._supported_snapshot_topics()):
                 loop.call_soon_threadsafe(
@@ -1752,6 +2127,140 @@ class SessionRuntime:
                 )
         if raw_type == "session.permissions_changed" and loop is not None:
             loop.call_soon_threadsafe(self._permission_reconcile_requested.set)
+        if raw_type in {
+            "session.managed_settings_resolved",
+            "session.managed_settings_enforced",
+        }:
+            payload = event.to_dict()
+            data = payload.get("data", {})
+            blocked = raw_type.endswith("_enforced") or (
+                isinstance(data, dict)
+                and (bool(data.get("bypassPermissionsDisabled")) or bool(data.get("failClosed")))
+            )
+            handler = self._permission_handler
+            if handler is not None:
+                handler.set_managed_permissions_blocked(blocked)
+            if loop is not None:
+                loop.call_soon_threadsafe(self._permission_reconcile_requested.set)
+        if (
+            raw_type
+            in {
+                "session_limits_exhausted.requested",
+                "sampling.requested",
+                "mcp.headers_refresh_required",
+            }
+            and loop is not None
+        ):
+            loop.call_soon_threadsafe(self._schedule_protocol_response, event)
+
+    def _schedule_protocol_response(self, event: Any) -> None:
+        if self._handle is None:
+            self._deferred_protocol_events.append(event)
+            return
+        raw_type = str(getattr(getattr(event, "type", None), "value", "unknown"))
+        task = self._tasks.create(
+            self._respond_protocol_request(event),
+            name=(
+                f"protocol-response:{self.binding.sdk_session_id}:"
+                f"{raw_type}:{getattr(event, 'id', 'unknown')}"
+            ),
+            source="protocol-response",
+            session_id=self.binding.sdk_session_id,
+            runtime_generation=self.binding.runtime_generation,
+        )
+        self._protocol_tasks.add(task)
+        task.add_done_callback(self._protocol_tasks.discard)
+
+    def _flush_deferred_protocol_responses(self) -> None:
+        deferred = self._deferred_protocol_events
+        self._deferred_protocol_events = []
+        for event in deferred:
+            self._schedule_protocol_response(event)
+
+    async def _respond_protocol_request(self, event: Any) -> None:
+        inbox = self._require_inbox()
+        await inbox.join()
+        raw_type = str(getattr(getattr(event, "type", None), "value", "unknown"))
+        raw_payload = event.to_dict()
+        data = raw_payload.get("data", {})
+        if not isinstance(data, dict) or data.get("requestId") is None:
+            return
+        request_id = str(data["requestId"])
+        capability = {
+            "session_limits_exhausted.requested": "protocol_session_limits_response",
+            "sampling.requested": "protocol_sampling_response",
+            "mcp.headers_refresh_required": "protocol_mcp_headers_response",
+        }.get(raw_type)
+        if capability is None:
+            return
+        if self._capabilities is not None and not self._capabilities.supports(capability):
+            await self._protocol_responses.mark_unsupported(
+                sdk_session_id=self.binding.sdk_session_id,
+                generation=self.binding.runtime_generation,
+                request_id=request_id,
+                reason=f"capability gate failed: {capability}",
+            )
+            return
+
+        safe_response: dict[str, Any]
+        headers: dict[str, str] | None = None
+        if raw_type == "session_limits_exhausted.requested":
+            safe_response = {"action": "cancel"}
+        elif raw_type == "sampling.requested":
+            safe_response = {"response": None}
+        else:
+            snapshot = self._extension_snapshot
+            server_name = str(data.get("serverName") or "")
+            headers = None if snapshot is None else snapshot.dynamic_headers(server_name)
+            safe_response = {
+                "kind": "headers" if headers else "none",
+                "header_names": sorted(headers or {}),
+            }
+        claim = await self._protocol_responses.claim(
+            sdk_session_id=self.binding.sdk_session_id,
+            generation=self.binding.runtime_generation,
+            owner_fence_token=self._require_fence_token(),
+            request_id=request_id,
+            response_payload=safe_response,
+        )
+        if claim is None:
+            return
+        try:
+            await self._assert_owned_handle(allow_attaching=True)
+            handle = self._require_handle()
+            if raw_type == "session_limits_exhausted.requested":
+                accepted = await self._sdk_call(
+                    self._bridge.respond_session_limits(handle, request_id)
+                )
+            elif raw_type == "sampling.requested":
+                accepted = await self._sdk_call(
+                    self._bridge.respond_sampling(handle, request_id, None)
+                )
+            else:
+                accepted = await self._sdk_call(
+                    self._bridge.respond_mcp_headers(handle, request_id, headers)
+                )
+        except asyncio.CancelledError:
+            await asyncio.shield(
+                self._protocol_responses.settle(
+                    claim,
+                    state="unknown",
+                    error_code="cancelled",
+                )
+            )
+            raise
+        except Exception as error:
+            await self._protocol_responses.settle(
+                claim,
+                state="unknown",
+                error_code=type(error).__name__,
+            )
+        else:
+            await self._protocol_responses.settle(
+                claim,
+                state="confirmed" if accepted else "rejected",
+                error_code=None if accepted else "already_resolved_or_expired",
+            )
 
     async def set_mode(
         self,
@@ -1862,21 +2371,31 @@ class SessionRuntime:
             reasoning_summary = reasoning_summary.strip()
             if not reasoning_summary:
                 raise CDInputError("reasoning summary cannot be empty")
-            if (
-                self._model_summary_adapter is None
-                or not self._model_summary_adapter.supports_reasoning_summary(model)
-            ):
+            if reasoning_summary not in {"none", "concise", "detailed"}:
+                raise CDInputError(f"unsupported reasoning summary: {reasoning_summary}")
+            adapter_supported = self._model_summary_adapter is not None and (
+                self._model_summary_adapter.supports_reasoning_summary(model)
+            )
+            capability_supported = self._capabilities is not None and (
+                self._capabilities.supports("reasoning_summary_readback")
+            )
+            if not adapter_supported and not capability_supported:
                 raise CDCapabilityError(
                     f"{model} does not expose confirmed reasoning-summary readback"
                 )
 
-        target = {
-            "modelId": model,
-            "reasoningEffort": reasoning_effort,
-            "contextTier": context_tier,
-        }
+        target: dict[str, Any] = {"modelId": model}
+        confirmation_mask = ["modelId"]
+        if reasoning_effort is not None:
+            target["reasoningEffort"] = reasoning_effort
+            confirmation_mask.append("reasoningEffort")
         if reasoning_summary is not None:
             target["reasoningSummary"] = reasoning_summary
+            confirmation_mask.append("reasoningSummary")
+        if context_tier is not None:
+            target["contextTier"] = context_tier
+            confirmation_mask.append("contextTier")
+        target["confirmationMask"] = confirmation_mask
         transition_id = str(
             uuid.uuid5(
                 uuid.NAMESPACE_URL,
@@ -1895,25 +2414,15 @@ class SessionRuntime:
         async def dispatch() -> dict[str, Any]:
             await self._assert_owned_handle()
             handle = self._require_handle()
-            if reasoning_summary is None:
-                await self._sdk_call(
-                    self._bridge.set_model(
-                        handle,
-                        model=model,
-                        reasoning_effort=reasoning_effort,
-                        context_tier=context_tier,
-                    )
+            await self._sdk_call(
+                self._bridge.set_model(
+                    handle,
+                    model=model,
+                    reasoning_effort=reasoning_effort,
+                    reasoning_summary=reasoning_summary,
+                    context_tier=context_tier,
                 )
-            else:
-                await self._sdk_call(
-                    self._bridge.set_model(
-                        handle,
-                        model=model,
-                        reasoning_effort=reasoning_effort,
-                        context_tier=context_tier,
-                        reasoning_summary=reasoning_summary,
-                    )
-                )
+            )
             observed = await self._sdk_call(self._bridge.get_current_model(handle))
             if reasoning_summary is not None and self._model_summary_adapter is not None:
                 readback = await self._model_summary_adapter.read_current_model(
@@ -1921,21 +2430,19 @@ class SessionRuntime:
                 )
                 if readback is not None:
                     observed = {**observed, **dict(readback)}
-            if observed.get("modelId") != model:
-                raise RuntimeError(
-                    f"model reconciliation returned {observed.get('modelId')}; expected {model}"
+            observed["knownFields"] = sorted(
+                key
+                for key in (
+                    "modelId",
+                    "reasoningEffort",
+                    "reasoningSummary",
+                    "contextTier",
                 )
-            if reasoning_effort is not None and observed.get("reasoningEffort") != reasoning_effort:
-                raise RuntimeError("model reasoning effort could not be confirmed")
-            observed_tier = observed.get("contextTier")
-            if context_tier is not None and observed_tier != context_tier:
-                raise RuntimeError("model context tier could not be confirmed")
-            if (
-                reasoning_summary is not None
-                and observed.get("reasoningSummary") != reasoning_summary
-            ):
-                raise RuntimeError("model reasoning summary could not be confirmed")
-            return observed
+                if key in observed
+            )
+            if not _model_config_matches(target, observed):
+                raise RuntimeError("model configuration could not be fully confirmed")
+            return {key: observed.get(key) for key in confirmation_mask}
 
         try:
             observed = await self._require_mailbox().submit(
@@ -1978,20 +2485,109 @@ class SessionRuntime:
 
     async def context_snapshot(self) -> dict[str, Any] | None:
         await self._assert_owned_handle()
-        return await self._projection_snapshot(
-            "context",
-            self._bridge.get_context(self._require_handle()),
-            allow_none=True,
+        capability_available = self._capabilities is None or self._capabilities.supports(
+            "context_info"
         )
+        error: Exception | None = None
+        if capability_available:
+            try:
+                payload = await self._sdk_call(self._bridge.get_context(self._require_handle()))
+                if payload is not None:
+                    observed_at = time.time()
+                    await self._require_inbox().commit_internal(
+                        {
+                            "type": "copilotd.context.observed",
+                            "data": {
+                                "payload": payload,
+                                "observed_at": observed_at,
+                            },
+                        },
+                        source="snapshot",
+                        internal_event_id=(
+                            f"context:{self.binding.runtime_generation}:{time.time_ns()}"
+                        ),
+                    )
+                    return payload
+            except Exception as caught:
+                error = caught
+                await self._require_inbox().commit_internal(
+                    {
+                        "type": "copilotd.context.failed",
+                        "data": {"error_type": type(caught).__name__},
+                    },
+                    source="snapshot",
+                    internal_event_id=(
+                        f"context:{self.binding.runtime_generation}:failed:{time.time_ns()}"
+                    ),
+                )
+        stale = await self._read_projection("context_projections")
+        if stale is not None:
+            return stale
+        if error is not None:
+            raise error
+        return None
 
     async def usage_snapshot(self) -> dict[str, Any]:
         await self._assert_owned_handle()
-        snapshot = await self._projection_snapshot(
-            "usage",
-            self._bridge.get_usage(self._require_handle()),
-            allow_none=False,
+        capability_available = self._capabilities is None or self._capabilities.supports("usage")
+        error: Exception | None = None
+        if capability_available:
+            try:
+                payload = await self._sdk_call(self._bridge.get_usage(self._require_handle()))
+                observed_at = time.time()
+                await self._require_inbox().commit_internal(
+                    {
+                        "type": "copilotd.usage.observed",
+                        "data": {
+                            "payload": payload,
+                            "observed_at": observed_at,
+                        },
+                    },
+                    source="snapshot",
+                    internal_event_id=(f"usage:{self.binding.runtime_generation}:{time.time_ns()}"),
+                )
+                return payload
+            except Exception as caught:
+                error = caught
+                await self._require_inbox().commit_internal(
+                    {
+                        "type": "copilotd.usage.failed",
+                        "data": {"error_type": type(caught).__name__},
+                    },
+                    source="snapshot",
+                    internal_event_id=(
+                        f"usage:{self.binding.runtime_generation}:failed:{time.time_ns()}"
+                    ),
+                )
+        stale = await self._read_projection("usage_projections")
+        if stale is not None:
+            return stale
+        if error is not None:
+            raise error
+        return {"_stale": True, "_unavailable": True}
+
+    async def _read_projection(self, table: str) -> dict[str, Any] | None:
+        if table not in {"context_projections", "usage_projections"}:
+            raise ValueError(f"unsupported projection table: {table}")
+        row = await self._database.fetchone(
+            f"""
+            SELECT payload_json, observed_at, stale, stale_reason
+            FROM {table} WHERE sdk_session_id = ?
+            """,
+            (self.binding.sdk_session_id,),
         )
-        return {} if snapshot is None else snapshot
+        if row is None:
+            return None
+        payload = json.loads(str(row["payload_json"]))
+        if not isinstance(payload, dict):
+            payload = {"value": payload}
+        return {
+            **payload,
+            "_stale": True,
+            "_observedAt": float(row["observed_at"]),
+            "_staleReason": row["stale_reason"] or "live reconciliation unavailable",
+            "_error": row["stale_reason"] or "live reconciliation unavailable",
+        }
 
     async def readiness_snapshot(self) -> dict[str, Any]:
         return await self._refresh_readiness()
@@ -2577,7 +3173,7 @@ class SessionRuntime:
         operation_key = f"fleet:{idempotency_key}"
         config = await self._database.fetchone(
             """
-            SELECT runtime_mode, runtime_agent, runtime_session_config_version
+            SELECT runtime_mode, runtime_agent, runtime_project_config_version
             FROM session_bindings WHERE sdk_session_id = ?
             """,
             (self.binding.sdk_session_id,),
@@ -2599,7 +3195,7 @@ class SessionRuntime:
                         "requested_mode": config["runtime_mode"],
                         "requested_agent": config["runtime_agent"],
                         "requested_session_config_version": config[
-                            "runtime_session_config_version"
+                            "runtime_project_config_version"
                         ],
                         "created_at": time.time(),
                     },
@@ -3648,65 +4244,52 @@ class SessionRuntime:
         result = await self._request_interaction("auto_mode_switch", request)
         return cast(str, result)
 
+    async def _handle_elicitation_request(
+        self,
+        context: dict[str, Any],
+    ) -> dict[str, Any]:
+        result = await self._request_interaction(
+            "elicitation",
+            context,
+            response_plane="sdk_handler",
+        )
+        return cast(dict[str, Any], result)
+
+    async def _handle_mcp_auth_request(
+        self,
+        request: dict[str, Any],
+        _context: dict[str, str],
+    ) -> dict[str, Any]:
+        authorizer = self._oauth_authorizer
+        automatic_response = None if authorizer is None else authorizer(request)
+        result = await self._request_interaction(
+            "mcp_oauth",
+            request,
+            protocol_request_id=(
+                None if request.get("requestId") is None else str(request["requestId"])
+            ),
+            response_plane="sdk_handler",
+            automatic_response=automatic_response,
+        )
+        return cast(dict[str, Any], result)
+
     async def _request_interaction(
         self,
-        kind: Literal["user_input", "exit_plan_mode", "auto_mode_switch"],
+        kind: InteractionKind,
         request: dict[str, Any],
+        *,
+        protocol_request_id: str | None = None,
+        response_plane: str = "direct_handler",
+        automatic_response: Awaitable[Mapping[str, Any]] | None = None,
     ) -> dict[str, Any] | str:
         await self._assert_owned_handle()
-        interaction_id = str(uuid.uuid4())
-        now = time.time()
-        expires_at = now + self._interaction_timeout_seconds
-        payload: dict[str, Any] = {
-            "interaction_id": interaction_id,
-            "thread_id": self.binding.thread_id,
-            "kind": kind,
-            "state": "pending",
-            "expires_at": expires_at,
-        }
-        payload.update(request)
-        if kind == "exit_plan_mode":
-            payload["choices"] = list(request.get("actions", []))
-        if kind == "auto_mode_switch":
-            payload["choices"] = ["yes", "yes_always", "no"]
-            retry_after = request.get("retryAfterSeconds")
-            suffix = "" if retry_after is None else f" Retry after {retry_after} seconds."
-            payload["question"] = (
-                f"Copilot reached an eligible rate limit. Switch to Auto mode?{suffix}"
-            )
-        future: asyncio.Future[dict[str, Any] | str] = asyncio.get_running_loop().create_future()
-        self._interaction_futures[interaction_id] = future
-        await self._require_inbox().commit_internal(
-            {"type": "copilotd.interaction.requested", "data": payload},
-            internal_event_id=f"interaction:{interaction_id}:requested",
+        return await self._require_interaction_gateway().request(
+            kind,
+            request,
+            protocol_request_id=protocol_request_id,
+            response_plane=response_plane,
+            automatic_response=automatic_response,
         )
-        try:
-            return await asyncio.wait_for(
-                asyncio.shield(future),
-                timeout=self._interaction_timeout_seconds,
-            )
-        except TimeoutError:
-            fallback = self._interaction_fallback(kind)
-            _claimed, settled_response = await self._settle_interaction(
-                interaction_id,
-                response=fallback,
-                display_response="Request timed out.",
-                state="expired",
-            )
-            return settled_response
-        except asyncio.CancelledError:
-            fallback = self._interaction_fallback(kind)
-            await asyncio.shield(
-                self._settle_interaction(
-                    interaction_id,
-                    response=fallback,
-                    display_response="Request cancelled because the handler stopped.",
-                    state="expired",
-                )
-            )
-            raise
-        finally:
-            self._interaction_futures.pop(interaction_id, None)
 
     async def respond_interaction(
         self,
@@ -3714,206 +4297,24 @@ class SessionRuntime:
         *,
         selection: int | None = None,
         freeform: str | None = None,
+        form_content: Mapping[str, Any] | None = None,
+        action: Literal["decline", "cancel"] | None = None,
+        secure_response: Mapping[str, Any] | None = None,
     ) -> Literal["resolved", "expired", "invalid"]:
-        row = await self._database.fetchone(
-            """
-            SELECT kind, expires_at, state, payload, runtime_generation,
-                   owner_fence_token
-            FROM pending_interactions
-            WHERE interaction_id = ? AND sdk_session_id = ?
-            """,
-            (interaction_id, self.binding.sdk_session_id),
-        )
-        if row is None:
-            return "invalid"
-        if (
-            row["state"] != "pending"
-            or float(row["expires_at"]) <= time.time()
-            or int(row["runtime_generation"]) != self.binding.runtime_generation
-            or int(row["owner_fence_token"]) != self.binding.owner_fence_token
-        ):
-            return "expired"
-        future = self._interaction_futures.get(interaction_id)
-        if future is None or future.done():
-            return "expired"
-        payload = json.loads(str(row["payload"]))
-        kind = str(row["kind"])
-        response: dict[str, Any] | str
-        display_response: str
-        if freeform is not None:
-            answer = freeform.strip()
-            choices = [str(choice) for choice in payload.get("choices", [])]
-            choice_fallback = len(choices) > 25 and answer in choices
-            if (
-                kind != "user_input"
-                or not answer
-                or (not payload.get("allowFreeform") and not choice_fallback)
-            ):
-                return "invalid"
-            response = {
-                "answer": answer,
-                "wasFreeform": not choice_fallback,
-            }
-            display_response = answer
-        else:
-            choices = payload.get("choices", [])
-            if not isinstance(selection, int) or not 0 <= selection < len(choices):
-                return "invalid"
-            answer = str(choices[selection])
-            if kind == "user_input":
-                response = {"answer": answer, "wasFreeform": False}
-            elif kind == "exit_plan_mode":
-                if answer not in payload.get("actions", []):
-                    return "invalid"
-                response = {"approved": True, "selectedAction": answer}
-            elif kind == "auto_mode_switch":
-                if answer not in {"yes", "yes_always", "no"}:
-                    return "invalid"
-                response = answer
-            else:
-                return "invalid"
-            display_response = answer
-        claimed, _settled_response = await self._settle_interaction(
+        return await self._require_interaction_gateway().respond(
             interaction_id,
-            response=response,
-            display_response=display_response,
-            state="resolved",
+            selection=selection,
+            freeform=freeform,
+            form_content=form_content,
+            action=action,
+            secure_response=secure_response,
         )
-        return "resolved" if claimed else "expired"
-
-    async def _settle_interaction(
-        self,
-        interaction_id: str,
-        *,
-        response: dict[str, Any] | str,
-        display_response: str,
-        state: Literal["resolved", "expired"],
-    ) -> tuple[bool, dict[str, Any] | str]:
-        future = self._interaction_futures.get(interaction_id)
-        encoded_response = json.dumps(response, ensure_ascii=False, sort_keys=True)
-        target_mode = interaction_target_mode(response) if state == "resolved" else None
-        now = time.time()
-        expiry_predicate = "AND expires_at > ?" if state == "resolved" else ""
-        parameters: tuple[Any, ...] = (
-            state,
-            encoded_response,
-            target_mode,
-            now,
-            interaction_id,
-            self.binding.sdk_session_id,
-            self.binding.runtime_generation,
-            self.binding.owner_fence_token,
-        )
-        if state == "resolved":
-            parameters = (*parameters, now)
-        async with self._database.transaction() as connection:
-            cursor = await connection.execute(
-                f"""
-                UPDATE pending_interactions
-                SET state = ?, response = ?, target_mode = ?, updated_at = ?
-                WHERE interaction_id = ? AND sdk_session_id = ?
-                  AND runtime_generation = ? AND owner_fence_token = ?
-                  AND state = 'pending' {expiry_predicate}
-                """,
-                parameters,
-            )
-            claimed = cursor.rowcount == 1
-            await cursor.close()
-            if claimed:
-                await connection.execute(
-                    """
-                    UPDATE liveness_leases
-                    SET state = 'released', refreshed_at = ?, released_at = ?
-                    WHERE sdk_session_id = ? AND lease_id = ?
-                      AND runtime_generation = ? AND owner_fence_token = ?
-                      AND state = 'active'
-                    """,
-                    (
-                        now,
-                        now,
-                        self.binding.sdk_session_id,
-                        f"interaction:{interaction_id}",
-                        self.binding.runtime_generation,
-                        self.binding.owner_fence_token,
-                    ),
-                )
-            row_cursor = await connection.execute(
-                """
-                SELECT kind, response FROM pending_interactions
-                WHERE interaction_id = ? AND sdk_session_id = ?
-                """,
-                (interaction_id, self.binding.sdk_session_id),
-            )
-            row = await row_cursor.fetchone()
-            await row_cursor.close()
-        settled_response = response
-        kind = "interaction"
-        if row is not None:
-            kind = str(row["kind"])
-            if row["response"] is not None:
-                settled_response = cast(
-                    dict[str, Any] | str,
-                    json.loads(str(row["response"])),
-                )
-        if claimed:
-            try:
-                await self._require_inbox().commit_internal(
-                    {
-                        "type": f"copilotd.interaction.{state}",
-                        "data": {
-                            "interaction_id": interaction_id,
-                            "kind": kind,
-                            "state": state,
-                            "response": response,
-                            "display_response": display_response,
-                            "target_mode": target_mode,
-                        },
-                    },
-                    internal_event_id=f"interaction:{interaction_id}:{state}",
-                )
-            finally:
-                if future is not None and not future.done():
-                    future.set_result(response)
-        elif row is not None and row["response"] is not None:
-            if future is not None and not future.done():
-                future.set_result(settled_response)
-        return claimed, settled_response
-
-    async def _interaction_kind(self, interaction_id: str) -> str:
-        row = await self._database.fetchone(
-            "SELECT kind FROM pending_interactions WHERE interaction_id = ?",
-            (interaction_id,),
-        )
-        return "interaction" if row is None else str(row["kind"])
-
-    @staticmethod
-    def _interaction_fallback(kind: str) -> dict[str, Any] | str:
-        if kind == "user_input":
-            return {
-                "answer": "No response was provided before the request expired.",
-                "wasFreeform": True,
-            }
-        if kind == "exit_plan_mode":
-            return {"approved": False}
-        return "no"
 
     async def cancel_pending_interactions(self, *, reason: str) -> int:
-        pending = [
-            (interaction_id, future)
-            for interaction_id, future in self._interaction_futures.items()
-            if not future.done()
-        ]
-        settled = 0
-        for interaction_id, _future in pending:
-            kind = await self._interaction_kind(interaction_id)
-            claimed, _response = await self._settle_interaction(
-                interaction_id,
-                response=self._interaction_fallback(kind),
-                display_response=reason,
-                state="expired",
-            )
-            settled += int(claimed)
-        return settled
+        gateway = self._interaction_gateway
+        if gateway is None:
+            return 0
+        return await gateway.cancel_pending(reason=reason)
 
     async def queue_items(self) -> list[dict[str, Any]]:
         rows = await self._database.fetchall(
@@ -4016,7 +4417,7 @@ class SessionRuntime:
             binding = await self._database.fetchone(
                 """
                 SELECT desired_mode, desired_model_config, desired_agent,
-                       desired_session_config_version
+                       desired_project_config_version
                 FROM session_bindings WHERE thread_id = ?
                 """,
                 (self.binding.thread_id,),
@@ -4044,7 +4445,7 @@ class SessionRuntime:
                         "requested_model_config": json.loads(str(binding["desired_model_config"])),
                         "requested_agent": str(binding["desired_agent"]),
                         "requested_session_config_version": int(
-                            binding["desired_session_config_version"]
+                            binding["desired_project_config_version"]
                         ),
                         "created_at": time.time(),
                     },
@@ -4777,7 +5178,31 @@ class SessionRuntime:
                 internal_event_id=(f"remote:{self.binding.runtime_generation}:{basis}"),
             )
 
-    async def _attach(self, *, create: bool, continue_pending_work: bool) -> None:
+    async def _attach(
+        self,
+        *,
+        create: bool,
+        continue_pending_work: bool,
+        reuse_owner: bool = False,
+        target_config_version: int | None = None,
+    ) -> None:
+        config_version = (
+            target_config_version
+            or self.binding.pending_session_config_version
+            or self.binding.desired_session_config_version
+        )
+        snapshot = await self._load_extension_snapshot(config_version)
+        extension_session_options = snapshot.sdk_session_options()
+        expected_hash = (
+            self.binding.pending_session_config_hash
+            if self.binding.pending_session_config_version == config_version
+            else self.binding.desired_session_config_hash
+        )
+        if expected_hash is not None and expected_hash != snapshot.config_hash:
+            raise SessionNotReady(
+                "extension config generation does not match the session binding hash"
+            )
+        self._extension_snapshot = snapshot
         async with self._lifecycle_lock:
             if self.state != RuntimeState.DETACHED:
                 raise SessionNotReady(f"runtime cannot attach from state {self.state}")
@@ -4789,15 +5214,26 @@ class SessionRuntime:
                 self.binding.session_config_snapshot_json
             )
             self.state = RuntimeState.ATTACHING
-            self._lease = await self._owner_leases.acquire(
-                self.binding.sdk_session_id,
-                self._owner_id,
-            )
-            self.binding = await self._bindings.begin_attachment(
-                thread_id=self.binding.thread_id,
-                lease=self._lease,
-                state=AttachmentState.CREATING if create else AttachmentState.RESUMING,
-            )
+            if reuse_owner:
+                if create or self._lease is None:
+                    raise SessionNotReady("same-owner reattach requires an active owner lease")
+                if not await self._owner_leases.is_current(self._lease):
+                    self.state = RuntimeState.FENCED
+                    raise FenceLost(f"owner fence lost for session {self.binding.sdk_session_id}")
+                self.binding = await self._bindings.begin_reattach(
+                    thread_id=self.binding.thread_id,
+                    lease=self._lease,
+                )
+            else:
+                self._lease = await self._owner_leases.acquire(
+                    self.binding.sdk_session_id,
+                    self._owner_id,
+                )
+                self.binding = await self._bindings.begin_attachment(
+                    thread_id=self.binding.thread_id,
+                    lease=self._lease,
+                    state=(AttachmentState.CREATING if create else AttachmentState.RESUMING),
+                )
             if (
                 not create
                 and self._capabilities is not None
@@ -4835,34 +5271,42 @@ class SessionRuntime:
                     raise SessionNotReady("session configuration snapshot is invalid")
                 session_options = dict(raw_options)
                 if create:
-                    create_kwargs = {
-                        "session_id": self.binding.sdk_session_id,
-                        "working_directory": str(self.binding.cwd_snapshot),
-                        "on_event": self._ingress,
-                        "on_user_input_request": self._handle_user_input_request,
-                        "on_exit_plan_mode_request": self._handle_exit_plan_mode_request,
-                        "on_auto_mode_switch_request": self._handle_auto_mode_switch_request,
-                    }
-                    if session_options:
-                        create_kwargs["session_config"] = session_options
-                    if launch_options is not None:
-                        create_kwargs["launch_options"] = launch_options
-                    handle = await self._sdk_call(self._bridge.create_session(**create_kwargs))
+                    handle = await self._sdk_call(
+                        self._bridge.create_session(
+                            session_id=self.binding.sdk_session_id,
+                            working_directory=str(self.binding.cwd_snapshot),
+                            on_event=self._ingress,
+                            on_user_input_request=self._handle_user_input_request,
+                            on_exit_plan_mode_request=self._handle_exit_plan_mode_request,
+                            on_auto_mode_switch_request=self._handle_auto_mode_switch_request,
+                            on_elicitation_request=self._handle_elicitation_request,
+                            on_mcp_auth_request=self._handle_mcp_auth_request,
+                            permission_handler=self._require_permission_handler(),
+                            hooks=self._require_hook_audit().handlers(),
+                            session_config=session_options or None,
+                            launch_options=launch_options,
+                            session_options=extension_session_options,
+                        )
+                    )
                 else:
-                    resume_kwargs = {
-                        "session_id": self.binding.sdk_session_id,
-                        "working_directory": str(self.binding.cwd_snapshot),
-                        "on_event": self._ingress,
-                        "continue_pending_work": continue_pending_work,
-                        "on_user_input_request": self._handle_user_input_request,
-                        "on_exit_plan_mode_request": self._handle_exit_plan_mode_request,
-                        "on_auto_mode_switch_request": self._handle_auto_mode_switch_request,
-                    }
-                    if session_options:
-                        resume_kwargs["session_config"] = session_options
-                    if launch_options is not None:
-                        resume_kwargs["launch_options"] = launch_options
-                    handle = await self._sdk_call(self._bridge.resume_session(**resume_kwargs))
+                    handle = await self._sdk_call(
+                        self._bridge.resume_session(
+                            session_id=self.binding.sdk_session_id,
+                            working_directory=str(self.binding.cwd_snapshot),
+                            on_event=self._ingress,
+                            continue_pending_work=continue_pending_work,
+                            on_user_input_request=self._handle_user_input_request,
+                            on_exit_plan_mode_request=self._handle_exit_plan_mode_request,
+                            on_auto_mode_switch_request=self._handle_auto_mode_switch_request,
+                            on_elicitation_request=self._handle_elicitation_request,
+                            on_mcp_auth_request=self._handle_mcp_auth_request,
+                            permission_handler=self._require_permission_handler(),
+                            hooks=self._require_hook_audit().handlers(),
+                            session_config=session_options or None,
+                            launch_options=launch_options,
+                            session_options=extension_session_options,
+                        )
+                    )
                 if handle.session_id != self.binding.sdk_session_id:
                     raise RuntimeError("SDK returned a different session ID")
             except Exception as error:
@@ -4882,6 +5326,7 @@ class SessionRuntime:
                 ) from error
 
             self._handle = handle
+            self._flush_deferred_protocol_responses()
             try:
                 await self._recover_event_log(handle, initialize=create)
                 if not create:
@@ -4900,6 +5345,8 @@ class SessionRuntime:
                     )
                 raise SessionAttachUnknown("event-log recovery failed during attach") from error
             try:
+                if self._require_permission_handler().managed_permissions_blocked:
+                    raise PermissionPostureError("managed settings block permission bypass")
                 await self._sdk_call(self._bridge.ensure_allow_all(handle))
             except PermissionPostureError:
                 self.binding = await self._bindings.mark_attached_blocked(
@@ -4979,7 +5426,7 @@ class SessionRuntime:
                 await self._reconcile_agent_after_attach(handle)
             config_row = await self._database.fetchone(
                 """
-                SELECT desired_session_config_version
+                SELECT desired_project_config_version
                 FROM session_bindings WHERE thread_id = ?
                 """,
                 (self.binding.thread_id,),
@@ -4988,12 +5435,25 @@ class SessionRuntime:
                 raise SessionNotReady("session configuration disappeared during attach")
             await self._require_inbox().commit_internal(
                 {
+                    "type": "copilotd.project_config.observed",
+                    "data": {"version": int(config_row["desired_project_config_version"])},
+                },
+                internal_event_id=(
+                    f"project-config:{self.binding.runtime_generation}:"
+                    f"{int(config_row['desired_project_config_version'])}"
+                ),
+            )
+            await self._require_inbox().commit_internal(
+                {
                     "type": "copilotd.config.observed",
-                    "data": {"version": int(config_row["desired_session_config_version"])},
+                    "data": {
+                        "version": snapshot.version,
+                        "config_hash": snapshot.config_hash,
+                    },
                 },
                 internal_event_id=(
                     f"config:{self.binding.runtime_generation}:"
-                    f"{int(config_row['desired_session_config_version'])}"
+                    f"{snapshot.version}:{snapshot.config_hash[:16]}"
                 ),
             )
             await self._reconcile_remote_after_attach(handle, create=create)
@@ -5039,6 +5499,41 @@ class SessionRuntime:
             fence_token=fence_token,
             capacity=self._ingress_capacity,
             thread_id=self.binding.thread_id,
+        )
+        self._interaction_gateway = InteractionGateway(
+            database=self._database,
+            inbox=self._inbox,
+            scope=InteractionScope(
+                sdk_session_id=self.binding.sdk_session_id,
+                runtime_generation=self.binding.runtime_generation,
+                owner_fence_token=fence_token,
+                thread_id=self.binding.thread_id,
+            ),
+            timeout_seconds=self._interaction_timeout_seconds,
+        )
+        snapshot = self._extension_snapshot
+        if snapshot is None:
+            raise SessionNotReady("extension config snapshot is unavailable")
+        self._hook_audit = SessionHookAudit(
+            inbox=self._inbox,
+            context=HookSessionContext(
+                sdk_session_id=self.binding.sdk_session_id,
+                runtime_generation=self.binding.runtime_generation,
+                owner_fence_token=fence_token,
+                thread_id=self.binding.thread_id,
+                project_id=self.binding.project_id,
+                project_source=self.binding.project_source,
+                cwd_snapshot=str(self.binding.cwd_snapshot),
+                config_version=snapshot.version,
+                config_hash=snapshot.config_hash,
+            ),
+        )
+        self._permission_handler = ManagedAwarePermissionHandler(
+            self._audit_permission,
+            self._is_mutation_safe_owner,
+        )
+        self._permission_handler.set_managed_permissions_blocked(
+            self.binding.managed_permissions_blocked
         )
         self._ingress = SdkEventIngress(
             self._inbox,
@@ -5407,6 +5902,9 @@ class SessionRuntime:
         if draining is not None and draining["value"] == "1":
             raise SessionNotReady("copilotD is draining for restart")
         await self._assert_owned_handle()
+        handler = self._permission_handler
+        if handler is not None and handler.managed_permissions_blocked:
+            raise SessionNotReady("managed permissions are platform-blocked")
         binding = await self._bindings.by_thread(self.binding.thread_id)
         if binding is None:
             raise SessionNotReady("session binding no longer exists")
@@ -5425,6 +5923,8 @@ class SessionRuntime:
         self.binding = binding
         if binding.attachment_state != AttachmentState.ATTACHED:
             raise SessionNotReady(f"session attachment is {binding.attachment_state}")
+        if binding.managed_permissions_blocked:
+            raise SessionNotReady("managed permissions are platform-blocked")
         if binding.permission_posture != PermissionPosture.VERIFIED_ALLOW_ALL:
             raise SessionNotReady(f"permission posture is {binding.permission_posture}")
         if binding.pending_mode is not None:
@@ -5433,6 +5933,22 @@ class SessionRuntime:
             raise SessionNotReady(
                 f"mode drift: desired={binding.desired_mode}, runtime={binding.runtime_mode}"
             )
+        if binding.pending_session_config_version is not None:
+            raise SessionNotReady(
+                "session extension config transition is pending: "
+                f"{binding.pending_session_config_version}"
+            )
+        if (
+            binding.runtime_session_config_version is None
+            or binding.runtime_session_config_hash is None
+        ):
+            raise SessionNotReady("runtime_session_config_unknown")
+        if (
+            binding.runtime_session_config_version != binding.desired_session_config_version
+            or binding.runtime_session_config_hash != binding.desired_session_config_hash
+            or binding.session_config_drift
+        ):
+            raise SessionNotReady("runtime extension configuration drifted")
         model_state = await self._database.fetchone(
             """
             SELECT desired_model_config, pending_model_config, runtime_model_config
@@ -5482,7 +5998,7 @@ class SessionRuntime:
         row = await self._database.fetchone(
             """
             SELECT runtime_mode, runtime_model_config, desired_agent, runtime_agent,
-                   desired_session_config_version, runtime_session_config_version
+                   desired_project_config_version, runtime_project_config_version
             FROM session_bindings WHERE thread_id = ?
             """,
             (self.binding.thread_id,),
@@ -5513,11 +6029,11 @@ class SessionRuntime:
         )
         if requested_agent != observed_agent:
             raise SessionNotReady("claimed queue agent snapshot drifted")
-        desired_config_version = int(row["desired_session_config_version"])
+        desired_config_version = int(row["desired_project_config_version"])
         observed_config_version = (
             desired_config_version
-            if row["runtime_session_config_version"] is None
-            else int(row["runtime_session_config_version"])
+            if row["runtime_project_config_version"] is None
+            else int(row["runtime_project_config_version"])
         )
         if (
             requested_session_config_version != desired_config_version
@@ -5680,6 +6196,11 @@ class SessionRuntime:
     ) -> None:
         self._accepting_sends = False
         errors: list[Exception] = []
+        protocol_tasks = list(self._protocol_tasks)
+        self._protocol_tasks.clear()
+        for task in protocol_tasks:
+            if task is not asyncio.current_task():
+                await self._cancel_component_task(task)
         overflow_task = self._overflow_task
         self._overflow_task = None
         if overflow_task is not None and overflow_task is not asyncio.current_task():
@@ -5726,10 +6247,15 @@ class SessionRuntime:
             self._reducer = None
         self._inbox = None
         self._ingress = None
+        self._interaction_gateway = None
+        self._hook_audit = None
+        self._permission_handler = None
         self._loop = None
         self._handle = None
+        self._deferred_protocol_events = []
         lease = self._lease
-        self._lease = None
+        if release_owner:
+            self._lease = None
         if release_owner and lease is not None:
             try:
                 await self._owner_leases.release(lease)
@@ -5756,10 +6282,78 @@ class SessionRuntime:
             raise SessionNotReady("session command mailbox is not running")
         return self._mailbox
 
+    def _require_interaction_gateway(self) -> InteractionGateway:
+        if self._interaction_gateway is None:
+            raise SessionNotReady("interaction gateway is not available")
+        return self._interaction_gateway
+
+    def _require_hook_audit(self) -> SessionHookAudit:
+        if self._hook_audit is None:
+            raise SessionNotReady("session hooks are not available")
+        return self._hook_audit
+
+    def _require_permission_handler(self) -> ManagedAwarePermissionHandler:
+        if self._permission_handler is None:
+            raise SessionNotReady("permission handler is not available")
+        return self._permission_handler
+
     def _require_fence_token(self) -> int:
         if self.binding.owner_fence_token is None:
             raise SessionNotReady("session binding has no owner fence")
         return self.binding.owner_fence_token
+
+    async def _load_extension_snapshot(
+        self,
+        version: int,
+    ) -> ExtensionConfigSnapshot:
+        project_source = self.binding.project_source
+        project_id = self.binding.project_id
+        if project_source == "explicit" and project_id is None:
+            project_source = "implicit-home"
+        if self._extension_configs is not None:
+            return await self._extension_configs.for_session(
+                project_source=project_source,
+                project_id=project_id,
+                cwd_snapshot=self.binding.cwd_snapshot,
+                version=version,
+            )
+        config = ProjectExtensionConfig()
+        return ExtensionConfigSnapshot(
+            scope_key=extension_scope_key(
+                project_source,
+                project_id,
+            ),
+            version=version,
+            project_id=project_id,
+            project_source=project_source,
+            cwd_snapshot=self.binding.cwd_snapshot,
+            config_hash=config.digest(),
+            config=config,
+        )
+
+    async def _audit_permission(self, payload: dict[str, Any]) -> None:
+        encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True)
+        audit_id = str(
+            uuid.uuid5(
+                uuid.NAMESPACE_URL,
+                (
+                    f"copilotd:{self.binding.sdk_session_id}:"
+                    f"{self.binding.runtime_generation}:permission:"
+                    f"{payload.get('request_id') or hashlib.sha256(encoded.encode()).hexdigest()}"
+                ),
+            )
+        )
+        await self._require_inbox().commit_internal(
+            {
+                "type": "copilotd.permission.audit",
+                "data": {
+                    "audit_id": audit_id,
+                    **payload,
+                    "observed_at": time.time(),
+                },
+            },
+            internal_event_id=f"permission:{audit_id}",
+        )
 
 
 def _consume_task_result(task: asyncio.Task[Any]) -> None:
@@ -5780,4 +6374,20 @@ def _model_config_matches(
 ) -> bool:
     if runtime is None:
         return False
-    return all(value is None or runtime.get(key) == value for key, value in desired.items())
+    explicit_mask = desired.get("confirmationMask")
+    mask = (
+        [str(item) for item in explicit_mask]
+        if isinstance(explicit_mask, list)
+        else [
+            key
+            for key in (
+                "modelId",
+                "reasoningEffort",
+                "reasoningSummary",
+                "contextTier",
+            )
+            if key in desired
+        ]
+    )
+    known_fields = set(runtime.get("knownFields", runtime))
+    return all(key in known_fields and runtime.get(key) == desired.get(key) for key in mask)

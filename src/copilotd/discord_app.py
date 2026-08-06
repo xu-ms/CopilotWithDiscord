@@ -51,13 +51,22 @@ from copilotd.core.commands import (
     TaskActionAdapter,
     UnknownInteractionError,
 )
+from copilotd.core.extensions import (
+    ExtensionConfigFileSource,
+    ExtensionConfigRepository,
+)
+from copilotd.core.interactions import (
+    DiscordInteractionAdapter,
+    ElicitationField,
+    ElicitationForm,
+)
 from copilotd.core.lifecycle_commands import (
     DiscordParentType,
     ProjectLifecycleService,
     SchedulerCommandService,
     WorktreeCommandService,
 )
-from copilotd.core.projects import ProjectRegistry
+from copilotd.core.projects import ProjectRegistry, ProjectSnapshot, ProjectSource
 from copilotd.core.recovery import RecoveryInventoryReport, StartupRecoveryInventory
 from copilotd.core.scheduler import SchedulerRepository, SchedulerWorker
 from copilotd.core.scheduler_adapter import ApplicationSchedulerAdapter
@@ -166,6 +175,8 @@ class CopilotDiscordBot(commands.Bot):
         self.command_executor = CommandExecutor(error_mapper=_map_command_error)
         self.projects: ProjectRegistry | None = None
         self.bindings: SessionBindingRepository | None = None
+        self.extension_configs: ExtensionConfigRepository | None = None
+        self.extension_config_source = ExtensionConfigFileSource()
         self.sessions: SessionRegistry | None = None
         self.creation: SessionCreationService | None = None
         self.dispatcher: RenderOutboxDispatcher | None = None
@@ -202,6 +213,7 @@ class CopilotDiscordBot(commands.Bot):
         )
         await self.projects.initialize()
         self.bindings = SessionBindingRepository(self.database)
+        self.extension_configs = ExtensionConfigRepository(self.database)
         leases = OwnerLeaseStore(
             self.database,
             ttl_seconds=self.settings.owner_lease_ttl_seconds,
@@ -240,6 +252,7 @@ class CopilotDiscordBot(commands.Bot):
                 send_frame_max_bytes=(self.settings.attachment_runtime_frame_max_bytes),
                 model_summary_adapter=self.model_summary_adapter,
                 task_action_adapter=self.task_action_adapter,
+                extension_configs=self.extension_configs,
             )
 
         self.sessions = SessionRegistry(self.bindings, runtime_factory)
@@ -249,6 +262,8 @@ class CopilotDiscordBot(commands.Bot):
             bindings=self.bindings,
             sessions=self.sessions,
             threads=DiscordThreadGateway(self),
+            extension_configs=self.extension_configs,
+            extension_config_source=self.extension_config_source,
         )
         self.scheduler_repository = SchedulerRepository(self.database)
         await self.scheduler_repository.recover()
@@ -613,6 +628,46 @@ class CopilotDiscordBot(commands.Bot):
                 interaction,
                 name="Copilot input",
             ).send_modal(InteractionResponseModal(self, interaction_id))
+            return
+        if action == "form":
+            row = await self.database.fetchone(
+                """
+                SELECT form_schema FROM pending_interactions
+                WHERE interaction_id = ? AND state = 'pending'
+                """,
+                (interaction_id,),
+            )
+            if row is None or row["form_schema"] is None:
+                await interaction.response.send_message(
+                    "This Copilot form has expired.",
+                    ephemeral=True,
+                )
+                return
+            form = ElicitationForm.from_dict(json.loads(str(row["form_schema"])))
+            await interaction.response.send_modal(
+                ElicitationResponseModal(self, interaction_id, form)
+            )
+            return
+        runtime = await self._interaction_runtime(interaction)
+        if action in {"decline", "cancel"}:
+            result = await runtime.respond_interaction(
+                interaction_id,
+                action=action,
+            )
+            await interaction.response.send_message(
+                _interaction_result_text(result),
+                ephemeral=True,
+            )
+            return
+        if action.startswith("choice-") and action.removeprefix("choice-").isdigit():
+            result = await runtime.respond_interaction(
+                interaction_id,
+                selection=int(action.removeprefix("choice-")),
+            )
+            await interaction.response.send_message(
+                _interaction_result_text(result),
+                ephemeral=True,
+            )
             return
         data = interaction.data
         values = data.get("values") if isinstance(data, dict) else None
@@ -1955,6 +2010,39 @@ class CopilotDiscordBot(commands.Bot):
             )
             await interaction.followup.send(
                 f"Project timezone is `{value}`.",
+                ephemeral=True,
+            )
+
+        @project.command(
+            name="config-reload",
+            description="Publish .copilotd/extensions.json and reattach this session",
+        )
+        async def project_config_reload(interaction: discord.Interaction) -> None:
+            await interaction.response.defer(ephemeral=True)
+            runtime = await self._interaction_runtime(interaction)
+            binding = runtime.binding
+            project_snapshot = ProjectSnapshot(
+                project_id=binding.project_id,
+                channel_id=f"session:{binding.thread_id}",
+                source=(
+                    ProjectSource.EXPLICIT
+                    if binding.project_id is not None
+                    else ProjectSource.IMPLICIT_HOME
+                ),
+                root_path=binding.cwd_snapshot,
+                cwd=binding.cwd_snapshot,
+                config_version=binding.desired_project_config_version,
+            )
+            config = await self.extension_config_source.load(project_snapshot)
+            snapshot = await runtime.reload_extension_config(
+                idempotency_key=f"interaction:{interaction.id}",
+                config=config,
+            )
+            await interaction.followup.send(
+                (
+                    f"Extension config `{snapshot.version}` reattached "
+                    f"(`{snapshot.config_hash[:12]}`)."
+                ),
                 ephemeral=True,
             )
 
@@ -3539,6 +3627,85 @@ class InteractionResponseModal(discord.ui.Modal):
         await responder.send_followup(text, ephemeral=True)
 
 
+class ElicitationResponseModal(discord.ui.Modal):
+    def __init__(
+        self,
+        bot: CopilotDiscordBot,
+        interaction_id: str,
+        form: ElicitationForm,
+    ) -> None:
+        super().__init__(title="Copilot form")
+        self._bot = bot
+        self._interaction_id = interaction_id
+        self._form = form
+        self._inputs: list[tuple[ElicitationField, discord.ui.TextInput[Any]]] = []
+        self._json_input: discord.ui.TextInput[Any] | None = None
+        if len(form.fields) > DiscordInteractionAdapter.MODAL_FIELD_LIMIT:
+            self._json_input = discord.ui.TextInput(
+                label="Form values as JSON",
+                style=discord.TextStyle.paragraph,
+                required=True,
+                max_length=4000,
+                placeholder='{"field": "value"}',
+            )
+            self.add_item(self._json_input)
+            return
+        for field in form.fields:
+            default = field.default
+            rendered_default = (
+                json.dumps(list(default))
+                if isinstance(default, tuple)
+                else None
+                if default is None
+                else str(default).lower()
+                if isinstance(default, bool)
+                else str(default)
+            )
+            text_input = discord.ui.TextInput(
+                label=_bounded_discord_text(field.title, 45),
+                style=(
+                    discord.TextStyle.paragraph
+                    if field.value_type == "array"
+                    else discord.TextStyle.short
+                ),
+                required=field.required,
+                default=rendered_default,
+                max_length=min(field.max_length or 4000, 4000),
+                placeholder=_elicitation_placeholder(field),
+            )
+            self._inputs.append((field, text_input))
+            self.add_item(text_input)
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        try:
+            if self._json_input is not None:
+                decoded = json.loads(str(self._json_input.value))
+                if not isinstance(decoded, dict):
+                    raise ValueError("form JSON must be an object")
+                content = decoded
+            else:
+                content = {
+                    field.name: _coerce_elicitation_value(field, str(item.value))
+                    for field, item in self._inputs
+                    if str(item.value) or field.required
+                }
+        except (ValueError, json.JSONDecodeError) as error:
+            await interaction.response.send_message(
+                f"Invalid form response: {error}",
+                ephemeral=True,
+            )
+            return
+        runtime = await self._bot._interaction_runtime(interaction)
+        result = await runtime.respond_interaction(
+            self._interaction_id,
+            form_content=content,
+        )
+        await interaction.response.send_message(
+            _interaction_result_text(result),
+            ephemeral=True,
+        )
+
+
 @dataclass(frozen=True, slots=True)
 class DiscordRenderBatch:
     content: str
@@ -3850,10 +4017,42 @@ def _render_view(
 
 
 def _interaction_view(metadata: dict[str, Any]) -> discord.ui.View:
-    interaction_id = str(metadata["interaction_id"])
+    plan = DiscordInteractionAdapter.plan(metadata)
+    interaction_id = plan.interaction_id
     view = discord.ui.View(timeout=None)
-    choices = metadata.get("choices")
-    if isinstance(choices, list) and choices:
+    if plan.form is not None:
+        view.add_item(
+            discord.ui.Button(
+                label="Fill form",
+                style=discord.ButtonStyle.primary,
+                custom_id=f"cdi:{interaction_id}:form",
+            )
+        )
+        view.add_item(
+            discord.ui.Button(
+                label="Decline",
+                style=discord.ButtonStyle.secondary,
+                custom_id=f"cdi:{interaction_id}:decline",
+            )
+        )
+        view.add_item(
+            discord.ui.Button(
+                label="Cancel",
+                style=discord.ButtonStyle.secondary,
+                custom_id=f"cdi:{interaction_id}:cancel",
+            )
+        )
+        return view
+    if plan.kind != "mcp_oauth" and plan.use_buttons:
+        for index, choice in enumerate(plan.choices):
+            view.add_item(
+                discord.ui.Button(
+                    label=_bounded_discord_text(choice, 80),
+                    style=discord.ButtonStyle.primary,
+                    custom_id=f"cdi:{interaction_id}:choice-{index}",
+                )
+            )
+    elif plan.kind != "mcp_oauth" and plan.use_select:
         view.add_item(
             discord.ui.Select(
                 custom_id=f"cdi:{interaction_id}:select",
@@ -3863,19 +4062,18 @@ def _interaction_view(metadata: dict[str, Any]) -> discord.ui.View:
                         label=_bounded_discord_text(str(choice), 100),
                         value=str(index),
                     )
-                    for index, choice in enumerate(choices[:25])
+                    for index, choice in enumerate(plan.choices)
                 ],
             )
         )
-    if metadata.get("kind") == "user_input" and (
-        metadata.get("allowFreeform") or (isinstance(choices, list) and len(choices) > 25)
+    if plan.allow_freeform or (
+        plan.kind == "exit_plan_mode" and len(plan.choices) > DiscordInteractionAdapter.SELECT_LIMIT
     ):
         view.add_item(
             discord.ui.Button(
                 label=(
                     "Enter a choice"
-                    if isinstance(choices, list)
-                    and len(choices) > 25
+                    if len(plan.choices) > DiscordInteractionAdapter.SELECT_LIMIT
                     and not metadata.get("allowFreeform")
                     else "Write a response"
                 ),
@@ -3883,7 +4081,50 @@ def _interaction_view(metadata: dict[str, Any]) -> discord.ui.View:
                 custom_id=f"cdi:{interaction_id}:freeform",
             )
         )
+    if plan.kind == "mcp_oauth":
+        view.add_item(
+            discord.ui.Button(
+                label="Cancel authorization",
+                style=discord.ButtonStyle.danger,
+                custom_id=f"cdi:{interaction_id}:cancel",
+            )
+        )
     return view
+
+
+def _elicitation_placeholder(field: ElicitationField) -> str | None:
+    if field.enum:
+        return _bounded_discord_text(
+            "Allowed: " + ", ".join(str(item) for item in field.enum),
+            100,
+        )
+    if field.value_type == "boolean":
+        return "true or false"
+    if field.value_type == "array":
+        return 'JSON array, for example ["one", "two"]'
+    if field.description:
+        return _bounded_discord_text(field.description, 100)
+    return None
+
+
+def _coerce_elicitation_value(field: ElicitationField, value: str) -> Any:
+    if field.value_type == "string":
+        return value
+    if field.value_type == "integer":
+        return int(value)
+    if field.value_type == "number":
+        return float(value)
+    if field.value_type == "boolean":
+        normalized = value.strip().lower()
+        if normalized in {"true", "yes", "1"}:
+            return True
+        if normalized in {"false", "no", "0"}:
+            return False
+        raise ValueError(f"{field.name} must be true or false")
+    decoded = json.loads(value)
+    if not isinstance(decoded, list):
+        raise ValueError(f"{field.name} must be a JSON array")
+    return decoded
 
 
 def _taskdeck_view(

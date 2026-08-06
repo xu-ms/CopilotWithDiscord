@@ -33,7 +33,7 @@ from pydantic import SecretStr
 
 from copilotd.config import Settings
 from copilotd.core.task_registry import TaskRegistry
-from copilotd.sdk.bridge import CopilotBridge
+from copilotd.sdk.bridge import CopilotBridge, ManagedAwarePermissionHandler
 from copilotd.sdk.capabilities import (
     CAPABILITY_SCHEMA_VERSION,
     MAIN_BRANCH_ONLY_EVENTS,
@@ -149,6 +149,7 @@ class SdkProbe:
                     session_id=session_id,
                     working_directory=workspace,
                     on_event=recorder.callback,
+                    permission_handler=ManagedAwarePermissionHandler(),
                 )
                 live["actual_session_id"] = session.session_id
                 live["session_id_matches"] = session.session_id == session_id
@@ -289,6 +290,7 @@ class SdkProbe:
                     working_directory=workspace,
                     on_event=resume_recorder.callback,
                     continue_pending_work=True,
+                    permission_handler=ManagedAwarePermissionHandler(),
                 )
                 live["resume_session_id_matches"] = resumed.session_id == session_id
                 await bridge.ensure_allow_all(resumed)
@@ -390,6 +392,36 @@ class SdkProbe:
                 "live-rpc-probe",
                 {"read": event_log_read, "tail": event_log_tail},
             ),
+            "hook_agent_stop": _evidence(
+                None,
+                "unprobed",
+                "SDK 1.0.8 does not expose a verified AgentStop callback",
+            ),
+            "hook_user_prompt_transformed": _evidence(
+                None,
+                "unprobed",
+                "SDK 1.0.8 does not expose a verified transformed-prompt callback",
+            ),
+            "config_reattach": _evidence(
+                None,
+                "unprobed",
+                "run sdk-probe --live-extensions for same-fence reattach acceptance",
+            ),
+            "managed_permission_handler": _evidence(
+                None,
+                "unprobed",
+                "run sdk-probe --live-extensions for permission-handler acceptance",
+            ),
+            "mcp_http": _evidence(
+                None,
+                "unprobed",
+                "run sdk-probe --live-extensions for disposable HTTP MCP acceptance",
+            ),
+            "mcp_stdio": _evidence(
+                None,
+                "unprobed",
+                "run sdk-probe --live-extensions for disposable stdio MCP acceptance",
+            ),
             "model_config": _evidence(
                 None,
                 "unprobed",
@@ -435,6 +467,36 @@ class SdkProbe:
                     "callback_survived_idle": live.get("callback_survived_idle"),
                 },
             ),
+            "protocol_elicitation": _evidence(
+                None,
+                "unprobed",
+                "run sdk-probe --live-extensions for MCP elicitation acceptance",
+            ),
+            "protocol_external_tool": _evidence(
+                None,
+                "unprobed",
+                "run sdk-probe --live-extensions for external-tool acceptance",
+            ),
+            "protocol_mcp_headers_response": _evidence(
+                None,
+                "unprobed",
+                "run sdk-probe --live-extensions for MCP header response RPC gate",
+            ),
+            "protocol_mcp_oauth": _evidence(
+                None,
+                "unprobed",
+                "run sdk-probe --live-extensions for MCP OAuth acceptance",
+            ),
+            "protocol_sampling_response": _evidence(
+                None,
+                "unprobed",
+                "run sdk-probe --live-extensions for sampling response RPC gate",
+            ),
+            "protocol_session_limits_response": _evidence(
+                None,
+                "unprobed",
+                "run sdk-probe --live-extensions for session-limit response RPC gate",
+            ),
             "reasoning_summary_readback": _evidence(
                 None,
                 "unprobed",
@@ -449,6 +511,16 @@ class SdkProbe:
                 _supported(live.get("agents")) and _supported(live.get("agent_current")),
                 "live-rpc-probe",
                 {"list": live.get("agents"), "current": live.get("agent_current")},
+            ),
+            "session_extension_config": _evidence(
+                None,
+                "unprobed",
+                "run sdk-probe --live-extensions for create/resume config acceptance",
+            ),
+            "session_hooks": _evidence(
+                None,
+                "unprobed",
+                "run sdk-probe --live-extensions for callback hook acceptance",
             ),
             "session_mode": _evidence(
                 _supported(live.get("mode_initial")) and _supported(live.get("mode_autopilot")),
@@ -823,6 +895,7 @@ class SdkProbe:
                     session_id=session_id,
                     working_directory=workspace,
                     on_event=recorder.callback,
+                    permission_handler=ManagedAwarePermissionHandler(),
                 )
                 detail["actual_session_id"] = session.session_id
                 detail["sessions_before_disconnect"] = [
@@ -874,6 +947,7 @@ class SdkProbe:
                     working_directory=workspace,
                     on_event=resume_recorder.callback,
                     continue_pending_work=True,
+                    permission_handler=ManagedAwarePermissionHandler(),
                 )
                 history = await resumed.get_events()
                 detail["history_event_count"] = len(history)

@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Callable
+import hashlib
+import json
+import threading
+from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from typing import Any, Literal, cast
 
@@ -12,9 +15,15 @@ from copilot.generated.rpc import (
     CommandsListRequest,
     EventLogReadRequest,
     FleetStartRequest,
+    HandlePendingToolCallRequest,
     HistoryCompactRequest,
+    MCPHeadersHandlePendingHeadersRefreshRequest,
+    MCPHeadersHandlePendingHeadersRefreshRequestKind,
+    MCPHeadersHandlePendingHeadersRefreshRequestRequest,
     MetadataContextInfoRequest,
     ModeSetRequest,
+    PermissionDecisionApproveOnce,
+    PermissionDecisionUserNotAvailable,
     PermissionsAllowAllMode,
     PermissionsSetAAllSource,
     PermissionsSetAllowAllRequest,
@@ -30,8 +39,12 @@ from copilot.generated.rpc import (
     TasksRemoveRequest,
     TasksSendMessageRequest,
     UIEphemeralQueryRequest,
+    UIHandlePendingSamplingRequest,
+    UIHandlePendingSessionLimitsExhaustedRequest,
+    UISessionLimitsExhaustedResponse,
+    UISessionLimitsExhaustedResponseAction,
 )
-from copilot.session import CopilotSession, PermissionHandler
+from copilot.session import CopilotSession
 from copilot.session_events import SessionEvent
 
 from copilotd.config import Settings
@@ -51,6 +64,7 @@ class PermissionPostureError(RuntimeError):
 class PermissionPosture:
     enabled: bool
     mode: str | None
+    approve_all_confirmed: bool
 
 
 @dataclass(frozen=True, slots=True)
@@ -60,6 +74,92 @@ class EventLogBatch:
     events: tuple[SessionEvent, ...]
     has_more: bool
     filtered_ephemeral: int
+
+
+PermissionAuditCallback = Callable[[dict[str, Any]], Awaitable[None]]
+ApprovalValidator = Callable[[], Awaitable[bool]]
+
+
+class ManagedAwarePermissionHandler:
+    """Approve ordinary yolo requests once and deterministically block managed ones."""
+
+    def __init__(
+        self,
+        audit: PermissionAuditCallback | None = None,
+        approval_validator: ApprovalValidator | None = None,
+    ) -> None:
+        self._audit = audit
+        self._approval_validator = approval_validator
+        self._managed_permissions_blocked = False
+        self._managed_lock = threading.Lock()
+
+    def set_managed_permissions_blocked(self, blocked: bool) -> None:
+        with self._managed_lock:
+            self._managed_permissions_blocked = blocked
+
+    @property
+    def managed_permissions_blocked(self) -> bool:
+        with self._managed_lock:
+            return self._managed_permissions_blocked
+
+    async def __call__(
+        self,
+        request: Any,
+        invocation: Mapping[str, Any],
+    ) -> Any:
+        request_payload = (
+            request.to_dict()
+            if hasattr(request, "to_dict")
+            else {"kind": getattr(request, "kind", "unknown")}
+        )
+        with self._managed_lock:
+            runtime_managed_block = self._managed_permissions_blocked
+        managed_settings = bool(invocation.get("managed_settings_enabled")) or runtime_managed_block
+        managed_request = getattr(request, "managed_approval_required", False) is True
+        decision_name = (
+            "user-not-available" if managed_settings or managed_request else "approve-once"
+        )
+        if self._audit is not None:
+            encoded = json.dumps(
+                request_payload,
+                ensure_ascii=False,
+                sort_keys=True,
+                default=str,
+            )
+            await self._audit(
+                {
+                    "request_id": invocation.get("request_id"),
+                    "permission_kind": str(
+                        request_payload.get("kind") or getattr(request, "kind", "unknown")
+                    ),
+                    "managed_settings": managed_settings,
+                    "managed_approval_required": managed_request,
+                    "decision": decision_name,
+                    "request_hash": hashlib.sha256(encoded.encode()).hexdigest(),
+                }
+            )
+        if managed_settings or managed_request:
+            return PermissionDecisionUserNotAvailable()
+        validator = self._approval_validator
+        owner_valid = validator is not None and await validator()
+        with self._managed_lock:
+            runtime_managed_block = self._managed_permissions_blocked
+        if runtime_managed_block or not owner_valid:
+            if self._audit is not None:
+                await self._audit(
+                    {
+                        "request_id": invocation.get("request_id"),
+                        "permission_kind": str(
+                            request_payload.get("kind") or getattr(request, "kind", "unknown")
+                        ),
+                        "managed_settings": runtime_managed_block,
+                        "managed_approval_required": managed_request,
+                        "decision": "user-not-available-after-fence-check",
+                        "request_hash": hashlib.sha256(encoded.encode()).hexdigest(),
+                    }
+                )
+            return PermissionDecisionUserNotAvailable()
+        return PermissionDecisionApproveOnce()
 
 
 class CopilotBridge:
@@ -89,14 +189,20 @@ class CopilotBridge:
             )
         else:
             connection = RuntimeConnection.for_stdio(args=("--yolo",))
+        github_token = self._settings.github_token
+        auth_options: dict[str, Any] = {}
+        if github_token is not None:
+            auth_options["github_token"] = github_token.get_secret_value()
         client = CopilotClient(
             connection=connection,
             log_level=cast(
                 Literal["none", "error", "warning", "info", "debug", "all"],
                 self._settings.sdk_log_level,
             ),
+            use_logged_in_user=(github_token is None or not self._settings.sdk_no_auto_login),
             session_idle_timeout_seconds=0,
             enable_remote_sessions=True,
+            **auth_options,
         )
         try:
             await client.start()
@@ -149,21 +255,35 @@ class CopilotBridge:
         on_auto_mode_switch_request: Callable[..., Any] | None = None,
         session_config: dict[str, Any] | None = None,
         launch_options: SessionLaunchOptions | None = None,
+        on_elicitation_request: Callable[..., Any] | None = None,
+        on_mcp_auth_request: Callable[..., Any] | None = None,
+        permission_handler: Callable[..., Any] | None = None,
+        hooks: Mapping[str, Any] | None = None,
+        session_options: Mapping[str, Any] | None = None,
     ) -> CopilotSession:
+        options = _validated_session_options(session_options)
         launch_kwargs = {} if launch_options is None else launch_options.sdk_kwargs()
         launch_kwargs.update(_session_config_kwargs(session_config))
+        options.update(launch_kwargs)
+        managed = self._managed_session_options()
+        if permission_handler is None:
+            raise PermissionPostureError("explicit fence-validating permission handler is required")
         return await self.client.create_session(
+            **options,
+            **managed,
             session_id=session_id,
             working_directory=working_directory,
             streaming=True,
             include_sub_agent_streaming_events=True,
             manage_schedule_enabled=False,
             on_event=on_event,
-            on_permission_request=PermissionHandler.approve_all,
+            on_permission_request=permission_handler,
             on_user_input_request=on_user_input_request,
             on_exit_plan_mode_request=on_exit_plan_mode_request,
             on_auto_mode_switch_request=on_auto_mode_switch_request,
-            **launch_kwargs,
+            on_elicitation_request=on_elicitation_request,
+            on_mcp_auth_request=on_mcp_auth_request,
+            hooks=None if hooks is None else dict(hooks),
         )
 
     async def resume_session(
@@ -178,28 +298,42 @@ class CopilotBridge:
         on_auto_mode_switch_request: Callable[..., Any] | None = None,
         session_config: dict[str, Any] | None = None,
         launch_options: SessionLaunchOptions | None = None,
+        on_elicitation_request: Callable[..., Any] | None = None,
+        on_mcp_auth_request: Callable[..., Any] | None = None,
+        permission_handler: Callable[..., Any] | None = None,
+        hooks: Mapping[str, Any] | None = None,
+        session_options: Mapping[str, Any] | None = None,
     ) -> CopilotSession:
+        options = _validated_session_options(session_options)
         launch_kwargs = {} if launch_options is None else launch_options.sdk_kwargs()
         launch_kwargs.update(_session_config_kwargs(session_config))
+        options.update(launch_kwargs)
+        managed = self._managed_session_options()
+        if permission_handler is None:
+            raise PermissionPostureError("explicit fence-validating permission handler is required")
         return await self.client.resume_session(
             session_id,
+            **options,
+            **managed,
             working_directory=working_directory,
             streaming=True,
             include_sub_agent_streaming_events=True,
             manage_schedule_enabled=False,
             continue_pending_work=continue_pending_work,
             on_event=on_event,
-            on_permission_request=PermissionHandler.approve_all,
+            on_permission_request=permission_handler,
             on_user_input_request=on_user_input_request,
             on_exit_plan_mode_request=on_exit_plan_mode_request,
             on_auto_mode_switch_request=on_auto_mode_switch_request,
-            **launch_kwargs,
+            on_elicitation_request=on_elicitation_request,
+            on_mcp_auth_request=on_mcp_auth_request,
+            hooks=None if hooks is None else dict(hooks),
         )
 
     async def ensure_allow_all(self, session: CopilotSession) -> PermissionPosture:
         state = await session.rpc.permissions.get_allow_all(timeout=10)
         if not state.enabled or state.mode != PermissionsAllowAllMode.ON:
-            await session.rpc.permissions.set_allow_all(
+            changed = await session.rpc.permissions.set_allow_all(
                 PermissionsSetAllowAllRequest(
                     enabled=True,
                     mode=PermissionsAllowAllMode.ON,
@@ -207,18 +341,23 @@ class CopilotBridge:
                 ),
                 timeout=10,
             )
-            await session.rpc.permissions.set_approve_all(
-                PermissionsSetApproveAllRequest(
-                    enabled=True,
-                    source=PermissionsSetAAllSource.RPC,
-                ),
-                timeout=10,
-            )
-            state = await session.rpc.permissions.get_allow_all(timeout=10)
+            if getattr(changed, "success", True) is not True:
+                raise PermissionPostureError("allow-all mutation was not accepted")
+        approve_all = await session.rpc.permissions.set_approve_all(
+            PermissionsSetApproveAllRequest(
+                enabled=True,
+                source=PermissionsSetAAllSource.RPC,
+            ),
+            timeout=10,
+        )
+        if getattr(approve_all, "success", False) is not True:
+            raise PermissionPostureError("approve-all mutation was not accepted")
+        state = await session.rpc.permissions.get_allow_all(timeout=10)
 
         posture = PermissionPosture(
             enabled=state.enabled,
             mode=None if state.mode is None else state.mode.value,
+            approve_all_confirmed=True,
         )
         if not posture.enabled or posture.mode != PermissionsAllowAllMode.ON.value:
             raise PermissionPostureError(
@@ -244,15 +383,95 @@ class CopilotBridge:
         *,
         model: str,
         reasoning_effort: str | None,
+        reasoning_summary: str | None,
         context_tier: str | None,
-        reasoning_summary: str | None = None,
     ) -> None:
         await session.set_model(
             model,
             reasoning_effort=reasoning_effort,
-            reasoning_summary=reasoning_summary,
+            reasoning_summary=cast(Any, reasoning_summary),
             context_tier=cast(Any, context_tier),
         )
+
+    async def respond_session_limits(
+        self,
+        session: CopilotSession,
+        request_id: str,
+    ) -> bool:
+        result = await session.rpc.ui.handle_pending_session_limits_exhausted(
+            UIHandlePendingSessionLimitsExhaustedRequest(
+                request_id=request_id,
+                response=UISessionLimitsExhaustedResponse(
+                    action=UISessionLimitsExhaustedResponseAction.CANCEL,
+                ),
+            ),
+            timeout=10,
+        )
+        return bool(result.success)
+
+    async def respond_sampling(
+        self,
+        session: CopilotSession,
+        request_id: str,
+        response: dict[str, Any] | None,
+    ) -> bool:
+        result = await session.rpc.ui.handle_pending_sampling(
+            UIHandlePendingSamplingRequest(
+                request_id=request_id,
+                response=response,
+            ),
+            timeout=10,
+        )
+        return bool(result.success)
+
+    async def respond_mcp_headers(
+        self,
+        session: CopilotSession,
+        request_id: str,
+        headers: dict[str, str] | None,
+    ) -> bool:
+        result = await session.rpc.mcp.headers.handle_pending_headers_refresh_request(
+            MCPHeadersHandlePendingHeadersRefreshRequestRequest(
+                request_id=request_id,
+                result=MCPHeadersHandlePendingHeadersRefreshRequest(
+                    kind=(
+                        MCPHeadersHandlePendingHeadersRefreshRequestKind.HEADERS
+                        if headers
+                        else MCPHeadersHandlePendingHeadersRefreshRequestKind.NONE
+                    ),
+                    headers=headers or None,
+                ),
+            ),
+            timeout=10,
+        )
+        return bool(result.success)
+
+    async def respond_external_tool(
+        self,
+        session: CopilotSession,
+        request_id: str,
+        *,
+        result: str | None = None,
+        error: str | None = None,
+    ) -> bool:
+        response = await session.rpc.tools.handle_pending_tool_call(
+            HandlePendingToolCallRequest(
+                request_id=request_id,
+                result=result,
+                error=error,
+            ),
+            timeout=10,
+        )
+        return bool(response.success)
+
+    async def get_mcp_servers(self, session: CopilotSession) -> dict[str, Any]:
+        return cast(dict[str, Any], (await session.rpc.mcp.list(timeout=10)).to_dict())
+
+    async def get_skills(self, session: CopilotSession) -> dict[str, Any]:
+        return cast(dict[str, Any], (await session.rpc.skills.list(timeout=10)).to_dict())
+
+    async def get_agents(self, session: CopilotSession) -> dict[str, Any]:
+        return cast(dict[str, Any], (await session.rpc.agent.list(timeout=10)).to_dict())
 
     async def get_current_model(self, session: CopilotSession) -> dict[str, Any]:
         current = await session.rpc.model.get_current(timeout=10)
@@ -554,6 +773,50 @@ class CopilotBridge:
             "auth_type": auth.authType,
             "auth_host": auth.host,
         }
+
+    def _managed_session_options(self) -> dict[str, Any]:
+        token = self._settings.github_token
+        if token is None:
+            return {}
+        return {
+            "enable_managed_settings": True,
+            "github_token": token.get_secret_value(),
+        }
+
+    def managed_settings_available(self) -> bool:
+        return self._settings.github_token is not None
+
+
+_FORCED_SESSION_OPTIONS = {
+    "session_id",
+    "working_directory",
+    "streaming",
+    "include_sub_agent_streaming_events",
+    "manage_schedule_enabled",
+    "on_event",
+    "on_permission_request",
+    "on_user_input_request",
+    "on_exit_plan_mode_request",
+    "on_auto_mode_switch_request",
+    "on_elicitation_request",
+    "on_mcp_auth_request",
+    "hooks",
+    "enable_managed_settings",
+    "github_token",
+    "continue_pending_work",
+}
+
+
+def _validated_session_options(
+    value: Mapping[str, Any] | None,
+) -> dict[str, Any]:
+    options = {} if value is None else dict(value)
+    forbidden = sorted(set(options).intersection(_FORCED_SESSION_OPTIONS))
+    if forbidden:
+        raise ValueError(
+            "session options cannot override runtime-owned fields: " + ", ".join(forbidden)
+        )
+    return options
 
 
 def _session_config_kwargs(session_config: dict[str, Any] | None) -> dict[str, Any]:

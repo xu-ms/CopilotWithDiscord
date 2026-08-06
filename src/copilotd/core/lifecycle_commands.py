@@ -133,7 +133,7 @@ class SchedulerCommandService:
                     "mode": str(row["desired_mode"]),
                     "model_config": json.loads(str(row["desired_model_config"])),
                     "agent": str(row["desired_agent"]),
-                    "session_config_version": int(row["desired_session_config_version"]),
+                    "session_config_version": int(row["desired_project_config_version"]),
                 },
             }
             return await self._repository.create(

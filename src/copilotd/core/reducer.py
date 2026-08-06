@@ -9,7 +9,7 @@ import time
 import uuid
 from collections.abc import Awaitable, Callable
 from pathlib import Path
-from typing import Any, ClassVar
+from typing import Any, ClassVar, cast
 
 from aiosqlite import Connection, Row
 
@@ -18,6 +18,7 @@ from copilotd.core.inbox import ReducerInbox
 from copilotd.core.interactions import interaction_target_mode
 from copilotd.core.models import AdaptedEvent, InboxEnvelope, RenderIntent
 from copilotd.core.native import stable_hash, timestamp_seconds
+from copilotd.core.protocol import apply_protocol_event
 from copilotd.core.task_registry import TaskRegistry
 from copilotd.storage.database import Database
 
@@ -1457,39 +1458,7 @@ class JournalReducer:
                 data=data,
                 now=now,
             )
-        request_id = data.get("requestId")
-        if request_id is not None and event.event_id is not None:
-            if event.raw_type.endswith(".requested"):
-                await connection.execute(
-                    """
-                    INSERT INTO protocol_requests(
-                        sdk_session_id, generation, request_id, requested_type,
-                        requested_event_id, state
-                    ) VALUES (?, ?, ?, ?, ?, 'requested')
-                    ON CONFLICT(sdk_session_id, generation, request_id) DO NOTHING
-                    """,
-                    (
-                        event.sdk_session_id,
-                        event.generation,
-                        str(request_id),
-                        event.raw_type,
-                        event.event_id,
-                    ),
-                )
-            elif event.raw_type.endswith(".completed"):
-                await connection.execute(
-                    """
-                    UPDATE protocol_requests
-                    SET completed_event_id = ?, state = 'completed'
-                    WHERE sdk_session_id = ? AND generation = ? AND request_id = ?
-                    """,
-                    (
-                        event.event_id,
-                        event.sdk_session_id,
-                        event.generation,
-                        str(request_id),
-                    ),
-                )
+        await apply_protocol_event(connection, event, data, now=now)
         if event.raw_type == "copilotd.operation.pending":
             await connection.execute(
                 """
@@ -1822,26 +1791,203 @@ class JournalReducer:
                 data=projection_data,
                 now=now,
             )
+        elif event.raw_type == "copilotd.hook.audit":
+            await connection.execute(
+                """
+                INSERT INTO hook_audit_events(
+                    audit_id, sdk_session_id, runtime_generation,
+                    owner_fence_token, hook_name, hook_invocation_id,
+                    phase, tool_name, tool_call_id, correlation_id,
+                    classification, payload_hash, payload_json, observed_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(audit_id) DO NOTHING
+                """,
+                (
+                    str(data["audit_id"]),
+                    event.sdk_session_id,
+                    event.generation,
+                    event.fence_token,
+                    str(data["hook_name"]),
+                    str(data["hook_invocation_id"]),
+                    str(data["phase"]),
+                    data.get("tool_name"),
+                    data.get("tool_call_id"),
+                    data.get("correlation_id"),
+                    data.get("classification"),
+                    str(data["payload_hash"]),
+                    json.dumps(data.get("payload", {}), sort_keys=True),
+                    float(data.get("observed_at", now)),
+                ),
+            )
+            if data["hook_name"] == "agent_stop":
+                payload = data.get("payload", {})
+                await connection.execute(
+                    """
+                    INSERT INTO agent_loop_projections(
+                        sdk_session_id, runtime_generation, owner_fence_token,
+                        state, stop_reason, source_hook_audit_id, observed_at, stale
+                    ) VALUES (?, ?, ?, 'stopped', ?, ?, ?, 0)
+                    ON CONFLICT(sdk_session_id) DO UPDATE SET
+                        runtime_generation = excluded.runtime_generation,
+                        owner_fence_token = excluded.owner_fence_token,
+                        state = excluded.state,
+                        stop_reason = excluded.stop_reason,
+                        source_hook_audit_id = excluded.source_hook_audit_id,
+                        observed_at = excluded.observed_at,
+                        stale = 0
+                    """,
+                    (
+                        event.sdk_session_id,
+                        event.generation,
+                        event.fence_token,
+                        (payload.get("stop_reason") if isinstance(payload, dict) else None),
+                        str(data["audit_id"]),
+                        float(data.get("observed_at", now)),
+                    ),
+                )
+            elif data["hook_name"] == "error_occurred":
+                payload = data.get("payload", {})
+                await connection.execute(
+                    """
+                    INSERT INTO session_error_projections(
+                        sdk_session_id, runtime_generation, owner_fence_token,
+                        classification, recoverable, correlation_id,
+                        source_hook_audit_id, observed_at, stale
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0)
+                    ON CONFLICT(sdk_session_id) DO UPDATE SET
+                        runtime_generation = excluded.runtime_generation,
+                        owner_fence_token = excluded.owner_fence_token,
+                        classification = excluded.classification,
+                        recoverable = excluded.recoverable,
+                        correlation_id = excluded.correlation_id,
+                        source_hook_audit_id = excluded.source_hook_audit_id,
+                        observed_at = excluded.observed_at,
+                        stale = 0
+                    """,
+                    (
+                        event.sdk_session_id,
+                        event.generation,
+                        event.fence_token,
+                        str(data.get("classification") or "unknown"),
+                        (
+                            None
+                            if not isinstance(payload, dict) or payload.get("recoverable") is None
+                            else int(bool(payload["recoverable"]))
+                        ),
+                        data.get("correlation_id"),
+                        str(data["audit_id"]),
+                        float(data.get("observed_at", now)),
+                    ),
+                )
+        elif event.raw_type == "copilotd.permission.audit":
+            await connection.execute(
+                """
+                INSERT INTO permission_audit_events(
+                    audit_id, sdk_session_id, runtime_generation,
+                    owner_fence_token, request_id, permission_kind,
+                    managed_settings, managed_approval_required,
+                    decision, request_hash, observed_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(audit_id) DO NOTHING
+                """,
+                (
+                    str(data["audit_id"]),
+                    event.sdk_session_id,
+                    event.generation,
+                    event.fence_token,
+                    data.get("request_id"),
+                    str(data["permission_kind"]),
+                    int(bool(data.get("managed_settings"))),
+                    int(bool(data.get("managed_approval_required"))),
+                    str(data["decision"]),
+                    str(data["request_hash"]),
+                    float(data.get("observed_at", now)),
+                ),
+            )
+            if data["decision"] == "user-not-available":
+                await connection.execute(
+                    """
+                    UPDATE session_bindings
+                    SET permission_posture = 'platform_blocked',
+                        permission_verified_at = NULL,
+                        managed_settings_state = 'enforced',
+                        updated_at = ?, row_version = row_version + 1
+                    WHERE sdk_session_id = ? AND runtime_generation = ?
+                      AND owner_fence_token = ?
+                    """,
+                    (
+                        now,
+                        event.sdk_session_id,
+                        event.generation,
+                        event.fence_token,
+                    ),
+                )
+        elif event.raw_type in {"hook.start", "hook.progress", "hook.end"}:
+            invocation_id = str(
+                data.get("hookInvocationId") or data.get("hook_invocation_id") or event.event_id
+            )
+            audit_id = str(event.event_id or f"{invocation_id}:{event.raw_type}")
+            payload_json = json.dumps(data, ensure_ascii=False, sort_keys=True)
+            await connection.execute(
+                """
+                INSERT INTO hook_audit_events(
+                    audit_id, sdk_session_id, runtime_generation,
+                    owner_fence_token, hook_name, hook_invocation_id,
+                    phase, tool_name, tool_call_id, correlation_id,
+                    classification, payload_hash, payload_json, observed_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(audit_id) DO NOTHING
+                """,
+                (
+                    audit_id,
+                    event.sdk_session_id,
+                    event.generation,
+                    event.fence_token,
+                    str(data.get("hookType") or data.get("hook_type") or "unknown"),
+                    invocation_id,
+                    event.raw_type.rsplit(".", 1)[-1],
+                    data.get("toolName") or data.get("tool_name"),
+                    event.tool_call_id,
+                    event.correlation_id,
+                    (str(data.get("status")) if data.get("status") is not None else None),
+                    hashlib.sha256(payload_json.encode()).hexdigest(),
+                    payload_json,
+                    event.received_at,
+                ),
+            )
         if event.raw_type == "copilotd.interaction.requested":
             interaction_id = str(data["interaction_id"])
             await connection.execute(
                 """
                 INSERT INTO pending_interactions(
-                    interaction_id, sdk_session_id, runtime_generation,
+                    interaction_id, protocol_request_id, sdk_session_id, runtime_generation,
                     owner_fence_token, thread_id, kind, response_plane,
-                    expires_at, state, payload, response, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, 'direct_handler', ?, 'pending', ?, NULL, ?, ?)
+                    expires_at, state, payload, response, form_schema,
+                    sensitive_response, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, NULL, ?, ?, ?, ?)
                 ON CONFLICT(interaction_id) DO NOTHING
                 """,
                 (
                     interaction_id,
+                    data.get("protocol_request_id"),
                     event.sdk_session_id,
                     event.generation,
                     event.fence_token,
                     str(data["thread_id"]),
                     str(data["kind"]),
+                    str(data.get("response_plane", "direct_handler")),
                     float(data["expires_at"]),
                     json.dumps(data, ensure_ascii=False, sort_keys=True),
+                    (
+                        None
+                        if data.get("form_schema") is None
+                        else json.dumps(
+                            data["form_schema"],
+                            ensure_ascii=False,
+                            sort_keys=True,
+                        )
+                    ),
+                    int(bool(data.get("sensitive_response"))),
                     now,
                     now,
                 ),
@@ -2887,6 +3033,160 @@ class JournalReducer:
             await self._apply_abort(connection, event, now=now)
         elif event.raw_type == "session.idle":
             await self._apply_session_idle(connection, event, data=data, now=now)
+        elif event.raw_type in {
+            "assistant.usage",
+            "session.usage_info",
+            "session.usage_checkpoint",
+            "copilotd.usage.observed",
+        }:
+            payload = data.get("payload") if event.raw_type == "copilotd.usage.observed" else data
+            values = payload if isinstance(payload, dict) else {}
+            observed_at = float(data.get("observed_at", event.received_at))
+            await connection.execute(
+                """
+                INSERT INTO usage_projections(
+                    sdk_session_id, runtime_generation, owner_fence_token,
+                    source_type, source_event_id, payload_json,
+                    observed_at, reconciled_at, stale, stale_reason
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, NULL)
+                ON CONFLICT(sdk_session_id) DO UPDATE SET
+                    runtime_generation = excluded.runtime_generation,
+                    owner_fence_token = excluded.owner_fence_token,
+                    source_type = excluded.source_type,
+                    source_event_id = excluded.source_event_id,
+                    payload_json = excluded.payload_json,
+                    observed_at = excluded.observed_at,
+                    reconciled_at = excluded.reconciled_at,
+                    stale = 0,
+                    stale_reason = NULL
+                """,
+                (
+                    event.sdk_session_id,
+                    event.generation,
+                    event.fence_token,
+                    event.raw_type,
+                    event.event_id or event.internal_event_id,
+                    json.dumps(values, ensure_ascii=False, sort_keys=True),
+                    observed_at,
+                    observed_at if event.source != "sdk" else None,
+                ),
+            )
+            if event.raw_type == "assistant.usage":
+                await connection.execute(
+                    """
+                    INSERT INTO usage_samples(
+                        session_id, turn_id, model, input_tokens,
+                        output_tokens, cache_read_tokens, cache_write_tokens,
+                        nano_aiu, premium_requests, observed_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        event.sdk_session_id,
+                        event.turn_id,
+                        _find_nested_value(values, "model"),
+                        _find_nested_value(values, "inputTokens"),
+                        _find_nested_value(values, "outputTokens"),
+                        _find_nested_value(values, "cacheReadTokens"),
+                        _find_nested_value(values, "cacheWriteTokens"),
+                        _find_nested_value(values, "nanoAiu"),
+                        _find_nested_value(values, "premiumRequests"),
+                        observed_at,
+                    ),
+                )
+        elif event.raw_type == "copilotd.usage.failed":
+            await connection.execute(
+                """
+                UPDATE usage_projections
+                SET stale = 1, stale_reason = ?, reconciled_at = ?
+                WHERE sdk_session_id = ?
+                """,
+                (
+                    str(data.get("error_type") or "usage_reconciliation_failed"),
+                    now,
+                    event.sdk_session_id,
+                ),
+            )
+        elif event.raw_type in {
+            "session.context_changed",
+            "copilotd.context.observed",
+        }:
+            payload = data.get("payload") if event.raw_type == "copilotd.context.observed" else data
+            values = payload if isinstance(payload, dict) else {}
+            observed_at = float(data.get("observed_at", event.received_at))
+            await connection.execute(
+                """
+                INSERT INTO context_projections(
+                    sdk_session_id, runtime_generation, owner_fence_token,
+                    source_type, source_event_id, payload_json,
+                    observed_at, reconciled_at, stale, stale_reason
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, NULL)
+                ON CONFLICT(sdk_session_id) DO UPDATE SET
+                    runtime_generation = excluded.runtime_generation,
+                    owner_fence_token = excluded.owner_fence_token,
+                    source_type = excluded.source_type,
+                    source_event_id = excluded.source_event_id,
+                    payload_json = excluded.payload_json,
+                    observed_at = excluded.observed_at,
+                    reconciled_at = excluded.reconciled_at,
+                    stale = 0,
+                    stale_reason = NULL
+                """,
+                (
+                    event.sdk_session_id,
+                    event.generation,
+                    event.fence_token,
+                    event.raw_type,
+                    event.event_id or event.internal_event_id,
+                    json.dumps(values, ensure_ascii=False, sort_keys=True),
+                    observed_at,
+                    observed_at if event.source != "sdk" else None,
+                ),
+            )
+        elif event.raw_type == "copilotd.context.failed":
+            await connection.execute(
+                """
+                UPDATE context_projections
+                SET stale = 1, stale_reason = ?, reconciled_at = ?
+                WHERE sdk_session_id = ?
+                """,
+                (
+                    str(data.get("error_type") or "context_reconciliation_failed"),
+                    now,
+                    event.sdk_session_id,
+                ),
+            )
+        elif event.raw_type in {
+            "session.session_limits_changed",
+            "session_limits_exhausted.requested",
+        }:
+            await connection.execute(
+                """
+                INSERT INTO session_limit_projections(
+                    sdk_session_id, runtime_generation, owner_fence_token,
+                    max_ai_credits, used_ai_credits, payload_json,
+                    source_event_id, observed_at, stale
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0)
+                ON CONFLICT(sdk_session_id) DO UPDATE SET
+                    runtime_generation = excluded.runtime_generation,
+                    owner_fence_token = excluded.owner_fence_token,
+                    max_ai_credits = excluded.max_ai_credits,
+                    used_ai_credits = excluded.used_ai_credits,
+                    payload_json = excluded.payload_json,
+                    source_event_id = excluded.source_event_id,
+                    observed_at = excluded.observed_at,
+                    stale = 0
+                """,
+                (
+                    event.sdk_session_id,
+                    event.generation,
+                    event.fence_token,
+                    _find_nested_value(data, "maxAiCredits"),
+                    _find_nested_value(data, "usedAiCredits"),
+                    json.dumps(data, ensure_ascii=False, sort_keys=True),
+                    event.event_id,
+                    event.received_at,
+                ),
+            )
         elif event.raw_type == "session.permissions_changed":
             await connection.execute(
                 """
@@ -2904,11 +3204,161 @@ class JournalReducer:
                     event.fence_token,
                 ),
             )
+        elif event.raw_type in {
+            "session.managed_settings_resolved",
+            "session.managed_settings_enforced",
+        }:
+            enforced = event.raw_type.endswith("_enforced")
+            managed_blocked = (
+                enforced
+                or bool(data.get("bypassPermissionsDisabled"))
+                or bool(data.get("failClosed"))
+            )
+            await connection.execute(
+                """
+                UPDATE session_bindings
+                SET managed_settings_state = ?,
+                    managed_permissions_blocked = ?,
+                    permission_posture = CASE
+                        WHEN ? THEN 'platform_blocked'
+                        WHEN permission_posture = 'platform_blocked'
+                        THEN 'unverified'
+                        ELSE permission_posture
+                    END,
+                    permission_verified_at = CASE
+                        WHEN ? OR permission_posture = 'platform_blocked'
+                        THEN NULL ELSE permission_verified_at
+                    END,
+                    updated_at = ?, row_version = row_version + 1
+                WHERE sdk_session_id = ? AND runtime_generation = ?
+                  AND owner_fence_token = ?
+                """,
+                (
+                    "enforced" if enforced else "resolved",
+                    int(managed_blocked),
+                    managed_blocked,
+                    managed_blocked,
+                    now,
+                    event.sdk_session_id,
+                    event.generation,
+                    event.fence_token,
+                ),
+            )
+        elif event.raw_type in {
+            "commands.changed",
+            "capabilities.changed",
+            "session.tools_updated",
+            "session.skills_loaded",
+            "session.custom_agents_updated",
+            "session.extensions_loaded",
+            "session.extensions.attachments_pushed",
+            "mcp.tools.list_changed",
+            "mcp.resources.list_changed",
+            "mcp.prompts.list_changed",
+        }:
+            extension_kind = {
+                "commands.changed": "commands",
+                "capabilities.changed": "capabilities",
+                "session.tools_updated": "tools",
+                "session.skills_loaded": "skills",
+                "session.custom_agents_updated": "custom_agents",
+                "session.extensions_loaded": "extensions",
+                "session.extensions.attachments_pushed": "extension_attachments",
+                "mcp.tools.list_changed": "mcp_tools",
+                "mcp.resources.list_changed": "mcp_resources",
+                "mcp.prompts.list_changed": "mcp_prompts",
+            }[event.raw_type]
+            await connection.execute(
+                """
+                INSERT INTO extension_runtime_projections(
+                    sdk_session_id, extension_kind, runtime_generation,
+                    owner_fence_token, state, detail_json,
+                    source_event_id, observed_at, stale
+                ) VALUES (?, ?, ?, ?, 'changed', ?, ?, ?, 1)
+                ON CONFLICT(sdk_session_id, extension_kind) DO UPDATE SET
+                    runtime_generation = excluded.runtime_generation,
+                    owner_fence_token = excluded.owner_fence_token,
+                    state = excluded.state,
+                    detail_json = excluded.detail_json,
+                    source_event_id = excluded.source_event_id,
+                    observed_at = excluded.observed_at,
+                    stale = 1
+                """,
+                (
+                    event.sdk_session_id,
+                    extension_kind,
+                    event.generation,
+                    event.fence_token,
+                    json.dumps(data, ensure_ascii=False, sort_keys=True),
+                    event.event_id,
+                    now,
+                ),
+            )
+        elif event.raw_type == "session.mcp_servers_loaded":
+            await connection.execute(
+                """
+                INSERT INTO extension_runtime_projections(
+                    sdk_session_id, extension_kind, runtime_generation,
+                    owner_fence_token, state, detail_json,
+                    source_event_id, observed_at, stale
+                ) VALUES (?, 'mcp_servers', ?, ?, 'loaded', ?, ?, ?, 0)
+                ON CONFLICT(sdk_session_id, extension_kind) DO UPDATE SET
+                    runtime_generation = excluded.runtime_generation,
+                    owner_fence_token = excluded.owner_fence_token,
+                    state = excluded.state,
+                    detail_json = excluded.detail_json,
+                    source_event_id = excluded.source_event_id,
+                    observed_at = excluded.observed_at,
+                    stale = 0
+                """,
+                (
+                    event.sdk_session_id,
+                    event.generation,
+                    event.fence_token,
+                    json.dumps(data, ensure_ascii=False, sort_keys=True),
+                    event.event_id,
+                    now,
+                ),
+            )
+        elif event.raw_type == "session.mcp_server_status_changed":
+            server_name = str(data.get("serverName") or data.get("name") or "unknown")
+            await connection.execute(
+                """
+                INSERT INTO mcp_server_projections(
+                    sdk_session_id, server_name, runtime_generation,
+                    owner_fence_token, transport, state, error_code,
+                    detail_json, source_event_id, observed_at, stale
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)
+                ON CONFLICT(sdk_session_id, server_name) DO UPDATE SET
+                    runtime_generation = excluded.runtime_generation,
+                    owner_fence_token = excluded.owner_fence_token,
+                    transport = excluded.transport,
+                    state = excluded.state,
+                    error_code = excluded.error_code,
+                    detail_json = excluded.detail_json,
+                    source_event_id = excluded.source_event_id,
+                    observed_at = excluded.observed_at,
+                    stale = 0
+                """,
+                (
+                    event.sdk_session_id,
+                    server_name,
+                    event.generation,
+                    event.fence_token,
+                    data.get("transport"),
+                    str(data.get("status") or data.get("state") or "unknown"),
+                    data.get("errorCode") or data.get("error_code"),
+                    json.dumps(data, ensure_ascii=False, sort_keys=True),
+                    event.event_id,
+                    now,
+                ),
+            )
         elif event.raw_type == "copilotd.mode.pending":
             await connection.execute(
                 """
                 UPDATE session_bindings
                 SET pending_mode = ?, pending_mode_transition_id = ?,
+                    mode_reconciliation_state = 'pending', mode_drift = 0,
                     updated_at = ?, row_version = row_version + 1
                 WHERE sdk_session_id = ? AND runtime_generation = ?
                   AND owner_fence_token = ? AND pending_mode IS NULL
@@ -2925,44 +3375,45 @@ class JournalReducer:
         elif event.raw_type in {"copilotd.mode.confirmed", "copilotd.mode.observed"}:
             mode = str(data["mode"])
             transition_id = data.get("transition_id")
+            cursor = await connection.execute(
+                """
+                SELECT desired_mode, pending_mode, pending_mode_transition_id
+                FROM session_bindings
+                WHERE sdk_session_id = ? AND runtime_generation = ?
+                  AND owner_fence_token = ?
+                """,
+                (event.sdk_session_id, event.generation, event.fence_token),
+            )
+            current = await cursor.fetchone()
+            await cursor.close()
+            if current is None:
+                return
+            pending_matches = current["pending_mode"] == mode and (
+                transition_id is None or current["pending_mode_transition_id"] == transition_id
+            )
+            desired_mode = mode if pending_matches else str(current["desired_mode"])
+            drift = desired_mode != mode
             await connection.execute(
                 """
                 UPDATE session_bindings
-                SET desired_mode = CASE
-                        WHEN pending_mode = ?
-                          AND (? IS NULL OR pending_mode_transition_id = ?)
-                        THEN ?
-                        ELSE desired_mode
-                    END,
+                SET desired_mode = ?,
                     runtime_mode = ?,
-                    pending_mode = CASE
-                        WHEN pending_mode = ?
-                          AND (? IS NULL OR pending_mode_transition_id = ?)
-                        THEN NULL
-                        ELSE pending_mode
-                    END,
+                    pending_mode = CASE WHEN ? THEN NULL ELSE pending_mode END,
                     pending_mode_transition_id = CASE
-                        WHEN pending_mode = ?
-                          AND (? IS NULL OR pending_mode_transition_id = ?)
-                        THEN NULL
-                        ELSE pending_mode_transition_id
-                    END,
+                        WHEN ? THEN NULL ELSE pending_mode_transition_id END,
+                    mode_reconciliation_state = ?,
+                    mode_drift = ?,
                     updated_at = ?, row_version = row_version + 1
                 WHERE sdk_session_id = ? AND runtime_generation = ?
                   AND owner_fence_token = ?
                 """,
                 (
+                    desired_mode,
                     mode,
-                    transition_id,
-                    transition_id,
-                    mode,
-                    mode,
-                    mode,
-                    transition_id,
-                    transition_id,
-                    mode,
-                    transition_id,
-                    transition_id,
+                    pending_matches,
+                    pending_matches,
+                    "drift" if drift else "synced",
+                    int(drift),
                     now,
                     event.sdk_session_id,
                     event.generation,
@@ -2973,7 +3424,9 @@ class JournalReducer:
             await connection.execute(
                 """
                 UPDATE session_bindings
-                SET runtime_mode = 'unknown', updated_at = ?,
+                SET runtime_mode = 'unknown',
+                    mode_reconciliation_state = 'unknown',
+                    mode_drift = 0, updated_at = ?,
                     row_version = row_version + 1
                 WHERE sdk_session_id = ? AND runtime_generation = ?
                   AND owner_fence_token = ?
@@ -2986,6 +3439,19 @@ class JournalReducer:
                 ),
             )
         elif event.raw_type == "copilotd.mode.rejected":
+            transition_id = str(data["transition_id"])
+            cursor = await connection.execute(
+                """
+                SELECT pending_mode_transition_id FROM session_bindings
+                WHERE sdk_session_id = ? AND runtime_generation = ?
+                  AND owner_fence_token = ?
+                """,
+                (event.sdk_session_id, event.generation, event.fence_token),
+            )
+            current = await cursor.fetchone()
+            await cursor.close()
+            if current is None or current["pending_mode_transition_id"] != transition_id:
+                return
             await connection.execute(
                 """
                 UPDATE session_bindings
@@ -2996,13 +3462,19 @@ class JournalReducer:
                         WHEN pending_mode_transition_id = ? THEN NULL
                         ELSE pending_mode_transition_id
                     END,
+                    mode_reconciliation_state = CASE
+                        WHEN runtime_mode = desired_mode THEN 'synced' ELSE 'drift'
+                    END,
+                    mode_drift = CASE
+                        WHEN runtime_mode = desired_mode THEN 0 ELSE 1
+                    END,
                     updated_at = ?, row_version = row_version + 1
                 WHERE sdk_session_id = ? AND runtime_generation = ?
                   AND owner_fence_token = ?
                 """,
                 (
-                    str(data["transition_id"]),
-                    str(data["transition_id"]),
+                    transition_id,
+                    transition_id,
                     now,
                     event.sdk_session_id,
                     event.generation,
@@ -3010,17 +3482,22 @@ class JournalReducer:
                 ),
             )
         elif event.raw_type == "copilotd.model.pending":
+            config = cast(dict[str, Any], data["config"])
+            confirmation_mask = _model_confirmation_mask(config)
             await connection.execute(
                 """
                 UPDATE session_bindings
                 SET pending_model_config = ?, pending_model_transition_id = ?,
+                    model_confirmation_mask = ?,
+                    model_reconciliation_state = 'pending', model_drift = 0,
                     updated_at = ?, row_version = row_version + 1
                 WHERE sdk_session_id = ? AND runtime_generation = ?
                   AND owner_fence_token = ? AND pending_model_config IS NULL
                 """,
                 (
-                    json.dumps(data["config"], sort_keys=True),
+                    json.dumps(config, sort_keys=True),
                     str(data["transition_id"]),
+                    json.dumps(confirmation_mask),
                     now,
                     event.sdk_session_id,
                     event.generation,
@@ -3028,97 +3505,31 @@ class JournalReducer:
                 ),
             )
         elif event.raw_type == "copilotd.model.observed":
-            observed = data["observed"]
-            cursor = await connection.execute(
-                """
-                SELECT desired_model_config, pending_model_config,
-                       pending_model_transition_id
-                FROM session_bindings
-                WHERE sdk_session_id = ? AND runtime_generation = ?
-                  AND owner_fence_token = ?
-                """,
-                (
-                    event.sdk_session_id,
-                    event.generation,
-                    event.fence_token,
-                ),
-            )
-            current = await cursor.fetchone()
-            await cursor.close()
-            pending = (
-                None
-                if current is None or current["pending_model_config"] is None
-                else json.loads(current["pending_model_config"])
-            )
-            pending_confirmed = pending is not None and _model_config_matches(
-                pending,
-                observed,
-            )
-            await connection.execute(
-                """
-                UPDATE session_bindings
-                SET desired_model_config = CASE WHEN ? THEN ? ELSE desired_model_config END,
-                    runtime_model_config = ?,
-                    pending_model_config = CASE
-                        WHEN ? THEN NULL ELSE pending_model_config
-                    END,
-                    pending_model_transition_id = CASE
-                        WHEN ? THEN NULL ELSE pending_model_transition_id
-                    END,
-                    updated_at = ?, row_version = row_version + 1
-                WHERE sdk_session_id = ? AND runtime_generation = ?
-                  AND owner_fence_token = ?
-                """,
-                (
-                    pending_confirmed,
-                    json.dumps(pending, sort_keys=True),
-                    json.dumps(observed, sort_keys=True),
-                    pending_confirmed,
-                    pending_confirmed,
-                    now,
-                    event.sdk_session_id,
-                    event.generation,
-                    event.fence_token,
-                ),
+            await _apply_model_observation(
+                connection,
+                event,
+                observed=cast(dict[str, Any], data["observed"]),
+                source="snapshot",
+                observation_id=event.internal_event_id or f"snapshot:{event.inbox_seq}",
+                now=now,
             )
         elif event.raw_type == "copilotd.model.confirmed":
-            transition_id = str(data["transition_id"])
-            await connection.execute(
-                """
-                UPDATE session_bindings
-                SET desired_model_config = CASE
-                        WHEN pending_model_transition_id = ? THEN ? ELSE desired_model_config
-                    END,
-                    runtime_model_config = ?,
-                    pending_model_config = CASE
-                        WHEN pending_model_transition_id = ? THEN NULL
-                        ELSE pending_model_config
-                    END,
-                    pending_model_transition_id = CASE
-                        WHEN pending_model_transition_id = ? THEN NULL
-                        ELSE pending_model_transition_id
-                    END,
-                    updated_at = ?, row_version = row_version + 1
-                WHERE sdk_session_id = ? AND runtime_generation = ?
-                  AND owner_fence_token = ?
-                """,
-                (
-                    transition_id,
-                    json.dumps(data["config"], sort_keys=True),
-                    json.dumps(data["observed"], sort_keys=True),
-                    transition_id,
-                    transition_id,
-                    now,
-                    event.sdk_session_id,
-                    event.generation,
-                    event.fence_token,
-                ),
+            await _apply_model_observation(
+                connection,
+                event,
+                observed=cast(dict[str, Any], data["observed"]),
+                source="confirmed",
+                observation_id=event.internal_event_id or f"confirmed:{event.inbox_seq}",
+                now=now,
+                transition_id=str(data["transition_id"]),
             )
         elif event.raw_type == "copilotd.model.unknown":
             await connection.execute(
                 """
                 UPDATE session_bindings
-                SET runtime_model_config = NULL, updated_at = ?,
+                SET runtime_model_config = NULL,
+                    model_reconciliation_state = 'unknown',
+                    model_drift = 0, updated_at = ?,
                     row_version = row_version + 1
                 WHERE sdk_session_id = ? AND runtime_generation = ?
                   AND owner_fence_token = ?
@@ -3131,6 +3542,28 @@ class JournalReducer:
                 ),
             )
         elif event.raw_type == "copilotd.model.rejected":
+            cursor = await connection.execute(
+                """
+                SELECT desired_model_config, runtime_model_config,
+                       pending_model_transition_id
+                FROM session_bindings
+                WHERE sdk_session_id = ? AND runtime_generation = ?
+                  AND owner_fence_token = ?
+                """,
+                (event.sdk_session_id, event.generation, event.fence_token),
+            )
+            current = await cursor.fetchone()
+            await cursor.close()
+            transition_id = str(data["transition_id"])
+            if current is None or current["pending_model_transition_id"] != transition_id:
+                return
+            runtime_model = (
+                None
+                if current["runtime_model_config"] is None
+                else json.loads(str(current["runtime_model_config"]))
+            )
+            desired_model = json.loads(str(current["desired_model_config"]))
+            model_synced = _model_config_matches(desired_model, runtime_model)
             await connection.execute(
                 """
                 UPDATE session_bindings
@@ -3142,13 +3575,17 @@ class JournalReducer:
                         WHEN pending_model_transition_id = ? THEN NULL
                         ELSE pending_model_transition_id
                     END,
+                    model_reconciliation_state = ?,
+                    model_drift = ?,
                     updated_at = ?, row_version = row_version + 1
                 WHERE sdk_session_id = ? AND runtime_generation = ?
                   AND owner_fence_token = ?
                 """,
                 (
-                    str(data["transition_id"]),
-                    str(data["transition_id"]),
+                    transition_id,
+                    transition_id,
+                    ("unknown" if runtime_model is None else "synced" if model_synced else "drift"),
+                    int(runtime_model is not None and not model_synced),
                     now,
                     event.sdk_session_id,
                     event.generation,
@@ -3191,27 +3628,212 @@ class JournalReducer:
                     event.fence_token,
                 ),
             )
-        elif event.raw_type == "copilotd.config.observed":
+        elif event.raw_type == "copilotd.project_config.observed":
             await connection.execute(
                 """
                 UPDATE session_bindings
-                SET runtime_session_config_version = ?,
-                    pending_session_config_version = CASE
-                        WHEN pending_session_config_version = ? THEN NULL
-                        ELSE pending_session_config_version
-                    END,
+                SET runtime_project_config_version = ?,
                     updated_at = ?, row_version = row_version + 1
                 WHERE sdk_session_id = ? AND runtime_generation = ?
                   AND owner_fence_token = ?
                 """,
                 (
                     int(data["version"]),
-                    int(data["version"]),
                     now,
                     event.sdk_session_id,
                     event.generation,
                     event.fence_token,
                 ),
+            )
+        elif event.raw_type == "copilotd.config.pending":
+            await connection.execute(
+                """
+                UPDATE session_bindings
+                SET pending_session_config_version = ?,
+                    pending_session_config_hash = ?,
+                    pending_session_config_transition_id = ?,
+                    session_config_state = 'pending',
+                    session_config_drift = 0,
+                    updated_at = ?, row_version = row_version + 1
+                WHERE sdk_session_id = ? AND runtime_generation = ?
+                  AND owner_fence_token = ?
+                  AND pending_session_config_version IS NULL
+                """,
+                (
+                    int(data["version"]),
+                    str(data["config_hash"]),
+                    str(data["transition_id"]),
+                    now,
+                    event.sdk_session_id,
+                    event.generation,
+                    event.fence_token,
+                ),
+            )
+        elif event.raw_type == "copilotd.config.observed":
+            observed_version = int(data["version"])
+            observed_hash = str(data["config_hash"])
+            cursor = await connection.execute(
+                """
+                SELECT desired_session_config_version,
+                       desired_session_config_hash,
+                       pending_session_config_version,
+                       pending_session_config_hash
+                FROM session_bindings
+                WHERE sdk_session_id = ? AND runtime_generation = ?
+                  AND owner_fence_token = ?
+                """,
+                (event.sdk_session_id, event.generation, event.fence_token),
+            )
+            current = await cursor.fetchone()
+            await cursor.close()
+            if current is None:
+                return
+            pending_matches = (
+                current["pending_session_config_version"] == observed_version
+                and current["pending_session_config_hash"] == observed_hash
+            )
+            desired_version = (
+                observed_version
+                if pending_matches
+                else int(current["desired_session_config_version"])
+            )
+            desired_hash = (
+                observed_hash
+                if pending_matches
+                or (
+                    desired_version == observed_version
+                    and current["desired_session_config_hash"] is None
+                )
+                else current["desired_session_config_hash"]
+            )
+            drift = desired_version != observed_version or (
+                desired_hash is not None and str(desired_hash) != observed_hash
+            )
+            await connection.execute(
+                """
+                UPDATE session_bindings
+                SET desired_session_config_version = ?,
+                    desired_session_config_hash = ?,
+                    runtime_session_config_version = ?,
+                    runtime_session_config_hash = ?,
+                    pending_session_config_version = CASE
+                        WHEN ? THEN NULL ELSE pending_session_config_version END,
+                    pending_session_config_hash = CASE
+                        WHEN ? THEN NULL ELSE pending_session_config_hash END,
+                    pending_session_config_transition_id = CASE
+                        WHEN ? THEN NULL
+                        ELSE pending_session_config_transition_id END,
+                    session_config_state = ?,
+                    session_config_drift = ?,
+                    updated_at = ?, row_version = row_version + 1
+                WHERE sdk_session_id = ? AND runtime_generation = ?
+                  AND owner_fence_token = ?
+                """,
+                (
+                    desired_version,
+                    desired_hash,
+                    observed_version,
+                    observed_hash,
+                    pending_matches,
+                    pending_matches,
+                    pending_matches,
+                    "drift" if drift else "synced",
+                    int(drift),
+                    now,
+                    event.sdk_session_id,
+                    event.generation,
+                    event.fence_token,
+                ),
+            )
+        elif event.raw_type == "copilotd.config.unknown":
+            await connection.execute(
+                """
+                UPDATE session_bindings
+                SET runtime_session_config_version = NULL,
+                    runtime_session_config_hash = NULL,
+                    session_config_state = 'unknown',
+                    session_config_drift = 0,
+                    updated_at = ?, row_version = row_version + 1
+                WHERE sdk_session_id = ? AND runtime_generation = ?
+                  AND owner_fence_token = ?
+                """,
+                (
+                    now,
+                    event.sdk_session_id,
+                    event.generation,
+                    event.fence_token,
+                ),
+            )
+        elif event.raw_type == "copilotd.config.rejected":
+            transition_id = str(data["transition_id"])
+            cursor = await connection.execute(
+                """
+                SELECT pending_session_config_transition_id
+                FROM session_bindings
+                WHERE sdk_session_id = ? AND runtime_generation = ?
+                  AND owner_fence_token = ?
+                """,
+                (event.sdk_session_id, event.generation, event.fence_token),
+            )
+            current = await cursor.fetchone()
+            await cursor.close()
+            if current is None or current["pending_session_config_transition_id"] != transition_id:
+                return
+            await connection.execute(
+                """
+                UPDATE session_bindings
+                SET pending_session_config_version = CASE
+                        WHEN pending_session_config_transition_id = ?
+                        THEN NULL ELSE pending_session_config_version END,
+                    pending_session_config_hash = CASE
+                        WHEN pending_session_config_transition_id = ?
+                        THEN NULL ELSE pending_session_config_hash END,
+                    pending_session_config_transition_id = CASE
+                        WHEN pending_session_config_transition_id = ?
+                        THEN NULL ELSE pending_session_config_transition_id END,
+                    session_config_state = CASE
+                        WHEN runtime_session_config_version =
+                             desired_session_config_version
+                          AND runtime_session_config_hash =
+                              desired_session_config_hash
+                        THEN 'synced' ELSE 'drift' END,
+                    session_config_drift = CASE
+                        WHEN runtime_session_config_version =
+                             desired_session_config_version
+                          AND runtime_session_config_hash =
+                              desired_session_config_hash
+                        THEN 0 ELSE 1 END,
+                    updated_at = ?, row_version = row_version + 1
+                WHERE sdk_session_id = ? AND runtime_generation = ?
+                  AND owner_fence_token = ?
+                """,
+                (
+                    transition_id,
+                    transition_id,
+                    transition_id,
+                    now,
+                    event.sdk_session_id,
+                    event.generation,
+                    event.fence_token,
+                ),
+            )
+        elif event.raw_type == "session.model_change":
+            observed: dict[str, Any] = {"modelId": data.get("newModel")}
+            for source, target in (
+                ("reasoningEffort", "reasoningEffort"),
+                ("reasoningSummary", "reasoningSummary"),
+                ("contextTier", "contextTier"),
+            ):
+                if source in data:
+                    observed[target] = data[source]
+            observed["knownFields"] = sorted(observed)
+            await _apply_model_observation(
+                connection,
+                event,
+                observed=observed,
+                source="session.model_change",
+                observation_id=event.event_id or f"model-change:{event.inbox_seq}",
+                now=now,
             )
         elif event.raw_type == "session.mode_changed":
             mode = data.get("mode") or data.get("newMode")
@@ -3256,6 +3878,27 @@ class JournalReducer:
                         mode,
                         mode,
                         now,
+                        event.sdk_session_id,
+                        event.generation,
+                        event.fence_token,
+                    ),
+                )
+                await connection.execute(
+                    """
+                    UPDATE session_bindings
+                    SET mode_reconciliation_state = CASE
+                            WHEN pending_mode IS NOT NULL THEN 'pending'
+                            WHEN runtime_mode = desired_mode THEN 'synced'
+                            ELSE 'drift'
+                        END,
+                        mode_drift = CASE
+                            WHEN pending_mode IS NULL
+                              AND runtime_mode != desired_mode THEN 1 ELSE 0
+                        END
+                    WHERE sdk_session_id = ? AND runtime_generation = ?
+                      AND owner_fence_token = ?
+                    """,
+                    (
                         event.sdk_session_id,
                         event.generation,
                         event.fence_token,
@@ -3723,6 +4366,61 @@ class JournalReducer:
                     event.sdk_session_id,
                     event.generation,
                     event.fence_token,
+                ),
+            )
+        elif topic == "extensions" and (positive or (fresh and caught_up)):
+            for extension_kind in ("skills", "agents"):
+                detail = values.get(extension_kind, {})
+                await connection.execute(
+                    """
+                    INSERT INTO extension_runtime_projections(
+                        sdk_session_id, extension_kind, runtime_generation,
+                        owner_fence_token, state, detail_json,
+                        source_event_id, observed_at, stale
+                    ) VALUES (?, ?, ?, ?, 'observed', ?, ?, ?, 0)
+                    ON CONFLICT(sdk_session_id, extension_kind) DO UPDATE SET
+                        runtime_generation = excluded.runtime_generation,
+                        owner_fence_token = excluded.owner_fence_token,
+                        state = excluded.state,
+                        detail_json = excluded.detail_json,
+                        source_event_id = excluded.source_event_id,
+                        observed_at = excluded.observed_at,
+                        stale = 0
+                    """,
+                    (
+                        event.sdk_session_id,
+                        extension_kind,
+                        event.generation,
+                        event.fence_token,
+                        json.dumps(detail, ensure_ascii=False, sort_keys=True),
+                        event.internal_event_id,
+                        observed_at,
+                    ),
+                )
+        elif topic == "mcp" and (positive or (fresh and caught_up)):
+            await connection.execute(
+                """
+                INSERT INTO extension_runtime_projections(
+                    sdk_session_id, extension_kind, runtime_generation,
+                    owner_fence_token, state, detail_json,
+                    source_event_id, observed_at, stale
+                ) VALUES (?, 'mcp_servers', ?, ?, 'observed', ?, ?, ?, 0)
+                ON CONFLICT(sdk_session_id, extension_kind) DO UPDATE SET
+                    runtime_generation = excluded.runtime_generation,
+                    owner_fence_token = excluded.owner_fence_token,
+                    state = excluded.state,
+                    detail_json = excluded.detail_json,
+                    source_event_id = excluded.source_event_id,
+                    observed_at = excluded.observed_at,
+                    stale = 0
+                """,
+                (
+                    event.sdk_session_id,
+                    event.generation,
+                    event.fence_token,
+                    json.dumps(values, ensure_ascii=False, sort_keys=True),
+                    event.internal_event_id,
+                    observed_at,
                 ),
             )
         elif topic == "schedules" and (positive or (fresh and caught_up)):
@@ -5740,6 +6438,34 @@ class JournalReducer:
         data: dict[str, Any],
         now: float,
     ) -> None:
+        aborted = bool(data.get("aborted"))
+        await connection.execute(
+            """
+            INSERT INTO agent_loop_projections(
+                sdk_session_id, runtime_generation, owner_fence_token,
+                state, stop_reason, source_hook_audit_id, source_event_id,
+                observed_at, stale
+            ) VALUES (?, ?, ?, ?, ?, NULL, ?, ?, 0)
+            ON CONFLICT(sdk_session_id) DO UPDATE SET
+                runtime_generation = excluded.runtime_generation,
+                owner_fence_token = excluded.owner_fence_token,
+                state = excluded.state,
+                stop_reason = excluded.stop_reason,
+                source_hook_audit_id = NULL,
+                source_event_id = excluded.source_event_id,
+                observed_at = excluded.observed_at,
+                stale = 0
+            """,
+            (
+                event.sdk_session_id,
+                event.generation,
+                event.fence_token,
+                "aborted" if aborted else "idle",
+                "session_idle_aborted" if aborted else "session_idle",
+                event.event_id,
+                event.received_at,
+            ),
+        )
         cursor = await connection.execute(
             """
             SELECT submission_id, requested_mode, task_completion_outcome,
@@ -5755,7 +6481,6 @@ class JournalReducer:
         await cursor.close()
         if not candidates:
             return
-        aborted = bool(data.get("aborted"))
         for candidate in candidates:
             submission_id = str(candidate["submission_id"])
             mode = candidate["requested_mode"]
@@ -6994,6 +7719,8 @@ def _snapshot_has_positive_evidence(topic: str, values: dict[str, Any]) -> bool:
         return str(values.get("mode", "unknown")) != "off"
     if topic == "schedules":
         return bool(values.get("schedules"))
+    if topic in {"extensions", "mcp"}:
+        return bool(values)
     return bool(values)
 
 
@@ -7697,11 +8424,174 @@ async def _fetchall_rows(
     return rows
 
 
+async def _apply_model_observation(
+    connection: Any,
+    event: AdaptedEvent,
+    *,
+    observed: dict[str, Any],
+    source: str,
+    observation_id: str,
+    now: float,
+    transition_id: str | None = None,
+) -> None:
+    normalized = _normalize_model_observation(observed)
+    cursor = await connection.execute(
+        """
+        SELECT desired_model_config, pending_model_config,
+               pending_model_transition_id, runtime_model_config
+        FROM session_bindings
+        WHERE sdk_session_id = ? AND runtime_generation = ?
+          AND owner_fence_token = ?
+        """,
+        (event.sdk_session_id, event.generation, event.fence_token),
+    )
+    current = await cursor.fetchone()
+    await cursor.close()
+    if current is None:
+        return
+    previous_runtime = (
+        {}
+        if current["runtime_model_config"] is None
+        else json.loads(str(current["runtime_model_config"]))
+    )
+    runtime = {
+        key: value
+        for key, value in previous_runtime.items()
+        if key in {"modelId", "reasoningEffort", "reasoningSummary", "contextTier"}
+    }
+    runtime.update(
+        {
+            key: value
+            for key, value in normalized.items()
+            if key in {"modelId", "reasoningEffort", "reasoningSummary", "contextTier"}
+        }
+    )
+    known_fields = set(previous_runtime.get("knownFields", []))
+    known_fields.update(normalized.get("knownFields", []))
+    runtime["knownFields"] = sorted(known_fields)
+    pending = (
+        None
+        if current["pending_model_config"] is None
+        else json.loads(str(current["pending_model_config"]))
+    )
+    pending_transition_matches = pending is not None and (
+        transition_id is None or current["pending_model_transition_id"] == transition_id
+    )
+    pending_confirmed = pending_transition_matches and _model_config_matches(pending, runtime)
+    desired = json.loads(str(current["desired_model_config"]))
+    if pending_confirmed:
+        desired = pending
+    drift = bool(desired) and not _model_config_matches(desired, runtime)
+    reconciliation_state = (
+        "pending"
+        if pending is not None and not pending_confirmed
+        else "drift"
+        if drift
+        else "synced"
+    )
+    await connection.execute(
+        """
+        UPDATE session_bindings
+        SET desired_model_config = ?,
+            runtime_model_config = ?,
+            pending_model_config = CASE WHEN ? THEN NULL ELSE pending_model_config END,
+            pending_model_transition_id = CASE
+                WHEN ? THEN NULL ELSE pending_model_transition_id END,
+            model_confirmation_mask = ?,
+            model_reconciliation_state = ?,
+            model_drift = ?,
+            updated_at = ?, row_version = row_version + 1
+        WHERE sdk_session_id = ? AND runtime_generation = ?
+          AND owner_fence_token = ?
+        """,
+        (
+            json.dumps(desired, sort_keys=True),
+            json.dumps(runtime, sort_keys=True),
+            pending_confirmed,
+            pending_confirmed,
+            json.dumps(_model_confirmation_mask(desired)),
+            reconciliation_state,
+            int(drift),
+            now,
+            event.sdk_session_id,
+            event.generation,
+            event.fence_token,
+        ),
+    )
+    await connection.execute(
+        """
+        INSERT INTO model_config_observations(
+            sdk_session_id, runtime_generation, event_id, model_id,
+            reasoning_effort, reasoning_summary, context_tier,
+            known_fields, source, observed_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(sdk_session_id, event_id) DO NOTHING
+        """,
+        (
+            event.sdk_session_id,
+            event.generation,
+            observation_id,
+            runtime.get("modelId"),
+            runtime.get("reasoningEffort"),
+            runtime.get("reasoningSummary"),
+            runtime.get("contextTier"),
+            json.dumps(sorted(known_fields)),
+            source,
+            now,
+        ),
+    )
+
+
+def _normalize_model_observation(value: dict[str, Any]) -> dict[str, Any]:
+    aliases = {
+        "modelId": ("modelId", "newModel", "model"),
+        "reasoningEffort": ("reasoningEffort",),
+        "reasoningSummary": ("reasoningSummary",),
+        "contextTier": ("contextTier",),
+    }
+    normalized: dict[str, Any] = {}
+    known_fields: set[str] = set()
+    explicit_known = value.get("knownFields")
+    if isinstance(explicit_known, list):
+        known_fields.update(str(item) for item in explicit_known)
+    for target, sources in aliases.items():
+        for source in sources:
+            if source in value:
+                normalized[target] = value[source]
+                known_fields.add(target)
+                break
+    normalized["knownFields"] = sorted(known_fields)
+    return normalized
+
+
+def _model_confirmation_mask(config: dict[str, Any]) -> list[str]:
+    explicit = config.get("confirmationMask")
+    if isinstance(explicit, list):
+        return sorted(
+            {
+                str(item)
+                for item in explicit
+                if str(item) in {"modelId", "reasoningEffort", "reasoningSummary", "contextTier"}
+            }
+        )
+    return sorted(
+        key
+        for key in ("modelId", "reasoningEffort", "reasoningSummary", "contextTier")
+        if key in config
+    )
+
+
 def _model_config_matches(
     requested: dict[str, Any],
-    observed: dict[str, Any],
+    observed: dict[str, Any] | None,
 ) -> bool:
-    return all(value is None or observed.get(key) == value for key, value in requested.items())
+    if observed is None:
+        return False
+    known_fields = set(observed.get("knownFields", observed))
+    return all(
+        key in known_fields and observed.get(key) == requested.get(key)
+        for key in _model_confirmation_mask(requested)
+    )
 
 
 def _tool_spill_path(root: Path, session_id: str, tool_call_id: str) -> Path:

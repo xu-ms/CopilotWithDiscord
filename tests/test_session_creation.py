@@ -1,4 +1,5 @@
 import asyncio
+import json
 from pathlib import Path
 from typing import Any
 from uuid import uuid4
@@ -6,6 +7,10 @@ from uuid import uuid4
 import pytest
 
 from copilotd.core.bindings import SessionBindingRepository
+from copilotd.core.extensions import (
+    ExtensionConfigFileSource,
+    ExtensionConfigRepository,
+)
 from copilotd.core.projects import (
     McpServerSnapshot,
     ProjectConfigSnapshot,
@@ -52,6 +57,10 @@ class FakeBridge:
         self.mode = "interactive"
         self.create_kwargs: dict[str, Any] = {}
         self.resume_kwargs: dict[str, Any] = {}
+        self.managed_settings_enabled = True
+
+    def managed_settings_available(self) -> bool:
+        return self.managed_settings_enabled
 
     async def create_session(self, **kwargs: Any) -> FakeHandle:
         self.create_calls += 1
@@ -119,6 +128,8 @@ async def _build_service(
     await projects.initialize()
     bindings = SessionBindingRepository(database)
     leases = OwnerLeaseStore(database)
+    extension_configs = ExtensionConfigRepository(database)
+    extension_source = ExtensionConfigFileSource()
 
     def runtime_factory(binding: Any) -> SessionRuntime:
         return SessionRuntime(
@@ -128,6 +139,7 @@ async def _build_service(
             owner_leases=leases,
             owner_id="process-1",
             binding=binding,
+            extension_configs=extension_configs,
         )
 
     sessions = SessionRegistry(bindings, runtime_factory)
@@ -137,8 +149,86 @@ async def _build_service(
         bindings=bindings,
         sessions=sessions,
         threads=threads,
+        extension_configs=extension_configs,
+        extension_config_source=extension_source,
     )
     return service, sessions
+
+
+@pytest.mark.asyncio
+async def test_new_session_ingests_production_extension_config(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    await asyncio.to_thread(home.mkdir)
+    config_dir = home / ".copilotd"
+    await asyncio.to_thread(config_dir.mkdir)
+    await asyncio.to_thread(
+        (config_dir / "extensions.json").write_text,
+        json.dumps({"disabled_skills": ["production-disabled-skill"]}),
+        "utf-8",
+    )
+    async with Database(tmp_path / "production-config.sqlite3") as database:
+        bridge = FakeBridge()
+        service, sessions = await _build_service(
+            database,
+            home,
+            bridge,
+            FakeThreads(),
+        )
+
+        runtime = await service.create_from_source(
+            channel_id="channel-production",
+            source_kind="message",
+            source_id="message-production",
+            prompt="hello",
+            thread_name="production",
+        )
+        generation = await database.fetchone(
+            """
+            SELECT version, config_hash
+            FROM project_extension_config_generations
+            WHERE scope_key = 'implicit-home'
+            """
+        )
+
+        assert generation is not None
+        assert runtime.binding.desired_session_config_hash == generation["config_hash"]
+        assert bridge.create_kwargs["session_options"]["disabled_skills"] == [
+            "production-disabled-skill"
+        ]
+        await sessions.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_creation_uses_logged_in_runtime_auth_without_managed_credentials(
+    tmp_path: Path,
+) -> None:
+    home = tmp_path / "home"
+    await asyncio.to_thread(home.mkdir)
+    async with Database(tmp_path / "creation-managed-auth.sqlite3") as database:
+        bridge = FakeBridge()
+        bridge.managed_settings_enabled = False
+        threads = FakeThreads()
+        service, sessions = await _build_service(
+            database,
+            home,
+            bridge,
+            threads,
+        )
+
+        runtime = await service.create_from_source(
+            channel_id="channel-managed-auth",
+            source_kind="message",
+            source_id="message-managed-auth",
+            prompt="hello",
+            thread_name="managed auth",
+        )
+        intent = await database.fetchone("SELECT state FROM session_creation_intents")
+
+        assert intent["state"] == "attached"
+        assert threads.create_calls == 1
+        assert bridge.create_calls == 1
+        assert runtime.binding.thread_id == "thread-1"
+        await sessions.shutdown()
 
 
 @pytest.mark.asyncio
@@ -239,7 +329,8 @@ async def test_future_session_snapshots_and_applies_project_configuration(
         assert options["custom_agents"][0]["name"] == "reviewer"
         assert threads.create_kwargs["layout"] == "text"
         assert binding is not None
-        assert binding.desired_session_config_version == 6
+        assert binding.desired_project_config_version == 6
+        assert binding.desired_session_config_version == 1
         assert binding.channel_config_snapshot["layout"] == "text"
         assert unchanged is not None
         assert unchanged.session_config_snapshot == binding.session_config_snapshot

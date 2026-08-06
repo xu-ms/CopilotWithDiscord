@@ -11,8 +11,9 @@ The implementation follows [`docs/copilotD-detailed-design.md`](docs/copilotD-de
 
 - Exact SDK/runtime/protocol startup assertion (`1.0.8` / `1.0.73` / `3`) backed
   by persisted, hash-checked capability evidence rather than generated method presence.
-- Bundled Copilot runtime launched with `--yolo`, with allow-all verified on every
-  create/resume and reconciled again after runtime permission-change events.
+- Bundled Copilot runtime launched with `--yolo`; the locally logged-in Copilot CLI
+  account is valid authentication. An explicit GitHub token is optional and enables
+  managed-settings session options when present.
 - One long-lived SDK session per Discord thread, eager resume, owner fencing, and
   conservative unknown outcomes across crash windows.
 - Explicit channel project bindings with immutable cwd snapshots; unbound channels
@@ -20,9 +21,9 @@ The implementation follows [`docs/copilotD-detailed-design.md`](docs/copilotD-de
 - Durable SQLite event journal with strict UUID SDK IDs, app FIFO, reducer-owned
   operation receipts, liveness leases, epoch/watermark snapshots, render outbox,
   and attachment manifests.
-- Seventeen applied migrations use reserved namespaces: Foundation owns `0001`-`0009`
-  and Discord surface owns `0030`-`0037`; `0010`-`0019` and `0020`-`0029` remain
-  intentionally reserved for Native and Scheduler.
+- Thirty-seven applied migrations use unique reserved namespaces: Foundation
+  `0001`-`0009`, Native `0010`-`0014`, Protocol `0015`-`0019`, Scheduler
+  `0020`-`0028`, Protocol compatibility `0029`, and Discord `0030`-`0037`.
 - Durable event-log backfill with cursor rebase/gap diagnostics and ingress-overflow
   freeze/backfill/generation replacement; unrecoverable ephemeral gaps remain
   explicitly outcome-unknown.
@@ -32,6 +33,15 @@ The implementation follows [`docs/copilotD-detailed-design.md`](docs/copilotD-de
 - Durable Copilot input requests: ask-user choices/freeform, Plan exit actions, and
   auto-mode-switch prompts render in-place and settle exactly once without blocking
   event reduction.
+- Immutable, versioned create/resume configuration for custom agents, skill/plugin
+  directories, disabled skills, stdio/HTTP MCP servers, and environment references,
+  including same-owner-fence config reattach and restart recovery.
+- Supported 1.0.8 callback hooks with redacted audit projections; managed-aware,
+  owner-fenced permission handling; JSON-Schema elicitation; MCP OAuth; and exactly-once
+  protocol response implementations. Sampling, limits, and dynamic-header responses stay
+  capability-gated until a real request/response/completion fixture succeeds.
+- Durable mode/model per-field reconciliation (including gated reasoning-summary
+  readback), MCP/extension health, and stale-aware usage/context projections.
 - Background task `refresh/list` reconciliation, disappearance-to-unknown handling,
   usage/status rendering, and lossless attachment delivery for tool output at or above
   8000 characters; oversized Discord uploads are split into ordered lossless parts.
@@ -64,18 +74,27 @@ topology is bundled-runtime rather than detached execution.
 
 ## Setup
 
-Python 3.11 or newer and an authenticated GitHub Copilot CLI identity are required.
+Python 3.11 or newer, a locally logged-in Copilot CLI account, and a Discord token are
+required. `COPILOTD_GITHUB_TOKEN` is optional. When present it is passed only through
+the protected credential source and enables managed-settings options; when absent,
+sessions use normal logged-in runtime authentication.
 
 ```bash
 python3.11 -m venv .venv
 .venv/bin/pip install -e '.[dev]'
 export COPILOTD_DISCORD_TOKEN='...'
 export COPILOTD_DISCORD_OPERATOR_IDS='123456789012345678'
+# Optional: export COPILOTD_GITHUB_TOKEN='...'
 .venv/bin/copilotd setup
 ```
 
-`setup` installs and starts the current platform's service definitions. For local
-development, use the explicit foreground entrypoint:
+`setup` fails before installation unless the Discord token is present. It writes configured
+secrets to the private service credential file (mode `0600` on macOS; current-user ACL on
+Windows). Service definitions, generated runners, logs, and acceptance evidence never
+contain token values. A runtime-reported managed policy/request fails deterministically
+with `UserNotAvailable` and never creates a Discord permission UI; ordinary typed requests
+remain owner-fenced `ApproveOnce`. For local development, use the explicit foreground
+entrypoint:
 
 `COPILOTD_DISCORD_OPERATOR_IDS` is a comma-separated allowlist. Administrative
 `/project` (including MCP, variables, agents, and worktrees) and runtime restart
@@ -94,6 +113,17 @@ Useful operations:
 .venv/bin/copilotd service restart
 .venv/bin/copilotd doctor
 ```
+
+Project extension configuration is loaded from the immutable project snapshot at
+`.copilotd/extensions.json`. The JSON accepts the typed custom-agent, skill directory,
+disabled-skill, plugin directory, MCP server, and environment-reference fields documented
+by the SDK adapter; store environment variable names, never secret values. New sessions
+ingest the file automatically. Inside an idle session thread, `/project config-reload`
+publishes a new generation and performs a fenced same-session reattach.
+
+SDK 1.0.8 does not invoke `on_user_prompt_transformed` or `on_agent_stop`; copilotD does
+not register those silent callbacks. Durable `session.idle` events provide the supported
+agent-loop observation instead.
 
 ## Development
 
@@ -120,7 +150,8 @@ JSON evidence. It requires both the CLI flag and an exact environment confirmati
 
 ```bash
 export COPILOTD_REAL_ACCEPTANCE='I_UNDERSTAND_THIS_USES_REAL_COPILOT'
-.venv/bin/copilotd native-acceptance --real --evidence /tmp/copilotd-native-evidence.json
+.venv/bin/copilotd native-acceptance \
+  --real --evidence "$HOME/copilotd-native-evidence.json"
 ```
 
 Scheduler/worktree integration has a stricter opt-in runner. It uses real Copilot
@@ -136,6 +167,14 @@ cleans disposable resources, and writes sanitized per-feature JSON plus `summary
 The runner accepts injected `ThreadGateway` and `HistoryForkAdapter` implementations,
 so a combined Discord branch can drive real threads without coupling scheduler state to
 Discord rendering internals. History fork is fail-closed when no verified adapter exists.
+
+The full protocol/extension acceptance uses an explicit token with auto-login disabled
+for its isolated probe only, disposable local stdio and HTTP MCP servers, sanitizes its
+evidence, and removes every temporary session:
+
+```bash
+.venv/bin/copilotd sdk-probe --live-extensions
+```
 
 Runtime data, cache, and logs use platform-specific user directories. Override them
 with `COPILOTD_DATA_DIR`, `COPILOTD_CACHE_DIR`, and `COPILOTD_LOG_DIR`. A guild-scoped

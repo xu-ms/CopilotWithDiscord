@@ -1405,7 +1405,8 @@ async def test_wire_requested_and_completed_events_pair_by_request_id(
         assert await JournalReducer(database).persist(events) == 2
         row = await database.fetchone(
             """
-            SELECT requested_type, requested_event_id, completed_event_id, state
+            SELECT requested_type, requested_event_id, completed_event_id,
+                   wire_state, response_state
             FROM protocol_requests WHERE request_id = 'request-1'
             """
         )
@@ -1414,8 +1415,385 @@ async def test_wire_requested_and_completed_events_pair_by_request_id(
         "requested_type": "user_input.requested",
         "requested_event_id": "event-requested",
         "completed_event_id": "event-completed",
-        "state": "completed",
+        "wire_state": "paired",
+        "response_state": "delegated",
     }
+
+
+@pytest.mark.asyncio
+async def test_external_mode_change_marks_drift_without_overwriting_desired(
+    tmp_path: Path,
+) -> None:
+    async with Database(tmp_path / "mode-drift.sqlite3") as database:
+        await _insert_projection_binding(database, "session-mode-drift")
+        reducer = JournalReducer(database)
+        await reducer.persist(
+            [
+                _adapted(
+                    "session.mode_changed",
+                    {"newMode": "autopilot", "previousMode": "interactive"},
+                    1,
+                    session_id="session-mode-drift",
+                )
+            ]
+        )
+        drifted = await database.fetchone(
+            """
+            SELECT desired_mode, runtime_mode, pending_mode,
+                   mode_reconciliation_state, mode_drift
+            FROM session_bindings WHERE sdk_session_id = 'session-mode-drift'
+            """
+        )
+        await reducer.persist(
+            [
+                _adapted(
+                    "copilotd.mode.pending",
+                    {"mode": "autopilot", "transition_id": "mode-transition"},
+                    2,
+                    source="internal",
+                    session_id="session-mode-drift",
+                ),
+                _adapted(
+                    "copilotd.mode.observed",
+                    {"mode": "autopilot", "transition_id": "mode-transition"},
+                    3,
+                    source="internal",
+                    session_id="session-mode-drift",
+                ),
+            ]
+        )
+        reconciled = await database.fetchone(
+            """
+            SELECT desired_mode, runtime_mode, pending_mode,
+                   mode_reconciliation_state, mode_drift
+            FROM session_bindings WHERE sdk_session_id = 'session-mode-drift'
+            """
+        )
+
+    assert dict(drifted) == {
+        "desired_mode": "interactive",
+        "runtime_mode": "autopilot",
+        "pending_mode": None,
+        "mode_reconciliation_state": "drift",
+        "mode_drift": 1,
+    }
+    assert dict(reconciled) == {
+        "desired_mode": "autopilot",
+        "runtime_mode": "autopilot",
+        "pending_mode": None,
+        "mode_reconciliation_state": "synced",
+        "mode_drift": 0,
+    }
+
+
+@pytest.mark.asyncio
+async def test_model_event_uses_per_field_mask_and_preserves_external_drift(
+    tmp_path: Path,
+) -> None:
+    async with Database(tmp_path / "model-fields.sqlite3") as database:
+        await _insert_projection_binding(database, "session-model-fields")
+        await database.execute(
+            """
+            UPDATE session_bindings
+            SET desired_model_config = ?,
+                runtime_model_config = ?,
+                model_confirmation_mask = ?
+            WHERE sdk_session_id = 'session-model-fields'
+            """,
+            (
+                json.dumps(
+                    {
+                        "modelId": "old-model",
+                        "confirmationMask": ["modelId"],
+                    }
+                ),
+                json.dumps(
+                    {
+                        "modelId": "old-model",
+                        "knownFields": ["modelId"],
+                    }
+                ),
+                json.dumps(["modelId"]),
+            ),
+        )
+        reducer = JournalReducer(database)
+        await reducer.persist(
+            [
+                _adapted(
+                    "session.model_change",
+                    {
+                        "newModel": "new-model",
+                        "reasoningSummary": "concise",
+                    },
+                    1,
+                    session_id="session-model-fields",
+                )
+            ]
+        )
+        drifted = await database.fetchone(
+            """
+            SELECT desired_model_config, runtime_model_config,
+                   model_reconciliation_state, model_drift
+            FROM session_bindings WHERE sdk_session_id = 'session-model-fields'
+            """
+        )
+        observation = await database.fetchone(
+            """
+            SELECT model_id, reasoning_summary, known_fields, source
+            FROM model_config_observations
+            """
+        )
+
+    assert json.loads(drifted["desired_model_config"])["modelId"] == "old-model"
+    assert json.loads(drifted["runtime_model_config"]) == {
+        "knownFields": ["modelId", "reasoningSummary"],
+        "modelId": "new-model",
+        "reasoningSummary": "concise",
+    }
+    assert drifted["model_reconciliation_state"] == "drift"
+    assert drifted["model_drift"] == 1
+    assert dict(observation) == {
+        "model_id": "new-model",
+        "reasoning_summary": "concise",
+        "known_fields": '["modelId", "reasoningSummary"]',
+        "source": "session.model_change",
+    }
+
+
+@pytest.mark.asyncio
+async def test_rejected_model_change_uses_semantic_mask_for_synced_state(
+    tmp_path: Path,
+) -> None:
+    desired = {
+        "modelId": "model-a",
+        "confirmationMask": ["modelId"],
+    }
+    runtime = {
+        "modelId": "model-a",
+        "reasoningEffort": "high",
+        "knownFields": ["modelId", "reasoningEffort"],
+    }
+    async with Database(tmp_path / "model-rejected.sqlite3") as database:
+        await _insert_projection_binding(database, "session-model-rejected")
+        await database.execute(
+            """
+            UPDATE session_bindings
+            SET desired_model_config = ?,
+                runtime_model_config = ?,
+                pending_model_config = ?,
+                pending_model_transition_id = 'transition-rejected',
+                model_reconciliation_state = 'pending'
+            WHERE sdk_session_id = 'session-model-rejected'
+            """,
+            (
+                json.dumps(desired),
+                json.dumps(runtime),
+                json.dumps(
+                    {
+                        "modelId": "model-b",
+                        "confirmationMask": ["modelId"],
+                    }
+                ),
+            ),
+        )
+        await JournalReducer(database).persist(
+            [
+                _adapted(
+                    "copilotd.model.rejected",
+                    {"transition_id": "transition-rejected"},
+                    1,
+                    source="internal",
+                    session_id="session-model-rejected",
+                )
+            ]
+        )
+        row = await database.fetchone(
+            """
+            SELECT pending_model_config, pending_model_transition_id,
+                   model_reconciliation_state, model_drift
+            FROM session_bindings
+            WHERE sdk_session_id = 'session-model-rejected'
+            """
+        )
+
+    assert dict(row) == {
+        "pending_model_config": None,
+        "pending_model_transition_id": None,
+        "model_reconciliation_state": "synced",
+        "model_drift": 0,
+    }
+
+
+@pytest.mark.asyncio
+async def test_stale_rejections_do_not_overwrite_newer_pending_transitions(
+    tmp_path: Path,
+) -> None:
+    async with Database(tmp_path / "stale-rejections.sqlite3") as database:
+        await _insert_projection_binding(database, "session-stale-rejections")
+        await database.execute(
+            """
+            UPDATE session_bindings
+            SET pending_mode = 'autopilot',
+                pending_mode_transition_id = 'mode-new',
+                mode_reconciliation_state = 'pending',
+                pending_model_config = '{"modelId":"model-new"}',
+                pending_model_transition_id = 'model-new',
+                model_reconciliation_state = 'pending',
+                pending_session_config_version = 2,
+                pending_session_config_hash = 'config-new',
+                pending_session_config_transition_id = 'config-new',
+                session_config_state = 'pending'
+            WHERE sdk_session_id = 'session-stale-rejections'
+            """
+        )
+        await JournalReducer(database).persist(
+            [
+                _adapted(
+                    "copilotd.mode.rejected",
+                    {"transition_id": "mode-old"},
+                    1,
+                    source="internal",
+                    session_id="session-stale-rejections",
+                ),
+                _adapted(
+                    "copilotd.model.rejected",
+                    {"transition_id": "model-old"},
+                    2,
+                    source="internal",
+                    session_id="session-stale-rejections",
+                ),
+                _adapted(
+                    "copilotd.config.rejected",
+                    {"transition_id": "config-old"},
+                    3,
+                    source="internal",
+                    session_id="session-stale-rejections",
+                ),
+            ]
+        )
+        row = await database.fetchone(
+            """
+            SELECT pending_mode, pending_mode_transition_id,
+                   mode_reconciliation_state,
+                   pending_model_config, pending_model_transition_id,
+                   model_reconciliation_state,
+                   pending_session_config_version,
+                   pending_session_config_hash,
+                   pending_session_config_transition_id,
+                   session_config_state
+            FROM session_bindings
+            WHERE sdk_session_id = 'session-stale-rejections'
+            """
+        )
+
+    assert dict(row) == {
+        "pending_mode": "autopilot",
+        "pending_mode_transition_id": "mode-new",
+        "mode_reconciliation_state": "pending",
+        "pending_model_config": '{"modelId":"model-new"}',
+        "pending_model_transition_id": "model-new",
+        "model_reconciliation_state": "pending",
+        "pending_session_config_version": 2,
+        "pending_session_config_hash": "config-new",
+        "pending_session_config_transition_id": "config-new",
+        "session_config_state": "pending",
+    }
+
+
+@pytest.mark.asyncio
+async def test_managed_settings_events_drive_durable_permission_block_state(
+    tmp_path: Path,
+) -> None:
+    async with Database(tmp_path / "managed-settings.sqlite3") as database:
+        await _insert_projection_binding(database, "session-managed-settings")
+        reducer = JournalReducer(database)
+        await reducer.persist(
+            [
+                _adapted(
+                    "session.managed_settings_resolved",
+                    {
+                        "bypassPermissionsDisabled": True,
+                        "failClosed": False,
+                        "managedKeys": ["bypassPermissions"],
+                    },
+                    1,
+                    session_id="session-managed-settings",
+                )
+            ]
+        )
+        blocked = await database.fetchone(
+            """
+            SELECT managed_settings_state, managed_permissions_blocked,
+                   permission_posture
+            FROM session_bindings
+            WHERE sdk_session_id = 'session-managed-settings'
+            """
+        )
+        await reducer.persist(
+            [
+                _adapted(
+                    "session.managed_settings_resolved",
+                    {
+                        "bypassPermissionsDisabled": False,
+                        "failClosed": False,
+                        "managedKeys": [],
+                    },
+                    2,
+                    session_id="session-managed-settings",
+                )
+            ]
+        )
+        unblocked = await database.fetchone(
+            """
+            SELECT managed_settings_state, managed_permissions_blocked,
+                   permission_posture
+            FROM session_bindings
+            WHERE sdk_session_id = 'session-managed-settings'
+            """
+        )
+
+    assert dict(blocked) == {
+        "managed_settings_state": "resolved",
+        "managed_permissions_blocked": 1,
+        "permission_posture": "platform_blocked",
+    }
+    assert dict(unblocked) == {
+        "managed_settings_state": "resolved",
+        "managed_permissions_blocked": 0,
+        "permission_posture": "unverified",
+    }
+
+
+@pytest.mark.asyncio
+async def test_session_idle_is_the_supported_agent_loop_observation(
+    tmp_path: Path,
+) -> None:
+    async with Database(tmp_path / "agent-loop-idle.sqlite3") as database:
+        await _insert_projection_binding(database, "session-agent-loop")
+        await JournalReducer(database).persist(
+            [
+                _adapted(
+                    "session.idle",
+                    {"aborted": False},
+                    1,
+                    session_id="session-agent-loop",
+                )
+            ]
+        )
+        row = await database.fetchone(
+            """
+            SELECT state, stop_reason, source_hook_audit_id,
+                   source_event_id, stale
+            FROM agent_loop_projections
+            WHERE sdk_session_id = 'session-agent-loop'
+            """
+        )
+
+    assert row["state"] == "idle"
+    assert row["stop_reason"] == "session_idle"
+    assert row["source_hook_audit_id"] is None
+    assert row["source_event_id"] is not None
+    assert row["stale"] == 0
 
 
 @pytest.mark.asyncio

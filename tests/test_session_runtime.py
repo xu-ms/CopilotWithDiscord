@@ -1,20 +1,28 @@
 import asyncio
+import json
 import time
 from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
-from uuid import UUID, uuid4
+from uuid import NAMESPACE_URL, UUID, uuid4, uuid5
 
 import pytest
 from copilot.generated.session_events import SessionMode
 from copilot.session_events import (
     AssistantMessageDeltaData,
+    ManagedSettingsResolvedSource,
+    McpHeadersRefreshRequiredData,
+    McpHeadersRefreshRequiredReason,
     PendingMessagesModifiedData,
+    SamplingRequestedData,
     SessionBackgroundTasksChangedData,
     SessionEvent,
     SessionEventType,
     SessionIdleData,
+    SessionLimitsExhaustedRequestedData,
+    SessionManagedSettingsResolvedData,
     SessionModeChangedData,
     SessionPermissionsChangedData,
     UserMessageData,
@@ -29,8 +37,18 @@ from copilotd.core.bindings import (
     PermissionPosture,
     SessionBindingRepository,
 )
-from copilotd.core.commands import CDSessionStateError
+from copilotd.core.commands import CDCapabilityError, CDSessionStateError
+from copilotd.core.extensions import (
+    ConfigReloadClaimStore,
+    EnvironmentBinding,
+    EnvironmentReference,
+    ExtensionConfigConflict,
+    ExtensionConfigRepository,
+    McpStdioServer,
+    ProjectExtensionConfig,
+)
 from copilotd.core.mailbox import OperationAmbiguous, OperationRejected
+from copilotd.core.projects import ProjectRegistry
 from copilotd.core.session_runtime import (
     DetachBlocked,
     RuntimeState,
@@ -85,6 +103,7 @@ class FakeBridge:
         self.model = {
             "modelId": "gpt-test",
             "reasoningEffort": None,
+            "reasoningSummary": None,
             "contextTier": None,
         }
         self.model_set_calls: list[dict[str, Any]] = []
@@ -101,6 +120,13 @@ class FakeBridge:
         self.tail_cursor = "tail-0"
         self.event_log_batches: list[EventLogBatch] = []
         self.event_log_reads = 0
+        self.protocol_response_calls: list[tuple[str, str, Any]] = []
+        self.context_error: Exception | None = None
+        self.usage_error: Exception | None = None
+        self.managed_settings_enabled = True
+
+    def managed_settings_available(self) -> bool:
+        return self.managed_settings_enabled
 
     async def create_session(self, **kwargs: Any) -> FakeHandle:
         self.create_calls += 1
@@ -147,12 +173,13 @@ class FakeBridge:
         *,
         model: str,
         reasoning_effort: str | None,
+        reasoning_summary: str | None,
         context_tier: str | None,
-        reasoning_summary: str | None = None,
     ) -> None:
         self.model = {
             "modelId": model,
             "reasoningEffort": reasoning_effort,
+            "reasoningSummary": reasoning_summary,
             "contextTier": context_tier,
         }
         if reasoning_summary is not None:
@@ -162,10 +189,40 @@ class FakeBridge:
     async def get_current_model(self, _session: FakeHandle) -> dict[str, Any]:
         return self.model
 
+    async def respond_session_limits(
+        self,
+        _session: FakeHandle,
+        _request_id: str,
+    ) -> bool:
+        self.protocol_response_calls.append(("session_limits", _request_id, {"action": "cancel"}))
+        return True
+
+    async def respond_sampling(
+        self,
+        _session: FakeHandle,
+        _request_id: str,
+        _response: dict[str, Any] | None,
+    ) -> bool:
+        self.protocol_response_calls.append(("sampling", _request_id, _response))
+        return True
+
+    async def respond_mcp_headers(
+        self,
+        _session: FakeHandle,
+        _request_id: str,
+        _headers: dict[str, str] | None,
+    ) -> bool:
+        self.protocol_response_calls.append(("mcp_headers", _request_id, _headers))
+        return True
+
     async def get_context(self, _session: FakeHandle) -> dict[str, Any]:
+        if self.context_error is not None:
+            raise self.context_error
         return {"totalTokens": 10, "limit": 100}
 
     async def get_usage(self, _session: FakeHandle) -> dict[str, Any]:
+        if self.usage_error is not None:
+            raise self.usage_error
         return {"totalUserRequests": 2}
 
     async def get_readiness(self, _session: FakeHandle) -> dict[str, Any]:
@@ -239,6 +296,15 @@ class FakeBridge:
     ) -> tuple[NativeCommandDefinition, ...]:
         assert include_builtins
         return ()
+
+    async def get_mcp_servers(self, _session: FakeHandle) -> dict[str, Any]:
+        return {"servers": []}
+
+    async def get_skills(self, _session: FakeHandle) -> dict[str, Any]:
+        return {"skills": []}
+
+    async def get_agents(self, _session: FakeHandle) -> dict[str, Any]:
+        return {"agents": []}
 
 
 class FakeSummaryAdapter:
@@ -465,6 +531,7 @@ async def test_immediate_delivery_steers_active_turn_while_queue_waits_for_quiet
             project_source="implicit-home",
         )
         bridge = FakeBridge(session_id)
+
         runtime = SessionRuntime(
             database=database,
             bridge=bridge,
@@ -2829,7 +2896,7 @@ async def test_capability_runtime_unknown_states_gate_dispatch(tmp_path: Path) -
         await database.execute(
             """
             UPDATE session_bindings
-            SET runtime_agent = 'default', runtime_session_config_version = NULL
+            SET runtime_agent = 'default', runtime_project_config_version = NULL
             WHERE sdk_session_id = ?
             """,
             (session_id,),
@@ -2839,7 +2906,7 @@ async def test_capability_runtime_unknown_states_gate_dispatch(tmp_path: Path) -
         await database.execute(
             """
             UPDATE session_bindings
-            SET runtime_session_config_version = desired_session_config_version,
+            SET runtime_project_config_version = desired_project_config_version,
                 runtime_remote_mode = 'unknown'
             WHERE sdk_session_id = ?
             """,
@@ -2963,7 +3030,7 @@ async def test_queue_blocks_agent_and_session_config_drift(tmp_path: Path) -> No
         await database.execute(
             """
             UPDATE session_bindings
-            SET desired_session_config_version = desired_session_config_version + 1
+            SET desired_project_config_version = desired_project_config_version + 1
             WHERE thread_id = 'thread-queue-drift'
             """
         )
@@ -3241,6 +3308,62 @@ async def test_permission_reconciliation_persists_platform_blocked_posture(
 
 
 @pytest.mark.asyncio
+async def test_managed_settings_event_blocks_handler_without_invocation_flags(
+    tmp_path: Path,
+) -> None:
+    session_id = str(uuid4())
+    async with Database(tmp_path / "managed-permission-event.sqlite3") as database:
+        bindings = SessionBindingRepository(database)
+        binding = await bindings.create(
+            thread_id="thread-managed-permission",
+            sdk_session_id=session_id,
+            cwd_snapshot=tmp_path,
+            project_source="implicit-home",
+        )
+        bridge = FakeBridge(session_id)
+        runtime = SessionRuntime(
+            database=database,
+            bridge=bridge,
+            bindings=bindings,
+            owner_leases=OwnerLeaseStore(database),
+            owner_id="process-managed-permission",
+            binding=binding,
+        )
+        await runtime.attach_create()
+        bridge.ingress(
+            _event(
+                SessionManagedSettingsResolvedData(
+                    bypass_permissions_disabled=True,
+                    device_managed=False,
+                    fail_closed=False,
+                    managed_keys=["bypassPermissions"],
+                    server_managed=True,
+                    source=ManagedSettingsResolvedSource.SERVER,
+                    settings={},
+                ),
+                SessionEventType.SESSION_MANAGED_SETTINGS_RESOLVED,
+            )
+        )
+        assert runtime.inbox is not None
+        with pytest.raises(SessionNotReady, match="managed permissions"):
+            await runtime._assert_dispatchable()
+        await runtime.inbox.join()
+        handler = bridge.create_kwargs["permission_handler"]
+        decision = await handler(
+            SimpleNamespace(kind="mcp", to_dict=lambda: {"kind": "mcp"}),
+            {"session_id": session_id},
+        )
+        blocked = await bindings.by_thread("thread-managed-permission")
+
+        assert decision.kind == "user-not-available"
+        assert blocked is not None
+        assert blocked.managed_permissions_blocked
+        with pytest.raises(SessionNotReady, match="managed permissions"):
+            await runtime.send("blocked", idempotency_key="managed-blocked")
+        await runtime.close(idempotency_key="close-managed-permission")
+
+
+@pytest.mark.asyncio
 async def test_bare_mode_changes_do_not_send_a_prompt(tmp_path: Path) -> None:
     session_id = str(uuid4())
     async with Database(tmp_path / "mode.sqlite3") as database:
@@ -3315,8 +3438,30 @@ async def test_model_change_is_validated_confirmed_and_persisted(tmp_path: Path)
             "contextTier": "long_context",
         }
         assert row["pending_model_config"] is None
-        assert '"modelId": "gpt-test"' in row["desired_model_config"]
-        assert row["runtime_model_config"] == row["desired_model_config"]
+        desired_model = json.loads(row["desired_model_config"])
+        runtime_model = json.loads(row["runtime_model_config"])
+        assert desired_model == {
+            "modelId": "gpt-test",
+            "reasoningEffort": "high",
+            "contextTier": "long_context",
+            "confirmationMask": [
+                "modelId",
+                "reasoningEffort",
+                "contextTier",
+            ],
+        }
+        assert {
+            key: runtime_model[key] for key in ("modelId", "reasoningEffort", "contextTier")
+        } == {
+            "modelId": "gpt-test",
+            "reasoningEffort": "high",
+            "contextTier": "long_context",
+        }
+        assert {
+            "modelId",
+            "reasoningEffort",
+            "contextTier",
+        } <= set(runtime_model["knownFields"])
         assert await runtime.context_snapshot() == {"totalTokens": 10, "limit": 100}
         assert await runtime.usage_snapshot() == {"totalUserRequests": 2}
 
@@ -3326,6 +3471,14 @@ async def test_model_change_is_validated_confirmed_and_persisted(tmp_path: Path)
                 reasoning_effort="xhigh",
                 context_tier=None,
                 idempotency_key="model-change-2",
+            )
+        with pytest.raises(CDCapabilityError, match="readback"):
+            await runtime.set_model(
+                "gpt-test",
+                reasoning_effort=None,
+                context_tier=None,
+                reasoning_summary="concise",
+                idempotency_key="model-change-summary",
             )
         assert len(bridge.model_set_calls) == 1
         await runtime.close(idempotency_key="close-model")
@@ -3371,8 +3524,12 @@ async def test_reasoning_summary_uses_capability_adapter_and_readback(
         )
 
         assert observed["reasoningSummary"] == "concise"
-        assert '"reasoningSummary": "concise"' in row["desired_model_config"]
-        assert row["runtime_model_config"] == row["desired_model_config"]
+        desired = json.loads(row["desired_model_config"])
+        runtime_model = json.loads(row["runtime_model_config"])
+        assert desired["reasoningSummary"] == "concise"
+        assert "reasoningSummary" in desired["confirmationMask"]
+        assert runtime_model["reasoningSummary"] == "concise"
+        assert "reasoningSummary" in runtime_model["knownFields"]
         await runtime.close(idempotency_key="close-model-summary")
 
 
@@ -3630,6 +3787,690 @@ async def test_taskdeck_actions_are_state_gated_and_adapter_backed(
             (session_id,),
         )
         await runtime.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_extension_config_hooks_and_same_fence_reattach(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("COPILOTD_TEST_MCP_VALUE", "non-secret-live-value")
+    session_id = str(uuid4())
+    async with Database(tmp_path / "extension-runtime.sqlite3") as database:
+        projects = ProjectRegistry(database, resolved_home=home)
+        await projects.initialize()
+        project = await projects.resolve("channel-extension")
+        configs = ExtensionConfigRepository(database)
+        first = await configs.publish(
+            project,
+            ProjectExtensionConfig(
+                environment_references=(
+                    EnvironmentReference("acceptance", "COPILOTD_TEST_MCP_VALUE"),
+                ),
+                mcp_servers=(
+                    McpStdioServer(
+                        name="local",
+                        command="test-server",
+                        environment=(EnvironmentBinding("VALUE", "acceptance"),),
+                    ),
+                ),
+            ),
+        )
+        bindings = SessionBindingRepository(database)
+        binding = await bindings.create(
+            thread_id="thread-extension",
+            sdk_session_id=session_id,
+            cwd_snapshot=home,
+            project_source=project.source.value,
+            desired_session_config_version=first.version,
+            desired_session_config_hash=first.config_hash,
+        )
+        bridge = FakeBridge(session_id)
+        runtime = SessionRuntime(
+            database=database,
+            bridge=bridge,
+            bindings=bindings,
+            owner_leases=OwnerLeaseStore(database),
+            owner_id="process-extension",
+            binding=binding,
+            extension_configs=configs,
+        )
+        await runtime.attach_create()
+        first_fence = runtime.binding.owner_fence_token
+        first_generation = runtime.binding.runtime_generation
+        options = bridge.create_kwargs["session_options"]
+        assert options["mcp_servers"]["local"]["env"] == {"VALUE": "non-secret-live-value"}
+        hooks = bridge.create_kwargs["hooks"]
+        assert {
+            "on_pre_tool_use",
+            "on_post_tool_use",
+            "on_post_tool_use_failure",
+            "on_user_prompt_submitted",
+            "on_session_start",
+            "on_session_end",
+            "on_error_occurred",
+        } <= set(hooks)
+        assert "on_user_prompt_transformed" not in hooks
+        assert "on_agent_stop" not in hooks
+        await hooks["on_pre_tool_use"](
+            {
+                "sessionId": session_id,
+                "timestamp": datetime.now(UTC),
+                "workingDirectory": str(home),
+                "toolName": "shell",
+                "toolArgs": {"command": "printf acceptance"},
+            },
+            {"hookInvocationId": "hook-1", "toolCallId": "tool-1"},
+        )
+        permission_handler = bridge.create_kwargs["permission_handler"]
+        decision = await permission_handler(
+            SimpleNamespace(
+                kind="shell",
+                managed_approval_required=False,
+                to_dict=lambda: {"kind": "shell"},
+            ),
+            {"managed_settings_enabled": False},
+        )
+        assert decision.kind == "approve-once"
+
+        second_config = ProjectExtensionConfig(disabled_skills=("disabled-test",))
+        second = await runtime.reload_extension_config(
+            idempotency_key="reload-1",
+            config=second_config,
+            expected_project_config_version=1,
+        )
+        replayed = await runtime.reload_extension_config(
+            idempotency_key="reload-1",
+            config=second_config,
+        )
+        with pytest.raises(ExtensionConfigConflict, match="different config hash"):
+            await runtime.reload_extension_config(
+                idempotency_key="reload-1",
+                config=ProjectExtensionConfig(disabled_skills=("conflicting-test",)),
+            )
+        for crash_state in ("started", "unknown"):
+            await database.execute(
+                """
+                UPDATE config_reload_claims
+                SET state = ?, settled_at = NULL
+                WHERE sdk_session_id = ? AND idempotency_key = 'reload-1'
+                """,
+                (crash_state, session_id),
+            )
+            reconciled_replay = await runtime.reload_extension_config(
+                idempotency_key="reload-1",
+                config=second_config,
+            )
+            assert reconciled_replay == second
+        hook_rows = await database.fetchall(
+            "SELECT hook_name, phase FROM hook_audit_events ORDER BY observed_at"
+        )
+        permission_rows = await database.fetchall(
+            "SELECT permission_kind, decision FROM permission_audit_events"
+        )
+        updated = await bindings.by_thread("thread-extension")
+        generations = await database.fetchone(
+            "SELECT COUNT(*) AS count FROM project_extension_config_generations"
+        )
+        reload_claim = await database.fetchone(
+            """
+            SELECT config_hash, state, config_version
+            FROM config_reload_claims
+            WHERE sdk_session_id = ? AND idempotency_key = 'reload-1'
+            """,
+            (session_id,),
+        )
+
+        assert second.version == 2
+        assert replayed == second
+        assert updated is not None
+        assert updated.runtime_generation == first_generation + 1
+        assert updated.owner_fence_token == first_fence
+        assert updated.session_config_state == "synced"
+        assert updated.desired_session_config_hash == second.config_hash
+        assert updated.runtime_session_config_hash == second.config_hash
+        assert bridge.resume_calls == 1
+        assert runtime.state == RuntimeState.READY
+        assert generations["count"] == 2
+        assert dict(reload_claim) == {
+            "config_hash": second.config_hash,
+            "state": "confirmed",
+            "config_version": second.version,
+        }
+        assert bridge.resume_kwargs["session_options"]["disabled_skills"] == ["disabled-test"]
+        assert [dict(row) for row in hook_rows] == [{"hook_name": "pre_tool_use", "phase": "pre"}]
+        assert [dict(row) for row in permission_rows] == [
+            {"permission_kind": "shell", "decision": "approve-once"}
+        ]
+        await runtime.close(idempotency_key="close-extension")
+
+
+@pytest.mark.parametrize("persist_pending_event", [False, True])
+@pytest.mark.asyncio
+async def test_config_reload_reconciles_crash_around_pending_event(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    persist_pending_event: bool,
+) -> None:
+    home = tmp_path / "home"
+    home.mkdir()
+    session_id = str(uuid4())
+    async with Database(tmp_path / f"reload-crash-{persist_pending_event}.sqlite3") as database:
+        projects = ProjectRegistry(database, resolved_home=home)
+        await projects.initialize()
+        project = await projects.resolve("channel-reload-crash")
+        configs = ExtensionConfigRepository(database)
+        first = await configs.publish(project, ProjectExtensionConfig())
+        bindings = SessionBindingRepository(database)
+        binding = await bindings.create(
+            thread_id="thread-reload-crash",
+            sdk_session_id=session_id,
+            cwd_snapshot=home,
+            project_source=project.source.value,
+            desired_session_config_version=first.version,
+            desired_session_config_hash=first.config_hash,
+        )
+        bridge = FakeBridge(session_id)
+        runtime = SessionRuntime(
+            database=database,
+            bridge=bridge,
+            bindings=bindings,
+            owner_leases=OwnerLeaseStore(database),
+            owner_id="process-reload-crash",
+            binding=binding,
+            extension_configs=configs,
+        )
+        await runtime.attach_create()
+        assert runtime.inbox is not None
+        original_commit = runtime.inbox.commit_internal
+
+        async def crash_at_pending_event(
+            payload: Any,
+            *,
+            source: str = "internal",
+            internal_event_id: str | None = None,
+        ) -> None:
+            if payload.get("type") == "copilotd.config.pending":
+                if persist_pending_event:
+                    await original_commit(
+                        payload,
+                        source=source,
+                        internal_event_id=internal_event_id,
+                    )
+                raise RuntimeError("simulated process crash")
+            await original_commit(
+                payload,
+                source=source,
+                internal_event_id=internal_event_id,
+            )
+
+        monkeypatch.setattr(runtime.inbox, "commit_internal", crash_at_pending_event)
+        second_config = ProjectExtensionConfig(disabled_skills=("after-crash",))
+        with pytest.raises(RuntimeError, match="simulated process crash"):
+            await runtime.reload_extension_config(
+                idempotency_key="reload-crash",
+                config=second_config,
+                expected_project_config_version=1,
+            )
+        pending = await bindings.by_thread(binding.thread_id)
+        claim = await database.fetchone("SELECT state, config_version FROM config_reload_claims")
+        generations_before = await database.fetchone(
+            "SELECT COUNT(*) AS count FROM project_extension_config_generations"
+        )
+        assert pending is not None
+        assert pending.pending_session_config_version == 2
+        assert dict(claim) == {"state": "started", "config_version": 2}
+        assert generations_before["count"] == 2
+
+        monkeypatch.setattr(runtime.inbox, "commit_internal", original_commit)
+        recovered = await runtime.reload_extension_config(
+            idempotency_key="reload-crash",
+            config=second_config,
+        )
+        generations_after = await database.fetchone(
+            "SELECT COUNT(*) AS count FROM project_extension_config_generations"
+        )
+        settled = await database.fetchone("SELECT state FROM config_reload_claims")
+
+        assert recovered.version == 2
+        assert generations_after["count"] == 2
+        assert settled["state"] == "confirmed"
+        assert bridge.resume_calls == 1
+        await runtime.close(idempotency_key="close-reload-crash")
+
+
+@pytest.mark.asyncio
+async def test_config_reload_takeover_reconciles_crash_after_disconnect(
+    tmp_path: Path,
+) -> None:
+    home = tmp_path / "home"
+    home.mkdir()
+    session_id = str(uuid4())
+    async with Database(tmp_path / "reload-disconnect-crash.sqlite3") as database:
+        projects = ProjectRegistry(database, resolved_home=home)
+        await projects.initialize()
+        project = await projects.resolve("channel-reload-disconnect-crash")
+        configs = ExtensionConfigRepository(database)
+        first = await configs.publish(project, ProjectExtensionConfig())
+        bindings = SessionBindingRepository(database)
+        binding = await bindings.create(
+            thread_id="thread-reload-disconnect-crash",
+            sdk_session_id=session_id,
+            cwd_snapshot=home,
+            project_source=project.source.value,
+            desired_session_config_version=first.version,
+            desired_session_config_hash=first.config_hash,
+        )
+        leases = OwnerLeaseStore(database)
+        bridge = FakeBridge(session_id)
+        crashed = SessionRuntime(
+            database=database,
+            bridge=bridge,
+            bindings=bindings,
+            owner_leases=leases,
+            owner_id="process-before-crash",
+            binding=binding,
+            extension_configs=configs,
+        )
+        await crashed.attach_create()
+        second_config = ProjectExtensionConfig(disabled_skills=("takeover",))
+        transition_id = str(uuid5(NAMESPACE_URL, f"copilotd:{session_id}:config:reload-takeover"))
+        assert crashed._lease is not None
+        claim, second, created = await ConfigReloadClaimStore(database).claim_and_publish(
+            sdk_session_id=session_id,
+            idempotency_key="reload-takeover",
+            project=project,
+            config=second_config,
+            owner_id=crashed._lease.owner_id,
+            runtime_generation=crashed.binding.runtime_generation,
+            owner_fence_token=crashed._lease.fence_token,
+            transition_id=transition_id,
+            minimum_headroom_seconds=40,
+        )
+        assert created and claim.state.value == "started"
+        await bridge.handle.disconnect()
+        await crashed.shutdown()
+
+        takeover_binding = await bindings.by_thread(binding.thread_id)
+        assert takeover_binding is not None
+        resumed = SessionRuntime(
+            database=database,
+            bridge=bridge,
+            bindings=bindings,
+            owner_leases=leases,
+            owner_id="process-after-crash",
+            binding=takeover_binding,
+            extension_configs=configs,
+        )
+        await resumed.attach_resume()
+        replayed = await resumed.reload_extension_config(
+            idempotency_key="reload-takeover",
+            config=second_config,
+        )
+        settled = await database.fetchone("SELECT state, config_version FROM config_reload_claims")
+        generations = await database.fetchone(
+            "SELECT COUNT(*) AS count FROM project_extension_config_generations"
+        )
+
+        assert replayed == second
+        assert dict(settled) == {"state": "confirmed", "config_version": second.version}
+        assert generations["count"] == 2
+        assert resumed.binding.desired_session_config_hash == second.config_hash
+        assert resumed.binding.runtime_session_config_hash == second.config_hash
+        await resumed.close(idempotency_key="close-reload-takeover")
+
+
+@pytest.mark.asyncio
+async def test_elicitation_and_oauth_handlers_are_exactly_once_and_redacted(
+    tmp_path: Path,
+) -> None:
+    session_id = str(uuid4())
+    oauth_token = "disposable-oauth-token"
+
+    async def authorize(_request: Any) -> dict[str, Any]:
+        return {
+            "kind": "token",
+            "accessToken": oauth_token,
+            "tokenType": "Bearer",
+            "expiresIn": 60,
+        }
+
+    async with Database(tmp_path / "elicitation-oauth.sqlite3") as database:
+        bindings = SessionBindingRepository(database)
+        binding = await bindings.create(
+            thread_id="thread-elicitation",
+            sdk_session_id=session_id,
+            cwd_snapshot=tmp_path,
+            project_source="implicit-home",
+        )
+        bridge = FakeBridge(session_id)
+        runtime = SessionRuntime(
+            database=database,
+            bridge=bridge,
+            bindings=bindings,
+            owner_leases=OwnerLeaseStore(database),
+            owner_id="process-elicitation",
+            binding=binding,
+            oauth_authorizer=authorize,
+        )
+        await runtime.attach_create()
+
+        elicitation_task = asyncio.create_task(
+            bridge.create_kwargs["on_elicitation_request"](
+                {
+                    "session_id": session_id,
+                    "message": "Provide values",
+                    "mode": "form",
+                    "requestedSchema": {
+                        "type": "object",
+                        "additionalProperties": False,
+                        "properties": {
+                            "label": {"type": "string"},
+                            "enabled": {"type": "boolean"},
+                        },
+                        "required": ["label", "enabled"],
+                    },
+                }
+            )
+        )
+        interaction_id = await _wait_for_pending_interaction(
+            database,
+            kind="elicitation",
+        )
+        assert (
+            await runtime.respond_interaction(
+                interaction_id,
+                form_content={"label": "accepted", "enabled": True},
+            )
+            == "resolved"
+        )
+        assert (
+            await runtime.respond_interaction(
+                interaction_id,
+                form_content={"label": "duplicate", "enabled": False},
+            )
+            == "expired"
+        )
+        assert await elicitation_task == {
+            "action": "accept",
+            "content": {"label": "accepted", "enabled": True},
+        }
+
+        oauth_result = await bridge.create_kwargs["on_mcp_auth_request"](
+            {
+                "requestId": "oauth-request-1",
+                "serverName": "local-oauth",
+                "serverUrl": "http://127.0.0.1/mcp",
+                "reason": "initial",
+                "staticClientConfig": {
+                    "clientId": "client",
+                    "clientSecret": "must-not-persist",
+                },
+            },
+            {"sessionId": session_id},
+        )
+        oauth_row = await database.fetchone(
+            """
+            SELECT payload, response, state, sensitive_response
+            FROM pending_interactions
+            WHERE kind = 'mcp_oauth'
+            """
+        )
+
+        assert oauth_result["accessToken"] == oauth_token
+        assert oauth_row["state"] == "resolved"
+        assert oauth_row["sensitive_response"] == 1
+        assert oauth_token not in oauth_row["response"]
+        assert "must-not-persist" not in oauth_row["payload"]
+        assert "[redacted]" in oauth_row["payload"]
+        await runtime.close(idempotency_key="close-elicitation")
+
+
+@pytest.mark.asyncio
+async def test_lost_oauth_settlement_never_returns_uncommitted_token(
+    tmp_path: Path,
+) -> None:
+    session_id = str(uuid4())
+    async with Database(tmp_path / "oauth-lost-claim.sqlite3") as database:
+        bindings = SessionBindingRepository(database)
+        binding = await bindings.create(
+            thread_id="thread-oauth-lost-claim",
+            sdk_session_id=session_id,
+            cwd_snapshot=tmp_path,
+            project_source="implicit-home",
+        )
+        bridge = FakeBridge(session_id)
+        runtime = SessionRuntime(
+            database=database,
+            bridge=bridge,
+            bindings=bindings,
+            owner_leases=OwnerLeaseStore(database),
+            owner_id="process-oauth-lost-claim",
+            binding=binding,
+            interaction_timeout_seconds=5,
+        )
+        await runtime.attach_create()
+        handler_task = asyncio.create_task(
+            bridge.create_kwargs["on_mcp_auth_request"](
+                {
+                    "requestId": "oauth-lost-claim",
+                    "serverName": "oauth",
+                    "serverUrl": "http://127.0.0.1/mcp",
+                    "reason": "initial",
+                },
+                {"sessionId": session_id},
+            )
+        )
+        interaction_id = await _wait_for_pending_interaction(
+            database,
+            kind="mcp_oauth",
+        )
+        await database.execute(
+            """
+            UPDATE pending_interactions
+            SET state = 'resolved', response = NULL
+            WHERE interaction_id = ?
+            """,
+            (interaction_id,),
+        )
+        gateway = runtime._require_interaction_gateway()
+        claimed, settled = await gateway._settle(
+            interaction_id,
+            response={"kind": "token", "accessToken": "uncommitted-token"},
+            persisted_response={"kind": "token", "accessToken": "[redacted]"},
+            display_response="stale response",
+            state="resolved",
+        )
+
+        assert claimed is False
+        assert settled == {"kind": "cancelled"}
+        assert await handler_task == {"kind": "cancelled"}
+        await runtime.close(
+            idempotency_key="close-oauth-lost-claim",
+            force=True,
+        )
+
+
+@pytest.mark.asyncio
+async def test_generated_response_planes_claim_once_and_use_typed_rpcs(
+    tmp_path: Path,
+) -> None:
+    session_id = str(uuid4())
+    async with Database(tmp_path / "response-planes.sqlite3") as database:
+        bindings = SessionBindingRepository(database)
+        binding = await bindings.create(
+            thread_id="thread-response-planes",
+            sdk_session_id=session_id,
+            cwd_snapshot=tmp_path,
+            project_source="implicit-home",
+        )
+        bridge = FakeBridge(session_id)
+        runtime = SessionRuntime(
+            database=database,
+            bridge=bridge,
+            bindings=bindings,
+            owner_leases=OwnerLeaseStore(database),
+            owner_id="process-response-planes",
+            binding=binding,
+        )
+        await runtime.attach_create()
+        bridge.ingress(
+            _event(
+                SessionLimitsExhaustedRequestedData(
+                    max_ai_credits=1,
+                    request_id="limits-1",
+                    used_ai_credits=1,
+                ),
+                SessionEventType.SESSION_LIMITS_EXHAUSTED_REQUESTED,
+            )
+        )
+        bridge.ingress(
+            _event(
+                SamplingRequestedData(
+                    mcp_request_id=7,
+                    request_id="sampling-1",
+                    server_name="local",
+                ),
+                SessionEventType.SAMPLING_REQUESTED,
+            )
+        )
+        headers_event = _event(
+            McpHeadersRefreshRequiredData(
+                reason=McpHeadersRefreshRequiredReason.STARTUP,
+                request_id="headers-1",
+                server_name="remote",
+                server_url="https://mcp.example.test",
+            ),
+            SessionEventType.MCP_HEADERS_REFRESH_REQUIRED,
+        )
+        bridge.ingress(headers_event)
+        bridge.ingress(
+            _event(
+                McpHeadersRefreshRequiredData(
+                    reason=McpHeadersRefreshRequiredReason.STARTUP,
+                    request_id="headers-1",
+                    server_name="remote",
+                    server_url="https://mcp.example.test",
+                ),
+                SessionEventType.MCP_HEADERS_REFRESH_REQUIRED,
+            )
+        )
+        await _wait_for_protocol_responses(database, count=3)
+        rows = await database.fetchall(
+            """
+            SELECT request_id, response_state
+            FROM protocol_requests
+            WHERE response_plane = 'app_rpc'
+            ORDER BY request_id
+            """
+        )
+        attempts = await database.fetchall(
+            """
+            SELECT request_id, state
+            FROM protocol_response_attempts ORDER BY request_id
+            """
+        )
+
+        assert bridge.protocol_response_calls == [
+            ("session_limits", "limits-1", {"action": "cancel"}),
+            ("sampling", "sampling-1", None),
+            ("mcp_headers", "headers-1", None),
+        ]
+        assert [dict(row) for row in rows] == [
+            {"request_id": "headers-1", "response_state": "confirmed"},
+            {"request_id": "limits-1", "response_state": "confirmed"},
+            {"request_id": "sampling-1", "response_state": "confirmed"},
+        ]
+        assert [dict(row) for row in attempts] == [
+            {"request_id": "headers-1", "state": "confirmed"},
+            {"request_id": "limits-1", "state": "confirmed"},
+            {"request_id": "sampling-1", "state": "confirmed"},
+        ]
+        await runtime.close(idempotency_key="close-response-planes")
+
+
+@pytest.mark.asyncio
+async def test_usage_and_context_return_durable_stale_projection_on_live_failure(
+    tmp_path: Path,
+) -> None:
+    session_id = str(uuid4())
+    async with Database(tmp_path / "stale-projections.sqlite3") as database:
+        bindings = SessionBindingRepository(database)
+        binding = await bindings.create(
+            thread_id="thread-stale-projections",
+            sdk_session_id=session_id,
+            cwd_snapshot=tmp_path,
+            project_source="implicit-home",
+        )
+        bridge = FakeBridge(session_id)
+        runtime = SessionRuntime(
+            database=database,
+            bridge=bridge,
+            bindings=bindings,
+            owner_leases=OwnerLeaseStore(database),
+            owner_id="process-stale-projections",
+            binding=binding,
+        )
+        await runtime.attach_create()
+        assert await runtime.context_snapshot() == {"totalTokens": 10, "limit": 100}
+        assert await runtime.usage_snapshot() == {"totalUserRequests": 2}
+
+        bridge.context_error = ConnectionError("context transport lost")
+        bridge.usage_error = ConnectionError("usage transport lost")
+        stale_context = await runtime.context_snapshot()
+        stale_usage = await runtime.usage_snapshot()
+        context_row = await database.fetchone("SELECT stale, stale_reason FROM context_projections")
+        usage_row = await database.fetchone("SELECT stale, stale_reason FROM usage_projections")
+
+        assert stale_context is not None
+        assert stale_context["totalTokens"] == 10
+        assert stale_context["_stale"] is True
+        assert stale_usage["totalUserRequests"] == 2
+        assert stale_usage["_stale"] is True
+        assert dict(context_row) == {
+            "stale": 1,
+            "stale_reason": "ConnectionError",
+        }
+        assert dict(usage_row) == {
+            "stale": 1,
+            "stale_reason": "ConnectionError",
+        }
+        await runtime.close(idempotency_key="close-stale-projections")
+
+
+async def _wait_for_pending_interaction(
+    database: Database,
+    *,
+    kind: str,
+) -> str:
+    for _ in range(100):
+        row = await database.fetchone(
+            """
+            SELECT interaction_id FROM pending_interactions
+            WHERE kind = ? AND state = 'pending'
+            """,
+            (kind,),
+        )
+        if row is not None:
+            return str(row["interaction_id"])
+        await asyncio.sleep(0.01)
+    raise AssertionError(f"pending interaction was not created: {kind}")
+
+
+async def _wait_for_protocol_responses(database: Database, *, count: int) -> None:
+    for _ in range(200):
+        row = await database.fetchone(
+            """
+            SELECT COUNT(*) AS count FROM protocol_requests
+            WHERE response_state = 'confirmed'
+            """
+        )
+        if int(row["count"]) == count:
+            return
+        await asyncio.sleep(0.01)
+    raise AssertionError("protocol response planes did not settle")
 
 
 @pytest.mark.asyncio

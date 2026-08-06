@@ -114,7 +114,7 @@ async def test_schedule_queue_replacement_transfers_nonterminal_slot_atomically(
             INSERT INTO session_bindings(
                 thread_id, project_source, cwd_snapshot, sdk_session_id,
                 attachment_state, permission_posture, runtime_mode, runtime_agent,
-                runtime_session_config_version, runtime_generation,
+                runtime_project_config_version, runtime_generation,
                 owner_fence_token, created_at, updated_at
             ) VALUES ('thread-1', 'explicit', '/tmp', 'session-1', 'attached',
                       'verified_allow_all', 'interactive', 'default', 1, 1, 7, 0, 0)
@@ -264,7 +264,7 @@ async def test_shutdown_unknown_does_not_terminalize_unsent_schedule_queue(
             INSERT INTO session_bindings(
                 thread_id, project_source, cwd_snapshot, sdk_session_id,
                 attachment_state, permission_posture, runtime_mode, runtime_agent,
-                runtime_session_config_version, runtime_generation,
+                runtime_project_config_version, runtime_generation,
                 owner_fence_token, created_at, updated_at
             ) VALUES ('thread-1', 'explicit', '/tmp', 'session-1', 'attached',
                       'verified_allow_all', 'interactive', 'default', 1, 1, 7, 0, 0)
@@ -352,7 +352,7 @@ async def test_observed_user_event_prevents_dispatch_unknown_after_send_timeout(
             INSERT INTO session_bindings(
                 thread_id, project_source, cwd_snapshot, sdk_session_id,
                 attachment_state, permission_posture, runtime_mode, runtime_agent,
-                runtime_session_config_version, runtime_generation,
+                runtime_project_config_version, runtime_generation,
                 owner_fence_token, created_at, updated_at
             ) VALUES ('thread-1', 'explicit', '/tmp', 'session-1', 'attached',
                       'verified_allow_all', 'interactive', 'default', 1, 1, 7, 0, 0)
@@ -441,7 +441,7 @@ async def test_pre_send_readiness_loss_requeues_without_dispatch_unknown(
             INSERT INTO session_bindings(
                 thread_id, project_source, cwd_snapshot, sdk_session_id,
                 attachment_state, permission_posture, runtime_mode, runtime_agent,
-                runtime_session_config_version, runtime_generation,
+                runtime_project_config_version, runtime_generation,
                 owner_fence_token, created_at, updated_at
             ) VALUES ('thread-1', 'explicit', '/tmp', 'session-1', 'attached',
                       'verified_allow_all', 'interactive', 'default', 1, 1, 7, 0, 0)
