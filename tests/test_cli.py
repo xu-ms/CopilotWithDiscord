@@ -102,7 +102,7 @@ async def test_schema_dependent_service_command_applies_forward_operations_migra
     async with Database(settings.database_path) as database:
         await database.execute("DROP TABLE service_admission_fences")
         await database.execute("DROP TABLE service_restart_intents")
-        await database.execute("DELETE FROM schema_migrations WHERE version >= 40")
+        await database.execute("DELETE FROM schema_migrations WHERE version BETWEEN 40 AND 44")
     manager = ServiceManager(settings, platform="unsupported")
     args = argparse.Namespace(command="service", service_command="status")
 
@@ -135,7 +135,7 @@ async def test_force_restart_applies_operations_migrations_before_coordination(
     async with Database(settings.database_path) as database:
         await database.execute("DROP TABLE service_admission_fences")
         await database.execute("DROP TABLE service_restart_intents")
-        await database.execute("DELETE FROM schema_migrations WHERE version >= 40")
+        await database.execute("DELETE FROM schema_migrations WHERE version BETWEEN 40 AND 44")
     manager = ServiceManager(settings, platform="unsupported")
     observed = False
 

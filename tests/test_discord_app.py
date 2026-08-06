@@ -12,8 +12,8 @@ from discord.ext import commands
 from PIL import Image
 
 from copilotd.config import Settings
-from copilotd.core.bindings import SessionBindingRepository
-from copilotd.core.commands import UnknownInteractionError
+from copilotd.core.bindings import BindingIntent, SessionBindingRepository
+from copilotd.core.commands import CDConflictError, UnknownInteractionError
 from copilotd.core.task_registry import TaskFailure
 from copilotd.discord_app import (
     CopilotDiscordBot,
@@ -68,7 +68,11 @@ def test_discord_command_manifest_has_core_modes_and_no_deleted_roots(tmp_path: 
         "Pin message",
     } <= roots
     session = next(command for command in bot.tree.get_commands() if command.name == "session")
-    assert "compact" in {command.name for command in session.commands}
+    session_commands = {command.name: command for command in session.commands}
+    assert {"compact", "delete"} <= session_commands.keys()
+    assert "fork" not in session_commands
+    assert {parameter.name for parameter in session_commands["delete"].parameters} == {"session_id"}
+    assert not session_commands["delete"].parameters[0].required
     expected_actions = {
         "agent": {"current", "list"},
         "after": {"cancel", "list"},
@@ -158,6 +162,59 @@ def test_model_reasoning_summary_option_is_capability_injected(tmp_path: Path) -
     supported_set = supported_model.get_command("set")
     assert supported_set is not None
     assert "reasoning_summary" in {parameter.name for parameter in supported_set.parameters}
+
+
+@pytest.mark.asyncio
+async def test_session_delete_uses_thread_binding_before_optional_session_id(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FakeThread:
+        def __init__(self, thread_id: int) -> None:
+            self.id = thread_id
+
+    bot = CopilotDiscordBot(Settings(data_dir=tmp_path))
+    bot._register_application_commands()
+    session = bot.tree.get_command("session")
+    assert isinstance(session, discord.app_commands.Group)
+    command = session.get_command("delete")
+    assert command is not None
+    binding = SimpleNamespace(
+        thread_id="123",
+        sdk_session_id="stable-session-id",
+    )
+    bindings = SimpleNamespace(
+        by_thread=AsyncMock(return_value=binding),
+        by_session=AsyncMock(),
+    )
+    deletions = SimpleNamespace(delete=AsyncMock(return_value=BindingIntent.DELETED))
+    bot.bindings = bindings
+    bot.deletions = deletions
+    results: list[str] = []
+
+    async def run_command(
+        _interaction: object,
+        _name: str,
+        operation: object,
+    ) -> None:
+        results.append(await operation(SimpleNamespace()))
+
+    monkeypatch.setattr(discord, "Thread", FakeThread)
+    monkeypatch.setattr(bot, "_run_command", run_command)
+    interaction = SimpleNamespace(channel=FakeThread(123), id=456)
+
+    await command.callback(interaction, None)
+
+    bindings.by_thread.assert_awaited_once_with("123")
+    bindings.by_session.assert_not_awaited()
+    deletions.delete.assert_awaited_once_with(
+        binding,
+        idempotency_key="interaction:456",
+    )
+    assert results == ["Session permanently deleted."]
+
+    with pytest.raises(CDConflictError, match="cannot delete another"):
+        await command.callback(interaction, "different-session-id")
 
 
 def test_discord_registration_omits_commands_without_capability_evidence(

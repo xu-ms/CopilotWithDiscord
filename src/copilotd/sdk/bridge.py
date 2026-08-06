@@ -330,6 +330,14 @@ class CopilotBridge:
             hooks=None if hooks is None else dict(hooks),
         )
 
+    async def delete_session(self, session_id: str) -> None:
+        """Permanently delete one persisted SDK session by its stable ID."""
+        await self.client.delete_session(session_id)
+
+    async def session_exists(self, session_id: str) -> bool:
+        """Authoritatively reconcile whether a persisted SDK session still exists."""
+        return await self.client.get_session_metadata(session_id) is not None
+
     async def ensure_allow_all(self, session: CopilotSession) -> PermissionPosture:
         state = await session.rpc.permissions.get_allow_all(timeout=10)
         if not state.enabled or state.mode != PermissionsAllowAllMode.ON:
@@ -508,6 +516,9 @@ class CopilotBridge:
             "pendingItems": [item.to_dict() for item in pending.items],
             "steeringMessages": list(pending.steering_messages),
         }
+
+    async def clear_native_queue(self, session: CopilotSession) -> None:
+        await session.rpc.queue.clear(timeout=10)
 
     async def get_tasks(self, session: CopilotSession) -> list[dict[str, Any]]:
         await self.refresh_tasks(session)

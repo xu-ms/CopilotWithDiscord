@@ -39,7 +39,6 @@ _TRUSTED_LOCAL_IMAGE_SUFFIXES = {
 class RenderPlanner:
     _STREAM_TYPES: ClassVar[set[str]] = {
         "assistant.message_delta",
-        "assistant.streaming_delta",
     }
     _FINAL_TYPES: ClassVar[set[str]] = {
         "assistant.message",
@@ -72,6 +71,7 @@ class RenderPlanner:
     _STATUS_TYPES: ClassVar[set[str]] = {
         "abort",
         "assistant.intent",
+        "assistant.reasoning_delta",
         "assistant.reasoning",
         "assistant.turn_retry",
         "copilotd.permissions.reconciled",
@@ -95,6 +95,8 @@ class RenderPlanner:
         suppress_default_artifact: bool = False,
     ) -> list[RenderIntent]:
         if payload_override is not None and payload_override.get("suppress"):
+            return []
+        if event.raw_type == "assistant.streaming_delta":
             return []
         agent_scoped_content = event.agent_id is not None and event.raw_type in (
             self._STREAM_TYPES | {"assistant.message"}
@@ -141,11 +143,13 @@ class RenderPlanner:
             lane = "status"
             finalized = event.raw_type not in {
                 "assistant.intent",
+                "assistant.reasoning_delta",
                 "session.compaction_start",
             }
             coalesce_key = (
                 "intent"
-                if event.raw_type in {"assistant.intent", "assistant.reasoning"}
+                if event.raw_type
+                in {"assistant.intent", "assistant.reasoning_delta", "assistant.reasoning"}
                 else "compaction"
                 if event.raw_type.startswith("session.compaction_")
                 else "autopilot-objective"
@@ -687,7 +691,12 @@ class JournalReducer:
             return {
                 "type": event.raw_type,
                 "content": f"**{title}**\n{_bounded_text(detail, 1600)}",
-                "finalized": event.raw_type not in {"assistant.intent", "session.compaction_start"},
+                "finalized": event.raw_type
+                not in {
+                    "assistant.intent",
+                    "assistant.reasoning_delta",
+                    "session.compaction_start",
+                },
             }
         if _is_task_projection_event(event) or event.raw_type in RenderPlanner._TASK_VIEW_TYPES:
             rows = await connection.execute(
@@ -3010,6 +3019,87 @@ class JournalReducer:
                         event.generation,
                         event.fence_token,
                         now,
+                    ),
+                )
+        elif event.raw_type == "copilotd.force_teardown.unknown":
+            unknown = {str(item) for item in data.get("unknown", [])}
+            observed_at = float(data.get("observed_at", now))
+            if "tasks" in unknown:
+                await connection.execute(
+                    """
+                    UPDATE task_card_projections
+                    SET state = 'unknown', progress_summary = ?,
+                        last_progress_at = ?, revision = revision + 1
+                    WHERE sdk_session_id = ?
+                      AND state IN ('running', 'idle', 'unknown')
+                    """,
+                    (
+                        "Forced teardown could not prove task termination.",
+                        observed_at,
+                        event.sdk_session_id,
+                    ),
+                )
+            if "schedules" in unknown:
+                await connection.execute(
+                    """
+                    UPDATE runtime_schedules
+                    SET state = 'unknown', updated_at = ?
+                    WHERE sdk_session_id = ? AND state IN ('active', 'unknown')
+                    """,
+                    (observed_at, event.sdk_session_id),
+                )
+            if "native_queue" in unknown:
+                await connection.execute(
+                    """
+                    UPDATE session_bindings
+                    SET native_queue_count = NULL, native_steering_count = NULL,
+                        queue_observed_at = ?, updated_at = ?,
+                        row_version = row_version + 1
+                    WHERE sdk_session_id = ? AND runtime_generation = ?
+                      AND owner_fence_token = ?
+                    """,
+                    (
+                        observed_at,
+                        now,
+                        event.sdk_session_id,
+                        event.generation,
+                        event.fence_token,
+                    ),
+                )
+            if "activity" in unknown or "abort" in unknown:
+                await connection.execute(
+                    """
+                    UPDATE session_bindings
+                    SET runtime_processing = NULL, runtime_has_active_work = NULL,
+                        runtime_abortable = NULL, activity_observed_at = ?,
+                        updated_at = ?, row_version = row_version + 1
+                    WHERE sdk_session_id = ? AND runtime_generation = ?
+                      AND owner_fence_token = ?
+                    """,
+                    (
+                        observed_at,
+                        now,
+                        event.sdk_session_id,
+                        event.generation,
+                        event.fence_token,
+                    ),
+                )
+            if "remote" in unknown:
+                await connection.execute(
+                    """
+                    UPDATE session_bindings
+                    SET runtime_remote_mode = 'unknown', remote_steerable = NULL,
+                        remote_observed_at = ?, updated_at = ?,
+                        row_version = row_version + 1
+                    WHERE sdk_session_id = ? AND runtime_generation = ?
+                      AND owner_fence_token = ?
+                    """,
+                    (
+                        observed_at,
+                        now,
+                        event.sdk_session_id,
+                        event.generation,
+                        event.fence_token,
                     ),
                 )
         elif event.raw_type == "user.message":
@@ -7779,7 +7869,6 @@ def _is_task_projection_event(event: AdaptedEvent) -> bool:
             "assistant.message_start",
             "assistant.message_delta",
             "assistant.message",
-            "assistant.streaming_delta",
         }
     )
 
@@ -7948,6 +8037,10 @@ def _status_title(raw_type: str) -> tuple[str, str]:
     values = {
         "abort": ("Copilot aborted", "The active agent loop was aborted."),
         "assistant.intent": ("Copilot is working", "Copilot updated its current intent."),
+        "assistant.reasoning_delta": (
+            "Copilot is thinking",
+            "Copilot is reasoning; raw chain-of-thought is hidden.",
+        ),
         "assistant.reasoning": (
             "Reasoning complete",
             "Copilot completed internal reasoning; raw chain-of-thought is hidden.",
@@ -7999,6 +8092,8 @@ def _status_title(raw_type: str) -> tuple[str, str]:
 
 
 def _status_detail(raw_type: str, data: dict[str, Any], *, fallback: str) -> str:
+    if raw_type == "assistant.reasoning_delta":
+        return fallback
     if raw_type == "assistant.reasoning":
         if any(key in data for key in ("encryptedContent", "opaque", "chainOfThought")):
             return fallback

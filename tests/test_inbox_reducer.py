@@ -33,6 +33,7 @@ from copilotd.core.models import AdaptedEvent, InboxEnvelope
 from copilotd.core.reducer import (
     EventReducerWorker,
     JournalReducer,
+    RenderPlanner,
     _diff_render_payload,
 )
 from copilotd.discord_app import _discord_render_plan
@@ -630,6 +631,45 @@ async def test_reducer_materializes_nonempty_status_and_usage_payloads(
     assert "private chain of thought" not in payloads[2][1]["content"]
     assert payloads[3][0] == "status"
     assert "`modified` `src/copilotd/app.py`" in payloads[3][1]["content"]
+
+
+@pytest.mark.asyncio
+async def test_reasoning_delta_is_safe_status_and_streaming_delta_is_suppressed(
+    tmp_path: Path,
+) -> None:
+    planner = RenderPlanner()
+    reasoning = _adapted(
+        "assistant.reasoning_delta",
+        {"content": "private step-by-step chain"},
+        1,
+    )
+    streaming = _adapted(
+        "assistant.streaming_delta",
+        {"content": "transport-only bytes"},
+        2,
+    )
+
+    intents = planner.plan(reasoning)
+
+    assert len(intents) == 1
+    assert intents[0].lane == "status"
+    assert intents[0].coalesce_key == "intent"
+    assert not intents[0].finalized
+    assert planner.plan(streaming) == []
+
+    async with Database(tmp_path / "reasoning-render.sqlite3") as database:
+        assert await JournalReducer(database).persist([reasoning, streaming]) == 2
+        rows = await database.fetchall(
+            "SELECT lane, coalesce_key, payload FROM render_outbox ORDER BY logical_seq"
+        )
+
+    assert len(rows) == 1
+    payload = json.loads(rows[0]["payload"])
+    assert rows[0]["lane"] == "status"
+    assert rows[0]["coalesce_key"] == "intent"
+    assert "Copilot is thinking" in payload["content"]
+    assert "private step-by-step chain" not in payload["content"]
+    assert "transport-only bytes" not in payload["content"]
 
 
 @pytest.mark.asyncio

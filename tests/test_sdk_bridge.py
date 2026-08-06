@@ -226,6 +226,8 @@ class FakeClient:
         self.create_kwargs: dict[str, object] = {}
         self.resume_id: str | None = None
         self.resume_kwargs: dict[str, object] = {}
+        self.deleted_session_ids: list[str] = []
+        self.metadata: object | None = object()
 
     async def create_session(self, **kwargs: object) -> object:
         self.create_kwargs = kwargs
@@ -235,6 +237,27 @@ class FakeClient:
         self.resume_id = session_id
         self.resume_kwargs = kwargs
         return object()
+
+    async def delete_session(self, session_id: str) -> None:
+        self.deleted_session_ids.append(session_id)
+
+    async def get_session_metadata(self, session_id: str) -> object | None:
+        assert session_id == "session-stable-id"
+        return self.metadata
+
+
+@pytest.mark.asyncio
+async def test_bridge_deletes_and_reconciles_by_stable_session_id() -> None:
+    client = FakeClient()
+    bridge = object.__new__(CopilotBridge)
+    bridge._client = client
+
+    await bridge.delete_session("session-stable-id")
+    assert await bridge.session_exists("session-stable-id")
+    client.metadata = None
+    assert not await bridge.session_exists("session-stable-id")
+
+    assert client.deleted_session_ids == ["session-stable-id"]
 
 
 class HungStopClient:

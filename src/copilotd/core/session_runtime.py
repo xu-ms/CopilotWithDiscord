@@ -160,6 +160,10 @@ class RuntimeBridge(Protocol):
         session_options: Mapping[str, Any],
     ) -> SessionHandle: ...
 
+    async def delete_session(self, session_id: str) -> None: ...
+
+    async def session_exists(self, session_id: str) -> bool: ...
+
     async def ensure_allow_all(self, session: SessionHandle) -> Any: ...
 
     async def get_mode(self, session: SessionHandle) -> str: ...
@@ -205,6 +209,8 @@ class RuntimeBridge(Protocol):
     async def get_usage(self, session: SessionHandle) -> dict[str, Any]: ...
 
     async def get_readiness(self, session: SessionHandle) -> dict[str, Any]: ...
+
+    async def clear_native_queue(self, session: SessionHandle) -> None: ...
 
     async def get_tasks(self, session: SessionHandle) -> list[dict[str, Any]]: ...
 
@@ -343,6 +349,7 @@ class RuntimeState(StrEnum):
     FENCED = "fenced"
     CLOSING = "closing"
     CLOSED = "closed"
+    TERMINAL = "terminal"
 
 
 class SessionAttachUnknown(RuntimeError):
@@ -394,6 +401,7 @@ class SessionRuntime:
         attachment_resolver: AttachmentResolver | None = None,
         interaction_timeout_seconds: float = 24 * 60 * 60,
         sdk_operation_timeout_seconds: float = 30,
+        abort_evidence_timeout_seconds: float = 15,
         shutdown_timeout_seconds: float = 5,
         capabilities: CapabilityManifest | None = None,
         task_registry: TaskRegistry | None = None,
@@ -416,6 +424,7 @@ class SessionRuntime:
         self._attachment_resolver = attachment_resolver
         self._interaction_timeout_seconds = interaction_timeout_seconds
         self._sdk_operation_timeout_seconds = sdk_operation_timeout_seconds
+        self._abort_evidence_timeout_seconds = abort_evidence_timeout_seconds
         self._shutdown_timeout_seconds = shutdown_timeout_seconds
         self._capabilities = capabilities
         self._send_frame_max_bytes = send_frame_max_bytes
@@ -469,10 +478,12 @@ class SessionRuntime:
         self._service_quiesce_violations = 0
         self._service_quiesce_violation_callback: Callable[[str], None] | None = None
         self._service_producers_stopped = False
+        self._handle_terminal = False
+        self._shutdown_finalize_task: asyncio.Task[None] | None = None
 
     @property
     def handle(self) -> SessionHandle | None:
-        return self._handle
+        return None if self._handle_terminal else self._handle
 
     @property
     def inbox(self) -> ReducerInbox | None:
@@ -2160,6 +2171,15 @@ class SessionRuntime:
             if raw_event_id is not None
             else f"missing-sdk-id:{self.binding.runtime_generation}:{time.time_ns()}"
         )
+        if raw_type == "session.shutdown":
+            self._handle_terminal = True
+            self._accepting_sends = False
+            if self.state != RuntimeState.CLOSING:
+                self.state = RuntimeState.TERMINAL
+            if loop is not None and (
+                self._shutdown_finalize_task is None or self._shutdown_finalize_task.done()
+            ):
+                loop.call_soon_threadsafe(self._schedule_shutdown_finalization)
         topics: set[str] = set()
         if raw_type == "session.background_tasks_changed":
             topics.update({"activity", "queue", "tasks"})
@@ -2232,6 +2252,47 @@ class SessionRuntime:
             and loop is not None
         ):
             loop.call_soon_threadsafe(self._schedule_protocol_response, event)
+
+    def _schedule_shutdown_finalization(self) -> None:
+        if self.state == RuntimeState.CLOSING:
+            return
+        self._shutdown_finalize_task = self._tasks.create(
+            self._finalize_handle_shutdown(),
+            name=f"session-shutdown:{self.binding.sdk_session_id}",
+            source="session-shutdown",
+            session_id=self.binding.sdk_session_id,
+            runtime_generation=self.binding.runtime_generation,
+        )
+
+    async def _finalize_handle_shutdown(self) -> None:
+        async with self._lifecycle_lock:
+            inbox = self._inbox
+            if inbox is not None:
+                await inbox.join()
+            current = await self._bindings.by_thread(self.binding.thread_id)
+            if current is None:
+                await self._stop_components(release_owner=True)
+                return
+            if self._inbox is not None and self._reducer is not None:
+                await self._force_active_unknown()
+                await self._inbox.join()
+            current = await self._bindings.by_thread(self.binding.thread_id)
+            if (
+                current is not None
+                and current.runtime_generation == self.binding.runtime_generation
+                and current.owner_fence_token == self.binding.owner_fence_token
+                and current.attachment_state
+                in {
+                    AttachmentState.CREATING,
+                    AttachmentState.RESUMING,
+                    AttachmentState.ATTACHED,
+                    AttachmentState.DISCONNECTING,
+                    AttachmentState.TERMINAL,
+                }
+            ):
+                self.binding = await self._bindings.mark_recovery_unknown(current)
+            await self._stop_components(release_owner=True)
+            self.state = RuntimeState.RECOVERY_UNKNOWN
 
     def _schedule_protocol_response(self, event: Any) -> None:
         if self._handle is None:
@@ -4979,6 +5040,45 @@ class SessionRuntime:
 
     async def abort(self, *, idempotency_key: str) -> None:
         await self._assert_owned_handle()
+        operation_key = f"abort:{idempotency_key}"
+        existing = await self._database.fetchone(
+            """
+            SELECT state FROM session_operations
+            WHERE sdk_session_id = ? AND idempotency_key = ? AND kind = 'abort'
+            """,
+            (self.binding.sdk_session_id, operation_key),
+        )
+        candidate = await self._database.fetchone(
+            """
+            SELECT submission_id, state, abort_event_id FROM submissions
+            WHERE sdk_session_id = ?
+              AND state IN (
+                'submitted', 'observed_active', 'continuation_expected',
+                'observed_aborted'
+              )
+            ORDER BY COALESCE(observed_at, created_at) DESC, created_at DESC
+            LIMIT 1
+            """,
+            (self.binding.sdk_session_id,),
+        )
+        if existing is None:
+            snapshot = await self._refresh_readiness()
+            if snapshot is None or not bool(snapshot.get("abortable")):
+                raise SessionNotReady("fresh runtime activity does not report abortable work")
+            if not bool(snapshot.get("processing") or snapshot.get("hasActiveWork")):
+                raise SessionNotReady("fresh runtime activity does not report current work")
+            if candidate is None or str(candidate["state"]) == "observed_aborted":
+                raise SessionNotReady("no current submission correlates with the abortable work")
+        if candidate is None:
+            raise SessionNotReady("abort evidence has no correlated submission")
+        submission_id = str(candidate["submission_id"])
+        if (
+            existing is not None
+            and existing["state"] == "confirmed"
+            and candidate["abort_event_id"] is not None
+            and candidate["state"] == "observed_aborted"
+        ):
+            return
         await self.cancel_pending_interactions(reason="Cancelled by session abort.")
         mailbox = self._require_mailbox()
 
@@ -4988,10 +5088,32 @@ class SessionRuntime:
 
         await mailbox.submit(
             kind="abort",
-            idempotency_key=f"abort:{idempotency_key}",
-            input_payload={},
+            idempotency_key=operation_key,
+            input_payload={"submission_id": submission_id},
             operation=dispatch,
         )
+        deadline = asyncio.get_running_loop().time() + self._abort_evidence_timeout_seconds
+        while True:
+            evidence = await self._database.fetchone(
+                """
+                SELECT state, abort_event_id FROM submissions
+                WHERE submission_id = ? AND sdk_session_id = ?
+                """,
+                (submission_id, self.binding.sdk_session_id),
+            )
+            if (
+                evidence is not None
+                and evidence["abort_event_id"] is not None
+                and evidence["state"] == "observed_aborted"
+            ):
+                return
+            remaining = deadline - asyncio.get_running_loop().time()
+            if remaining <= 0:
+                raise OperationAmbiguous(
+                    "abort RPC returned but correlated abort + idle(aborted=true) "
+                    "evidence was not observed"
+                )
+            await asyncio.sleep(min(0.05, remaining))
 
     async def close(
         self,
@@ -5021,15 +5143,8 @@ class SessionRuntime:
                     self._accepting_sends = True
                 mailbox.thaw()
                 raise DetachBlocked(blockers)
-            if force and blockers:
-                await self.clear_queue()
-                await self.cancel_pending_interactions(reason="Cancelled by forced session close.")
-                if self._inbox is not None and self._reducer is not None:
-                    await self._force_active_unknown()
-                try:
-                    await self.abort(idempotency_key=f"{idempotency_key}:force")
-                except (OperationAmbiguous, OperationRejected):
-                    pass
+            if force:
+                await self._force_close_teardown(idempotency_key=idempotency_key)
             if force:
                 await mailbox.freeze_and_drain()
 
@@ -5064,6 +5179,228 @@ class SessionRuntime:
                     )
                 await self._stop_components(release_owner=True)
                 self.state = RuntimeState.CLOSED if succeeded else RuntimeState.RECOVERY_UNKNOWN
+
+    async def _force_close_teardown(self, *, idempotency_key: str) -> None:
+        unknown: set[str] = set()
+        await self.clear_queue()
+        await self.cancel_pending_interactions(reason="Cancelled by forced session close.")
+        try:
+            async with asyncio.timeout(15):
+                readiness: dict[str, Any] | None = None
+                try:
+                    readiness = await self._refresh_readiness()
+                except Exception:
+                    unknown.update({"activity", "native_queue"})
+
+                if readiness is not None and bool(readiness.get("abortable")):
+                    try:
+                        await self.abort(idempotency_key=f"{idempotency_key}:force")
+                    except (OperationAmbiguous, OperationRejected, SessionNotReady):
+                        unknown.add("abort")
+
+                if self._supports_capability("native_queue_snapshot") and hasattr(
+                    self._bridge,
+                    "clear_native_queue",
+                ):
+                    try:
+                        await self._force_mailbox_call(
+                            kind="force-native-queue-clear",
+                            idempotency_key=f"force-native-queue:{idempotency_key}",
+                            input_payload={},
+                            operation=lambda: self._sdk_call(
+                                self._bridge.clear_native_queue(self._require_handle())
+                            ),
+                        )
+                        queue = await self._refresh_readiness()
+                        if (
+                            queue is None
+                            or queue.get("pendingItems")
+                            or queue.get("steeringMessages")
+                        ):
+                            unknown.add("native_queue")
+                    except Exception:
+                        unknown.add("native_queue")
+                else:
+                    unknown.add("native_queue")
+
+                if self._supports_capability("tasks_list") and self._supports_capability(
+                    "tasks_cancel"
+                ):
+                    try:
+                        tasks = await self._sdk_call(self._bridge.get_tasks(self._require_handle()))
+                    except Exception:
+                        unknown.add("tasks")
+                    else:
+                        for task in tasks:
+                            state = str(task.get("status", "")).lower()
+                            if state in TERMINAL_TASK_STATES:
+                                continue
+                            task_id = task.get("id")
+                            if task_id is None:
+                                unknown.add("tasks")
+                                continue
+                            try:
+                                cancelled = await self._force_mailbox_call(
+                                    kind="force-task-cancel",
+                                    idempotency_key=(f"force-task:{idempotency_key}:{task_id}"),
+                                    input_payload={"task_id": str(task_id)},
+                                    operation=lambda task_id=str(task_id): self._sdk_call(
+                                        self._bridge.cancel_task(
+                                            self._require_handle(),
+                                            task_id,
+                                        )
+                                    ),
+                                )
+                                if not cancelled:
+                                    unknown.add("tasks")
+                            except Exception:
+                                unknown.add("tasks")
+                        try:
+                            remaining = await self._sdk_call(
+                                self._bridge.get_tasks(self._require_handle())
+                            )
+                            if any(
+                                str(task.get("status", "")).lower() not in TERMINAL_TASK_STATES
+                                for task in remaining
+                            ):
+                                unknown.add("tasks")
+                            await self._require_inbox().commit_internal(
+                                {
+                                    "type": "copilotd.tasks.snapshot",
+                                    "data": {
+                                        "tasks": remaining,
+                                        "observed_at": time.time(),
+                                    },
+                                },
+                                source="snapshot",
+                                internal_event_id=(f"force-close:{idempotency_key}:tasks:snapshot"),
+                            )
+                        except Exception:
+                            unknown.add("tasks")
+                else:
+                    unknown.add("tasks")
+
+                if self._supports_capability("schedules_list") and self._supports_capability(
+                    "schedules_stop"
+                ):
+                    try:
+                        schedules = await self._sdk_call(
+                            self._bridge.get_native_schedules(self._require_handle())
+                        )
+                    except Exception:
+                        unknown.add("schedules")
+                    else:
+                        for schedule in schedules:
+                            schedule_id = schedule.get("id")
+                            if schedule_id is None:
+                                unknown.add("schedules")
+                                continue
+                            try:
+                                stopped = await self._force_mailbox_call(
+                                    kind="force-schedule-stop",
+                                    idempotency_key=(
+                                        f"force-schedule:{idempotency_key}:{schedule_id}"
+                                    ),
+                                    input_payload={"schedule_id": int(schedule_id)},
+                                    operation=lambda schedule_id=int(schedule_id): self._sdk_call(
+                                        self._bridge.stop_native_schedule(
+                                            self._require_handle(),
+                                            schedule_id,
+                                        )
+                                    ),
+                                )
+                                if stopped is None:
+                                    unknown.add("schedules")
+                            except Exception:
+                                unknown.add("schedules")
+                        try:
+                            remaining_schedules = await self._sdk_call(
+                                self._bridge.get_native_schedules(self._require_handle())
+                            )
+                            if remaining_schedules:
+                                unknown.add("schedules")
+                            await self._query_snapshot_topic("schedules")
+                        except Exception:
+                            unknown.add("schedules")
+                else:
+                    unknown.add("schedules")
+
+                if self._supports_capability("remote_disable"):
+                    try:
+                        await self._force_mailbox_call(
+                            kind="force-remote-disable",
+                            idempotency_key=f"force-remote:{idempotency_key}",
+                            input_payload={"target": "off"},
+                            operation=lambda: self._sdk_call(
+                                self._bridge.disable_remote(self._require_handle())
+                            ),
+                        )
+                        snapshot = await self._sdk_call(
+                            self._bridge.get_remote_state(self._require_handle())
+                        )
+                        await self._require_inbox().commit_internal(
+                            {
+                                "type": "copilotd.remote.observed",
+                                "data": {
+                                    "mode": "off",
+                                    "steerable": False,
+                                    "snapshot": snapshot,
+                                    "clear_pending": True,
+                                    "observed_at": time.time(),
+                                },
+                            },
+                            internal_event_id=(f"force-close:{idempotency_key}:remote:off"),
+                        )
+                    except Exception:
+                        unknown.add("remote")
+                else:
+                    unknown.add("remote")
+        except TimeoutError:
+            unknown.update(
+                {
+                    "activity",
+                    "abort",
+                    "native_queue",
+                    "tasks",
+                    "schedules",
+                    "remote",
+                }
+            )
+
+        if self._inbox is not None and self._reducer is not None:
+            if unknown:
+                await self._require_inbox().commit_internal(
+                    {
+                        "type": "copilotd.force_teardown.unknown",
+                        "data": {
+                            "unknown": sorted(unknown),
+                            "observed_at": time.time(),
+                        },
+                    },
+                    internal_event_id=(
+                        f"force-close:{self._native_id('teardown', idempotency_key)}:unknown"
+                    ),
+                )
+            await self._force_active_unknown()
+            await self._require_inbox().join()
+
+    async def _force_mailbox_call(
+        self,
+        *,
+        kind: str,
+        idempotency_key: str,
+        input_payload: dict[str, Any],
+        operation: Callable[[], Awaitable[Any]],
+    ) -> Any:
+        return await self._require_mailbox().submit(
+            kind=kind,
+            idempotency_key=idempotency_key,
+            input_payload=input_payload,
+            operation=operation,
+        )
+
+    def _supports_capability(self, capability: str) -> bool:
+        return self._capabilities is None or self._capabilities.supports(capability)
 
     async def detach_blockers(self) -> list[str]:
         refresh_error: Exception | None = None
@@ -5514,6 +5851,7 @@ class SessionRuntime:
                 ) from error
 
             self._handle = handle
+            self._handle_terminal = False
             self._flush_deferred_protocol_responses()
             try:
                 await self._recover_event_log(handle, initialize=create)
@@ -6673,6 +7011,7 @@ class SessionRuntime:
         self._permission_handler = None
         self._loop = None
         self._handle = None
+        self._handle_terminal = True
         self._deferred_protocol_events = []
         lease = self._lease
         if release_owner:
@@ -6690,7 +7029,7 @@ class SessionRuntime:
             raise ExceptionGroup("session component shutdown failed", errors)
 
     def _require_handle(self) -> SessionHandle:
-        if self._handle is None:
+        if self._handle is None or self._handle_terminal:
             raise SessionNotReady("session handle is not attached")
         return self._handle
 

@@ -376,7 +376,13 @@ class SessionRegistry:
         self._transition_cleanup_tasks: set[asyncio.Task[None]] = set()
 
     def for_thread(self, thread_id: str) -> SessionRuntime | None:
-        return self._runtimes.get(thread_id)
+        runtime = self._runtimes.get(thread_id)
+        if runtime is not None and (
+            getattr(runtime, "state", None) == RuntimeState.TERMINAL
+            or getattr(runtime, "_handle_terminal", False)
+        ):
+            return None
+        return runtime
 
     def register(self, runtime: SessionRuntime) -> None:
         if not self._accepting:
@@ -418,6 +424,17 @@ class SessionRegistry:
                 runtime = self._runtime_factory(binding)
                 self._register_admitted(runtime)
                 return runtime
+
+    async def retire(self, thread_id: str) -> None:
+        """Remove a terminal runtime so a deleted binding can never be reused."""
+        async with self._mutation_lock:
+            runtime = self._runtimes.pop(thread_id, None)
+        if runtime is not None and runtime.state not in {
+            RuntimeState.CLOSED,
+            RuntimeState.RECOVERY_UNKNOWN,
+            RuntimeState.TERMINAL,
+        }:
+            await runtime.shutdown()
 
     async def ensure_attached(
         self,
@@ -540,6 +557,7 @@ class SessionRegistry:
                 RuntimeState.CLOSED,
                 RuntimeState.FENCED,
                 RuntimeState.RECOVERY_UNKNOWN,
+                RuntimeState.TERMINAL,
             }:
                 runtime = await self.replace(binding)
             if runtime.state == RuntimeState.DETACHED:

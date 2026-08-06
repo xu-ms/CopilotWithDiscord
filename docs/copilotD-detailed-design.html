@@ -5327,14 +5327,15 @@ model、<code>/mode</code>、<code>/goal</code>、<code>/bare</code>、<code>/to
 unknown</td>
 </tr>
 <tr>
-<td>42 个唯一版本 SQLite migration：Foundation
+<td>43 个唯一版本 SQLite migration：Foundation
 <code>0001</code>–<code>0009</code>、Native RPC
 <code>0010</code>–<code>0014</code>、Protocol
 <code>0015</code>–<code>0019</code>、Scheduler
 <code>0020</code>–<code>0028</code>、Protocol compatibility
 <code>0029</code>、Discord surface <code>0030</code>–<code>0037</code>、保留
 <code>0038</code>–<code>0039</code>、Operations forward migrations
-<code>0040</code>–<code>0044</code>；project
+<code>0040</code>–<code>0044</code>、session deletion cleanup
+<code>0045</code>；project
 <code>$HOME</code>
 fallback/cwd snapshot、owner fence、creation saga、strict-UUID event
 journal、reducer-owned operation/submission/native-command
@@ -5366,9 +5367,9 @@ ambiguity 不自动重放</td>
 </tr>
 <tr>
 <td>Discord core 命令；strict dynamic builtin manifest；Native-Gated
-<code>/ask</code>、<code>/session compact</code>、<code>/fleet</code>、<code>/tasks</code>、<code>/agent list|current</code>、<code>/after|every list|cancel</code>、<code>/remote status|off</code>、<code>/review</code>、<code>/security-review</code>、<code>/research</code>、<code>/rubber-duck</code>；全部
-action 由 exact capability 决定</td>
-<td><code>/session delete|fork</code> 按本次范围不实现；<code>/after|every create</code>
+<code>/ask</code>、<code>/session compact</code>、<code>/fleet</code>、<code>/tasks</code>、<code>/agent list|current</code>、<code>/after|every list|cancel</code>、<code>/remote status|off</code>、<code>/review</code>、<code>/security-review</code>、<code>/research</code>、<code>/rubber-duck</code>；thread-first
+<code>/session delete session-id?</code>；全部 action 由 exact capability 决定</td>
+<td>current-runtime fork 仍 capability-gated 且不注册；<code>/after|every create</code>
 因 real invoke 返回 <code>text</code> 而非 required <code>completed</code>
 不注册；agent select/deselect、task promote、remote on/export 的 real gate
 未通过；elicitation/MCP OAuth 仍待接入</td>
@@ -5384,11 +5385,24 @@ retry-after 仍需真实 gateway fixture</td>
 <tr>
 <td>tool/subagent/agent-scoped output 归并为原 thread 的单条 TaskDeck；4
 秒 cadence、pending coalescing、terminal
-flush、select/expand/collapse/prev/next；typed task
+flush、select/expand/collapse/prev/next；<code>assistant.reasoning_delta</code>
+仅进入 coalesced thinking status、final reasoning 仅显示 configured concise
+summary、<code>assistant.streaming_delta</code> 不进入 Discord UI；typed task
 list/show/progress/message/cancel-all/remove/wait 与 Fleet
 projection；&gt;=8000 字符 tool result/error 逐字附件化；零 child-thread 路径</td>
 <td>real current-promotable fixture 未通过，promote action
-不注册；完整 reasoning summary/diff artifact lane 尚未实现</td>
+不注册；完整 diff artifact lane 尚未实现</td>
+</tr>
+<tr>
+<td>durable <code>DELETING → DELETE_UNKNOWN/DELETED</code> permanent-delete
+saga；stable SDK <code>delete_session(session_id)</code> + metadata not-found
+reconcile；non-deleted app schedule reference fail-closed；active target force
+teardown、15 秒 bounded native task/schedule/queue/remote cleanup、unprovable result
+unknown；confirmed delete 后才清 attachment/worktree metadata；abort 等 correlated
+abort + aborted-idle；unexpected <code>session.shutdown</code> terminalizes current
+handle and enters recovery</td>
+<td>SDK response loss 仍需显式 retry，同一 mapping/session ID 保留；缺失 native
+capability 明确记录 unknown；只有 explicit close 可完成 CLOSED</td>
 </tr>
 <tr>
 <td>共享 TaskRegistry、failure consumer、10 分钟 active-execution SUSPECT +

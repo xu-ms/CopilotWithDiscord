@@ -583,6 +583,7 @@ class SessionBindingRepository:
                 AttachmentState.RESUMING,
                 AttachmentState.ATTACHED,
                 AttachmentState.DISCONNECTING,
+                AttachmentState.TERMINAL,
             ),
         )
 

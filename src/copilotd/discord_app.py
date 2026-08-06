@@ -71,6 +71,11 @@ from copilotd.core.projects import ProjectRegistry, ProjectSnapshot, ProjectSour
 from copilotd.core.recovery import RecoveryInventoryReport, StartupRecoveryInventory
 from copilotd.core.scheduler import SchedulerRepository, SchedulerWorker
 from copilotd.core.scheduler_adapter import ApplicationSchedulerAdapter
+from copilotd.core.session_deletion import (
+    SessionDeletionBlocked,
+    SessionDeletionService,
+    SessionDeletionUnknown,
+)
 from copilotd.core.session_runtime import (
     DetachBlocked,
     SessionNotReady,
@@ -189,6 +194,7 @@ class CopilotDiscordBot(commands.Bot):
         self.extension_configs: ExtensionConfigRepository | None = None
         self.extension_config_source = ExtensionConfigFileSource()
         self.sessions: SessionRegistry | None = None
+        self.deletions: SessionDeletionService | None = None
         self.creation: SessionCreationService | None = None
         self.dispatcher: RenderOutboxDispatcher | None = None
         self.scheduler_repository: SchedulerRepository | None = None
@@ -300,6 +306,13 @@ class CopilotDiscordBot(commands.Bot):
             )
 
         self.sessions = SessionRegistry(self.bindings, runtime_factory)
+        self.deletions = SessionDeletionService(
+            self.database,
+            self.bindings,
+            self.sessions,
+            self.bridge,
+            data_dir=self.settings.data_dir,
+        )
         self.creation = SessionCreationService(
             projects=self.projects,
             intents=CreationIntentRepository(self.database),
@@ -1936,6 +1949,34 @@ class CopilotDiscordBot(commands.Bot):
 
             await self._run_command(interaction, "session close", operation)
 
+        @session.command(name="delete", description="Permanently delete a Copilot session")
+        async def session_delete(
+            interaction: discord.Interaction,
+            session_id: str | None = None,
+        ) -> None:
+            async def operation(_: CommandInvocation) -> str:
+                if isinstance(interaction.channel, discord.Thread):
+                    binding = await self._require_bindings().by_thread(str(interaction.channel.id))
+                    if binding is None:
+                        raise CDSessionNotFoundError(
+                            "this thread is not bound to a Copilot session"
+                        )
+                    if session_id is not None and session_id != binding.sdk_session_id:
+                        raise CDConflictError("this thread cannot delete another Copilot session")
+                else:
+                    if session_id is None:
+                        raise CDInputError("session_id is required outside a session thread")
+                    binding = await self._require_bindings().by_session(session_id)
+                    if binding is None:
+                        raise CDSessionNotFoundError("the requested copilotD session is unknown")
+                await self._require_deletions().delete(
+                    binding,
+                    idempotency_key=f"interaction:{interaction.id}",
+                )
+                return "Session permanently deleted."
+
+            await self._run_command(interaction, "session delete", operation)
+
         @session.command(name="resume", description="Resume this thread's original session")
         async def session_resume(
             interaction: discord.Interaction,
@@ -3320,6 +3361,11 @@ class CopilotDiscordBot(commands.Bot):
             raise RuntimeError("session bindings are not initialized")
         return self.bindings
 
+    def _require_deletions(self) -> SessionDeletionService:
+        if self.deletions is None:
+            raise RuntimeError("session deletion service is not initialized")
+        return self.deletions
+
     def _require_sessions(self) -> SessionRegistry:
         if self.sessions is None:
             raise RuntimeError("session registry is not initialized")
@@ -4517,7 +4563,10 @@ def _is_unknown_interaction(error: discord.HTTPException) -> bool:
 def _map_command_error(error: BaseException) -> CDCommandError:
     if isinstance(error, CDCommandError):
         return error
-    if isinstance(error, DetachBlocked | SessionNotReady):
+    if isinstance(
+        error,
+        DetachBlocked | SessionDeletionBlocked | SessionDeletionUnknown | SessionNotReady,
+    ):
         return CDSessionStateError(str(error))
     if isinstance(error, SessionCreationUnknown):
         return CDResumeError(str(error))

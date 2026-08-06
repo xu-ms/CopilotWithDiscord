@@ -10,7 +10,7 @@ import pytest
 
 from copilotd.storage.database import Database
 
-EXPECTED_MIGRATION_VERSIONS = [*range(1, 38), *range(40, 45)]
+EXPECTED_MIGRATION_VERSIONS = [*range(1, 38), *range(40, 46)]
 
 
 def _create_migration_fixture(path: Path, *, through_version: int) -> None:
@@ -226,6 +226,7 @@ async def test_initial_migration_creates_full_schema(tmp_path: Path) -> None:
         foreign_keys = await database.fetchone("PRAGMA foreign_keys")
         journal_mode = await database.fetchone("PRAGMA journal_mode")
         agent_columns = await database.fetchall("PRAGMA table_info(agent_loop_projections)")
+        binding_columns = await database.fetchall("PRAGMA table_info(session_bindings)")
 
     assert {row["name"] for row in tables} == expected_tables
     assert dict(migration) == {"version": 1, "name": "0001_initial.sql"}
@@ -234,6 +235,11 @@ async def test_initial_migration_creates_full_schema(tmp_path: Path) -> None:
     assert foreign_keys[0] == 1
     assert journal_mode[0] == "wal"
     assert "source_event_id" in {row["name"] for row in agent_columns}
+    assert {
+        "delete_cleanup_state",
+        "delete_cleanup_error",
+        "deleted_at",
+    } <= {row["name"] for row in binding_columns}
 
 
 @pytest.mark.asyncio

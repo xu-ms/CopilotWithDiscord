@@ -2,7 +2,7 @@ import asyncio
 import json
 import time
 from dataclasses import replace
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -11,6 +11,8 @@ from uuid import NAMESPACE_URL, UUID, uuid4, uuid5
 import pytest
 from copilot.generated.session_events import SessionMode
 from copilot.session_events import (
+    AbortData,
+    AbortReason,
     AssistantMessageDeltaData,
     ManagedSettingsResolvedSource,
     McpHeadersRefreshRequiredData,
@@ -25,6 +27,9 @@ from copilot.session_events import (
     SessionManagedSettingsResolvedData,
     SessionModeChangedData,
     SessionPermissionsChangedData,
+    SessionShutdownData,
+    ShutdownCodeChanges,
+    ShutdownType,
     UserMessageData,
 )
 
@@ -375,6 +380,23 @@ def _message_delta() -> SessionEvent:
     return _event(
         AssistantMessageDeltaData(delta_content="early", message_id="message-early"),
         SessionEventType.ASSISTANT_MESSAGE_DELTA,
+    )
+
+
+def _shutdown_event(shutdown_type: ShutdownType = ShutdownType.ROUTINE) -> SessionEvent:
+    return _event(
+        SessionShutdownData(
+            code_changes=ShutdownCodeChanges(
+                files_modified=[],
+                lines_added=0,
+                lines_removed=0,
+            ),
+            model_metrics={},
+            session_start_time=0,
+            shutdown_type=shutdown_type,
+            total_api_duration=timedelta(),
+        ),
+        SessionEventType.SESSION_SHUTDOWN,
     )
 
 
@@ -2255,6 +2277,237 @@ async def test_graceful_shutdown_preserves_local_queued_submissions(
 
 
 @pytest.mark.asyncio
+async def test_unexpected_sdk_shutdown_terminalizes_handle_and_registry_runtime(
+    tmp_path: Path,
+) -> None:
+    session_id = str(uuid4())
+    async with Database(tmp_path / "sdk-shutdown-terminal.sqlite3") as database:
+        bindings = SessionBindingRepository(database)
+        binding = await bindings.create(
+            thread_id="thread-sdk-shutdown",
+            sdk_session_id=session_id,
+            cwd_snapshot=tmp_path,
+            project_source="implicit-home",
+        )
+        bridge = FakeBridge(session_id)
+
+        def runtime_factory(current_binding):
+            return SessionRuntime(
+                database=database,
+                bridge=bridge,
+                bindings=bindings,
+                owner_leases=OwnerLeaseStore(database),
+                owner_id="sdk-shutdown-owner",
+                binding=current_binding,
+            )
+
+        registry = SessionRegistry(bindings, runtime_factory)
+        runtime = runtime_factory(binding)
+        registry.register(runtime)
+        await runtime.attach_create()
+
+        bridge.ingress(_shutdown_event())
+
+        assert runtime.state == RuntimeState.TERMINAL
+        assert runtime.handle is None
+        assert registry.for_thread(binding.thread_id) is None
+        with pytest.raises(SessionNotReady):
+            await runtime.abort(idempotency_key="after-shutdown")
+
+        for _ in range(200):
+            current = await bindings.by_thread(binding.thread_id)
+            if (
+                runtime.state == RuntimeState.RECOVERY_UNKNOWN
+                and current is not None
+                and current.attachment_state == AttachmentState.RECOVERY_UNKNOWN
+            ):
+                break
+            await asyncio.sleep(0.005)
+
+        assert current is not None
+        assert current.binding_intent == BindingIntent.ACTIVE
+        assert current.attachment_state == AttachmentState.RECOVERY_UNKNOWN
+        assert runtime.state == RuntimeState.RECOVERY_UNKNOWN
+        assert runtime.handle is None
+        assert registry.for_thread(binding.thread_id) is None
+
+
+@pytest.mark.asyncio
+async def test_sdk_shutdown_during_explicit_close_finishes_closed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    session_id = str(uuid4())
+    async with Database(tmp_path / "sdk-shutdown-close.sqlite3") as database:
+        bindings = SessionBindingRepository(database)
+        binding = await bindings.create(
+            thread_id="thread-sdk-shutdown-close",
+            sdk_session_id=session_id,
+            cwd_snapshot=tmp_path,
+            project_source="implicit-home",
+        )
+        bridge = FakeBridge(session_id)
+        runtime = SessionRuntime(
+            database=database,
+            bridge=bridge,
+            bindings=bindings,
+            owner_leases=OwnerLeaseStore(database),
+            owner_id="sdk-shutdown-close-owner",
+            binding=binding,
+        )
+        await runtime.attach_create()
+        original_disconnect = bridge.handle.disconnect
+
+        async def disconnect_with_shutdown() -> None:
+            bridge.ingress(_shutdown_event())
+            await original_disconnect()
+
+        monkeypatch.setattr(bridge.handle, "disconnect", disconnect_with_shutdown)
+
+        await runtime.close(idempotency_key="explicit-close-with-shutdown")
+        current = await bindings.by_thread(binding.thread_id)
+
+        assert current is not None
+        assert current.binding_intent == BindingIntent.CLOSED
+        assert current.attachment_state == AttachmentState.ABSENT
+        assert runtime.state == RuntimeState.CLOSED
+        assert runtime.handle is None
+
+
+@pytest.mark.asyncio
+async def test_sdk_shutdown_preserves_scheduler_temporary_closed_intent(
+    tmp_path: Path,
+) -> None:
+    session_id = str(uuid4())
+    async with Database(tmp_path / "sdk-shutdown-scheduler.sqlite3") as database:
+        bindings = SessionBindingRepository(database)
+        await bindings.create(
+            thread_id="thread-sdk-shutdown-scheduler",
+            sdk_session_id=session_id,
+            cwd_snapshot=tmp_path,
+            project_source="implicit-home",
+        )
+        await database.execute(
+            """
+            UPDATE session_bindings
+            SET binding_intent = 'closed', attachment_reason = 'scheduler_run',
+                row_version = row_version + 1
+            WHERE sdk_session_id = ?
+            """,
+            (session_id,),
+        )
+        closed = await bindings.by_session(session_id)
+        assert closed is not None
+        bridge = FakeBridge(session_id)
+        runtime = SessionRuntime(
+            database=database,
+            bridge=bridge,
+            bindings=bindings,
+            owner_leases=OwnerLeaseStore(database),
+            owner_id="sdk-shutdown-scheduler-owner",
+            binding=closed,
+        )
+        await runtime.attach_resume()
+
+        bridge.ingress(_shutdown_event(ShutdownType.ERROR))
+        for _ in range(200):
+            current = await bindings.by_session(session_id)
+            if current is not None and current.attachment_state == AttachmentState.RECOVERY_UNKNOWN:
+                break
+            await asyncio.sleep(0.005)
+
+        assert current is not None
+        assert current.binding_intent == BindingIntent.CLOSED
+        assert current.attachment_state == AttachmentState.RECOVERY_UNKNOWN
+        assert current.attachment_reason == "scheduler_run"
+        assert runtime.handle is None
+
+
+@pytest.mark.asyncio
+async def test_abort_requires_fresh_work_and_waits_for_correlated_aborted_idle(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    session_id = str(uuid4())
+    async with Database(tmp_path / "abort-evidence.sqlite3") as database:
+        bindings = SessionBindingRepository(database)
+        binding = await bindings.create(
+            thread_id="thread-abort-evidence",
+            sdk_session_id=session_id,
+            cwd_snapshot=tmp_path,
+            project_source="implicit-home",
+        )
+        bridge = FakeBridge(session_id)
+        runtime = SessionRuntime(
+            database=database,
+            bridge=bridge,
+            bindings=bindings,
+            owner_leases=OwnerLeaseStore(database),
+            owner_id="abort-evidence-owner",
+            binding=binding,
+            abort_evidence_timeout_seconds=1,
+        )
+        await runtime.attach_create()
+
+        with pytest.raises(SessionNotReady, match="abortable work"):
+            await runtime.abort(idempotency_key="no-current-work")
+        assert bridge.handle.abort_calls == 0
+
+        message_id = await runtime.send(
+            "work to abort",
+            idempotency_key="work-to-abort",
+            mode="immediate",
+        )
+        bridge.ingress(
+            _event(
+                UserMessageData(content="work to abort"),
+                SessionEventType.USER_MESSAGE,
+                event_id=UUID(message_id),
+            )
+        )
+        assert runtime.inbox is not None
+        await runtime.inbox.join()
+        bridge.processing = True
+        original_abort = bridge.handle.abort
+
+        async def abort_with_evidence() -> None:
+            await original_abort()
+            bridge.ingress(
+                _event(
+                    AbortData(reason=AbortReason.USER_INITIATED),
+                    SessionEventType.ABORT,
+                )
+            )
+            bridge.ingress(
+                _event(
+                    SessionIdleData(aborted=True),
+                    SessionEventType.SESSION_IDLE,
+                )
+            )
+
+        monkeypatch.setattr(bridge.handle, "abort", abort_with_evidence)
+
+        await runtime.abort(idempotency_key="evidenced-abort")
+        await runtime.abort(idempotency_key="evidenced-abort")
+        submission = await database.fetchone(
+            """
+            SELECT state, abort_event_id, completion_basis
+            FROM submissions WHERE accepted_message_id = ?
+            """,
+            (message_id,),
+        )
+
+        assert submission["state"] == "observed_aborted"
+        assert submission["abort_event_id"] is not None
+        assert submission["completion_basis"] == "session_idle_aborted"
+        assert bridge.handle.abort_calls == 1
+        assert runtime.state == RuntimeState.READY
+        assert runtime.inbox is not None
+        bridge.processing = False
+        await runtime.close(idempotency_key="close-after-abort")
+
+
+@pytest.mark.asyncio
 async def test_forced_close_cancels_submission_before_atomic_dispatch_claim(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -2325,6 +2578,14 @@ async def test_forced_close_cancels_submission_before_atomic_dispatch_claim(
             await send_task
         await close_task
         assert bridge.handle.sent == []
+        teardown = await database.fetchone(
+            """
+            SELECT raw_payload FROM event_journal
+            WHERE raw_type = 'copilotd.force_teardown.unknown'
+            """
+        )
+        assert teardown is not None
+        assert "native_queue" in json.loads(teardown["raw_payload"])["data"]["unknown"]
 
 
 @pytest.mark.asyncio
