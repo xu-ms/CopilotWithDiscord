@@ -26,6 +26,7 @@ from copilotd.core.models import AdaptedEvent
 from copilotd.core.reducer import JournalReducer
 from copilotd.discord_app import (
     CopilotDiscordBot,
+    _discord_embeds,
     _discord_files,
     _discord_render_plan,
     _taskdeck_view,
@@ -120,6 +121,7 @@ class _DryRunRenderTransport:
             message = await self._thread.send(
                 batch.content or "\u200b",
                 files=_discord_files(list(batch.assets)),
+                embeds=_discord_embeds(tuple(getattr(batch, "embeds", ()))),
                 silent=True,
             )
             self._created_messages.append(message)
@@ -791,6 +793,7 @@ class DiscordRealHarness:
             sent = await thread.send(
                 batch.content or "\u200b",
                 files=_discord_files(list(batch.assets)),
+                embeds=_discord_embeds(tuple(getattr(batch, "embeds", ()))),
                 silent=True,
             )
             self._created_messages.append(sent)
@@ -855,6 +858,22 @@ class DiscordRealHarness:
         )
 
         task_payload = {
+            "type": "taskdeck",
+            "content": "**TaskDeck** — 1 item(s)",
+            "finalized": False,
+            "cards": [
+                {
+                    "card_token": "e2ecard",
+                    "title": "E2E task",
+                    "state": "running",
+                    "kind": "agent",
+                    "elapsed": "12s",
+                    "progress_summary": "Rendering the complete Discord message gallery.",
+                    "detail_artifact": None,
+                    "dependencies": ["gallery-seed"],
+                    "artifact_links": ["taskdeck-preview.md"],
+                }
+            ],
             "taskdeck": {
                 "panel_id": "e2epanel",
                 "revision": 1,
@@ -864,18 +883,33 @@ class DiscordRealHarness:
                 "expanded": False,
                 "actions": ["download"],
                 "options": [{"label": "E2E task", "value": "e2ecard", "state": "running"}],
-            }
+            },
         }
+        task_plan = await _discord_render_plan(task_payload)
+        task_batch = task_plan.batches[0]
         task_message = await thread.send(
-            "**TaskDeck** — E2E",
+            task_batch.content or "\u200b",
+            files=_discord_files(list(task_batch.assets)),
+            embeds=_discord_embeds(tuple(getattr(task_batch, "embeds", ()))),
             view=_taskdeck_view(task_payload),
             silent=True,
         )
         self._created_messages.append(task_message)
         fetched_task = await thread.fetch_message(task_message.id)
         self._stable_ids["taskdeck_message_id"] = str(task_message.id)
+        if not fetched_task.embeds:
+            raise DiscordE2EError("TaskDeck embeds were not serialized by Discord")
         if not fetched_task.components:
             raise DiscordE2EError("TaskDeck components were not serialized by Discord")
+        self.evidence.features.append(
+            FeatureEvidence(
+                feature="TaskDeck embeds",
+                status="passed",
+                transport="real Discord embed serialization",
+                detail=f"{len(fetched_task.embeds)} embed card(s)",
+                discord_ids=[str(task_message.id)],
+            )
+        )
         self.evidence.features.append(
             FeatureEvidence(
                 feature="TaskDeck components",

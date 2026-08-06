@@ -21,16 +21,19 @@ The implementation follows [`docs/copilotD-detailed-design.md`](docs/copilotD-de
 - Durable SQLite event journal with strict UUID SDK IDs, app FIFO, reducer-owned
   operation receipts, liveness leases, epoch/watermark snapshots, render outbox,
   and attachment manifests.
-- Forty-two applied migrations use unique reserved namespaces: Foundation
+- Forty-four applied migrations use unique reserved namespaces: Foundation
   `0001`-`0009`, Native `0010`-`0014`, Protocol `0015`-`0019`, Scheduler
   `0020`-`0028`, Protocol compatibility `0029`, and Discord `0030`-`0037`;
-  `0038`-`0039` are reserved and Operations uses forward-only `0040`-`0044`.
+  `0038`-`0039` are reserved, Operations uses forward-only `0040`-`0044`, and
+  session deletion and attachment lifecycle recovery are `0045`-`0046`.
 - Durable event-log backfill with cursor rebase/gap diagnostics and ingress-overflow
   freeze/backfill/generation replacement; unrecoverable ephemeral gaps remain
   explicitly outcome-unknown.
+- Restart-recoverable input attachment preparation, ready-orphan resubmission,
+  reference-aware release, and seven-day retained-file garbage collection.
 - Streaming replies, file/image attachments, table-aware Markdown rendering, and one
-  in-thread TaskDeck for tool/subagent activity with select, expand/collapse, and
-  pagination controls.
+  in-thread, embed-backed TaskDeck for tool/subagent activity with select,
+  expand/collapse, and pagination controls.
 - Durable Copilot input requests: ask-user choices/freeform, Plan exit actions, and
   auto-mode-switch prompts render in-place and settle exactly once without blocking
   event reduction.
@@ -62,7 +65,8 @@ The implementation follows [`docs/copilotD-detailed-design.md`](docs/copilotD-de
 - Capability-backed registration for core `/session`, `/project`, `/model`,
   `/autopilot`, `/plan`, `/steer`, `/context`, `/usage`, and `/queue` commands.
 - Application-owned `/schedule` message/new-session jobs with durable leases, DST-safe
-  IANA time handling, FIFO coupling, crash recovery, and semantic completion evidence.
+  IANA time handling, FIFO coupling, crash recovery, semantic completion evidence, and
+  fatal-loop reporting through the shared task supervisor.
 - Intent-first `/project worktree` lifecycle with exact Git ownership checks, durable
   compensation/recovery, reference blockers, and capability-gated history forks.
 - Default always-on definitions for macOS LaunchAgents and Windows Scheduled Tasks,

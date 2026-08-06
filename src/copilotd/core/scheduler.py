@@ -13,6 +13,7 @@ from typing import Any, Protocol
 from aiosqlite import Connection, Row
 
 from copilotd.core.schedule_time import ParsedSchedule, parse_schedule, planned_key
+from copilotd.core.task_registry import TaskRegistry
 from copilotd.storage.database import Database
 
 SCHEDULE_LEASE_SECONDS = 60.0
@@ -2210,6 +2211,7 @@ class SchedulerWorker:
         poll_seconds: float = 1.0,
         lease_seconds: float = SCHEDULE_LEASE_SECONDS,
         renew_seconds: float = SCHEDULE_RENEW_SECONDS,
+        task_registry: TaskRegistry | None = None,
     ) -> None:
         self._repository = repository
         self._adapter = adapter
@@ -2218,6 +2220,7 @@ class SchedulerWorker:
         self._poll_seconds = poll_seconds
         self._lease_seconds = lease_seconds
         self._renew_seconds = renew_seconds
+        self._task_registry = task_registry
         self._stop = asyncio.Event()
         self._task: asyncio.Task[None] | None = None
 
@@ -2228,23 +2231,40 @@ class SchedulerWorker:
         if self._task is not None:
             raise RuntimeError("scheduler worker is already started")
         self._stop.clear()
-        self._task = asyncio.create_task(
-            self.run(),
-            name=f"scheduler:{self._owner_id}",
-        )
+        if self._task_registry is None:
+            self._task = asyncio.create_task(
+                self.run(),
+                name=f"scheduler:{self._owner_id}",
+            )
+        else:
+            self._task = self._task_registry.create(
+                self.run(),
+                name=f"scheduler:{self._owner_id}",
+                source="app-scheduler",
+            )
 
     async def stop(self) -> None:
         self._stop.set()
         task = self._task
         self._task = None
+        failure: BaseException | None = None
         if task is not None:
-            task.cancel()
-            await asyncio.gather(task, return_exceptions=True)
+            if not task.done():
+                task.cancel()
+            result = (await asyncio.gather(task, return_exceptions=True))[0]
+            if (
+                self._task_registry is None
+                and isinstance(result, BaseException)
+                and not isinstance(result, asyncio.CancelledError)
+            ):
+                failure = result
         await self._repository.mark_tick(
             self._owner_id,
             now=self._clock.now(),
             worker_state="stopped",
         )
+        if failure is not None:
+            raise failure
 
     async def run(self) -> None:
         while not self._stop.is_set():

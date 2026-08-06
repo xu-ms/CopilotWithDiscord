@@ -11,6 +11,7 @@ from copilotd.discord_app import (
     CopilotDiscordBot,
     DiscordRenderBatch,
     DiscordRenderPlan,
+    _render_batch_hash,
 )
 from copilotd.render.tables import TableAsset
 from copilotd.storage.database import Database
@@ -34,9 +35,11 @@ class FakeThread:
     def __init__(self) -> None:
         self.messages: dict[int, FakeMessage] = {}
         self.send_calls = 0
+        self.send_payloads: list[dict[str, Any]] = []
 
     async def send(self, **kwargs: Any) -> FakeMessage:
         self.send_calls += 1
+        self.send_payloads.append(kwargs)
         message = FakeMessage(
             100 + self.send_calls,
             nonce=None if kwargs.get("nonce") is None else str(kwargs["nonce"]),
@@ -305,6 +308,43 @@ async def test_edit_followup_crash_reconciles_without_orphan_duplicate(
         {"batch_index": 0, "discord_message_id": "101"},
         {"batch_index": 1, "discord_message_id": "102"},
     ]
+
+
+@pytest.mark.asyncio
+async def test_taskdeck_embeds_survive_send_and_in_place_edit(tmp_path: Path) -> None:
+    bot = CopilotDiscordBot(Settings(data_dir=tmp_path))
+    thread = FakeThread()
+    initial = DiscordRenderBatch(
+        "TaskDeck",
+        embeds=({"title": "Worker A", "description": "running"},),
+    )
+    updated = DiscordRenderBatch(
+        "TaskDeck",
+        embeds=({"title": "Worker A", "description": "completed"},),
+    )
+    assert _render_batch_hash(initial) != _render_batch_hash(updated)
+
+    async with Database(tmp_path / "taskdeck-embed-delivery.sqlite3") as database:
+        bot.database = database
+        first_id = await bot._deliver_render_plan(
+            thread=thread,
+            session_id="session-taskdeck",
+            payload={"type": "taskdeck", "finalized": False},
+            plan=DiscordRenderPlan((initial,)),
+            delivery_id="taskdeck:deck:payload:1:1111111111111111",
+        )
+        edited_id = await bot._deliver_render_plan(
+            thread=thread,
+            session_id="session-taskdeck",
+            payload={"type": "taskdeck", "finalized": True},
+            plan=DiscordRenderPlan((updated,)),
+            delivery_id="taskdeck:deck:payload:2:2222222222222222",
+        )
+
+    assert first_id == edited_id == "101"
+    assert thread.send_calls == 1
+    assert thread.send_payloads[0]["embeds"][0].description == "running"
+    assert thread.messages[101].edits[-1]["embeds"][0].description == "completed"
 
 
 class BlockingDispatcher:

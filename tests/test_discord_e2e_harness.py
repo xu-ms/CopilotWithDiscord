@@ -174,6 +174,7 @@ class DryRunMessage:
     id: int
     content: str = ""
     attachments: list[DryRunAttachment] = field(default_factory=list)
+    embeds: list[object] = field(default_factory=list)
     components: list[object] = field(default_factory=list)
     channel: DryRunChannel | None = None  # type: ignore[name-defined]
     author: object = field(default_factory=lambda: SimpleNamespace(id=777))
@@ -209,6 +210,7 @@ class DryRunThread:
         *,
         file=None,
         files=None,
+        embeds=None,
         view=None,
         silent: bool = True,
     ):
@@ -232,6 +234,7 @@ class DryRunThread:
             id=self.channel.next_message_id(),
             content=content,
             attachments=attachments,
+            embeds=list(embeds or []),
             components=[view] if view is not None else [],
             channel=self.channel,
         )
@@ -799,10 +802,16 @@ async def test_dry_run_traverses_snapshot_sync_channel_probe_cleanup_without_net
     http = DryRunHttp()
 
     async def fake_render_plan(*args, **kwargs):
+        embeds = (
+            ({"title": "E2E task"},)
+            if args and isinstance(args[0], dict) and args[0].get("type") == "taskdeck"
+            else ()
+        )
         return SimpleNamespace(
             batches=[
                 SimpleNamespace(
                     content="rendered content",
+                    embeds=embeds,
                     assets=[
                         SimpleNamespace(
                             filename="local-image.png",
@@ -944,10 +953,16 @@ async def test_run_aggregates_original_cleanup_restore_and_write_errors(
     http.bulk_upsert_guild_commands = failing_restore  # type: ignore[assignment]
 
     async def fake_render_plan(*args, **kwargs):
+        embeds = (
+            ({"title": "E2E task"},)
+            if args and isinstance(args[0], dict) and args[0].get("type") == "taskdeck"
+            else ()
+        )
         return SimpleNamespace(
             batches=[
                 SimpleNamespace(
                     content="rendered content",
+                    embeds=embeds,
                     assets=[
                         SimpleNamespace(
                             filename="local-image.png",

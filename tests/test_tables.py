@@ -68,8 +68,7 @@ async def test_medium_cjk_table_uses_png_and_markdown_source() -> None:
     headers = "| 名称 | 状态 | 负责人 | 耗时 | 备注 |"
     delimiter = "| --- | --- | --- | ---: | --- |"
     rows = "\n".join(
-        f"| 任务{index} | 完成 | 张三 | {index} | 保留完整可复制内容 |"
-        for index in range(13)
+        f"| 任务{index} | 完成 | 张三 | {index} | 保留完整可复制内容 |" for index in range(13)
     )
     plan = await render_table(f"{headers}\n{delimiter}\n{rows}")
     media = Counter(asset.media_type for asset in plan.assets)
@@ -86,8 +85,7 @@ async def test_large_scalar_table_gets_preview_markdown_and_csv() -> None:
     headers = "| " + " | ".join(f"C{index}" for index in range(9)) + " |"
     delimiter = "|" + "|".join(" --- " for _ in range(9)) + "|"
     rows = "\n".join(
-        "| " + " | ".join(str(row * 10 + column) for column in range(9)) + " |"
-        for row in range(60)
+        "| " + " | ".join(str(row * 10 + column) for column in range(9)) + " |" for row in range(60)
     )
     plan = await render_table(f"{headers}\n{delimiter}\n{rows}")
     media = {asset.media_type for asset in plan.assets}

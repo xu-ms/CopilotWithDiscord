@@ -1,8 +1,8 @@
 # copilotD 详细设计与实施计划
 
-> 当前阶段：详细设计 v2.5 已批准，durable/capability foundation、Discord core、
-> interaction router 与 background-task reconciliation 已实现；当前继续按 capability
-> gate 补齐产品能力并做真实平台验收。
+> 当前阶段：详细设计 v2.5 已批准，设计承诺的 repository implementation 已完成对齐；
+> 当前按顺序执行完整 deterministic/package gate、真实 Copilot Bridge 功能矩阵、
+> 真实 Discord 消息 gallery 与平台实机验收。
 >
 > 本版固定前提：单用户、私有部署、Copilot runtime 全程 `--yolo`，不设计多用户共享、
 > 工具确认流程、安全沙箱或租户隔离。
@@ -66,7 +66,7 @@ GitHub 已提供官方 Python SDK：
 | Custom Agents/Subagents | `custom_agents` + subagent/task events | 直接支持；原 thread 内折叠 TaskDeck，不为 worker 新建 thread |
 | Skills | `skill_directories` / `disabled_skills` | 直接支持 |
 | Plugins | `plugin_directories` 或 runtime `--plugin-dir` | 直接支持 |
-| Hooks | Copilot session hooks | 支持；Hook 名称和 payload 需适配 |
+| Hooks | Copilot session hooks | 支持 SDK 1.0.8 实际可调用子集；`onUserPromptTransformed`/`onAgentStop` 不注册 |
 | Context 展示 | `session.usage_info` / context-info RPC | 直接支持 |
 | 用量 | `/usage`、AI Credits、premium request multiplier、account quota | 只读展示 Copilot 原生语义，不提供 limits 配置 |
 | worktree | 应用层调用 Git 创建并绑定新工作目录 | copilotD durable extension |
@@ -527,16 +527,16 @@ closed 的 binding，绝不自动重发结果未知的 prompt。
 | `custom_agents` | project_id, name, description, prompt, tools_json, enabled |
 | `session_creation_intents` | source_kind(message/context-menu/slash/schedule), source_id, creation_token, project_source, cwd_snapshot, sdk_session_id(preallocated UUID), thread_id?, starter_message_id?, attachment_manifest_id?, state(reserved/thread_created/creating/attached/unknown/failed), created_at；`source_kind+source_id` 唯一 |
 | `session_bindings` | thread_id(PK), project_id?, project_source(explicit/home), cwd_snapshot, sdk_session_id(unique), binding_intent(active/closed/deleting/delete_unknown/deleted), attachment_state, attachment_reason(user_active/scheduler_run/recovery_cleanup)?, permission_posture(unverified/verified_allow_all/platform_blocked/unknown), permission_verified_at?, desired_mode, pending_mode?, pending_mode_transition_id?, runtime_mode, desired_model_config, pending_model_config?, pending_model_transition_id?, runtime_model_config?, desired_agent(default/name), pending_agent?, pending_agent_transition_id?, runtime_agent(unknown/default/name), pending_remote_target?, pending_remote_transition_id?, runtime_remote_mode(unknown/off/export/on), remote_url?, desired_session_config_version, pending_session_config_version?, runtime_session_config_version?, runtime_processing?, runtime_has_active_work?, runtime_abortable?, activity_observed_at?, runtime_generation, owner_fence_token, event_cursor?, cursor_status?, last_inbox_seq, last_sdk_receive_seq?, last_event_at, row_version |
-| `session_owner_leases` | sdk_session_id, owner_id, fence_token(monotonic integer), acquired_at, renewed_at, expires_at；60 秒 TTL/20 秒续租，跨进程唯一 create/resume/send/abort/disconnect 权限 |
+| `session_owner_leases` | sdk_session_id, owner_id, fence_token(monotonic integer), acquired_at, renewed_at, expires_at；60 秒 TTL/15 秒续租，跨进程唯一 create/resume/send/abort/disconnect 权限 |
 | `session_operations` | operation_id, sdk_session_id, runtime_generation, owner_fence_token, kind, idempotency_key, input_hash, state(pending/started/confirmed/rejected/unknown), result_ref?, error_code?, started_at?, settled_at?；`sdk_session_id+idempotency_key` 唯一；所有 app-initiated mutating/exclusive RPC 的 durable envelope，domain row 仍是权威状态 |
 | `reconciliation_state` | sdk_session_id, topic, requested_epoch, applied_epoch, status(idle/querying/stale/failed), runtime_generation, owner_fence_token, query_start_sdk_receive_seq?, query_end_sdk_receive_seq?, observed_at?；防止迟到的 negative snapshot 覆盖更新的 event evidence |
 | `submissions` | submission_id, sdk_session_id, origin(app_message/app_queue/app_schedule/fleet/runtime_observed), source_operation_id?, parent_submission_id?, discord_message_id?, schedule_run_id?(unique), runtime_schedule_id?, attachment_manifest_id?, prompt_hash?, requested_mode?, requested_model_config?, requested_agent?, requested_session_config_version?, requested_delivery?, observed_delivery?, state, accepted_message_id?, native_queue_item_id?, observed_user_event_id?, observed_origin_hint?(fleet/remote/native_schedule/autopilot_continuation/unknown), correlation_basis?, autopilot_objective_id?, task_completion_outcome?, completion_basis?, created_at, idle_at |
 | `model_turns` | sdk_turn_id, submission_id?, agent_id?, interaction_id?, state, started_at, ended_at；一个 turn 只代表一次 LLM call |
 | `message_queue` | id, thread_id, discord_message_id?, schedule_run_id?, prompt, attachment_manifest_id?, requested_mode_snapshot, requested_model_config_snapshot, requested_agent_snapshot?, requested_session_config_version, position, state, replaces_id?；只属于 app，不镜像 SDK queue；每个 `schedule_run_id` 最多一个 nonterminal row（partial unique），resubmit 创建新 row 而不改旧 snapshot |
-| `attachment_manifests` | id, source_kind, source_id, session_id?, state(preparing/ready/failed/released), total_bytes, created_at, retention_until?；creation/queue/submission/outbox 的 durable owner |
+| `attachment_manifests` | id, source_kind, source_id, source_channel_id?, source_message_id?, session_id?, recovery_prompt?, recovery_idempotency_key?, recovery_origin?, state(preparing/ready/failed/released), error_code?, error_detail?, total_bytes, created_at, updated_at, retention_until?；creation/queue/submission/outbox 的 durable owner 与 restart recovery locator |
 | `attachment_items` | manifest_id, item_index, discord_attachment_id?, original_name, mime_type, byte_size, sha256, local_path, sdk_attachment_kind, state；`manifest_id+item_index` 唯一 |
 | `background_observations` | sdk_session_id, runtime_generation, task_id?, task_type?, agent_id?, source_event_id, observed_state, terminal_evidence?, last_progress_at；不声明超出 task RPC snapshot 的 lifecycle |
-| `task_card_projections` | sdk_session_id, panel_id, card_token, card_key(task-id 或 orphan-agent-id), task_id?, agent_id?, kind(agent/shell/fleet/orphan), title, state, progress_summary, detail_artifact?, first_seen_at, terminal_at?, revision；TaskDeck 可重建 read model，不拥有 lifecycle |
+| `task_card_projections` | sdk_session_id, panel_id, card_token, card_key(task-id 或 orphan-agent-id), task_id?, agent_id?, kind(agent/shell/fleet/orphan), title, state, progress_summary, detail_artifact?, dependencies, artifact_links, can_promote, first_seen_at, last_progress_at, terminal_at?, revision；TaskDeck 可重建 read model，不拥有 lifecycle |
 | `liveness_leases` | session_id, lease_id, kind, source_id, runtime_generation, owner_fence_token, state(active/released/orphaned), acquired_at, refreshed_at, released_at?；无 duration TTL，但只对当前 generation/fence 生效 |
 | `event_journal` | sdk_session_id, generation, inbox_seq, source(sdk/internal), sdk_receive_seq?, event_id?, internal_event_id?, ephemeral?, persistence_class, raw_type, parent_id?, agent_id?, message_id?, turn_id?, interaction_id?, request_id?, reducer_hash, received_at；SDK event 以 `(sdk_session_id,event_id)` 跨 generation/cursor 去重；command/snapshot receipt 以 app `internal_event_id` 幂等 |
 | `render_outbox` | id, session_id, logical_seq, lane, coalesce_key, idempotency_key(unique), payload, state, attempts, next_attempt_at |
@@ -1115,13 +1115,15 @@ invoke，只有 fixture 证明 active-safe 且结果不启动新 agent turn 的�
 | `/project unbind` | active project retired；未来 session 回落 `$HOME`；已有 SessionRuntime 不停止、不迁移 |
 | `/project layout value` | value 为 `text` 或 `forum`；只控制后续 Discord thread 组织，不叫 Copilot mode |
 | `/project mention required` | 更新 channel trigger；默认 false |
+| `/project timezone value` | 校验并保存 IANA timezone，供省略 timezone 的 future app schedule 使用 |
 | `/project variable set name value` | 保存 future-session reference value；显式 project only；只解析到 typed MCP/environment reference，不批量注入 runtime process environment |
 | `/project variable list reveal=false` | 项目 reference value 视图 |
-| `/project variable remove name` | 删除项目 reference value；被 MCP/environment binding 引用时 fail closed；已有 session snapshot 不热变更 |
+| `/project variable remove|unset name` | 删除项目 reference value；`unset` 是同一路径的 Discord alias；被 MCP/environment binding 引用时 fail closed；已有 session snapshot 不热变更 |
 | `/project mcp action` | explicit project only；管理 future-session `mcp_servers` config；不是 CLI `/mcp` runtime UI |
 | `/project skill action` | explicit project only；管理 future-session skill directories；不是 CLI `/skills` dispatch |
 | `/project plugin action` | explicit project only；管理 future-session plugin directories；不是 CLI `/plugins` marketplace UI |
-| `/project agent action` | explicit project only；管理 future-session custom-agent config；不自动改 active runtime，未来若提供 apply 必须 detach-safe reattach |
+| `/project agent action` | explicit project only；管理 future-session custom-agent config；不自动改 active runtime |
+| `/project config-reload` | thread-only；读取 immutable cwd 下 `.copilotd/extensions.json`，要求 detach-safe/quiet，经 fenced same-session reattach 发布新 config generation；失败或歧义保持 recovery/config unknown，不假装 rollback |
 | `/project worktree create name base? history?` | 建 Git worktree + 新 thread/session；history fork 仅真实 fork RPC 可用时开放 |
 | `/project worktree list` | 显示 branch/path/session/submission/lease/schedule references |
 | `/project worktree close name` | 所有绑定 session 必须已 `CLOSED+ABSENT`，且无 active lease、remote steerable/unknown exposure、active/unknown native schedule 或 non-deleted app schedule 指向该 worktree；移除 worktree 但不删除 branch |
@@ -1169,6 +1171,9 @@ Catch-up 最多执行最近一次遗漏。SDK acceptance 不确定时不重发�
 | `/ops diagnostics session-id?` | capability manifest、stderr tail、last event、generation、stalled reason |
 | `/ops restart-runtime force=false` | active liveness lease、remote steerable/unknown exposure 或 active/unknown native schedule 时拒绝；force 把 in-flight/remote/native-trigger window 标 outcome unknown，重启后 fresh remote/schedule reconciliation |
 | `/ops debug level duration` | level 为 `info`、`debug` 或 `trace`，最长 30 分钟 |
+| `/ops scheduler` | app scheduler worker、definition/run、attached/protected-work 与 restart blocker 快照 |
+| `/ops log-tail correlation-id?` | 有界、脱敏的本地 rotating log tail；可按 correlation ID 过滤 |
+| `/ops event-dump session-id?` | 最多 250 条 durable event timeline，只读且脱敏 |
 | `/ops log-dump correlation-id?` | 有界日志和 event timeline 附件 |
 | Context menu `Ask Copilot` | 从消息创建 thread/session；无 binding 使用 `$HOME`；保留 provenance/attachments |
 | Context menu `Pin message` | Discord 原生 pin，不经过 Copilot |
@@ -1381,15 +1386,16 @@ Discord 输入不会阻塞 SDK notification callback 或 ReducerWorker；timeout
 | `onPostToolUse` | 提取 diff/artifact metadata；不篡改业务结果 |
 | `onPostToolUseFailure` | 失败分类/retry guidance；非幂等操作不自动重试 |
 | `onUserPromptSubmitted` | Discord provenance、mention 清理；不改变用户意图 |
-| `onUserPromptTransformed` | 记录 turn 关联 |
+| `onUserPromptTransformed` | SDK 1.0.8 不调用，copilotD 不注册；保留兼容方法但不把沉默 callback 当证据 |
 | `onSessionStart` | 注入 typed project/session context |
 | `onSessionEnd` | 任一 terminal end 都做 usage/outbox flush；只有已持久化 explicit close/delete intent 才提交用户关闭语义，不能因 AgentStop 释放 runtime |
 | `onErrorOccurred` | 统一错误分类和 correlation ID |
-| `onAgentStop` | 更新 observed agent-loop 状态；不 unsubscribe ingress，不假定 background 工作结束 |
+| `onAgentStop` | SDK 1.0.8 不调用，copilotD 不注册；使用 `session.idle`/turn/task 事件观察 agent loop |
 
-所有 app-level `asyncio.create_task()` 必须经 `TaskRegistry.spawn()` 创建。Registry 保存
-强引用、task name/source/session/generation，done callback 记录异常并释放引用；任何 heartbeat
-loop 异常都进入 Supervisor，不能静默停止。
+所有 long-lived/fire-and-forget app task 必须经 `TaskRegistry.create()` 创建。Registry 保存
+强引用、task name/source/session/generation，done callback 记录异常并释放引用；app scheduler、
+heartbeat 与 maintenance loop 的 fatal exception 都进入 Supervisor，不能静默停止。局部并发
+child task 必须由调用方立即 await/cancel，不得脱离其 owner coroutine。
 
 ### Discord Renderer
 
@@ -1426,7 +1432,8 @@ InternalEvent
 - Discord 没有原生 collapsible embed，TaskDeck 用“编辑同一 durable message”实现折叠：
   compact view 显示每项 `state/title/type/elapsed/progress`；select menu 选择 card，
   `Expand/Collapse` 在同一 message 原位切换 bounded detail；`Prev/Next` 分页。单页最多 8 张
-  embed card、select 最多 25 项；超过后分页，不创建额外 thread。
+  embed card、全部 embed 合计不超过 Discord 的 6000 字符限制，select 最多 25 项；超过后
+  分页，不创建额外 thread。
 - expanded detail 只显示最近进度、最终摘要、错误、tool/artifact links 和依赖；raw reasoning
   不显示。详情超过 embed/message 限制时写 `.md`/`.txt` artifact，卡片只保留摘要与下载按钮。
   下载按钮返回 ephemeral attachment follow-up，不替换 TaskDeck message 的 attachment set，也不
@@ -2169,7 +2176,7 @@ frame-too-large、MCP、tool、Discord、storage 和 internal bug。rate limit �
   fresh create 首条消息不依赖预先 idle、resume unknown 最多 tentatively dispatch 一项、禁止
   批量预装 native queue、submitted-unknown 不重发、owner fence takeover、remote steerability/
   native schedule 阻止 normal close，force close typed-cancel pending interaction 与
-  per-task cancel/disable/stop/trigger race unknown；owner 20 秒 renew、60 秒 expiry、
+  per-task cancel/disable/stop/trigger race unknown；owner 15 秒 renew、60 秒 expiry、
   monotonic token、每类 mutating RPC 的 session-operation started/settled envelope、失租后
   unsettled operation 转 unknown、零新 mutating RPC 且旧 owner 不 disconnect 新 owner；sleep
   后无 intervening fence 的 self-reacquire 与已有 takeover 的 quarantine 分支；delete response
@@ -2381,27 +2388,31 @@ claudeD issue 回归门禁：
 
 ### 当前实现快照（2026-08-06）
 
-首个可运行 slice 已按本设计开始落地，当前不是“全部能力完成”：
+repository implementation 已按本设计完成对齐；剩余工作是 credentialed Bridge、真实 Discord、
+macOS/Windows 实机与长时稳定性验收，不再以 mock/fixture 结果替代真实 gate：
 
 | 已实现 | 当前边界 |
 |---|---|
 | 官方 `github-copilot-sdk==1.0.8` + bundled runtime 1.0.73，stdio `--yolo`，create/resume 后 full allow-all 对账 | sidecar client transport 断开后 session retention 实测失败，因此不声明 detached continuation；crash window 保守标 outcome unknown |
-| 43 个唯一版本 SQLite migration：Foundation `0001`–`0009`、Native RPC `0010`–`0014`、Protocol `0015`–`0019`、Scheduler `0020`–`0028`、Protocol compatibility `0029`、Discord surface `0030`–`0037`、保留 `0038`–`0039`、Operations forward migrations `0040`–`0044`、session deletion cleanup `0045`；project `$HOME` fallback/cwd snapshot、owner fence、creation saga、strict-UUID event journal、reducer-owned operation/submission/native-command receipts、submission-task links、liveness leases、startup recovery inventory 与 eager resume；attach 时按 current state 结算 pending agent、强制 uncertain remote off；force restart 使用 producer/journal dual epoch、loss watermark admission fence 与 owner handoff | bundled runtime 进程死亡后的 in-flight execution 仍只能标 outcome unknown；真实 fixture 无 current-promotable task，task promote 保持 gated |
+| 44 个唯一版本 SQLite migration：Foundation `0001`–`0009`、Native RPC `0010`–`0014`、Protocol `0015`–`0019`、Scheduler `0020`–`0028`、Protocol compatibility `0029`、Discord surface `0030`–`0037`、保留 `0038`–`0039`、Operations `0040`–`0044`、session deletion `0045`、attachment lifecycle `0046`；project `$HOME` fallback/cwd snapshot、owner fence、creation saga、strict-UUID event journal、reducer-owned operation/submission/native-command receipts、submission-task links、liveness leases、startup recovery inventory 与 eager resume；attach 时按 current state 结算 pending agent、强制 uncertain remote off；force restart 使用 producer/journal dual epoch、loss watermark admission fence 与 owner handoff | bundled runtime 进程死亡后的 in-flight execution 仍只能标 outcome unknown；真实 fixture 无 current-promotable task，task promote 保持 gated |
 | eventLog `read/tail` durable backfill（固定过滤 ephemeral）、cursor epoch/rebase/predecessor-gap diagnostics、overflow freeze/backfill/generation replacement；activity/queue/task/remote/schedule snapshot requested/applied epoch 与 query watermark；crossing command/agent snapshot 禁止 merge 并强制 requery | ephemeral idle/delta 离开 live window 后不可恢复，不从 transcript 猜 terminal；compaction 无 completion evidence 时保持 unknown 并阻塞普通 submission |
 | durable app FIFO；fresh readiness snapshot、reducer caught-up、config/agent/remote/schedule/task known gate 后只派发队首；attachment manifest READY + hash/size 复验，无 attachment-free fallback；`/queue add/list/remove/clear`；project variables 只解析到 typed MCP/environment reference，不作为任意 process environment 注入 | native queue entry 没有 stable opaque ID 时只以 snapshot-local opaque key 诊断；transport ambiguity 不自动重放 |
 | Discord core 命令；strict dynamic builtin manifest；Native-Gated `/ask`、`/session compact`、`/fleet`、`/tasks`、`/agent list|current`、`/after|every list|cancel`、`/remote status|off`、`/review`、`/security-review`、`/research`、`/rubber-duck`；thread-first `/session delete session-id?`；JSON-Schema elicitation 与 MCP OAuth typed/exactly-once response plane；全部 action 由 exact capability 决定 | current-runtime fork 仍 capability-gated 且不注册；`/after|every create` 因 real invoke 返回 `text` 而非 required `completed` 不注册；agent select/deselect、task promote、remote on/export 的 real gate 未通过 |
-| durable input attachment manifest、hash/size 复验、图片 blob 压缩；stream/final RenderOutbox；table hold 与 code/PNG/MD/CSV assets；Discord HTTP/rate-limit 错误分类，超上限 artifact 按序无损分片 | Discord archived/locked thread、attachment edit、exact 429 retry-after 仍需真实 gateway fixture |
-| tool/subagent/agent-scoped output 归并为原 thread 的单条 TaskDeck；4 秒 cadence、pending coalescing、terminal flush、select/expand/collapse/prev/next；reasoning delta/coalesced thinking 与 configured final concise reasoning summary 已实现，`assistant.streaming_delta` 不进入 Discord UI；structured tool diff 与 local workspace diff artifact lane；typed task list/show/progress/message/cancel-all/remove/wait 与 Fleet projection；>=8000 字符 tool result/error 逐字附件化；零 child-thread 路径 | real current-promotable fixture 未通过，promote action 不注册；Discord 上的 diff 附件/图片 delivery 仍受 upload limit 与 archived/locked thread 约束 |
+| durable input attachment manifest、hash/size 复验、图片 blob 压缩；中断的 `preparing` 可按 Discord channel/message locator 重启恢复，ready orphan 幂等重提，引用释放后默认保留 7 天再 GC；stream/final RenderOutbox；table hold 与 code/PNG/MD/CSV assets；Discord HTTP/rate-limit 错误分类，超上限 artifact 按序无损分片 | Discord archived/locked thread、attachment edit、exact 429 retry-after 仍需真实 gateway fixture |
+| tool/subagent/agent-scoped output 归并为原 thread 的单条 embed-backed TaskDeck；每页最多 8 张 embed、总字符受 Discord 6000 限制，4 秒 cadence、pending coalescing、terminal flush、select/expand/collapse/prev/next，embed/asset hash 与 crash recovery 保持原位 edit；reasoning delta/coalesced thinking 与 configured final concise reasoning summary 已实现，`assistant.streaming_delta` 不进入 Discord UI；structured tool diff 与 local workspace diff artifact lane；typed task list/show/progress/message/cancel-all/remove/wait 与 Fleet projection；>=8000 字符 tool result/error 逐字附件化；零 child-thread 路径 | real current-promotable fixture 未通过，promote action 不注册；Discord 上的 diff 附件/图片 delivery 仍受 upload limit 与 archived/locked thread 约束 |
 | durable `DELETING → DELETE_UNKNOWN/DELETED` permanent-delete saga；stable SDK `delete_session(session_id)` + metadata not-found reconcile；non-deleted app schedule reference fail-closed；active target force teardown、15 秒 bounded native task/schedule/queue/remote cleanup、unprovable result unknown；confirmed delete 后才清 attachment/worktree metadata；abort 等 correlated abort + aborted-idle；unexpected `session.shutdown` terminalizes current handle and enters recovery | SDK response loss 仍需显式 retry，同一 mapping/session ID 保留；缺失 native capability 明确记录 unknown；只有 explicit close 可完成 CLOSED |
-| 共享 TaskRegistry、failure consumer、10 分钟 active-execution SUSPECT + non-destructive ping、结构化 heartbeat、完整 setup preflight、fresh PID/generation/current-fence status、bounded restart saga、restart-storm alert、10 MiB × 7 JSON log、macOS LaunchAgent 与 Windows Scheduled Task 的 bundled 2-unit / sidecar 3-unit install/status/uninstall/effective-definition contract | 默认 bundled runtime 没有独立 runtime service；sidecar 三组件需要显式 runtime argv/URI/connection token；真实 credentialed install、sleep/wake、macOS soak 与 Windows 实机未在 deterministic suite 中验证 |
+| 共享 TaskRegistry、failure consumer、app scheduler fatal-loop supervision、10 分钟 active-execution SUSPECT + non-destructive ping、结构化 heartbeat、完整 setup preflight、fresh PID/generation/current-fence status、bounded restart saga、restart-storm alert、10 MiB × 7 JSON log、macOS LaunchAgent 与 Windows Scheduled Task 的 bundled 2-unit / sidecar 3-unit install/status/uninstall/effective-definition contract；owned Git 在 POSIX 使用 inherited `flock`，Windows 使用 `msvcrt` byte lock、独立进程组与 `taskkill /T /F` | 默认 bundled runtime 没有独立 runtime service；sidecar 三组件需要显式 runtime argv/URI/connection token；真实 credentialed install、sleep/wake、macOS soak 与 Windows 实机未在 deterministic suite 中验证 |
 
-当前 deterministic 验证基线包括 `ruff check src tests scripts`、完整 pytest、CLI JSON/error
-contract、service definition/effective-state simulations 与 wheel/sdist isolated install。仓库内 hash-checked
-fixture 固定 SDK 1.0.8 / runtime 1.0.73 / protocol 3、114-event inventory 与 capability
-evidence；`copilotd native-acceptance --real` 还要求 exact 环境确认，按 suite 创建 disposable
-repo/session、执行 supported mutation（包括 model set/readback/restore）、清理 remote/schedule/session，并生成 sanitized JSON
-evidence；unsupported action 保存 real discovery/gate，不由 deterministic fixture 冒充。这个快照用于区分“已验证实现”和后续
-设计，不降低以下章节对最终产品的契约要求。
+当前 deterministic 验证基线为 793 个 pytest case、`ruff check .`、`ruff format --check .`、
+`compileall`、ops/design audit、CLI JSON/error contract、service definition/effective-state
+simulations，以及 wheel/sdist 的 isolated build/install。`copilotd doctor` 已真实启动 bundled
+runtime 并确认 SDK 1.0.8 / runtime 1.0.73 / protocol 3、authentication 与 migration 46。
+仓库内 hash-checked fixture 固定 114-event inventory 与 capability evidence；
+`copilotd native-acceptance --real` 仍要求 exact 环境确认，按 suite 创建 disposable
+repo/session、执行 supported mutation（包括 model set/readback/restore）、清理
+remote/schedule/session，并生成 sanitized JSON evidence；unsupported action 保存 real
+discovery/gate，不由 deterministic fixture 冒充。这个快照用于区分“已验证实现”和后续设计，
+不降低以下章节对最终产品的契约要求。
 
 ### HTML 交付要求
 
@@ -2493,15 +2504,14 @@ evidence；unsupported action 保存 real discovery/gate，不由 deterministic 
 
 ## 待办
 
-1. 继续加固 eventLog backfill 与 crash/reconnect reconciliation；elicitation/MCP OAuth、
-   reasoning summary 及 structured/local diff artifact lane 已进入 deterministic baseline。
-2. 按 capability fixture 逐项实现 Native-Gated ask/Fleet/Tasks/agents/after/every/remote/
-   review/security-review/research/rubber-duck；fixture 缺失时继续不注册。
-3. 完成 project MCP/skills/plugins/agents、durable scheduler、worktree 和 session delete/fork/compact。
-4. 在真实 Discord 验证 archive/locked thread、TaskDeck component restart、attachment edit、table
-   assets 与精确 429 retry-after。
-5. 实机安装和验证 macOS LaunchAgent、Windows Scheduled Task、sleep/wake、crash/restart storm；
-   完成 claudeD issue 回归、90 分钟 soak、恢复、故障与 forward-compatibility 测试。
+1. 运行完整 Ruff/pytest/compile/package/ops/design gate，提交唯一 phase-1 implementation commit。
+2. 对真实 Copilot 逐项执行 Bridge 功能矩阵和负能力门禁，保存脱敏 evidence；未执行、skip、
+   mock 或未观测结果继续标 unsupported/unprobed。
+3. 向真实 Discord 发送 text/stream/reasoning/tool/diff/table/image/file/interaction/TaskDeck/
+   error/usage 等完整 gallery，保留消息供人工 review，并记录稳定 Discord ID。
+4. 实机验证 macOS LaunchAgent 与 Windows Scheduled Task 的 install/login/sleep/wake/crash/
+   restart-storm；完成 90 分钟 liveness soak 与平台字体/时区检查。
+5. 将通过上述 gate 的提交集中到默认 `master`；不得把未通过的真实能力提升为 supported。
 
 ## 主要风险
 

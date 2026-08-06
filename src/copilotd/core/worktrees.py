@@ -1,11 +1,11 @@
 from __future__ import annotations
 
 import asyncio
-import fcntl
 import json
 import os
 import re
 import signal
+import subprocess
 import sys
 import time
 import unicodedata
@@ -29,6 +29,16 @@ from copilotd.core.sessions import SessionCreationService, SessionCreationUnknow
 from copilotd.core.task_registry import TaskRegistry
 from copilotd.storage.database import Database
 
+try:
+    import fcntl as _fcntl
+except ImportError:  # Windows
+    _fcntl = None
+
+try:
+    import msvcrt as _msvcrt
+except ImportError:  # POSIX
+    _msvcrt = None
+
 WORKTREE_GIT_CREATE_LEASE_SECONDS = 300.0
 _GIT_CHILD_STOP_SECONDS = 5.0
 _GIT_EXEC_WRAPPER = """
@@ -42,6 +52,52 @@ if os.read(gate_fd, 1) != b"1":
 os.close(gate_fd)
 os.set_inheritable(lock_fd, True)
 os.execvp(sys.argv[3], sys.argv[3:])
+"""
+_WINDOWS_GIT_EXEC_WRAPPER = r"""
+import msvcrt
+import os
+import pathlib
+import subprocess
+import sys
+import time
+
+gate_path = pathlib.Path(sys.argv[1])
+ack_path = pathlib.Path(sys.argv[2])
+lock_path = pathlib.Path(sys.argv[3])
+parent_pid = int(sys.argv[4])
+argv = sys.argv[5:]
+deadline = time.monotonic() + 30.0
+while not gate_path.exists():
+    try:
+        os.kill(parent_pid, 0)
+    except OSError:
+        os._exit(125)
+    if time.monotonic() >= deadline:
+        os._exit(125)
+    time.sleep(0.01)
+
+lock_fd = os.open(lock_path, os.O_CREAT | os.O_RDWR)
+if os.fstat(lock_fd).st_size == 0:
+    os.write(lock_fd, b"\0")
+os.lseek(lock_fd, 0, os.SEEK_SET)
+try:
+    msvcrt.locking(lock_fd, msvcrt.LK_NBLCK, 1)
+except OSError:
+    sys.stderr.write("copilotd-owned-git-lock-busy\n")
+    os._exit(75)
+
+temporary_ack = ack_path.with_suffix(ack_path.suffix + ".tmp")
+temporary_ack.write_text(str(os.getpid()), encoding="ascii")
+os.replace(temporary_ack, ack_path)
+creation_flags = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+process = subprocess.Popen(argv, creationflags=creation_flags)
+try:
+    return_code = process.wait()
+finally:
+    os.lseek(lock_fd, 0, os.SEEK_SET)
+    msvcrt.locking(lock_fd, msvcrt.LK_UNLCK, 1)
+    os.close(lock_fd)
+raise SystemExit(return_code)
 """
 _RETRYABLE_GIT_PREFLIGHT_ERRORS = {
     "worktree_branch_conflict",
@@ -171,7 +227,7 @@ class SubprocessGitRunner:
             cwd=str(cwd),
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
-            start_new_session=True,
+            **_subprocess_group_kwargs(),
         )
         return await _communicate_git_process(process)
 
@@ -184,13 +240,24 @@ class SubprocessGitRunner:
         on_started: Callable[[int], Awaitable[None]],
     ) -> GitCommandResult:
         _validate_git_argv(argv)
+        if sys.platform == "win32":
+            return await self._run_owned_windows(
+                argv,
+                cwd=cwd,
+                lock_path=lock_path,
+                on_started=on_started,
+            )
+        if _fcntl is None:
+            raise WorktreeCapabilityError(
+                "owned Git mutations require POSIX flock or Windows msvcrt locking"
+            )
         lock_path.parent.mkdir(parents=True, exist_ok=True)
         lock_fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
         gate_read, gate_write = os.pipe()
         process: asyncio.subprocess.Process | None = None
         try:
             try:
-                fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                _fcntl.flock(lock_fd, _fcntl.LOCK_EX | _fcntl.LOCK_NB)
             except BlockingIOError as error:
                 raise _OwnedGitMutationBusy(
                     "a prior owned Git mutation is still running"
@@ -234,10 +301,64 @@ class SubprocessGitRunner:
                 if descriptor >= 0:
                     os.close(descriptor)
 
+    async def _run_owned_windows(
+        self,
+        argv: list[str],
+        *,
+        cwd: Path,
+        lock_path: Path,
+        on_started: Callable[[int], Awaitable[None]],
+    ) -> GitCommandResult:
+        if _msvcrt is None:
+            raise WorktreeCapabilityError("Windows owned Git mutations require msvcrt")
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        token = uuid.uuid4().hex
+        gate_path = lock_path.with_name(f"{lock_path.name}.{token}.gate")
+        ack_path = lock_path.with_name(f"{lock_path.name}.{token}.ack")
+        process: asyncio.subprocess.Process | None = None
+        try:
+            process = await asyncio.create_subprocess_exec(
+                sys.executable,
+                "-c",
+                _WINDOWS_GIT_EXEC_WRAPPER,
+                str(gate_path),
+                str(ack_path),
+                str(lock_path),
+                str(os.getpid()),
+                *argv,
+                cwd=str(cwd),
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                **_subprocess_group_kwargs(),
+            )
+            try:
+                await on_started(process.pid)
+            except BaseException:
+                await _terminate_git_process(process)
+                raise
+            await asyncio.to_thread(gate_path.write_bytes, b"1")
+            result = await _communicate_git_process(process)
+            if result.returncode == 75 and "copilotd-owned-git-lock-busy" in result.stderr:
+                raise _OwnedGitMutationBusy("a prior owned Git mutation is still running")
+            return result
+        except asyncio.CancelledError:
+            if process is not None:
+                await asyncio.shield(_terminate_git_process(process))
+            raise
+        finally:
+            await asyncio.to_thread(gate_path.unlink, missing_ok=True)
+            await asyncio.to_thread(ack_path.unlink, missing_ok=True)
+
 
 def _validate_git_argv(argv: list[str]) -> None:
     if not argv or argv[0] != "git":
         raise ValueError("Git runner only accepts a literal git argv")
+
+
+def _subprocess_group_kwargs() -> dict[str, object]:
+    if sys.platform == "win32":
+        return {"creationflags": getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)}
+    return {"start_new_session": True}
 
 
 async def _communicate_git_process(
@@ -261,24 +382,49 @@ async def _terminate_git_process(
     communication: asyncio.Task[tuple[bytes, bytes]] | None = None,
 ) -> None:
     if process.returncode is None:
-        try:
-            os.killpg(process.pid, signal.SIGTERM)
-        except ProcessLookupError:
-            pass
+        if sys.platform == "win32":
+            await _terminate_windows_process_tree(process)
+        else:
+            try:
+                os.killpg(process.pid, signal.SIGTERM)
+            except ProcessLookupError:
+                pass
     waiter: Awaitable[object] = process.wait() if communication is None else communication
     try:
         async with asyncio.timeout(_GIT_CHILD_STOP_SECONDS):
             await asyncio.shield(waiter)
     except TimeoutError:
         if process.returncode is None:
-            try:
-                os.killpg(process.pid, signal.SIGKILL)
-            except ProcessLookupError:
-                pass
+            if sys.platform == "win32":
+                await _terminate_windows_process_tree(process)
+            else:
+                try:
+                    os.killpg(process.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
         if communication is None:
             await process.wait()
         else:
             await communication
+
+
+async def _terminate_windows_process_tree(process: asyncio.subprocess.Process) -> None:
+    try:
+        terminator = await asyncio.create_subprocess_exec(
+            "taskkill.exe",
+            "/PID",
+            str(process.pid),
+            "/T",
+            "/F",
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.DEVNULL,
+        )
+    except FileNotFoundError:
+        process.kill()
+        return
+    await terminator.wait()
+    if process.returncode is None and terminator.returncode:
+        process.kill()
 
 
 def _git_lock_is_held(path: Path) -> bool:
@@ -286,11 +432,26 @@ def _git_lock_is_held(path: Path) -> bool:
         return False
     descriptor = os.open(path, os.O_RDWR)
     try:
+        if sys.platform == "win32":
+            if _msvcrt is None:
+                raise WorktreeCapabilityError("Windows Git lock inspection requires msvcrt")
+            if os.fstat(descriptor).st_size == 0:
+                os.write(descriptor, b"\0")
+            os.lseek(descriptor, 0, os.SEEK_SET)
+            try:
+                _msvcrt.locking(descriptor, _msvcrt.LK_NBLCK, 1)
+            except OSError:
+                return True
+            os.lseek(descriptor, 0, os.SEEK_SET)
+            _msvcrt.locking(descriptor, _msvcrt.LK_UNLCK, 1)
+            return False
+        if _fcntl is None:
+            raise WorktreeCapabilityError("Git lock inspection requires POSIX flock")
         try:
-            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            _fcntl.flock(descriptor, _fcntl.LOCK_EX | _fcntl.LOCK_NB)
         except BlockingIOError:
             return True
-        fcntl.flock(descriptor, fcntl.LOCK_UN)
+        _fcntl.flock(descriptor, _fcntl.LOCK_UN)
         return False
     finally:
         os.close(descriptor)

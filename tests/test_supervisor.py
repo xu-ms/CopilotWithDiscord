@@ -62,9 +62,7 @@ async def test_stall_monitor_marks_only_active_execution_suspect_and_never_guess
         incident = await database.fetchone(
             "SELECT kind FROM runtime_incidents WHERE session_id = 'session-1'"
         )
-        binding = await database.fetchone(
-            "SELECT attachment_state FROM session_bindings"
-        )
+        binding = await database.fetchone("SELECT attachment_state FROM session_bindings")
         submission = await database.fetchone("SELECT state FROM submissions")
 
         assert len(suspects) == 1
@@ -87,9 +85,7 @@ async def test_stall_monitor_marks_only_active_execution_suspect_and_never_guess
             """
         )
         assert await monitor.check(now=1000) == []
-        health = await database.fetchone(
-            "SELECT state, suspect_since FROM execution_health"
-        )
+        health = await database.fetchone("SELECT state, suspect_since FROM execution_health")
 
     assert dict(health) == {"state": "healthy", "suspect_since": None}
     assert pings == 1

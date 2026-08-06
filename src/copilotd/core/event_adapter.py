@@ -87,8 +87,7 @@ class EventAdapter:
             persistence_class="internal",
             raw_type=raw_type,
             agent_id=_first_identifier(data, "agentId", "agent_id"),
-            thread_id=envelope.thread_id
-            or _first_identifier(data, "threadId", "thread_id"),
+            thread_id=envelope.thread_id or _first_identifier(data, "threadId", "thread_id"),
             message_id=_first_identifier(data, "messageId", "message_id"),
             turn_id=_first_identifier(data, "turnId", "turn_id"),
             interaction_id=_first_identifier(data, "interactionId", "interaction_id"),
@@ -109,16 +108,16 @@ class EventAdapter:
 
 
 def _strict_uuid(value: Any, *, field: str) -> str:
-        if value is None:
-            raise InvalidSdkEvent(f"missing_{field}", f"SDK event {field} is missing")
-        try:
-            parsed = UUID(str(value))
-        except (AttributeError, TypeError, ValueError) as error:
-            raise InvalidSdkEvent(
-                f"invalid_{field}",
-                f"SDK event {field} is not a UUID: {value!r}",
-            ) from error
-        return str(parsed)
+    if value is None:
+        raise InvalidSdkEvent(f"missing_{field}", f"SDK event {field} is missing")
+    try:
+        parsed = UUID(str(value))
+    except (AttributeError, TypeError, ValueError) as error:
+        raise InvalidSdkEvent(
+            f"invalid_{field}",
+            f"SDK event {field} is not a UUID: {value!r}",
+        ) from error
+    return str(parsed)
 
 
 def _first_identifier(data: Any, *keys: str) -> str | None:

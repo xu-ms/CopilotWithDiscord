@@ -40,9 +40,7 @@ class OwnerLeaseStore:
         ttl_seconds: float = OWNER_LEASE_TTL_SECONDS,
     ) -> None:
         if ttl_seconds < MUTATION_HEADROOM_SECONDS + RENEWAL_JITTER_MARGIN_SECONDS:
-            raise ValueError(
-                "owner lease TTL must exceed mutation headroom by the jitter margin"
-            )
+            raise ValueError("owner lease TTL must exceed mutation headroom by the jitter margin")
         self._database = database
         self._ttl_seconds = ttl_seconds
 

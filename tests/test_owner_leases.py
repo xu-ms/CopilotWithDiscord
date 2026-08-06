@@ -142,18 +142,12 @@ async def test_takeover_atomically_orphans_all_old_generation_domain_state(
         )
 
         takeover = await store.acquire("session-1", "owner-b", now=161)
-        operation = await database.fetchone(
-            "SELECT state, error_code FROM session_operations"
-        )
+        operation = await database.fetchone("SELECT state, error_code FROM session_operations")
         submission = await database.fetchone(
             "SELECT state FROM submissions WHERE submission_id = 'submission-1'"
         )
-        background = await database.fetchone(
-            "SELECT observed_state FROM background_observations"
-        )
-        interaction = await database.fetchone(
-            "SELECT state FROM pending_interactions"
-        )
+        background = await database.fetchone("SELECT observed_state FROM background_observations")
+        interaction = await database.fetchone("SELECT state FROM pending_interactions")
         liveness = await database.fetchone("SELECT state FROM liveness_leases")
         schedule = await database.fetchone("SELECT state FROM runtime_schedules")
 
@@ -229,9 +223,7 @@ async def test_takeover_replay_reconciles_persisted_acceptance_without_duplicate
     prompt = "accepted before crash"
     accepted_id = str(uuid4())
     async with Database(tmp_path / "takeover-replay.sqlite3") as database:
-        await CapabilityRegistry(
-            Settings(_env_file=None, data_dir=tmp_path)
-        ).activate(
+        await CapabilityRegistry(Settings(_env_file=None, data_dir=tmp_path)).activate(
             database,
             {
                 "runtime_version": "1.0.73",

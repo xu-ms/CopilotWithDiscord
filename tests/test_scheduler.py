@@ -18,6 +18,7 @@ from copilotd.core.scheduler import (
     ScheduleRunState,
     SchedulerWorker,
 )
+from copilotd.core.task_registry import TaskRegistry
 from copilotd.ops.heartbeat import HeartbeatWriter
 from copilotd.storage.database import Database
 
@@ -133,6 +134,38 @@ async def test_worker_refuses_start_and_tick_before_recovery(tmp_path: Path) -> 
             await worker.start()
         with pytest.raises(SchedulerNotRecovered):
             await worker.tick()
+
+
+@pytest.mark.asyncio
+async def test_scheduler_loop_failure_is_reported_through_task_registry(
+    tmp_path: Path,
+) -> None:
+    class FailingClock(FakeClock):
+        async def sleep(self, seconds: float) -> None:
+            del seconds
+            raise RuntimeError("scheduler sleep failed")
+
+    async with Database(tmp_path / "scheduler-supervision.sqlite3") as database:
+        repository = SchedulerRepository(database)
+        await repository.recover(now=0)
+        registry = TaskRegistry()
+        worker = SchedulerWorker(
+            repository,
+            DeterministicSchedulerAdapter(),
+            owner_id="supervised-worker",
+            clock=FailingClock(0),
+            task_registry=registry,
+        )
+
+        await worker.start()
+        failure = await asyncio.wait_for(registry.errors.get(), timeout=1)
+        await worker.stop()
+
+    assert failure.name == "scheduler:supervised-worker"
+    assert failure.source == "app-scheduler"
+    assert isinstance(failure.error, RuntimeError)
+    assert str(failure.error) == "scheduler sleep failed"
+    assert registry.active_count == 0
 
 
 @pytest.mark.asyncio

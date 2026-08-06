@@ -293,9 +293,7 @@ async def test_active_delete_performs_force_teardown_before_sdk_delete(tmp_path:
         assert registry.ensure_calls == [binding.sdk_session_id]
         assert runtime.close_calls == [
             {
-                "idempotency_key": (
-                    f"session-delete:{binding.sdk_session_id}:teardown"
-                ),
+                "idempotency_key": (f"session-delete:{binding.sdk_session_id}:teardown"),
                 "force": True,
             }
         ]

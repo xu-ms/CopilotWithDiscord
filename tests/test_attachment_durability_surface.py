@@ -41,6 +41,21 @@ class FakeAttachment:
         return self.content
 
 
+@dataclass
+class BlockingAttachment(FakeAttachment):
+    started: asyncio.Event | None = None
+    release: asyncio.Event | None = None
+
+    async def read(self, *, use_cached: bool = True) -> bytes:
+        assert use_cached
+        self.read_calls += 1
+        assert self.started is not None
+        assert self.release is not None
+        self.started.set()
+        await self.release.wait()
+        return self.content
+
+
 def _path_exists(path: Path) -> bool:
     return path.exists()
 
@@ -814,3 +829,174 @@ async def test_attachment_manifest_survives_restart_and_detects_tampering(
             (manifest_id,),
         )
         assert failed is not None and failed["state"] == "failed"
+
+
+@pytest.mark.asyncio
+async def test_interrupted_preparation_resumes_from_durable_discord_source(
+    tmp_path: Path,
+) -> None:
+    database_path = tmp_path / "preparing-recovery.sqlite3"
+    started = asyncio.Event()
+    release = asyncio.Event()
+    blocked = BlockingAttachment(
+        id=44,
+        filename="resume.txt",
+        content=b"recovered content",
+        content_type="text/plain",
+        started=started,
+        release=release,
+    )
+
+    async with Database(database_path) as database:
+        service = AttachmentService(database, tmp_path, retention_seconds=10)
+        preparation = asyncio.create_task(
+            service.prepare(
+                source_kind="discord-message",
+                source_id="message-preparing",
+                session_id="session-preparing",
+                attachments=[blocked],
+                source_channel_id="123",
+                source_message_id="456",
+                recovery_prompt="resume this attachment",
+                recovery_idempotency_key="discord-message:456",
+                recovery_origin="discord_message",
+            )
+        )
+        await started.wait()
+        preparation.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await preparation
+        manifest = await database.fetchone(
+            """
+            SELECT id, state, source_channel_id, source_message_id,
+                   recovery_idempotency_key
+            FROM attachment_manifests
+            """
+        )
+
+    assert manifest is not None
+    assert dict(manifest) == {
+        "id": str(
+            uuid.uuid5(
+                uuid.NAMESPACE_URL,
+                "copilotd:attachment:discord-message:message-preparing",
+            )
+        ),
+        "state": "preparing",
+        "source_channel_id": "123",
+        "source_message_id": "456",
+        "recovery_idempotency_key": "discord-message:456",
+    }
+
+    async with Database(database_path) as reopened:
+        service = AttachmentService(reopened, tmp_path, retention_seconds=10)
+        pending = await service.pending_recoveries()
+        assert len(pending) == 1
+        recovery = pending[0]
+        assert recovery.state == "preparing"
+        assert recovery.needs_submission
+
+        prepared = await service.prepare(
+            source_kind=recovery.source_kind,
+            source_id=recovery.source_id,
+            session_id=recovery.session_id,
+            attachments=[
+                FakeAttachment(
+                    id=44,
+                    filename="resume.txt",
+                    content=b"recovered content",
+                    content_type="text/plain",
+                )
+            ],
+            source_channel_id=recovery.source_channel_id,
+            source_message_id=recovery.source_message_id,
+            recovery_prompt=recovery.prompt,
+            recovery_idempotency_key=recovery.idempotency_key,
+            recovery_origin=recovery.origin,
+        )
+        assert prepared is not None
+        assert await service.release_unreferenced(now=100) == 0
+
+        await reopened.execute(
+            """
+            INSERT INTO submissions(
+                submission_id, sdk_session_id, origin,
+                attachment_manifest_id, state, created_at
+            ) VALUES ('submission-recovered', 'session-preparing',
+                      'discord_message', ?, 'local_queued', 101)
+            """,
+            (prepared.manifest_id,),
+        )
+        assert await service.pending_recoveries() == ()
+
+
+@pytest.mark.asyncio
+async def test_attachment_retention_waits_for_terminal_reference_then_collects(
+    tmp_path: Path,
+) -> None:
+    async with Database(tmp_path / "attachment-gc.sqlite3") as database:
+        service = AttachmentService(database, tmp_path, retention_seconds=10)
+        prepared = await service.prepare(
+            source_kind="fixture",
+            source_id="attachment-gc",
+            session_id="session-gc",
+            attachments=[
+                FakeAttachment(
+                    id=9,
+                    filename="retained.txt",
+                    content=b"retain me",
+                    content_type="text/plain",
+                )
+            ],
+        )
+        assert prepared is not None
+        item = await database.fetchone(
+            "SELECT local_path FROM attachment_items WHERE manifest_id = ?",
+            (prepared.manifest_id,),
+        )
+        local_path = Path(str(item["local_path"]))
+        await database.execute(
+            """
+            INSERT INTO submissions(
+                submission_id, sdk_session_id, origin,
+                attachment_manifest_id, state, created_at
+            ) VALUES ('submission-gc', 'session-gc', 'app_message',
+                      ?, 'observed_active', 1)
+            """,
+            (prepared.manifest_id,),
+        )
+
+        assert await service.release_unreferenced(now=100) == 0
+        assert await asyncio.to_thread(_path_exists, local_path)
+
+        await database.execute(
+            """
+            UPDATE submissions SET state = 'semantic_complete'
+            WHERE submission_id = 'submission-gc'
+            """
+        )
+        assert await service.release_unreferenced(now=100) == 1
+        assert await service.garbage_collect(now=109) == 0
+        assert await asyncio.to_thread(_path_exists, local_path)
+        assert await service.garbage_collect(now=110) == 1
+        assert await service.garbage_collect(now=111) == 0
+        manifest = await database.fetchone(
+            """
+            SELECT state, total_bytes, retention_until
+            FROM attachment_manifests
+            WHERE id = ?
+            """,
+            (prepared.manifest_id,),
+        )
+        item_count = await database.fetchone(
+            "SELECT COUNT(*) FROM attachment_items WHERE manifest_id = ?",
+            (prepared.manifest_id,),
+        )
+
+    assert not await asyncio.to_thread(_path_exists, local_path)
+    assert dict(manifest) == {
+        "state": "released",
+        "total_bytes": 0,
+        "retention_until": None,
+    }
+    assert item_count[0] == 0

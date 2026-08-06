@@ -10,7 +10,7 @@ import pytest
 
 from copilotd.storage.database import Database
 
-EXPECTED_MIGRATION_VERSIONS = [*range(1, 38), *range(40, 46)]
+EXPECTED_MIGRATION_VERSIONS = [*range(1, 38), *range(40, 47)]
 
 
 def _create_migration_fixture(path: Path, *, through_version: int) -> None:

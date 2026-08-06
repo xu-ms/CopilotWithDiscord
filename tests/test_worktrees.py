@@ -1,11 +1,14 @@
 import asyncio
+import os
 import subprocess
+import sys
 import time
 import uuid
 from pathlib import Path
 
 import pytest
 
+import copilotd.core.worktrees as worktrees_module
 from copilotd.core.bindings import (
     AttachmentState,
     BindingConflict,
@@ -58,6 +61,37 @@ def _create_repo(path: Path) -> None:
     (path / "README.txt").write_text("root\n", encoding="utf-8")
     _git(path, "add", "README.txt")
     _git(path, "commit", "-m", "initial")
+
+
+def test_worktree_module_imports_without_posix_fcntl() -> None:
+    repository_root = Path(__file__).resolve().parents[1]
+    environment = dict(os.environ)
+    environment["PYTHONPATH"] = str(repository_root / "src")
+    completed = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            ("import subprocess, sys; sys.modules['fcntl'] = None; import copilotd.core.worktrees"),
+        ],
+        cwd=repository_root,
+        env=environment,
+        check=False,
+        capture_output=True,
+        text=True,
+        shell=False,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+
+
+def test_windows_subprocesses_use_process_groups(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(worktrees_module.sys, "platform", "win32")
+
+    kwargs = worktrees_module._subprocess_group_kwargs()
+
+    assert kwargs == {
+        "creationflags": getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0),
+    }
 
 
 async def _manager(

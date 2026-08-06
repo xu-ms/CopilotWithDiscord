@@ -212,6 +212,7 @@ class CopilotDiscordBot(commands.Bot):
         self._shutdown_initiator: asyncio.Task[Any] | None = None
         self._accepting_handlers = True
         self._admitted_handlers: set[asyncio.Task[Any]] = set()
+        self._attachment_recovery_task: asyncio.Task[None] | None = None
 
     def _heartbeat_metrics(self) -> tuple[int, int, float | None]:
         if self.sessions is None:
@@ -358,6 +359,7 @@ class CopilotDiscordBot(commands.Bot):
                 self.capabilities,
             ),
             owner_id=f"scheduler:{self._owner_id}",
+            task_registry=self._tasks,
         )
         await self.scheduler_worker.start()
         self.dispatcher = RenderOutboxDispatcher(self.database, self)
@@ -390,6 +392,11 @@ class CopilotDiscordBot(commands.Bot):
             ).run(),
             name="copilotd-service-control",
             source="service-control",
+        )
+        self._tasks.create(
+            self._attachment_maintenance_loop(),
+            name="attachment-lifecycle-maintenance",
+            source="attachments",
         )
         self._register_application_commands()
         if self.settings.discord_guild_id is not None:
@@ -539,11 +546,131 @@ class CopilotDiscordBot(commands.Bot):
 
     async def on_ready(self) -> None:
         self.heartbeat.set_gateway("ready")
+        if self._accepting_handlers and (
+            self._attachment_recovery_task is None or self._attachment_recovery_task.done()
+        ):
+            self._attachment_recovery_task = self._tasks.create(
+                self._recover_attachment_manifests(),
+                name="attachment-source-recovery",
+                source="attachments",
+            )
         await logger.ainfo(
             "discord_ready",
             user=None if self.user is None else str(self.user),
             guilds=len(self.guilds),
         )
+
+    async def _recover_attachment_manifests(self) -> None:
+        recoveries = await self.attachment_service.pending_recoveries()
+        for recovery in recoveries:
+            if (
+                recovery.session_id is None
+                or recovery.prompt is None
+                or recovery.idempotency_key is None
+                or (
+                    recovery.state == "preparing"
+                    and (recovery.source_channel_id is None or recovery.source_message_id is None)
+                )
+            ):
+                await self.attachment_service.record_recovery_error(
+                    recovery.manifest_id,
+                    code="source_locator_unavailable",
+                    detail="attachment preparation cannot be resumed without its durable source",
+                    terminal=True,
+                )
+                continue
+            try:
+                if recovery.state == "preparing":
+                    channel_id = int(recovery.source_channel_id or "")
+                    message_id = int(recovery.source_message_id or "")
+                    channel = self.get_channel(channel_id)
+                    if channel is None:
+                        channel = await self.fetch_channel(channel_id)
+                    fetch_message = getattr(channel, "fetch_message", None)
+                    if fetch_message is None:
+                        raise AttachmentError(
+                            "the durable Discord attachment source is not message-addressable"
+                        )
+                    message = await fetch_message(message_id)
+                    prepared = await self.attachment_service.prepare(
+                        source_kind=recovery.source_kind,
+                        source_id=recovery.source_id,
+                        session_id=recovery.session_id,
+                        attachments=list(message.attachments),
+                        source_channel_id=recovery.source_channel_id,
+                        source_message_id=recovery.source_message_id,
+                        recovery_prompt=recovery.prompt,
+                        recovery_idempotency_key=recovery.idempotency_key,
+                        recovery_origin=recovery.origin,
+                    )
+                    if prepared is None:
+                        raise AttachmentError("the durable Discord source has no attachments")
+                else:
+                    prepared = await self.attachment_service.prepared_manifest(recovery.manifest_id)
+                if not recovery.needs_submission:
+                    await self.attachment_service.record_recovery_success(recovery.manifest_id)
+                    continue
+                binding = await self._require_bindings().by_session(recovery.session_id)
+                if binding is None or binding.binding_intent != BindingIntent.ACTIVE:
+                    raise AttachmentError("the attachment source session is no longer active")
+                runtime = await self._require_sessions().ensure_attached(binding)
+                sdk_attachments = await self.attachment_service.sdk_attachments(
+                    prepared.manifest_id
+                )
+                await runtime.send(
+                    recovery.prompt,
+                    idempotency_key=recovery.idempotency_key,
+                    attachments=sdk_attachments,
+                    attachment_manifest_id=recovery.manifest_id,
+                    origin=recovery.origin or "discord_message",
+                )
+            except (discord.NotFound, discord.Forbidden, AttachmentError) as error:
+                await self.attachment_service.record_recovery_error(
+                    recovery.manifest_id,
+                    code="source_recovery_failed",
+                    detail=f"{type(error).__name__}: {error}",
+                    terminal=True,
+                )
+            except (discord.HTTPException, OSError, TimeoutError) as error:
+                await self.attachment_service.record_recovery_error(
+                    recovery.manifest_id,
+                    code="source_recovery_deferred",
+                    detail=f"{type(error).__name__}: {error}",
+                    terminal=False,
+                )
+                await logger.awarning(
+                    "attachment_recovery_deferred",
+                    manifest_id=recovery.manifest_id,
+                    error_type=type(error).__name__,
+                    error=str(error),
+                )
+            except Exception as error:
+                await self.attachment_service.record_recovery_error(
+                    recovery.manifest_id,
+                    code="submission_recovery_deferred",
+                    detail=f"{type(error).__name__}: {error}",
+                    terminal=False,
+                )
+                await logger.awarning(
+                    "attachment_submission_recovery_deferred",
+                    manifest_id=recovery.manifest_id,
+                    error_type=type(error).__name__,
+                    error=str(error),
+                )
+            else:
+                await self.attachment_service.record_recovery_success(recovery.manifest_id)
+
+    async def _attachment_maintenance_loop(self) -> None:
+        while True:
+            released = await self.attachment_service.release_unreferenced()
+            removed = await self.attachment_service.garbage_collect()
+            if released or removed:
+                await logger.ainfo(
+                    "attachment_lifecycle_maintained",
+                    released=released,
+                    removed=removed,
+                )
+            await asyncio.sleep(300)
 
     async def on_disconnect(self) -> None:
         self.heartbeat.set_gateway("reconnecting")
@@ -824,6 +951,11 @@ class CopilotDiscordBot(commands.Bot):
                     source_id=str(message.id),
                     session_id=runtime.binding.sdk_session_id,
                     attachments=message.attachments,
+                    source_channel_id=str(message.channel.id),
+                    source_message_id=str(message.id),
+                    recovery_prompt=prompt or "Please inspect the attached files.",
+                    recovery_idempotency_key=f"discord-message:{message.id}",
+                    recovery_origin="discord_message",
                 )
                 sdk_attachments = (
                     None
@@ -869,6 +1001,11 @@ class CopilotDiscordBot(commands.Bot):
                 source_id=str(message.id),
                 session_id=runtime.binding.sdk_session_id,
                 attachments=message.attachments,
+                source_channel_id=str(message.channel.id),
+                source_message_id=str(message.id),
+                recovery_prompt=effective_prompt,
+                recovery_idempotency_key=f"message:{message.id}",
+                recovery_origin="discord_message",
             )
             sdk_attachments = (
                 None
@@ -911,6 +1048,7 @@ class CopilotDiscordBot(commands.Bot):
                 message = await destination.send(
                     content=content or "\u200b",
                     files=_discord_files(assets[:10]),
+                    embeds=_discord_embeds(_taskdeck_embed_payloads(payload)),
                     view=_render_view(payload),
                     silent=True,
                 )
@@ -972,6 +1110,7 @@ class CopilotDiscordBot(commands.Bot):
                 await message.edit(
                     content=content or "\u200b",
                     attachments=_discord_files(assets[:10]),
+                    embeds=_discord_embeds(_taskdeck_embed_payloads(payload)),
                     view=_render_view(payload),
                 )
                 for index in range(10, len(assets), 10):
@@ -1163,6 +1302,7 @@ class CopilotDiscordBot(commands.Bot):
                 await recovery_message.edit(
                     content=batch.content or "\u200b",
                     attachments=_discord_files(list(batch.assets)),
+                    embeds=_discord_embeds(batch.embeds),
                     view=(
                         _render_view(
                             payload,
@@ -1179,6 +1319,7 @@ class CopilotDiscordBot(commands.Bot):
                 sent = await thread.send(
                     content=batch.content or "\u200b",
                     files=_discord_files(list(batch.assets)),
+                    embeds=_discord_embeds(batch.embeds),
                     view=(
                         _render_view(
                             payload,
@@ -3136,6 +3277,11 @@ class CopilotDiscordBot(commands.Bot):
                     source_id=f"{target.id}:{interaction.id}",
                     session_id=runtime.binding.sdk_session_id,
                     attachments=target.attachments,
+                    source_channel_id=str(target.channel.id),
+                    source_message_id=str(target.id),
+                    recovery_prompt=provenance,
+                    recovery_idempotency_key=f"context-ask:{interaction.id}",
+                    recovery_origin="context_menu_ask",
                 )
                 sdk_attachments = (
                     None
@@ -3960,6 +4106,7 @@ class ElicitationResponseModal(discord.ui.Modal):
 class DiscordRenderBatch:
     content: str
     assets: tuple[TableAsset, ...] = ()
+    embeds: tuple[dict[str, Any], ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -3998,7 +4145,8 @@ async def _discord_render_plan(
     max_bytes: int | None = None,
 ) -> DiscordRenderPlan:
     content = str(payload.get("content", ""))
-    if not payload.get("finalized"):
+    taskdeck_embeds = _taskdeck_embed_payloads(payload)
+    if not payload.get("finalized") and not taskdeck_embeds:
         return DiscordRenderPlan((DiscordRenderBatch(_safe_stream_content(content)),))
 
     explicit_assets: list[TableAsset] = []
@@ -4189,6 +4337,7 @@ async def _discord_render_plan(
                 batches[-1] = DiscordRenderBatch(
                     content=f"{last.content}\n\n{segment.content}".strip(),
                     assets=last.assets,
+                    embeds=last.embeds,
                 )
             else:
                 batches.append(
@@ -4199,6 +4348,14 @@ async def _discord_render_plan(
                 )
     if not batches:
         batches.append(DiscordRenderBatch(""))
+
+    if taskdeck_embeds:
+        first = batches[0]
+        batches[0] = DiscordRenderBatch(
+            content=first.content,
+            assets=first.assets,
+            embeds=taskdeck_embeds,
+        )
 
     batches = _append_assets_to_batches(batches, explicit_assets)
     for index in range(0, len(local_image_assets), 10):
@@ -4221,13 +4378,19 @@ async def _discord_render_plan(
             max_bytes=max_bytes or 2**63 - 1,
         )
         if not prepared_assets:
-            prepared_batches.append(DiscordRenderBatch(prepared_content))
+            prepared_batches.append(
+                DiscordRenderBatch(
+                    prepared_content,
+                    embeds=batch.embeds,
+                )
+            )
             continue
         for index in range(0, len(prepared_assets), 10):
             prepared_batches.append(
                 DiscordRenderBatch(
                     content=prepared_content if index == 0 else "",
                     assets=tuple(prepared_assets[index : index + 10]),
+                    embeds=batch.embeds if index == 0 else (),
                 )
             )
     return DiscordRenderPlan(tuple(prepared_batches))
@@ -4253,6 +4416,140 @@ def _safe_stream_content(content: str) -> str:
 def _bounded_discord_text(content: str, limit: int) -> str:
     normalized = " ".join(content.split())
     return normalized if len(normalized) <= limit else normalized[: limit - 1] + "…"
+
+
+def _discord_embeds(payloads: tuple[dict[str, Any], ...]) -> list[discord.Embed]:
+    return [discord.Embed.from_dict(payload) for payload in payloads]
+
+
+def _taskdeck_embed_payloads(payload: dict[str, Any]) -> tuple[dict[str, Any], ...]:
+    if payload.get("type") != "taskdeck":
+        return ()
+    cards = payload.get("cards")
+    if not isinstance(cards, list):
+        raise RenderPermanentError("TaskDeck render payload has no card list")
+    if not cards:
+        return (
+            {
+                "title": "TaskDeck",
+                "description": "No observed tasks.",
+                "color": 0x747F8D,
+            },
+        )
+    metadata = payload.get("taskdeck")
+    if not isinstance(metadata, dict):
+        raise RenderPermanentError("TaskDeck render payload has no panel metadata")
+    try:
+        page = max(0, int(metadata.get("page", 0)))
+    except (TypeError, ValueError) as error:
+        raise RenderPermanentError("TaskDeck render payload has an invalid page") from error
+    visible = cards[page * 8 : (page + 1) * 8]
+    selected_token = str(metadata.get("selected_card_token") or "")
+    expanded = bool(metadata.get("expanded"))
+    embeds: list[dict[str, Any]] = []
+    for card in visible:
+        if not isinstance(card, dict):
+            raise RenderPermanentError("TaskDeck render payload contains an invalid card")
+        title = _bounded_discord_text(str(card.get("title") or "Untitled task"), 100)
+        state = _bounded_discord_text(str(card.get("state") or "unknown"), 40)
+        kind = _bounded_discord_text(str(card.get("kind") or "unknown"), 40)
+        token = str(card.get("card_token") or "")
+        is_selected = token == selected_token
+        is_expanded = is_selected and expanded
+        progress = _bounded_discord_text(
+            str(card.get("progress_summary") or "No progress reported."),
+            360,
+        )
+        description = progress
+        if is_expanded and card.get("detail_artifact"):
+            filename = f"task-{token}-detail.md"
+            description = (
+                f"{progress}\n\nFull detail is attached as `{filename}` and remains "
+                "available from Download."
+            )
+        fields = [
+            {"name": "State", "value": f"`{state}`", "inline": True},
+            {"name": "Type", "value": f"`{kind}`", "inline": True},
+            {
+                "name": "Elapsed",
+                "value": f"`{_taskdeck_elapsed(card)}`",
+                "inline": True,
+            },
+        ]
+        dependencies = card.get("dependencies")
+        if is_expanded and isinstance(dependencies, list) and dependencies:
+            fields.append(
+                {
+                    "name": "Dependencies",
+                    "value": _bounded_discord_text(
+                        ", ".join(f"`{value}`" for value in dependencies[:10]),
+                        140,
+                    ),
+                    "inline": False,
+                }
+            )
+        artifact_links = card.get("artifact_links")
+        if is_expanded and isinstance(artifact_links, list) and artifact_links:
+            fields.append(
+                {
+                    "name": "Artifacts",
+                    "value": _bounded_discord_text(
+                        "\n".join(str(value) for value in artifact_links[:8]),
+                        160,
+                    ),
+                    "inline": False,
+                }
+            )
+        embed: dict[str, Any] = {
+            "title": f"{_taskdeck_state_icon(state)} {title}",
+            "description": _bounded_discord_text(description, 780),
+            "color": _taskdeck_state_color(state),
+            "fields": fields,
+        }
+        if is_selected:
+            embed["footer"] = {"text": "Selected · expanded" if expanded else "Selected"}
+        embeds.append(embed)
+    return tuple(embeds)
+
+
+def _taskdeck_elapsed(card: dict[str, Any]) -> str:
+    elapsed = card.get("elapsed")
+    if isinstance(elapsed, str) and elapsed:
+        return _bounded_discord_text(elapsed, 32)
+    first_seen = card.get("first_seen_at")
+    observed_end = card.get("terminal_at") or card.get("last_progress_at")
+    if not isinstance(first_seen, (int, float)) or not isinstance(observed_end, (int, float)):
+        return "unknown"
+    total = max(0, int(observed_end - first_seen))
+    minutes, seconds = divmod(total, 60)
+    hours, minutes = divmod(minutes, 60)
+    if hours:
+        return f"{hours}h {minutes}m"
+    if minutes:
+        return f"{minutes}m {seconds}s"
+    return f"{seconds}s"
+
+
+def _taskdeck_state_icon(state: str) -> str:
+    return {
+        "running": "▶",
+        "idle": "⏸",
+        "completed": "✅",
+        "failed": "❌",
+        "cancelled": "⏹",
+        "unknown": "⚠️",
+    }.get(state, "•")
+
+
+def _taskdeck_state_color(state: str) -> int:
+    return {
+        "running": 0x5865F2,
+        "idle": 0xFEE75C,
+        "completed": 0x57F287,
+        "failed": 0xED4245,
+        "cancelled": 0x747F8D,
+        "unknown": 0xF0B232,
+    }.get(state, 0x747F8D)
 
 
 def _render_view(
@@ -4590,6 +4887,15 @@ def _render_delivery_family(delivery_id: str) -> str:
 def _render_batch_hash(batch: DiscordRenderBatch) -> str:
     digest = hashlib.sha256()
     digest.update(batch.content.encode("utf-8"))
+    digest.update(b"\0embeds\0")
+    digest.update(
+        json.dumps(
+            batch.embeds,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    )
     for asset in batch.assets:
         digest.update(b"\0")
         digest.update(asset.filename.encode("utf-8"))
@@ -4611,6 +4917,7 @@ def _append_assets_to_batches(
     batches[0] = DiscordRenderBatch(
         content=first.content,
         assets=first.assets + tuple(assets[:capacity]),
+        embeds=first.embeds,
     )
     for index in range(capacity, len(assets), 10):
         batches.append(

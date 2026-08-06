@@ -2014,8 +2014,9 @@ async def test_subagent_output_stays_in_one_collapsed_taskdeck(tmp_path: Path) -
     assert {row["lane"] for row in outbox} == {"taskdeck"}
     assert {row["coalesce_key"] for row in outbox} == {"taskdeck"}
     final_payload = json.loads(outbox[-1]["payload"])
-    assert "**TaskDeck**" in final_payload["content"]
-    assert "✅ **Parser investigator**" in final_payload["content"]
+    assert final_payload["content"] == "**TaskDeck** — 1 item(s)"
+    assert final_payload["cards"][0]["title"] == "Parser investigator"
+    assert final_payload["cards"][0]["elapsed"].endswith("s")
     assert final_payload["finalized"] is True
     assert final_payload["taskdeck"]["expanded"] is False
     assert final_payload["taskdeck"]["options"][0]["label"] == "Parser investigator"
@@ -2152,8 +2153,8 @@ async def test_taskdeck_view_change_expands_the_selected_card_in_place(
 
     expanded = json.loads(expanded_row["payload"])
     assert expanded["taskdeck"]["expanded"] is True
-    assert "**Parser investigator details**" in expanded["content"]
-    assert "Investigate the parser" in expanded["content"]
+    assert expanded["content"] == "**TaskDeck** — 1 item(s)"
+    assert expanded["cards"][0]["progress_summary"] == "Investigate the parser"
 
 
 @pytest.mark.asyncio

@@ -774,10 +774,9 @@ copilotD 扩展</a></li>
 </nav>
 <h1 id="copilotd-详细设计与实施计划">copilotD 详细设计与实施计划</h1>
 <blockquote>
-<p>当前阶段：详细设计 v2.5 已批准，durable/capability
-foundation、Discord core、 interaction router 与 background-task
-reconciliation 已实现；当前继续按 capability gate
-补齐产品能力并做真实平台验收。</p>
+<p>当前阶段：详细设计 v2.5 已批准，设计承诺的 repository implementation
+已完成对齐； 当前按顺序执行完整 deterministic/package gate、真实 Copilot
+Bridge 功能矩阵、 真实 Discord 消息 gallery 与平台实机验收。</p>
 <p>本版固定前提：单用户、私有部署、Copilot runtime 全程
 <code>--yolo</code>，不设计多用户共享、
 工具确认流程、安全沙箱或租户隔离。</p>
@@ -930,7 +929,9 @@ idle/delta 不做 durable restart replay</td>
 <tr>
 <td>Hooks</td>
 <td>Copilot session hooks</td>
-<td>支持；Hook 名称和 payload 需适配</td>
+<td>支持 SDK 1.0.8
+实际可调用子集；<code>onUserPromptTransformed</code>/<code>onAgentStop</code>
+不注册</td>
 </tr>
 <tr>
 <td>Context 展示</td>
@@ -1928,7 +1929,7 @@ last_inbox_seq, last_sdk_receive_seq?, last_event_at, row_version</td>
 <tr>
 <td><code>session_owner_leases</code></td>
 <td>sdk_session_id, owner_id, fence_token(monotonic integer),
-acquired_at, renewed_at, expires_at；60 秒 TTL/20 秒续租，跨进程唯一
+acquired_at, renewed_at, expires_at；60 秒 TTL/15 秒续租，跨进程唯一
 create/resume/send/abort/disconnect 权限</td>
 </tr>
 <tr>
@@ -1980,9 +1981,12 @@ snapshot</td>
 </tr>
 <tr>
 <td><code>attachment_manifests</code></td>
-<td>id, source_kind, source_id, session_id?,
-state(preparing/ready/failed/released), total_bytes, created_at,
-retention_until?；creation/queue/submission/outbox 的 durable owner</td>
+<td>id, source_kind, source_id, source_channel_id?, source_message_id?,
+session_id?, recovery_prompt?, recovery_idempotency_key?,
+recovery_origin?, state(preparing/ready/failed/released), error_code?,
+error_detail?, total_bytes, created_at, updated_at,
+retention_until?；creation/queue/submission/outbox 的 durable owner 与
+restart recovery locator</td>
 </tr>
 <tr>
 <td><code>attachment_items</code></td>
@@ -2000,7 +2004,8 @@ last_progress_at；不声明超出 task RPC snapshot 的 lifecycle</td>
 <td><code>task_card_projections</code></td>
 <td>sdk_session_id, panel_id, card_token, card_key(task-id 或
 orphan-agent-id), task_id?, agent_id?, kind(agent/shell/fleet/orphan),
-title, state, progress_summary, detail_artifact?, first_seen_at,
+title, state, progress_summary, detail_artifact?, dependencies,
+artifact_links, can_promote, first_seen_at, last_progress_at,
 terminal_at?, revision；TaskDeck 可重建 read model，不拥有
 lifecycle</td>
 </tr>
@@ -3046,6 +3051,11 @@ thread 组织，不叫 Copilot mode</td>
 <td>更新 channel trigger；默认 false</td>
 </tr>
 <tr>
+<td><code>/project timezone value</code></td>
+<td>校验并保存 IANA timezone，供省略 timezone 的 future app schedule
+使用</td>
+</tr>
+<tr>
 <td><code>/project variable set name value</code></td>
 <td>保存 future-session reference value；显式 project only；只解析到
 typed MCP/environment reference，不批量注入 runtime process
@@ -3056,9 +3066,8 @@ environment</td>
 <td>项目 reference value 视图</td>
 </tr>
 <tr>
-<td><code>/project variable remove name</code></td>
-<td>删除项目 reference value；被 MCP/environment binding 引用时 fail
-closed；已有 session snapshot 不热变更</td>
+<td>`/project variable remove</td>
+<td>unset name`</td>
 </tr>
 <tr>
 <td><code>/project mcp action</code></td>
@@ -3078,8 +3087,14 @@ CLI <code>/plugins</code> marketplace UI</td>
 <tr>
 <td><code>/project agent action</code></td>
 <td>explicit project only；管理 future-session custom-agent
-config；不自动改 active runtime，未来若提供 apply 必须 detach-safe
-reattach</td>
+config；不自动改 active runtime</td>
+</tr>
+<tr>
+<td><code>/project config-reload</code></td>
+<td>thread-only；读取 immutable cwd 下
+<code>.copilotd/extensions.json</code>，要求 detach-safe/quiet，经
+fenced same-session reattach 发布新 config generation；失败或歧义保持
+recovery/config unknown，不假装 rollback</td>
 </tr>
 <tr>
 <td><code>/project worktree create name base? history?</code></td>
@@ -3215,6 +3230,19 @@ remote/schedule reconciliation</td>
 <td><code>/ops debug level duration</code></td>
 <td>level 为 <code>info</code>、<code>debug</code> 或
 <code>trace</code>，最长 30 分钟</td>
+</tr>
+<tr>
+<td><code>/ops scheduler</code></td>
+<td>app scheduler worker、definition/run、attached/protected-work 与
+restart blocker 快照</td>
+</tr>
+<tr>
+<td><code>/ops log-tail correlation-id?</code></td>
+<td>有界、脱敏的本地 rotating log tail；可按 correlation ID 过滤</td>
+</tr>
+<tr>
+<td><code>/ops event-dump session-id?</code></td>
+<td>最多 250 条 durable event timeline，只读且脱敏</td>
 </tr>
 <tr>
 <td><code>/ops log-dump correlation-id?</code></td>
@@ -3930,7 +3958,8 @@ ReducerWorker；timeout/cancel、重复点击和 晚到 completed
 </tr>
 <tr>
 <td><code>onUserPromptTransformed</code></td>
-<td>记录 turn 关联</td>
+<td>SDK 1.0.8 不调用，copilotD 不注册；保留兼容方法但不把沉默 callback
+当证据</td>
 </tr>
 <tr>
 <td><code>onSessionStart</code></td>
@@ -3948,15 +3977,17 @@ runtime</td>
 </tr>
 <tr>
 <td><code>onAgentStop</code></td>
-<td>更新 observed agent-loop 状态；不 unsubscribe ingress，不假定
-background 工作结束</td>
+<td>SDK 1.0.8 不调用，copilotD 不注册；使用
+<code>session.idle</code>/turn/task 事件观察 agent loop</td>
 </tr>
 </tbody>
 </table>
-<p>所有 app-level <code>asyncio.create_task()</code> 必须经
-<code>TaskRegistry.spawn()</code> 创建。Registry 保存 强引用、task
-name/source/session/generation，done callback 记录异常并释放引用；任何
-heartbeat loop 异常都进入 Supervisor，不能静默停止。</p>
+<p>所有 long-lived/fire-and-forget app task 必须经
+<code>TaskRegistry.create()</code> 创建。Registry 保存 强引用、task
+name/source/session/generation，done callback 记录异常并释放引用；app
+scheduler、 heartbeat 与 maintenance loop 的 fatal exception 都进入
+Supervisor，不能静默停止。局部并发 child task 必须由调用方立即
+await/cancel，不得脱离其 owner coroutine。</p>
 <h3 id="discord-renderer">Discord Renderer</h3>
 <p>Discord 不原生渲染 GFM 表格，且 2000 字符限制、message edit rate
 limit、附件上限会破坏 普通 Markdown 流。因此 Renderer 必须先生成逻辑
@@ -3996,8 +4027,9 @@ subagent/task/Fleet worker 创建 child thread，也不为每个 ToolUse 单独
 message”实现折叠： compact view 显示每项
 <code>state/title/type/elapsed/progress</code>；select menu 选择 card，
 <code>Expand/Collapse</code> 在同一 message 原位切换 bounded
-detail；<code>Prev/Next</code> 分页。单页最多 8 张 embed card、select
-最多 25 项；超过后分页，不创建额外 thread。</li>
+detail；<code>Prev/Next</code> 分页。单页最多 8 张 embed card、全部
+embed 合计不超过 Discord 的 6000 字符限制，select 最多 25 项；超过后
+分页，不创建额外 thread。</li>
 <li>expanded detail 只显示最近进度、最终摘要、错误、tool/artifact links
 和依赖；raw reasoning 不显示。详情超过 embed/message 限制时写
 <code>.md</code>/<code>.txt</code> artifact，卡片只保留摘要与下载按钮。
@@ -5112,7 +5144,7 @@ idle、resume unknown 最多 tentatively dispatch 一项、禁止 批量预装
 native queue、submitted-unknown 不重发、owner fence takeover、remote
 steerability/ native schedule 阻止 normal close，force close
 typed-cancel pending interaction 与 per-task cancel/disable/stop/trigger
-race unknown；owner 20 秒 renew、60 秒 expiry、 monotonic token、每类
+race unknown；owner 15 秒 renew、60 秒 expiry、 monotonic token、每类
 mutating RPC 的 session-operation started/settled envelope、失租后
 unsettled operation 转 unknown、零新 mutating RPC 且旧 owner 不
 disconnect 新 owner；sleep 后无 intervening fence 的 self-reacquire
@@ -5428,7 +5460,9 @@ model、<code>/mode</code>、<code>/goal</code>、<code>/bare</code>、<code>/to
 <code>$HOME</code> 行为固定启用。</li>
 </ul>
 <h3 id="当前实现快照2026-08-06">当前实现快照（2026-08-06）</h3>
-<p>首个可运行 slice 已按本设计开始落地，当前不是“全部能力完成”：</p>
+<p>repository implementation 已按本设计完成对齐；剩余工作是 credentialed
+Bridge、真实 Discord、 macOS/Windows 实机与长时稳定性验收，不再以
+mock/fixture 结果替代真实 gate：</p>
 <table>
 <thead>
 <tr>
@@ -5446,22 +5480,23 @@ model、<code>/mode</code>、<code>/goal</code>、<code>/bare</code>、<code>/to
 unknown</td>
 </tr>
 <tr>
-<td>43 个唯一版本 SQLite migration：Foundation
+<td>44 个唯一版本 SQLite migration：Foundation
 <code>0001</code>–<code>0009</code>、Native RPC
 <code>0010</code>–<code>0014</code>、Protocol
 <code>0015</code>–<code>0019</code>、Scheduler
 <code>0020</code>–<code>0028</code>、Protocol compatibility
 <code>0029</code>、Discord surface
 <code>0030</code>–<code>0037</code>、保留
-<code>0038</code>–<code>0039</code>、Operations forward migrations
-<code>0040</code>–<code>0044</code>、session deletion cleanup
-<code>0045</code>；project <code>$HOME</code> fallback/cwd
-snapshot、owner fence、creation saga、strict-UUID event
-journal、reducer-owned operation/submission/native-command
-receipts、submission-task links、liveness leases、startup recovery
-inventory 与 eager resume；attach 时按 current state 结算 pending
-agent、强制 uncertain remote off；force restart 使用 producer/journal
-dual epoch、loss watermark admission fence 与 owner handoff</td>
+<code>0038</code>–<code>0039</code>、Operations
+<code>0040</code>–<code>0044</code>、session deletion
+<code>0045</code>、attachment lifecycle <code>0046</code>；project
+<code>$HOME</code> fallback/cwd snapshot、owner fence、creation
+saga、strict-UUID event journal、reducer-owned
+operation/submission/native-command receipts、submission-task
+links、liveness leases、startup recovery inventory 与 eager
+resume；attach 时按 current state 结算 pending agent、强制 uncertain
+remote off；force restart 使用 producer/journal dual epoch、loss
+watermark admission fence 与 owner handoff</td>
 <td>bundled runtime 进程死亡后的 in-flight execution 仍只能标 outcome
 unknown；真实 fixture 无 current-promotable task，task promote 保持
 gated</td>
@@ -5496,17 +5531,21 @@ list</td>
 </tr>
 <tr>
 <td>durable input attachment manifest、hash/size 复验、图片 blob
-压缩；stream/final RenderOutbox；table hold 与 code/PNG/MD/CSV
+压缩；中断的 <code>preparing</code> 可按 Discord channel/message locator
+重启恢复，ready orphan 幂等重提，引用释放后默认保留 7 天再
+GC；stream/final RenderOutbox；table hold 与 code/PNG/MD/CSV
 assets；Discord HTTP/rate-limit 错误分类，超上限 artifact
 按序无损分片</td>
 <td>Discord archived/locked thread、attachment edit、exact 429
 retry-after 仍需真实 gateway fixture</td>
 </tr>
 <tr>
-<td>tool/subagent/agent-scoped output 归并为原 thread 的单条 TaskDeck；4
-秒 cadence、pending coalescing、terminal
-flush、select/expand/collapse/prev/next；reasoning delta/coalesced
-thinking 与 configured final concise reasoning summary
+<td>tool/subagent/agent-scoped output 归并为原 thread 的单条
+embed-backed TaskDeck；每页最多 8 张 embed、总字符受 Discord 6000
+限制，4 秒 cadence、pending coalescing、terminal
+flush、select/expand/collapse/prev/next，embed/asset hash 与 crash
+recovery 保持原位 edit；reasoning delta/coalesced thinking 与 configured
+final concise reasoning summary
 已实现，<code>assistant.streaming_delta</code> 不进入 Discord
 UI；structured tool diff 与 local workspace diff artifact lane；typed
 task list/show/progress/message/cancel-all/remove/wait 与 Fleet
@@ -5531,12 +5570,16 @@ native capability 明确记录 unknown；只有 explicit close 可完成
 CLOSED</td>
 </tr>
 <tr>
-<td>共享 TaskRegistry、failure consumer、10 分钟 active-execution
-SUSPECT + non-destructive ping、结构化 heartbeat、完整 setup
-preflight、fresh PID/generation/current-fence status、bounded restart
-saga、restart-storm alert、10 MiB × 7 JSON log、macOS LaunchAgent 与
-Windows Scheduled Task 的 bundled 2-unit / sidecar 3-unit
-install/status/uninstall/effective-definition contract</td>
+<td>共享 TaskRegistry、failure consumer、app scheduler fatal-loop
+supervision、10 分钟 active-execution SUSPECT + non-destructive
+ping、结构化 heartbeat、完整 setup preflight、fresh
+PID/generation/current-fence status、bounded restart saga、restart-storm
+alert、10 MiB × 7 JSON log、macOS LaunchAgent 与 Windows Scheduled Task
+的 bundled 2-unit / sidecar 3-unit
+install/status/uninstall/effective-definition contract；owned Git 在
+POSIX 使用 inherited <code>flock</code>，Windows 使用
+<code>msvcrt</code> byte lock、独立进程组与
+<code>taskkill /T /F</code></td>
 <td>默认 bundled runtime 没有独立 runtime service；sidecar
 三组件需要显式 runtime argv/URI/connection token；真实 credentialed
 install、sleep/wake、macOS soak 与 Windows 实机未在 deterministic suite
@@ -5544,18 +5587,20 @@ install、sleep/wake、macOS soak 与 Windows 实机未在 deterministic suite
 </tr>
 </tbody>
 </table>
-<p>当前 deterministic 验证基线包括
-<code>ruff check src tests scripts</code>、完整 pytest、CLI JSON/error
-contract、service definition/effective-state simulations 与 wheel/sdist
-isolated install。仓库内 hash-checked fixture 固定 SDK 1.0.8 / runtime
-1.0.73 / protocol 3、114-event inventory 与 capability
-evidence；<code>copilotd native-acceptance --real</code> 还要求 exact
-环境确认，按 suite 创建 disposable repo/session、执行 supported
-mutation（包括 model set/readback/restore）、清理
-remote/schedule/session，并生成 sanitized JSON evidence；unsupported
-action 保存 real discovery/gate，不由 deterministic fixture
-冒充。这个快照用于区分“已验证实现”和后续
-设计，不降低以下章节对最终产品的契约要求。</p>
+<p>当前 deterministic 验证基线为 793 个 pytest
+case、<code>ruff check .</code>、<code>ruff format --check .</code>、
+<code>compileall</code>、ops/design audit、CLI JSON/error
+contract、service definition/effective-state simulations，以及
+wheel/sdist 的 isolated build/install。<code>copilotd doctor</code>
+已真实启动 bundled runtime 并确认 SDK 1.0.8 / runtime 1.0.73 / protocol
+3、authentication 与 migration 46。 仓库内 hash-checked fixture 固定
+114-event inventory 与 capability evidence；
+<code>copilotd native-acceptance --real</code> 仍要求 exact 环境确认，按
+suite 创建 disposable repo/session、执行 supported mutation（包括 model
+set/readback/restore）、清理 remote/schedule/session，并生成 sanitized
+JSON evidence；unsupported action 保存 real discovery/gate，不由
+deterministic fixture 冒充。这个快照用于区分“已验证实现”和后续设计，
+不降低以下章节对最终产品的契约要求。</p>
 <h3 id="html-交付要求">HTML 交付要求</h3>
 <ul>
 <li>以本文件“目标、调研结论、详细设计、实施阶段、风险和官方依据”为唯一内容源。</li>
@@ -5682,20 +5727,20 @@ restart-storm alert。</li>
 </ul>
 <h2 id="待办">待办</h2>
 <ol type="1">
-<li>继续加固 eventLog backfill 与 crash/reconnect
-reconciliation；elicitation/MCP OAuth、 reasoning summary 及
-structured/local diff artifact lane 已进入 deterministic baseline。</li>
-<li>按 capability fixture 逐项实现 Native-Gated
-ask/Fleet/Tasks/agents/after/every/remote/
-review/security-review/research/rubber-duck；fixture
-缺失时继续不注册。</li>
-<li>完成 project MCP/skills/plugins/agents、durable scheduler、worktree
-和 session delete/fork/compact。</li>
-<li>在真实 Discord 验证 archive/locked thread、TaskDeck component
-restart、attachment edit、table assets 与精确 429 retry-after。</li>
-<li>实机安装和验证 macOS LaunchAgent、Windows Scheduled
-Task、sleep/wake、crash/restart storm； 完成 claudeD issue 回归、90 分钟
-soak、恢复、故障与 forward-compatibility 测试。</li>
+<li>运行完整 Ruff/pytest/compile/package/ops/design gate，提交唯一
+phase-1 implementation commit。</li>
+<li>对真实 Copilot 逐项执行 Bridge 功能矩阵和负能力门禁，保存脱敏
+evidence；未执行、skip、 mock 或未观测结果继续标
+unsupported/unprobed。</li>
+<li>向真实 Discord 发送
+text/stream/reasoning/tool/diff/table/image/file/interaction/TaskDeck/
+error/usage 等完整 gallery，保留消息供人工 review，并记录稳定 Discord
+ID。</li>
+<li>实机验证 macOS LaunchAgent 与 Windows Scheduled Task 的
+install/login/sleep/wake/crash/ restart-storm；完成 90 分钟 liveness
+soak 与平台字体/时区检查。</li>
+<li>将通过上述 gate 的提交集中到默认
+<code>master</code>；不得把未通过的真实能力提升为 supported。</li>
 </ol>
 <h2 id="主要风险">主要风险</h2>
 <ul>

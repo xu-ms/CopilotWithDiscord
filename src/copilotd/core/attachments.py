@@ -7,6 +7,7 @@ import io
 import json
 import os
 import re
+import shutil
 import time
 import uuid
 import weakref
@@ -49,6 +50,21 @@ class PreparedAttachments:
 
 
 @dataclass(frozen=True)
+class AttachmentRecovery:
+    manifest_id: str
+    source_kind: str
+    source_id: str
+    source_channel_id: str | None
+    source_message_id: str | None
+    session_id: str | None
+    state: str
+    prompt: str | None
+    idempotency_key: str | None
+    origin: str | None
+    needs_submission: bool
+
+
+@dataclass(frozen=True)
 class _StoredItem:
     item_index: int
     original_name: str
@@ -83,6 +99,7 @@ class AttachmentService:
         message_max_bytes: int = 100 * 1024 * 1024,
         blob_max_bytes: int = 7 * 1024 * 1024,
         capabilities: AttachmentCapabilities | None = None,
+        retention_seconds: float = 7 * 24 * 60 * 60,
     ) -> None:
         self._database = database
         self._data_dir = data_dir
@@ -90,6 +107,7 @@ class AttachmentService:
         self._message_max_bytes = message_max_bytes
         self._blob_max_bytes = blob_max_bytes
         self._capabilities = capabilities
+        self._retention_seconds = retention_seconds
         self._locks: weakref.WeakValueDictionary[str, asyncio.Lock] = weakref.WeakValueDictionary()
 
     async def prepare(
@@ -99,6 +117,11 @@ class AttachmentService:
         source_id: str,
         session_id: str,
         attachments: list[DiscordAttachment],
+        source_channel_id: str | None = None,
+        source_message_id: str | None = None,
+        recovery_prompt: str | None = None,
+        recovery_idempotency_key: str | None = None,
+        recovery_origin: str | None = None,
     ) -> PreparedAttachments | None:
         if not attachments:
             return None
@@ -115,6 +138,14 @@ class AttachmentService:
                 (manifest_id,),
             )
             if existing is not None and existing["state"] == "ready":
+                await self._update_recovery_metadata(
+                    manifest_id,
+                    source_channel_id=source_channel_id,
+                    source_message_id=source_message_id,
+                    recovery_prompt=recovery_prompt,
+                    recovery_idempotency_key=recovery_idempotency_key,
+                    recovery_origin=recovery_origin,
+                )
                 items = await self._verified_items(manifest_id)
                 return PreparedAttachments(
                     manifest_id=manifest_id,
@@ -127,6 +158,11 @@ class AttachmentService:
                 source_kind=source_kind,
                 source_id=source_id,
                 session_id=session_id,
+                source_channel_id=source_channel_id,
+                source_message_id=source_message_id,
+                recovery_prompt=recovery_prompt,
+                recovery_idempotency_key=recovery_idempotency_key,
+                recovery_origin=recovery_origin,
             )
             try:
                 self._validate_declared_sizes(
@@ -136,10 +172,17 @@ class AttachmentService:
                 stored = await self._download_all(manifest_id, session_id, attachments)
                 total_bytes = sum(item.byte_size for item in stored)
                 await self._commit_items(manifest_id, stored, total_bytes)
-            except BaseException:
+            except asyncio.CancelledError:
+                raise
+            except Exception as error:
                 await self._database.execute(
-                    "UPDATE attachment_manifests SET state = 'failed' WHERE id = ?",
-                    (manifest_id,),
+                    """
+                    UPDATE attachment_manifests
+                    SET state = 'failed', error_code = 'prepare_failed',
+                        error_detail = ?, updated_at = ?
+                    WHERE id = ?
+                    """,
+                    (_bounded_error(error), time.time(), manifest_id),
                 )
                 raise
 
@@ -148,6 +191,221 @@ class AttachmentService:
             count=len(stored),
             total_bytes=total_bytes,
         )
+
+    async def prepared_manifest(self, manifest_id: str) -> PreparedAttachments:
+        row = await self._database.fetchone(
+            "SELECT state, total_bytes FROM attachment_manifests WHERE id = ?",
+            (manifest_id,),
+        )
+        if row is None or str(row["state"]) != "ready":
+            raise AttachmentError(f"attachment manifest is not ready: {manifest_id}")
+        items = await self._verified_items(manifest_id)
+        return PreparedAttachments(
+            manifest_id=manifest_id,
+            count=len(items),
+            total_bytes=int(row["total_bytes"]),
+        )
+
+    async def pending_recoveries(self) -> tuple[AttachmentRecovery, ...]:
+        rows = await self._database.fetchall(
+            """
+            SELECT m.id, m.source_kind, m.source_id, m.source_channel_id,
+                   m.source_message_id, m.session_id, m.state,
+                   m.recovery_prompt, m.recovery_idempotency_key,
+                   m.recovery_origin,
+                   EXISTS (
+                       SELECT 1 FROM message_queue q
+                       WHERE q.attachment_manifest_id = m.id
+                   ) OR EXISTS (
+                       SELECT 1 FROM submissions s
+                       WHERE s.attachment_manifest_id = m.id
+                   ) AS has_submission_reference
+            FROM attachment_manifests m
+            WHERE m.state = 'preparing'
+               OR (
+                   m.state = 'ready'
+                   AND m.recovery_idempotency_key IS NOT NULL
+                   AND NOT EXISTS (
+                       SELECT 1 FROM message_queue q
+                       WHERE q.attachment_manifest_id = m.id
+                   )
+                   AND NOT EXISTS (
+                       SELECT 1 FROM submissions s
+                       WHERE s.attachment_manifest_id = m.id
+                   )
+               )
+            ORDER BY m.created_at, m.id
+            """
+        )
+        return tuple(
+            AttachmentRecovery(
+                manifest_id=str(row["id"]),
+                source_kind=str(row["source_kind"]),
+                source_id=str(row["source_id"]),
+                source_channel_id=(
+                    None if row["source_channel_id"] is None else str(row["source_channel_id"])
+                ),
+                source_message_id=(
+                    None if row["source_message_id"] is None else str(row["source_message_id"])
+                ),
+                session_id=None if row["session_id"] is None else str(row["session_id"]),
+                state=str(row["state"]),
+                prompt=None if row["recovery_prompt"] is None else str(row["recovery_prompt"]),
+                idempotency_key=(
+                    None
+                    if row["recovery_idempotency_key"] is None
+                    else str(row["recovery_idempotency_key"])
+                ),
+                origin=None if row["recovery_origin"] is None else str(row["recovery_origin"]),
+                needs_submission=not bool(row["has_submission_reference"]),
+            )
+            for row in rows
+        )
+
+    async def record_recovery_error(
+        self,
+        manifest_id: str,
+        *,
+        code: str,
+        detail: str,
+        terminal: bool,
+    ) -> None:
+        await self._database.execute(
+            """
+            UPDATE attachment_manifests
+            SET state = CASE WHEN ? THEN 'failed' ELSE state END,
+                error_code = ?, error_detail = ?, updated_at = ?
+            WHERE id = ? AND state IN ('preparing', 'ready', 'released')
+            """,
+            (int(terminal), code, detail[:1000], time.time(), manifest_id),
+        )
+
+    async def record_recovery_success(self, manifest_id: str) -> None:
+        await self._database.execute(
+            """
+            UPDATE attachment_manifests
+            SET error_code = NULL, error_detail = NULL, updated_at = ?
+            WHERE id = ? AND state = 'ready'
+            """,
+            (time.time(), manifest_id),
+        )
+
+    async def release_unreferenced(self, *, now: float | None = None) -> int:
+        timestamp = time.time() if now is None else now
+        retention_until = timestamp + self._retention_seconds
+        return await self._database.execute_count(
+            """
+            UPDATE attachment_manifests AS manifest
+            SET state = 'released', retention_until = ?, updated_at = ?
+            WHERE state IN ('ready', 'failed')
+              AND NOT EXISTS (
+                  SELECT 1 FROM message_queue queue
+                  WHERE queue.attachment_manifest_id = manifest.id
+                    AND queue.state NOT IN ('cancelled', 'submitted', 'failed')
+              )
+              AND NOT EXISTS (
+                  SELECT 1 FROM submissions submission
+                  WHERE submission.attachment_manifest_id = manifest.id
+                    AND submission.state NOT IN (
+                        'rejected', 'semantic_complete', 'semantic_blocked',
+                        'observed_aborted', 'outcome_unknown', 'cancelled', 'failed'
+                    )
+              )
+              AND NOT EXISTS (
+                  SELECT 1 FROM session_creation_intents creation
+                  WHERE creation.attachment_manifest_id = manifest.id
+                    AND creation.state NOT IN ('attached', 'failed')
+              )
+              AND (
+                  state = 'failed'
+                  OR recovery_idempotency_key IS NULL
+                  OR EXISTS (
+                      SELECT 1 FROM message_queue queue
+                      WHERE queue.attachment_manifest_id = manifest.id
+                  )
+                  OR EXISTS (
+                      SELECT 1 FROM submissions submission
+                      WHERE submission.attachment_manifest_id = manifest.id
+                  )
+              )
+            """,
+            (retention_until, timestamp),
+        )
+
+    async def garbage_collect(self, *, now: float | None = None) -> int:
+        timestamp = time.time() if now is None else now
+        rows = await self._database.fetchall(
+            """
+            SELECT manifest.id, manifest.session_id
+            FROM attachment_manifests manifest
+            WHERE manifest.state = 'released'
+              AND manifest.retention_until IS NOT NULL
+              AND manifest.retention_until <= ?
+              AND NOT EXISTS (
+                  SELECT 1 FROM message_queue queue
+                  WHERE queue.attachment_manifest_id = manifest.id
+                    AND queue.state NOT IN ('cancelled', 'submitted', 'failed')
+              )
+              AND NOT EXISTS (
+                  SELECT 1 FROM submissions submission
+                  WHERE submission.attachment_manifest_id = manifest.id
+                    AND submission.state NOT IN (
+                        'rejected', 'semantic_complete', 'semantic_blocked',
+                        'observed_aborted', 'outcome_unknown', 'cancelled', 'failed'
+                    )
+              )
+              AND NOT EXISTS (
+                  SELECT 1 FROM session_creation_intents creation
+                  WHERE creation.attachment_manifest_id = manifest.id
+                    AND creation.state NOT IN ('attached', 'failed')
+              )
+            ORDER BY manifest.updated_at, manifest.id
+            """,
+            (timestamp,),
+        )
+        removed = 0
+        for row in rows:
+            manifest_id = str(row["id"])
+            session_id = None if row["session_id"] is None else str(row["session_id"])
+            if session_id is None:
+                await self.record_recovery_error(
+                    manifest_id,
+                    code="cleanup_missing_session",
+                    detail="attachment manifest has no session directory owner",
+                    terminal=False,
+                )
+                continue
+            directory = self._manifest_directory(session_id, manifest_id)
+            try:
+                await asyncio.to_thread(
+                    _remove_manifest_directory,
+                    directory,
+                    self._data_dir / "sessions",
+                )
+            except OSError as error:
+                await self.record_recovery_error(
+                    manifest_id,
+                    code="cleanup_failed",
+                    detail=_bounded_error(error),
+                    terminal=False,
+                )
+                continue
+            async with self._database.transaction() as connection:
+                await connection.execute(
+                    "DELETE FROM attachment_items WHERE manifest_id = ?",
+                    (manifest_id,),
+                )
+                await connection.execute(
+                    """
+                    UPDATE attachment_manifests
+                    SET total_bytes = 0, error_code = NULL, error_detail = NULL,
+                        retention_until = NULL, updated_at = ?
+                    WHERE id = ? AND state = 'released'
+                    """,
+                    (timestamp, manifest_id),
+                )
+            removed += 1
+        return removed
 
     async def sdk_attachments(self, manifest_id: str) -> list[dict[str, Any]]:
         items = await self._verified_items(manifest_id)
@@ -239,25 +497,109 @@ class AttachmentService:
         source_kind: str,
         source_id: str,
         session_id: str,
+        source_channel_id: str | None,
+        source_message_id: str | None,
+        recovery_prompt: str | None,
+        recovery_idempotency_key: str | None,
+        recovery_origin: str | None,
     ) -> None:
+        await asyncio.to_thread(
+            _remove_manifest_directory,
+            self._manifest_directory(session_id, manifest_id),
+            self._data_dir / "sessions",
+        )
+        timestamp = time.time()
         async with self._database.transaction() as connection:
             await connection.execute(
                 """
                 INSERT INTO attachment_manifests(
                     id, source_kind, source_id, session_id, state,
-                    total_bytes, created_at
-                ) VALUES (?, ?, ?, ?, 'preparing', 0, ?)
+                    total_bytes, created_at, source_channel_id,
+                    source_message_id, recovery_prompt,
+                    recovery_idempotency_key, recovery_origin, updated_at
+                ) VALUES (?, ?, ?, ?, 'preparing', 0, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(id) DO UPDATE SET
                     session_id = excluded.session_id,
                     state = 'preparing',
-                    total_bytes = 0
+                    total_bytes = 0,
+                    retention_until = NULL,
+                    source_channel_id = COALESCE(
+                        excluded.source_channel_id,
+                        attachment_manifests.source_channel_id
+                    ),
+                    source_message_id = COALESCE(
+                        excluded.source_message_id,
+                        attachment_manifests.source_message_id
+                    ),
+                    recovery_prompt = COALESCE(
+                        excluded.recovery_prompt,
+                        attachment_manifests.recovery_prompt
+                    ),
+                    recovery_idempotency_key = COALESCE(
+                        excluded.recovery_idempotency_key,
+                        attachment_manifests.recovery_idempotency_key
+                    ),
+                    recovery_origin = COALESCE(
+                        excluded.recovery_origin,
+                        attachment_manifests.recovery_origin
+                    ),
+                    error_code = NULL,
+                    error_detail = NULL,
+                    updated_at = excluded.updated_at
                 """,
-                (manifest_id, source_kind, source_id, session_id, time.time()),
+                (
+                    manifest_id,
+                    source_kind,
+                    source_id,
+                    session_id,
+                    timestamp,
+                    source_channel_id,
+                    source_message_id,
+                    recovery_prompt,
+                    recovery_idempotency_key,
+                    recovery_origin,
+                    timestamp,
+                ),
             )
             await connection.execute(
                 "DELETE FROM attachment_items WHERE manifest_id = ?",
                 (manifest_id,),
             )
+
+    async def _update_recovery_metadata(
+        self,
+        manifest_id: str,
+        *,
+        source_channel_id: str | None,
+        source_message_id: str | None,
+        recovery_prompt: str | None,
+        recovery_idempotency_key: str | None,
+        recovery_origin: str | None,
+    ) -> None:
+        await self._database.execute(
+            """
+            UPDATE attachment_manifests
+            SET source_channel_id = COALESCE(?, source_channel_id),
+                source_message_id = COALESCE(?, source_message_id),
+                recovery_prompt = COALESCE(?, recovery_prompt),
+                recovery_idempotency_key = COALESCE(?, recovery_idempotency_key),
+                recovery_origin = COALESCE(?, recovery_origin),
+                updated_at = ?
+            WHERE id = ?
+            """,
+            (
+                source_channel_id,
+                source_message_id,
+                recovery_prompt,
+                recovery_idempotency_key,
+                recovery_origin,
+                time.time(),
+                manifest_id,
+            ),
+        )
+
+    def _manifest_directory(self, session_id: str, manifest_id: str) -> Path:
+        return self._data_dir / "sessions" / session_id / "attachments" / manifest_id
 
     def _validate_declared_sizes(
         self,
@@ -284,7 +626,7 @@ class AttachmentService:
         session_id: str,
         attachments: list[DiscordAttachment],
     ) -> list[_StoredItem]:
-        directory = self._data_dir / "sessions" / session_id / "attachments" / manifest_id
+        directory = self._manifest_directory(session_id, manifest_id)
         await asyncio.to_thread(directory.mkdir, parents=True, exist_ok=True)
         stored: list[_StoredItem] = []
         limits = self._resolved_limits()
@@ -405,10 +747,11 @@ class AttachmentService:
             await connection.execute(
                 """
                 UPDATE attachment_manifests
-                SET state = 'ready', total_bytes = ?
+                SET state = 'ready', total_bytes = ?, retention_until = NULL,
+                    error_code = NULL, error_detail = NULL, updated_at = ?
                 WHERE id = ? AND state = 'preparing'
                 """,
-                (total_bytes, manifest_id),
+                (total_bytes, time.time(), manifest_id),
             )
 
     async def _verified_items(self, manifest_id: str) -> list[_StoredItem]:
@@ -480,8 +823,17 @@ class AttachmentService:
             valid = await asyncio.to_thread(_matches_integrity, item)
             if not valid:
                 await self._database.execute(
-                    "UPDATE attachment_manifests SET state = 'failed' WHERE id = ?",
-                    (manifest_id,),
+                    """
+                    UPDATE attachment_manifests
+                    SET state = 'failed', error_code = 'integrity_failed',
+                        error_detail = ?, updated_at = ?
+                    WHERE id = ?
+                    """,
+                    (
+                        f"integrity check failed: {item.original_name}"[:1000],
+                        time.time(),
+                        manifest_id,
+                    ),
                 )
                 raise AttachmentError(f"attachment integrity check failed: {item.original_name}")
         return items
@@ -565,6 +917,21 @@ def _atomic_write(path: Path, content: bytes) -> None:
         os.replace(temporary, path)
     finally:
         temporary.unlink(missing_ok=True)
+
+
+def _remove_manifest_directory(directory: Path, sessions_root: Path) -> None:
+    resolved_root = sessions_root.resolve()
+    resolved_directory = directory.resolve(strict=False)
+    if not resolved_directory.is_relative_to(resolved_root):
+        raise OSError(f"attachment directory escapes the managed sessions root: {directory}")
+    if directory.is_symlink():
+        directory.unlink(missing_ok=True)
+    elif directory.exists():
+        shutil.rmtree(directory)
+
+
+def _bounded_error(error: BaseException) -> str:
+    return f"{type(error).__name__}: {error}"[:1000]
 
 
 def _sha256_hex(content: bytes) -> str:

@@ -720,6 +720,10 @@ class JournalReducer:
                 card["dependencies"] = json.loads(str(card["dependencies_json"]))
                 card["artifact_links"] = json.loads(str(card["artifact_links_json"]))
                 card["can_promote"] = bool(card["can_promote"])
+                ended_at = card["terminal_at"] or now
+                card["elapsed"] = _format_elapsed(
+                    max(0.0, float(ended_at) - float(card["first_seen_at"]))
+                )
             if not cards:
                 if event.raw_type == "copilotd.tasks.snapshot":
                     return {"suppress": True}
@@ -783,23 +787,11 @@ class JournalReducer:
                 ),
             )
             lines = [f"**TaskDeck** — {len(cards)} item(s)"]
-            for card in visible:
-                state = str(card["state"])
-                icon = _task_state_icon(state)
-                title = _bounded_text(str(card["title"]), 120)
-                ended_at = card["terminal_at"] or now
-                elapsed = _format_elapsed(max(0.0, float(ended_at) - float(card["first_seen_at"])))
-                lines.append(f"{icon} **{title}** · `{card['kind']}` · `{state}` · `{elapsed}`")
             attachments: list[dict[str, Any]] = []
             if expanded:
-                lines.extend(("", f"**{selected_card['title']} details**"))
-                detail = selected_card["progress_summary"]
                 artifact = selected_card["detail_artifact"]
                 if artifact:
                     filename = f"task-{selected_card['card_token']}-detail.md"
-                    lines.append(
-                        f"Large detail attached as `{filename}`; use Download for a fresh copy."
-                    )
                     attachments.append(
                         {
                             "filename": filename,
@@ -807,24 +799,8 @@ class JournalReducer:
                             "content": str(artifact),
                         }
                     )
-                elif detail:
-                    lines.append(_bounded_text(str(detail), 700))
-                dependencies = selected_card["dependencies"]
-                if dependencies:
-                    lines.append(
-                        "**Dependencies:** "
-                        + ", ".join(
-                            f"`{_bounded_text(str(value), 80)}`" for value in dependencies[:10]
-                        )
-                    )
-                artifact_links = selected_card["artifact_links"]
-                if artifact_links:
-                    lines.append(
-                        "**Artifacts:** "
-                        + " · ".join(_bounded_text(str(value), 160) for value in artifact_links[:8])
-                    )
             if page_count > 1:
-                lines.append(f"\nPage {page + 1}/{page_count}")
+                lines.append(f"Page {page + 1}/{page_count}")
             selected_state = str(selected_card["state"])
             actions: list[str] = []
             if selected_card["task_id"] is not None and selected_state in {"running", "idle"}:
@@ -8379,16 +8355,6 @@ def _structured_tool_text(value: Any) -> str:
                 return str(value[key])
         return json.dumps(value, ensure_ascii=False, indent=2, sort_keys=True)
     return str(value)
-
-
-def _task_state_icon(state: str) -> str:
-    return {
-        "running": "▶",
-        "completed": "✅",
-        "failed": "❌",
-        "cancelled": "⏹",
-        "unknown": "❔",
-    }.get(state, "•")
 
 
 def _format_elapsed(seconds: float) -> str:

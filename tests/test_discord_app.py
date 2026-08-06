@@ -36,6 +36,17 @@ from copilotd.sdk.capabilities import CapabilityRegistry
 from copilotd.storage.database import Database
 
 
+class _DiscordAttachmentFixture:
+    id = 1
+    filename = "recovery.txt"
+    size = 9
+    content_type = "text/plain"
+
+    async def read(self, *, use_cached: bool = True) -> bytes:
+        assert use_cached
+        return b"recovered"
+
+
 def test_discord_command_manifest_has_core_modes_and_no_deleted_roots(tmp_path: Path) -> None:
     bot = CopilotDiscordBot(Settings(data_dir=tmp_path))
     bot._register_application_commands()
@@ -141,6 +152,70 @@ def test_discord_command_manifest_has_core_modes_and_no_deleted_roots(tmp_path: 
         parameter for parameter in worktree_create.parameters if parameter.name == "history"
     )
     assert {choice.value for choice in history.choices} == {"none"}
+
+
+@pytest.mark.asyncio
+async def test_ready_attachment_orphan_is_resubmitted_after_gateway_recovery(
+    tmp_path: Path,
+) -> None:
+    bot = CopilotDiscordBot(Settings(data_dir=tmp_path))
+    await bot.database.open()
+    bindings = SessionBindingRepository(bot.database)
+    binding = await bindings.create(
+        thread_id="thread-attachment-recovery",
+        sdk_session_id="session-attachment-recovery",
+        cwd_snapshot=tmp_path,
+        project_source="home",
+    )
+    bot.bindings = bindings
+    sent: list[dict[str, Any]] = []
+
+    class Runtime:
+        async def send(self, prompt: str, **kwargs: Any) -> str:
+            sent.append({"prompt": prompt, **kwargs})
+            await bot.database.execute(
+                """
+                INSERT INTO submissions(
+                    submission_id, sdk_session_id, origin,
+                    attachment_manifest_id, state, created_at
+                ) VALUES ('submission-attachment-recovery', ?,
+                          'discord_message', ?, 'local_queued', 1)
+                """,
+                (
+                    binding.sdk_session_id,
+                    kwargs["attachment_manifest_id"],
+                ),
+            )
+            return "accepted"
+
+    runtime = Runtime()
+
+    class Sessions:
+        async def ensure_attached(self, candidate):
+            assert candidate == binding
+            return runtime
+
+    bot.sessions = Sessions()  # type: ignore[assignment]
+    prepared = await bot.attachment_service.prepare(
+        source_kind="discord-message",
+        source_id="message-ready-orphan",
+        session_id=binding.sdk_session_id,
+        attachments=[_DiscordAttachmentFixture()],
+        source_channel_id="100",
+        source_message_id="200",
+        recovery_prompt="recover this message",
+        recovery_idempotency_key="discord-message:200",
+        recovery_origin="discord_message",
+    )
+    assert prepared is not None
+
+    await bot._recover_attachment_manifests()
+
+    assert sent[0]["prompt"] == "recover this message"
+    assert sent[0]["idempotency_key"] == "discord-message:200"
+    assert sent[0]["attachment_manifest_id"] == prepared.manifest_id
+    assert await bot.attachment_service.pending_recoveries() == ()
+    await bot.database.close()
 
 
 class _SummaryCapability:
@@ -1034,6 +1109,61 @@ def test_taskdeck_view_uses_short_in_place_controls() -> None:
         "cdtd:panel-token:12:next",
     ]
     assert all(len(custom_id) < 100 for custom_id in custom_ids)
+
+
+@pytest.mark.asyncio
+async def test_taskdeck_render_plan_uses_bounded_embeds_and_preserves_them_across_assets() -> None:
+    cards = [
+        {
+            "card_token": f"card-{index}",
+            "title": f"Worker {index}",
+            "state": "running" if index == 0 else "idle",
+            "kind": "agent",
+            "elapsed": f"{index + 1}s",
+            "progress_summary": f"Progress {index}",
+            "detail_artifact": "full detail" if index == 0 else None,
+            "dependencies": ["setup"] if index == 0 else [],
+            "artifact_links": ["artifact.md"] if index == 0 else [],
+        }
+        for index in range(10)
+    ]
+    plan = await _discord_render_plan(
+        {
+            "type": "taskdeck",
+            "content": "**TaskDeck** — 10 item(s)",
+            "cards": cards,
+            "attachments": [
+                {
+                    "filename": f"artifact-{index}.txt",
+                    "media_type": "text/plain",
+                    "content": str(index),
+                }
+                for index in range(11)
+            ],
+            "finalized": False,
+            "taskdeck": {
+                "page": 0,
+                "selected_card_token": "card-0",
+                "expanded": True,
+            },
+        }
+    )
+
+    assert len(plan.batches) == 2
+    assert len(plan.batches[0].embeds) == 8
+    assert plan.batches[1].embeds == ()
+    assert [field["name"] for field in plan.batches[0].embeds[0]["fields"]] == [
+        "State",
+        "Type",
+        "Elapsed",
+        "Dependencies",
+        "Artifacts",
+    ]
+    assert plan.batches[0].embeds[0]["footer"]["text"] == "Selected · expanded"
+    assert "Full detail is attached" in plan.batches[0].embeds[0]["description"]
+    assert sum(len(discord.Embed.from_dict(item)) for item in plan.batches[0].embeds) <= 6000
+    assert len(plan.batches[0].assets) == 10
+    assert len(plan.batches[1].assets) == 1
 
 
 def test_interaction_view_uses_bounded_buttons_and_freeform_modal_button() -> None:
