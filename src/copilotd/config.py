@@ -1,6 +1,10 @@
 from __future__ import annotations
 
+import json
+import os
+import stat
 from pathlib import Path
+from typing import Any
 
 from platformdirs import user_cache_path, user_data_path, user_log_path
 from pydantic import AliasChoices, Field, SecretStr, field_validator, model_validator
@@ -22,6 +26,7 @@ class Settings(BaseSettings):
         env_file=".env",
         env_file_encoding="utf-8",
         extra="ignore",
+        populate_by_name=True,
     )
 
     data_dir: Path = Field(default_factory=lambda: user_data_path("copilotD", ensure_exists=False))
@@ -109,6 +114,28 @@ class Settings(BaseSettings):
         return value
 
     @property
+    def service_secrets_path(self) -> Path:
+        return self.data_dir / "config" / "service-secrets.json"
+
+    def write_service_secrets(self) -> Path:
+        payload = {
+            "schema_version": 1,
+            "discord_token": (
+                None if self.discord_token is None else self.discord_token.get_secret_value()
+            ),
+            "github_token": (
+                None if self.github_token is None else self.github_token.get_secret_value()
+            ),
+            "runtime_connection_token": (
+                None
+                if self.runtime_connection_token is None
+                else self.runtime_connection_token.get_secret_value()
+            ),
+        }
+        _atomic_private_json(self.service_secrets_path, payload)
+        return self.service_secrets_path
+
+    @property
     def database_path(self) -> Path:
         return self.data_dir / "copilotd.sqlite3"
 
@@ -131,3 +158,50 @@ class Settings(BaseSettings):
     @property
     def heartbeat_path(self) -> Path:
         return self.cache_dir / "heartbeat.json"
+
+
+def load_settings() -> Settings:
+    """Load environment settings plus the private service credential source."""
+
+    settings = Settings()
+    configured_path = os.environ.get("COPILOTD_SERVICE_SECRETS")
+    secret_path = (
+        settings.service_secrets_path
+        if configured_path is None
+        else Path(configured_path).expanduser().resolve()
+    )
+    if configured_path is None and not secret_path.exists():
+        return settings
+    if os.name == "posix":
+        mode = stat.S_IMODE(secret_path.stat().st_mode)
+        if mode & 0o077:
+            raise ValueError(
+                f"service secret file must not be group/world accessible: {secret_path}"
+            )
+    payload = json.loads(secret_path.read_text(encoding="utf-8"))
+    if not isinstance(payload, dict) or payload.get("schema_version") != 1:
+        raise ValueError(f"unsupported service secret schema: {secret_path}")
+    updates: dict[str, SecretStr] = {}
+    for field in ("discord_token", "github_token", "runtime_connection_token"):
+        if getattr(settings, field) is None and payload.get(field):
+            updates[field] = SecretStr(str(payload[field]))
+    return settings.model_copy(update=updates)
+
+
+def _atomic_private_json(path: Path, payload: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if os.name == "posix":
+        path.parent.chmod(0o700)
+    temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+            json.dump(payload, stream, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+            stream.write("\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        if os.name == "posix":
+            temporary.chmod(0o600)
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)

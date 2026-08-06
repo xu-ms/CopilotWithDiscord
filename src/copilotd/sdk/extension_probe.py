@@ -4,8 +4,8 @@ import asyncio
 import hashlib
 import json
 import os
+import shutil
 import sys
-import tempfile
 import time
 import uuid
 from collections.abc import Awaitable, Callable
@@ -63,8 +63,11 @@ class ExtensionAcceptanceProbe:
                 raise LiveAcceptanceAuthError(
                     "authenticated Copilot identity is required for live extension acceptance"
                 )
-            with tempfile.TemporaryDirectory(prefix="copilotd-extension-acceptance-") as root:
-                workspace = Path(root)
+            workspace = (
+                self._settings.cache_dir / f"extension-acceptance-workspace-{uuid.uuid4().hex}"
+            )
+            await asyncio.to_thread(workspace.mkdir, parents=True)
+            try:
                 primary = await self._run_primary(
                     bridge,
                     workspace / "primary",
@@ -83,6 +86,8 @@ class ExtensionAcceptanceProbe:
                     session_ids,
                     wait_seconds=wait_seconds,
                 )
+            finally:
+                await asyncio.to_thread(shutil.rmtree, workspace, True)
             negative_auth = await self._probe_missing_auth_gate()
             leftovers = await self._leftover_acceptance_sessions(bridge, session_ids)
             if leftovers:
@@ -813,14 +818,25 @@ class ExtensionAcceptanceProbe:
                 wait_seconds=wait_seconds,
                 minimum_idle_count=int(idle_before["count"]) + 1,
             )
-            tool_completion = await database.fetchone(
+            tool_events = await database.fetchall(
                 """
-                SELECT COUNT(*) AS count FROM event_journal
+                SELECT raw_type, tool_call_id, raw_payload
+                FROM event_journal
                 WHERE sdk_session_id = ?
                   AND generation = ?
-                  AND raw_type = 'tool.execution_complete'
+                  AND raw_type IN (
+                      'tool.execution_start',
+                      'tool.execution_complete'
+                  )
+                ORDER BY inbox_seq
                 """,
                 (session_id, runtime.binding.runtime_generation),
+            )
+            tool_evidence = _correlate_mcp_tool_evidence(
+                tool_events,
+                server_name="second",
+                tool_name="echo",
+                marker="REATTACH_TOOL_OK",
             )
             result = {
                 "config_reattach": _passed(
@@ -832,7 +848,7 @@ class ExtensionAcceptanceProbe:
                         and mcp_names == ["second"]
                         and "reattach_agent" in agent_names
                         and "echo" in tool_names
-                        and int(tool_completion["count"]) > 0
+                        and tool_evidence["correlated"]
                     ),
                     same_owner_fence=runtime.binding.owner_fence_token == fence,
                     generation_incremented=(runtime.binding.runtime_generation == generation + 1),
@@ -844,7 +860,7 @@ class ExtensionAcceptanceProbe:
                     removed_server_absent="first" not in mcp_names,
                     custom_agent_loaded="reattach_agent" in agent_names,
                     mcp_tools=tool_names,
-                    tool_call_completed=int(tool_completion["count"]) > 0,
+                    tool_call=tool_evidence,
                 )
             }
             await runtime.close(idempotency_key="acceptance-close")
@@ -1008,6 +1024,69 @@ def _protocol_response_evidence(
         "trigger_attempted": trigger_attempted,
         "missing_request_rpc_returned_false": True,
         **({} if turn_completed is None else {"tool_turn_completed": turn_completed}),
+    }
+
+
+def _correlate_mcp_tool_evidence(
+    rows: list[Any],
+    *,
+    server_name: str,
+    tool_name: str,
+    marker: str,
+) -> dict[str, Any]:
+    starts: dict[str, list[dict[str, Any]]] = {}
+    completions: dict[str, list[dict[str, Any]]] = {}
+    for row in rows:
+        tool_call_id = row["tool_call_id"]
+        if tool_call_id is None:
+            continue
+        try:
+            payload = json.loads(str(row["raw_payload"]))
+        except json.JSONDecodeError:
+            continue
+        data = payload.get("data", {})
+        if not isinstance(data, dict):
+            continue
+        if str(data.get("toolCallId") or "") != str(tool_call_id):
+            continue
+        if row["raw_type"] == "tool.execution_start":
+            starts.setdefault(str(tool_call_id), []).append(data)
+        elif row["raw_type"] == "tool.execution_complete":
+            completions.setdefault(str(tool_call_id), []).append(data)
+    matching_ids: list[str] = []
+    for tool_call_id, start_events in starts.items():
+        if len(start_events) != 1:
+            continue
+        start = start_events[0]
+        observed_server = start.get("mcpServerName")
+        observed_tool = start.get("mcpToolName")
+        arguments = start.get("arguments")
+        if (
+            observed_server == server_name
+            and observed_tool == tool_name
+            and isinstance(arguments, dict)
+            and arguments.get("text") == marker
+        ):
+            matching_ids.append(tool_call_id)
+    completed_ids = [
+        tool_call_id
+        for tool_call_id in matching_ids
+        if len(completions.get(tool_call_id, [])) == 1
+        and completions[tool_call_id][0].get("success") is True
+        and marker
+        in json.dumps(
+            completions[tool_call_id][0].get("result"),
+            sort_keys=True,
+        )
+    ]
+    return {
+        "correlated": len(matching_ids) == 1 and completed_ids == matching_ids,
+        "matching_start_count": len(matching_ids),
+        "matching_completion_count": len(completed_ids),
+        "request_identity_matched": bool(completed_ids),
+        "server": server_name,
+        "tool": tool_name,
+        "result_marker_matched": bool(completed_ids),
     }
 
 

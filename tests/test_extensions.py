@@ -3,7 +3,11 @@ from pathlib import Path
 
 import pytest
 
+from copilotd.core import extensions as extension_module
+from copilotd.core.bindings import AttachmentState, SessionBindingRepository
 from copilotd.core.extensions import (
+    ConfigReloadClaimStore,
+    ConfigReloadState,
     CustomAgent,
     EnvironmentBinding,
     EnvironmentReference,
@@ -19,6 +23,7 @@ from copilotd.core.extensions import (
 )
 from copilotd.core.projects import ProjectRegistry
 from copilotd.storage.database import Database
+from copilotd.storage.leases import OwnerLeaseStore
 
 
 @pytest.mark.asyncio
@@ -269,6 +274,285 @@ async def test_extension_file_source_rejects_symlink_and_oversize(
             await ExtensionConfigFileSource(max_bytes=4).load(project)
     finally:
         await projects_database.close()
+
+
+@pytest.mark.asyncio
+async def test_atomic_reload_publication_rejects_stale_owner_takeover(
+    tmp_path: Path,
+) -> None:
+    home = tmp_path / "home"
+    home.mkdir()
+    async with Database(tmp_path / "atomic-reload.sqlite3") as database:
+        projects = ProjectRegistry(database, resolved_home=home)
+        await projects.initialize()
+        project = await projects.resolve("channel-atomic-reload")
+        leases = OwnerLeaseStore(database)
+        stale_lease = await leases.acquire(
+            "session-atomic",
+            "owner-stale",
+            now=100,
+        )
+        bindings = SessionBindingRepository(database)
+        binding = await bindings.create(
+            thread_id="thread-atomic",
+            sdk_session_id="session-atomic",
+            cwd_snapshot=project.cwd,
+            project_source=project.source.value,
+        )
+        binding = await bindings.begin_attachment(
+            thread_id=binding.thread_id,
+            lease=stale_lease,
+            state=AttachmentState.RESUMING,
+            now=100,
+        )
+        await bindings.mark_attached(binding, permission_verified_at=100)
+        claims = ConfigReloadClaimStore(database)
+        config = ProjectExtensionConfig(disabled_skills=("atomic-skill",))
+        first_claim, first_snapshot, created = await claims.claim_and_publish(
+            sdk_session_id="session-atomic",
+            idempotency_key="reload-atomic",
+            project=project,
+            config=config,
+            owner_id=stale_lease.owner_id,
+            runtime_generation=1,
+            owner_fence_token=stale_lease.fence_token,
+            transition_id="transition-atomic",
+            minimum_headroom_seconds=40,
+            now=101,
+        )
+        current_lease = await leases.acquire(
+            "session-atomic",
+            "owner-current",
+            now=200,
+        )
+        with pytest.raises(ExtensionConfigConflict, match="owner fence"):
+            await claims.claim_and_publish(
+                sdk_session_id="session-atomic",
+                idempotency_key="stale-publication",
+                project=project,
+                config=ProjectExtensionConfig(disabled_skills=("stale-owner-skill",)),
+                owner_id=stale_lease.owner_id,
+                runtime_generation=2,
+                owner_fence_token=stale_lease.fence_token,
+                transition_id="transition-stale",
+                minimum_headroom_seconds=40,
+                now=201,
+            )
+        binding = await bindings.by_thread("thread-atomic")
+        assert binding is not None
+        binding = await bindings.begin_attachment(
+            thread_id=binding.thread_id,
+            lease=current_lease,
+            state=AttachmentState.RESUMING,
+            now=201,
+        )
+        await bindings.mark_attached(binding, permission_verified_at=201)
+        takeover_claim, takeover_snapshot, takeover_created = await claims.claim_and_publish(
+            sdk_session_id="session-atomic",
+            idempotency_key="reload-atomic",
+            project=project,
+            config=config,
+            owner_id=current_lease.owner_id,
+            runtime_generation=2,
+            owner_fence_token=current_lease.fence_token,
+            transition_id="transition-atomic",
+            minimum_headroom_seconds=40,
+            now=201,
+        )
+        with pytest.raises(ExtensionConfigConflict, match="changed concurrently"):
+            await claims.transition(
+                first_claim,
+                ConfigReloadState.UNKNOWN,
+                now=202,
+            )
+        generations = await database.fetchone(
+            "SELECT COUNT(*) AS count FROM project_extension_config_generations"
+        )
+
+    assert created
+    assert first_claim.config_version == first_snapshot.version == 1
+    assert takeover_created is False
+    assert takeover_snapshot == first_snapshot
+    assert takeover_claim.owner_fence_token == current_lease.fence_token
+    assert takeover_claim.claimed_generation == 2
+    assert generations["count"] == 1
+
+
+@pytest.mark.asyncio
+async def test_reload_publication_fault_rolls_back_claim_generation_and_binding(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    home = tmp_path / "home"
+    home.mkdir()
+    async with Database(tmp_path / "atomic-reload-fault.sqlite3") as database:
+        projects = ProjectRegistry(database, resolved_home=home)
+        await projects.initialize()
+        project = await projects.resolve("channel-atomic-reload-fault")
+        leases = OwnerLeaseStore(database)
+        lease = await leases.acquire("session-atomic-fault", "owner", now=100)
+        bindings = SessionBindingRepository(database)
+        binding = await bindings.create(
+            thread_id="thread-atomic-fault",
+            sdk_session_id=lease.sdk_session_id,
+            cwd_snapshot=project.cwd,
+            project_source=project.source.value,
+        )
+        binding = await bindings.begin_attachment(
+            thread_id=binding.thread_id,
+            lease=lease,
+            state=AttachmentState.RESUMING,
+            now=100,
+        )
+        await bindings.mark_attached(binding, permission_verified_at=100)
+
+        async def fail_children(*_args: object, **_kwargs: object) -> None:
+            raise RuntimeError("simulated publication crash")
+
+        monkeypatch.setattr(extension_module, "_insert_config_children", fail_children)
+        with pytest.raises(RuntimeError, match="simulated publication crash"):
+            await ConfigReloadClaimStore(database).claim_and_publish(
+                sdk_session_id=lease.sdk_session_id,
+                idempotency_key="reload-fault",
+                project=project,
+                config=ProjectExtensionConfig(disabled_skills=("never-published",)),
+                owner_id=lease.owner_id,
+                runtime_generation=1,
+                owner_fence_token=lease.fence_token,
+                transition_id="transition-fault",
+                minimum_headroom_seconds=40,
+                now=101,
+            )
+        claim_count = await database.fetchone("SELECT COUNT(*) AS count FROM config_reload_claims")
+        generation_count = await database.fetchone(
+            "SELECT COUNT(*) AS count FROM project_extension_config_generations"
+        )
+        recovered = await bindings.by_thread(binding.thread_id)
+
+    assert claim_count["count"] == 0
+    assert generation_count["count"] == 0
+    assert recovered is not None
+    assert recovered.pending_session_config_version is None
+
+
+@pytest.mark.asyncio
+async def test_unknown_config_key_does_not_replace_existing_generation(
+    tmp_path: Path,
+) -> None:
+    home = tmp_path / "home"
+    home.mkdir()
+    config_dir = home / ".copilotd"
+    config_dir.mkdir()
+    async with Database(tmp_path / "unknown-config-key.sqlite3") as database:
+        projects = ProjectRegistry(database, resolved_home=home)
+        await projects.initialize()
+        project = await projects.resolve("channel-unknown-key")
+        repository = ExtensionConfigRepository(database)
+        existing = await repository.publish(
+            project,
+            ProjectExtensionConfig(disabled_skills=("existing-skill",)),
+        )
+        (config_dir / "extensions.json").write_text(
+            json.dumps({"disabled_skill": ["typo"]}),
+            encoding="utf-8",
+        )
+
+        with pytest.raises(ExtensionConfigError, match="unknown keys"):
+            await repository.ingest(
+                project,
+                ExtensionConfigFileSource(),
+            )
+        latest = await repository.latest(project)
+        count = await database.fetchone(
+            "SELECT COUNT(*) AS count FROM project_extension_config_generations"
+        )
+
+    assert latest == existing
+    assert count["count"] == 1
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {
+            "environment_references": [
+                {
+                    "name": "token",
+                    "source_env": "TOKEN",
+                    "source_enb": "typo",
+                }
+            ]
+        },
+        {
+            "mcp_servers": [
+                {
+                    "name": "local",
+                    "transport": "stdio",
+                    "command": "server",
+                    "argz": [],
+                }
+            ]
+        },
+        {
+            "environment_references": [{"name": "token", "source_env": "TOKEN"}],
+            "mcp_servers": [
+                {
+                    "name": "local",
+                    "transport": "stdio",
+                    "command": "server",
+                    "environment": [
+                        {
+                            "name": "TOKEN",
+                            "reference": "token",
+                            "referance": "typo",
+                        }
+                    ],
+                }
+            ],
+        },
+        {
+            "mcp_servers": [
+                {
+                    "name": "remote",
+                    "transport": "http",
+                    "url": "https://mcp.example.test",
+                    "timeout": 1000,
+                }
+            ]
+        },
+        {
+            "environment_references": [{"name": "token", "source_env": "TOKEN"}],
+            "mcp_servers": [
+                {
+                    "name": "remote",
+                    "transport": "http",
+                    "url": "https://mcp.example.test",
+                    "headers": [
+                        {
+                            "name": "Authorization",
+                            "reference": "token",
+                            "referance": "typo",
+                        }
+                    ],
+                }
+            ],
+        },
+        {
+            "custom_agents": [
+                {
+                    "name": "agent",
+                    "prompt": "Review.",
+                    "toolz": ["read"],
+                }
+            ]
+        },
+    ],
+)
+def test_nested_extension_records_reject_unknown_keys(
+    payload: dict[str, object],
+) -> None:
+    with pytest.raises(ExtensionConfigError, match="unknown keys"):
+        ProjectExtensionConfig.from_dict(payload)
     with pytest.raises(ExtensionConfigError, match="unknown environment"):
         ProjectExtensionConfig(
             mcp_servers=(

@@ -1,6 +1,8 @@
 import asyncio
 import json
+import os
 import plistlib
+import stat
 import time
 import xml.etree.ElementTree as ET
 from dataclasses import asdict
@@ -10,7 +12,8 @@ from pathlib import Path
 import pytest
 from pydantic import SecretStr
 
-from copilotd.config import Settings
+from copilotd.cli import build_parser, run_command
+from copilotd.config import Settings, load_settings
 from copilotd.ops.heartbeat import HeartbeatSnapshot, HeartbeatWriter, read_heartbeat
 from copilotd.ops.service import ServiceManager
 from copilotd.storage.database import Database
@@ -23,6 +26,7 @@ def _settings(tmp_path: Path) -> Settings:
         log_dir=tmp_path / "logs",
         resolved_home=tmp_path,
         discord_token=SecretStr("test-token"),
+        github_token=SecretStr("github-test-token"),
     )
 
 
@@ -38,8 +42,7 @@ def test_macos_service_templates_use_bundled_topology_without_background_process
     )
 
     definitions = {
-        name: plistlib.loads(content)
-        for name, content in manager.macos_plists().items()
+        name: plistlib.loads(content) for name, content in manager.macos_plists().items()
     }
 
     assert set(definitions) == {
@@ -55,7 +58,12 @@ def test_macos_service_templates_use_bundled_topology_without_background_process
     assert watchdog["StartInterval"] == 300
     assert watchdog["RunAtLoad"] is True
     assert "ProcessType" not in watchdog
-    assert bot["EnvironmentVariables"]["COPILOTD_DISCORD_TOKEN"] == "test-token"
+    serialized = b"".join(manager.macos_plists().values())
+    assert b"test-token" not in serialized
+    assert b"github-test-token" not in serialized
+    assert bot["EnvironmentVariables"]["COPILOTD_SERVICE_SECRETS"] == str(
+        settings.service_secrets_path
+    )
 
 
 def test_windows_tasks_have_logon_restart_and_five_minute_watchdog(
@@ -78,7 +86,86 @@ def test_windows_tasks_have_logon_restart_and_five_minute_watchdog(
     assert bot.find(".//t:LogonTrigger", namespace) is not None
     assert watchdog.findtext(".//t:Repetition/t:Interval", namespaces=namespace) == "PT5M"
     assert watchdog.findtext(".//t:StartWhenAvailable", namespaces=namespace) == "true"
-    assert "$env:COPILOTD_DISCORD_TOKEN = 'test-token'" in manager.windows_runner()
+    runner = manager.windows_runner()
+    assert "test-token" not in runner
+    assert "github-test-token" not in runner
+    assert str(manager.settings.service_secrets_path) in runner
+    assert "$env:COPILOTD_SERVICE_SECRETS" in runner
+
+
+def test_service_install_fails_before_side_effects_without_managed_token(
+    tmp_path: Path,
+) -> None:
+    settings = _settings(tmp_path).model_copy(update={"github_token": None})
+    launch_agents = tmp_path / "LaunchAgents"
+    manager = ServiceManager(
+        settings,
+        entrypoint=tmp_path / "bin" / "copilotd",
+        platform="darwin",
+        launch_agents_dir=launch_agents,
+    )
+
+    with pytest.raises(RuntimeError, match="COPILOTD_GITHUB_TOKEN"):
+        manager.install()
+
+    assert not launch_agents.exists()
+    assert not settings.data_dir.exists()
+
+
+@pytest.mark.asyncio
+async def test_setup_missing_managed_token_fails_before_filesystem_or_install(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    data_dir = tmp_path / "data"
+    monkeypatch.setenv("COPILOTD_DATA_DIR", str(data_dir))
+    monkeypatch.setenv("COPILOTD_CACHE_DIR", str(tmp_path / "cache"))
+    monkeypatch.setenv("COPILOTD_LOG_DIR", str(tmp_path / "logs"))
+    monkeypatch.setenv("COPILOTD_DISCORD_TOKEN", "discord-token")
+    monkeypatch.delenv("COPILOTD_SERVICE_SECRETS", raising=False)
+    monkeypatch.delenv("COPILOTD_GITHUB_TOKEN", raising=False)
+    monkeypatch.delenv("COPILOT_GITHUB_TOKEN", raising=False)
+    monkeypatch.delenv("GH_TOKEN", raising=False)
+    monkeypatch.delenv("GITHUB_TOKEN", raising=False)
+
+    with pytest.raises(ValueError, match="COPILOTD_GITHUB_TOKEN"):
+        await run_command(build_parser().parse_args(["setup"]))
+
+    assert not data_dir.exists()
+
+
+def test_service_install_persists_tokens_only_in_private_credential_source(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    settings = _settings(tmp_path)
+    manager = ServiceManager(
+        settings,
+        entrypoint=tmp_path / "bin" / "copilotd",
+        platform="darwin",
+        launch_agents_dir=tmp_path / "LaunchAgents",
+    )
+    monkeypatch.setattr(manager, "_install_macos", lambda: None)
+
+    manager.install()
+
+    payload = json.loads(settings.service_secrets_path.read_text(encoding="utf-8"))
+    assert payload["discord_token"] == "test-token"
+    assert payload["github_token"] == "github-test-token"
+    if os.name == "posix":
+        assert stat.S_IMODE(settings.service_secrets_path.stat().st_mode) == 0o600
+
+    monkeypatch.setenv("COPILOTD_SERVICE_SECRETS", str(settings.service_secrets_path))
+    monkeypatch.delenv("COPILOTD_DISCORD_TOKEN", raising=False)
+    monkeypatch.delenv("COPILOTD_GITHUB_TOKEN", raising=False)
+    monkeypatch.delenv("COPILOT_GITHUB_TOKEN", raising=False)
+    monkeypatch.delenv("GH_TOKEN", raising=False)
+    monkeypatch.delenv("GITHUB_TOKEN", raising=False)
+    loaded = load_settings()
+    assert loaded.discord_token is not None
+    assert loaded.github_token is not None
+    assert loaded.discord_token.get_secret_value() == "test-token"
+    assert loaded.github_token.get_secret_value() == "github-test-token"
 
 
 @pytest.mark.asyncio

@@ -112,25 +112,32 @@ class ServiceManager:
         }
 
     def windows_runner(self) -> str:
+        secret_path = str(self.settings.service_secrets_path)
         lines = [
             "$ErrorActionPreference = 'Stop'",
             *[
                 f"$env:{key} = '{_powershell_quote(value)}'"
                 for key, value in sorted(self._service_environment().items())
             ],
+            f"$secretPath = '{_powershell_quote(secret_path)}'",
+            "if (-not (Test-Path -LiteralPath $secretPath -PathType Leaf)) {",
+            '  throw "copilotD service secret file is missing: $secretPath"',
+            "}",
             "$action = $args[0]",
             "if ($action -eq 'run') {",
             f"  & '{_powershell_quote(str(self.entrypoint))}' run --foreground",
             "} elseif ($action -eq 'watchdog') {",
             f"  & '{_powershell_quote(str(self.entrypoint))}' service watchdog",
-            "} else { throw \"Unknown copilotD service action: $action\" }",
+            '} else { throw "Unknown copilotD service action: $action" }',
             "exit $LASTEXITCODE",
             "",
         ]
         return "\n".join(lines)
 
     def install(self) -> None:
+        self._require_install_credentials()
         self.settings.ensure_directories()
+        self.settings.write_service_secrets()
         if self.platform == "darwin":
             self._install_macos()
         elif self.platform == "win32":
@@ -167,9 +174,7 @@ class ServiceManager:
 
         if self.platform == "darwin":
             domain = f"gui/{os.getuid()}"
-            bot_loaded = _command_succeeds(
-                ["launchctl", "print", f"{domain}/{_MAC_BOT_LABEL}"]
-            )
+            bot_loaded = _command_succeeds(["launchctl", "print", f"{domain}/{_MAC_BOT_LABEL}"])
             watchdog_loaded = _command_succeeds(
                 ["launchctl", "print", f"{domain}/{_MAC_WATCHDOG_LABEL}"]
             )
@@ -178,9 +183,7 @@ class ServiceManager:
                 for label in (_MAC_BOT_LABEL, _MAC_WATCHDOG_LABEL)
             )
         elif self.platform == "win32":
-            bot_loaded = _command_succeeds(
-                ["schtasks.exe", "/Query", "/TN", _WINDOWS_BOT_TASK]
-            )
+            bot_loaded = _command_succeeds(["schtasks.exe", "/Query", "/TN", _WINDOWS_BOT_TASK])
             watchdog_loaded = _command_succeeds(
                 ["schtasks.exe", "/Query", "/TN", _WINDOWS_WATCHDOG_TASK]
             )
@@ -227,9 +230,7 @@ class ServiceManager:
                 )
                 return "runtime-down-protected"
             if self._restart_storm(current):
-                self._write_alert(
-                    "runtime-down restart suppressed after 3 attempts in 5 minutes"
-                )
+                self._write_alert("runtime-down restart suppressed after 3 attempts in 5 minutes")
                 return "restart-storm"
             self._record_restart(current)
             self._restart_bot()
@@ -263,6 +264,21 @@ class ServiceManager:
             _run_required(["launchctl", "kickstart", f"{domain}/{label}"])
 
     def _install_windows(self) -> None:
+        _run_required(
+            [
+                "powershell.exe",
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                (
+                    "$path = $args[0]; $sid = [System.Security.Principal.WindowsIdentity]"
+                    "::GetCurrent().User.Value; & icacls.exe $path '/inheritance:r' "
+                    "'/grant:r' \"*$sid`:(R,W)\" | Out-Null; "
+                    "if ($LASTEXITCODE -ne 0) { throw 'Could not restrict service secret ACL' }"
+                ),
+                str(self.settings.service_secrets_path),
+            ]
+        )
         runner = self.settings.data_dir / "runtime" / "copilotd-service.ps1"
         _atomic_write_text(runner, self.windows_runner())
         task_directory = self.settings.data_dir / "runtime" / "tasks"
@@ -270,9 +286,7 @@ class ServiceManager:
         for task, xml in self.windows_task_xml().items():
             path = task_directory / f"{task.replace(' ', '-')}.xml"
             _atomic_write_text(path, xml)
-            _run_required(
-                ["schtasks.exe", "/Create", "/TN", task, "/XML", str(path), "/F"]
-            )
+            _run_required(["schtasks.exe", "/Create", "/TN", task, "/XML", str(path), "/F"])
             _run_required(["schtasks.exe", "/Run", "/TN", task])
 
     def _restart_bot(self) -> None:
@@ -300,25 +314,29 @@ class ServiceManager:
             "COPILOTD_RESOLVED_HOME": str(self.settings.resolved_home),
             "COPILOTD_LOG_LEVEL": self.settings.log_level,
             "COPILOTD_SDK_LOG_LEVEL": self.settings.sdk_log_level,
+            "COPILOTD_SERVICE_SECRETS": str(self.settings.service_secrets_path),
         }
-        if self.settings.discord_token is not None:
-            environment["COPILOTD_DISCORD_TOKEN"] = (
-                self.settings.discord_token.get_secret_value()
-            )
         if self.settings.discord_guild_id is not None:
-            environment["COPILOTD_DISCORD_GUILD_ID"] = str(
-                self.settings.discord_guild_id
-            )
+            environment["COPILOTD_DISCORD_GUILD_ID"] = str(self.settings.discord_guild_id)
         if self.settings.runtime_uri is not None:
             environment["COPILOTD_RUNTIME_URI"] = self.settings.runtime_uri
         if self.settings.runtime_connection_token is not None:
             environment["COPILOTD_RUNTIME_CONNECTION_TOKEN"] = (
                 self.settings.runtime_connection_token.get_secret_value()
             )
-        environment["COPILOTD_MENTION_REQUIRED"] = str(
-            self.settings.mention_required
-        ).lower()
+        environment["COPILOTD_MENTION_REQUIRED"] = str(self.settings.mention_required).lower()
         return environment
+
+    def _require_install_credentials(self) -> None:
+        missing: list[str] = []
+        if self.settings.discord_token is None:
+            missing.append("COPILOTD_DISCORD_TOKEN")
+        if self.settings.github_token is None:
+            missing.append("COPILOTD_GITHUB_TOKEN")
+        if missing:
+            raise RuntimeError(
+                "service installation requires protected credentials: " + ", ".join(missing)
+            )
 
     def _restart_storm(self, now: float) -> bool:
         history = self._restart_history()
@@ -336,9 +354,7 @@ class ServiceManager:
     def _restart_history(self) -> list[float]:
         try:
             payload = json.loads(
-                (self.settings.cache_dir / "watchdog-state.json").read_text(
-                    encoding="utf-8"
-                )
+                (self.settings.cache_dir / "watchdog-state.json").read_text(encoding="utf-8")
             )
             return [float(value) for value in payload.get("restarts", [])]
         except (OSError, ValueError, TypeError, json.JSONDecodeError):

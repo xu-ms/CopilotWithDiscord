@@ -244,12 +244,31 @@ class ProjectExtensionConfig:
     @classmethod
     def from_dict(cls, payload: Mapping[str, Any]) -> ProjectExtensionConfig:
         try:
+            _reject_unknown_keys(
+                payload,
+                {
+                    "environment_references",
+                    "mcp_servers",
+                    "skill_directories",
+                    "disabled_skills",
+                    "plugin_directories",
+                    "custom_agents",
+                },
+                "extension config",
+            )
+            environment_items = _mapping_list(payload.get("environment_references", []))
+            for item in environment_items:
+                _reject_unknown_keys(
+                    item,
+                    {"name", "source_env"},
+                    "environment reference",
+                )
             environment_references = tuple(
                 EnvironmentReference(
                     name=str(item["name"]),
                     source_env=str(item["source_env"]),
                 )
-                for item in _mapping_list(payload.get("environment_references", []))
+                for item in environment_items
             )
             mcp_servers = tuple(
                 _mcp_from_dict(item) for item in _mapping_list(payload.get("mcp_servers", []))
@@ -431,53 +450,16 @@ class ExtensionConfigRepository:
         config_hash = hashlib.sha256(encoded.encode()).hexdigest()
         scope_key = extension_scope_key(project.source.value, project.project_id)
         timestamp = time.time() if now is None else now
-        version: int
         async with self._database.transaction() as connection:
-            cursor = await connection.execute(
-                """
-                SELECT version, config_hash
-                FROM project_extension_config_generations
-                WHERE scope_key = ?
-                ORDER BY version DESC LIMIT 1
-                """,
-                (scope_key,),
+            version = await _publish_config_in_transaction(
+                connection,
+                project=project,
+                config=normalized,
+                config_hash=config_hash,
+                encoded=encoded,
+                expected_current_version=expected_current_version,
+                timestamp=timestamp,
             )
-            current = await cursor.fetchone()
-            await cursor.close()
-            current_version = 0 if current is None else int(current["version"])
-            if expected_current_version is not None and current_version != expected_current_version:
-                raise ExtensionConfigConflict(
-                    f"extension config changed: expected {expected_current_version}, "
-                    f"found {current_version}"
-                )
-            if current is not None and str(current["config_hash"]) == config_hash:
-                version = current_version
-            else:
-                version = current_version + 1
-                await connection.execute(
-                    """
-                    INSERT INTO project_extension_config_generations(
-                        scope_key, version, project_id, project_source,
-                        cwd_snapshot, config_hash, config_json, created_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                    """,
-                    (
-                        scope_key,
-                        version,
-                        project.project_id,
-                        project.source.value,
-                        str(project.cwd),
-                        config_hash,
-                        encoded,
-                        timestamp,
-                    ),
-                )
-                await _insert_config_children(
-                    connection,
-                    scope_key=scope_key,
-                    version=version,
-                    config=normalized,
-                )
         return ExtensionConfigSnapshot(
             scope_key=scope_key,
             version=version,
@@ -562,6 +544,29 @@ class ConfigReloadClaimStore:
     def __init__(self, database: Database) -> None:
         self._database = database
 
+    async def find(
+        self,
+        *,
+        sdk_session_id: str,
+        idempotency_key: str,
+        config_hash: str,
+    ) -> ConfigReloadClaim | None:
+        row = await self._database.fetchone(
+            """
+            SELECT * FROM config_reload_claims
+            WHERE sdk_session_id = ? AND idempotency_key = ?
+            """,
+            (sdk_session_id, idempotency_key),
+        )
+        if row is None:
+            return None
+        claim = _row_to_reload_claim(row)
+        if claim.config_hash != config_hash:
+            raise ExtensionConfigConflict(
+                "config reload idempotency key was reused with a different config hash"
+            )
+        return claim
+
     async def claim(
         self,
         *,
@@ -613,6 +618,271 @@ class ConfigReloadClaimStore:
             )
         return claim, False
 
+    async def claim_and_publish(
+        self,
+        *,
+        sdk_session_id: str,
+        idempotency_key: str,
+        project: ProjectSnapshot,
+        config: ProjectExtensionConfig,
+        owner_id: str,
+        runtime_generation: int,
+        owner_fence_token: int,
+        transition_id: str,
+        minimum_headroom_seconds: float,
+        expected_current_version: int | None = None,
+        now: float | None = None,
+    ) -> tuple[ConfigReloadClaim, ExtensionConfigSnapshot, bool]:
+        timestamp = time.time() if now is None else now
+        normalized = config.normalized(project.cwd)
+        encoded = normalized.canonical_json()
+        config_hash = hashlib.sha256(encoded.encode()).hexdigest()
+        created = False
+        async with self._database.transaction() as connection:
+            owner_cursor = await connection.execute(
+                """
+                SELECT 1 FROM session_owner_leases
+                WHERE sdk_session_id = ? AND owner_id = ? AND fence_token = ?
+                  AND expires_at - ? >= ?
+                """,
+                (
+                    sdk_session_id,
+                    owner_id,
+                    owner_fence_token,
+                    timestamp,
+                    minimum_headroom_seconds,
+                ),
+            )
+            owner = await owner_cursor.fetchone()
+            await owner_cursor.close()
+            if owner is None:
+                raise ExtensionConfigConflict("owner fence is not current for config publication")
+            binding_cursor = await connection.execute(
+                """
+                SELECT desired_session_config_version,
+                       desired_session_config_hash,
+                       pending_session_config_version,
+                       pending_session_config_hash,
+                       pending_session_config_transition_id,
+                       runtime_session_config_version,
+                       runtime_session_config_hash,
+                       session_config_state
+                FROM session_bindings
+                WHERE sdk_session_id = ? AND runtime_generation = ?
+                  AND owner_fence_token = ? AND attachment_state = 'attached'
+                  AND project_source = ? AND project_id IS ?
+                  AND cwd_snapshot = ?
+                """,
+                (
+                    sdk_session_id,
+                    runtime_generation,
+                    owner_fence_token,
+                    project.source.value,
+                    project.project_id,
+                    str(project.cwd),
+                ),
+            )
+            binding = await binding_cursor.fetchone()
+            await binding_cursor.close()
+            if binding is None:
+                raise ExtensionConfigConflict(
+                    "session binding fence is not current for config publication"
+                )
+            cursor = await connection.execute(
+                """
+                SELECT * FROM config_reload_claims
+                WHERE sdk_session_id = ? AND idempotency_key = ?
+                """,
+                (sdk_session_id, idempotency_key),
+            )
+            row = await cursor.fetchone()
+            await cursor.close()
+            if row is not None and str(row["config_hash"]) != config_hash:
+                raise ExtensionConfigConflict(
+                    "config reload idempotency key was reused with a different config hash"
+                )
+            if row is None or (
+                row["state"] == ConfigReloadState.CLAIMED.value and row["config_version"] is None
+            ):
+                version = await _publish_config_in_transaction(
+                    connection,
+                    project=project,
+                    config=normalized,
+                    config_hash=config_hash,
+                    encoded=encoded,
+                    expected_current_version=expected_current_version,
+                    timestamp=timestamp,
+                )
+                if row is None:
+                    await connection.execute(
+                        """
+                        INSERT INTO config_reload_claims(
+                            sdk_session_id, idempotency_key, config_hash,
+                            claimed_generation, owner_fence_token, state,
+                            config_version, created_at
+                        ) VALUES (?, ?, ?, ?, ?, 'started', ?, ?)
+                        """,
+                        (
+                            sdk_session_id,
+                            idempotency_key,
+                            config_hash,
+                            runtime_generation,
+                            owner_fence_token,
+                            version,
+                            timestamp,
+                        ),
+                    )
+                    created = True
+                else:
+                    await connection.execute(
+                        """
+                        UPDATE config_reload_claims
+                        SET state = 'started', config_version = ?,
+                            claimed_generation = ?, owner_fence_token = ?,
+                            error_code = NULL, settled_at = NULL
+                        WHERE sdk_session_id = ? AND idempotency_key = ?
+                          AND state = 'claimed' AND config_version IS NULL
+                        """,
+                        (
+                            version,
+                            runtime_generation,
+                            owner_fence_token,
+                            sdk_session_id,
+                            idempotency_key,
+                        ),
+                    )
+                row = await _fetch_reload_claim(
+                    connection,
+                    sdk_session_id,
+                    idempotency_key,
+                )
+            version = None if row["config_version"] is None else int(row["config_version"])
+            if version is None:
+                raise ExtensionConfigConflict("config reload claim has no deterministic generation")
+            generation_cursor = await connection.execute(
+                """
+                SELECT config_hash FROM project_extension_config_generations
+                WHERE scope_key = ? AND version = ?
+                """,
+                (
+                    extension_scope_key(project.source.value, project.project_id),
+                    version,
+                ),
+            )
+            generation = await generation_cursor.fetchone()
+            await generation_cursor.close()
+            if generation is None or str(generation["config_hash"]) != config_hash:
+                raise ExtensionConfigConflict(
+                    "config reload claim generation does not match its hash"
+                )
+            if row["state"] in {
+                ConfigReloadState.CLAIMED.value,
+                ConfigReloadState.STARTED.value,
+                ConfigReloadState.UNKNOWN.value,
+            }:
+                await connection.execute(
+                    """
+                    UPDATE config_reload_claims
+                    SET state = 'started', claimed_generation = ?,
+                        owner_fence_token = ?, error_code = NULL,
+                        settled_at = NULL
+                    WHERE sdk_session_id = ? AND idempotency_key = ?
+                      AND config_hash = ?
+                    """,
+                    (
+                        runtime_generation,
+                        owner_fence_token,
+                        sdk_session_id,
+                        idempotency_key,
+                        config_hash,
+                    ),
+                )
+                row = await _fetch_reload_claim(
+                    connection,
+                    sdk_session_id,
+                    idempotency_key,
+                )
+            if row["state"] in {
+                ConfigReloadState.STARTED.value,
+                ConfigReloadState.UNKNOWN.value,
+            }:
+                pending_version = binding["pending_session_config_version"]
+                pending_matches = (
+                    pending_version is not None
+                    and int(pending_version) == version
+                    and binding["pending_session_config_hash"] == config_hash
+                    and binding["pending_session_config_transition_id"] == transition_id
+                )
+                already_synced = (
+                    pending_version is None
+                    and int(binding["desired_session_config_version"]) == version
+                    and binding["desired_session_config_hash"] == config_hash
+                    and binding["runtime_session_config_version"] == version
+                    and binding["runtime_session_config_hash"] == config_hash
+                    and binding["session_config_state"] == "synced"
+                )
+                if pending_version is not None and not pending_matches:
+                    raise ExtensionConfigConflict(
+                        "another extension config transition is already pending"
+                    )
+                if not already_synced:
+                    update = await connection.execute(
+                        """
+                        UPDATE session_bindings
+                        SET pending_session_config_version = ?,
+                            pending_session_config_hash = ?,
+                            pending_session_config_transition_id = ?,
+                            session_config_state = 'pending',
+                            session_config_drift = 0,
+                            updated_at = ?, row_version = row_version + 1
+                        WHERE sdk_session_id = ? AND runtime_generation = ?
+                          AND owner_fence_token = ? AND attachment_state = 'attached'
+                          AND (
+                            pending_session_config_version IS NULL
+                            OR (
+                              pending_session_config_version = ?
+                              AND pending_session_config_hash = ?
+                              AND pending_session_config_transition_id = ?
+                            )
+                          )
+                        """,
+                        (
+                            version,
+                            config_hash,
+                            transition_id,
+                            timestamp,
+                            sdk_session_id,
+                            runtime_generation,
+                            owner_fence_token,
+                            version,
+                            config_hash,
+                            transition_id,
+                        ),
+                    )
+                    if update.rowcount != 1:
+                        await update.close()
+                        raise ExtensionConfigConflict(
+                            "session binding changed during config publication"
+                        )
+                    await update.close()
+        claim = _row_to_reload_claim(row)
+        return (
+            claim,
+            ExtensionConfigSnapshot(
+                scope_key=extension_scope_key(
+                    project.source.value,
+                    project.project_id,
+                ),
+                version=version,
+                project_id=project.project_id,
+                project_source=project.source.value,
+                cwd_snapshot=project.cwd,
+                config_hash=config_hash,
+                config=normalized,
+            ),
+            created,
+        )
+
     async def transition(
         self,
         claim: ConfigReloadClaim,
@@ -661,6 +931,15 @@ class ConfigReloadClaimStore:
                     error_code = ?, settled_at = ?
                 WHERE sdk_session_id = ? AND idempotency_key = ?
                   AND config_hash = ? AND state = ?
+                  AND claimed_generation = ? AND owner_fence_token = ?
+                  AND EXISTS (
+                    SELECT 1 FROM session_owner_leases
+                    WHERE session_owner_leases.sdk_session_id =
+                          config_reload_claims.sdk_session_id
+                      AND session_owner_leases.fence_token =
+                          config_reload_claims.owner_fence_token
+                      AND session_owner_leases.expires_at > ?
+                  )
                 """,
                 (
                     state.value,
@@ -671,6 +950,9 @@ class ConfigReloadClaimStore:
                     claim.idempotency_key,
                     claim.config_hash,
                     claim.state.value,
+                    claim.claimed_generation,
+                    claim.owner_fence_token,
+                    timestamp,
                 ),
             )
             if cursor.rowcount != 1:
@@ -745,6 +1027,64 @@ def _snapshot_from_row(row: Any) -> ExtensionConfigSnapshot:
         config_hash=config_hash,
         config=config,
     )
+
+
+async def _publish_config_in_transaction(
+    connection: Any,
+    *,
+    project: ProjectSnapshot,
+    config: ProjectExtensionConfig,
+    config_hash: str,
+    encoded: str,
+    expected_current_version: int | None,
+    timestamp: float,
+) -> int:
+    scope_key = extension_scope_key(project.source.value, project.project_id)
+    cursor = await connection.execute(
+        """
+        SELECT version, config_hash
+        FROM project_extension_config_generations
+        WHERE scope_key = ?
+        ORDER BY version DESC LIMIT 1
+        """,
+        (scope_key,),
+    )
+    current = await cursor.fetchone()
+    await cursor.close()
+    current_version = 0 if current is None else int(current["version"])
+    if expected_current_version is not None and current_version != expected_current_version:
+        raise ExtensionConfigConflict(
+            f"extension config changed: expected {expected_current_version}, "
+            f"found {current_version}"
+        )
+    if current is not None and str(current["config_hash"]) == config_hash:
+        return current_version
+    version = current_version + 1
+    await connection.execute(
+        """
+        INSERT INTO project_extension_config_generations(
+            scope_key, version, project_id, project_source,
+            cwd_snapshot, config_hash, config_json, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            scope_key,
+            version,
+            project.project_id,
+            project.source.value,
+            str(project.cwd),
+            config_hash,
+            encoded,
+            timestamp,
+        ),
+    )
+    await _insert_config_children(
+        connection,
+        scope_key=scope_key,
+        version=version,
+        config=config,
+    )
+    return version
 
 
 async def _insert_config_children(
@@ -888,6 +1228,27 @@ def _mcp_to_dict(server: McpServer) -> dict[str, Any]:
 def _mcp_from_dict(payload: Mapping[str, Any]) -> McpServer:
     transport = str(payload["transport"])
     if transport == "stdio":
+        _reject_unknown_keys(
+            payload,
+            {
+                "name",
+                "transport",
+                "command",
+                "args",
+                "environment",
+                "working_directory",
+                "tools",
+                "timeout_ms",
+            },
+            "stdio MCP server",
+        )
+        environment = _mapping_list(payload.get("environment", []))
+        for item in environment:
+            _reject_unknown_keys(
+                item,
+                {"name", "reference"},
+                "MCP environment binding",
+            )
         return McpStdioServer(
             name=str(payload["name"]),
             command=str(payload["command"]),
@@ -897,7 +1258,7 @@ def _mcp_from_dict(payload: Mapping[str, Any]) -> McpServer:
                     name=str(item["name"]),
                     reference=str(item["reference"]),
                 )
-                for item in _mapping_list(payload.get("environment", []))
+                for item in environment
             ),
             working_directory=(
                 None
@@ -908,6 +1269,25 @@ def _mcp_from_dict(payload: Mapping[str, Any]) -> McpServer:
             timeout_ms=_optional_int(payload.get("timeout_ms")),
         )
     if transport == "http":
+        _reject_unknown_keys(
+            payload,
+            {
+                "name",
+                "transport",
+                "url",
+                "headers",
+                "tools",
+                "timeout_ms",
+            },
+            "HTTP MCP server",
+        )
+        headers = _mapping_list(payload.get("headers", []))
+        for item in headers:
+            _reject_unknown_keys(
+                item,
+                {"name", "reference"},
+                "MCP header binding",
+            )
         return McpHttpServer(
             name=str(payload["name"]),
             url=str(payload["url"]),
@@ -916,7 +1296,7 @@ def _mcp_from_dict(payload: Mapping[str, Any]) -> McpServer:
                     name=str(item["name"]),
                     reference=str(item["reference"]),
                 )
-                for item in _mapping_list(payload.get("headers", []))
+                for item in headers
             ),
             tools=_string_tuple(payload.get("tools", ["*"])),
             timeout_ms=_optional_int(payload.get("timeout_ms")),
@@ -940,6 +1320,22 @@ def _agent_to_dict(agent: CustomAgent) -> dict[str, Any]:
 
 
 def _agent_from_dict(payload: Mapping[str, Any]) -> CustomAgent:
+    _reject_unknown_keys(
+        payload,
+        {
+            "name",
+            "display_name",
+            "description",
+            "prompt",
+            "tools",
+            "skills",
+            "mcp_server_names",
+            "infer",
+            "model",
+            "reasoning_effort",
+        },
+        "custom agent",
+    )
     tools = payload.get("tools")
     return CustomAgent(
         name=str(payload["name"]),
@@ -1006,3 +1402,13 @@ def _optional_int(value: Any) -> int | None:
     if isinstance(value, bool):
         raise ExtensionConfigError("expected an integer")
     return int(value)
+
+
+def _reject_unknown_keys(
+    payload: Mapping[str, Any],
+    allowed: set[str],
+    context: str,
+) -> None:
+    unknown = sorted(str(key) for key in set(payload) - allowed)
+    if unknown:
+        raise ExtensionConfigError(f"{context} contains unknown keys: {', '.join(unknown)}")

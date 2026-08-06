@@ -66,8 +66,10 @@ export COPILOTD_GITHUB_TOKEN='...'
 .venv/bin/copilotd setup
 ```
 
-`setup` installs and starts the current platform's service definitions. For local
-development, use the explicit foreground entrypoint:
+`setup` fails before installation unless both tokens are present, then writes them to the
+private service credential file (mode `0600` on macOS; current-user ACL on Windows).
+Service definitions, generated runners, logs, and acceptance evidence never contain either
+token. For local development, use the explicit foreground entrypoint:
 
 ```bash
 .venv/bin/copilotd run --foreground

@@ -5,7 +5,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
-from uuid import UUID, uuid4
+from uuid import NAMESPACE_URL, UUID, uuid4, uuid5
 
 import pytest
 from copilot.generated.session_events import SessionMode
@@ -36,6 +36,7 @@ from copilotd.core.bindings import (
     SessionBindingRepository,
 )
 from copilotd.core.extensions import (
+    ConfigReloadClaimStore,
     EnvironmentBinding,
     EnvironmentReference,
     ExtensionConfigConflict,
@@ -2463,6 +2464,181 @@ async def test_extension_config_hooks_and_same_fence_reattach(
             {"permission_kind": "shell", "decision": "approve-once"}
         ]
         await runtime.close(idempotency_key="close-extension")
+
+
+@pytest.mark.parametrize("persist_pending_event", [False, True])
+@pytest.mark.asyncio
+async def test_config_reload_reconciles_crash_around_pending_event(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    persist_pending_event: bool,
+) -> None:
+    home = tmp_path / "home"
+    home.mkdir()
+    session_id = str(uuid4())
+    async with Database(tmp_path / f"reload-crash-{persist_pending_event}.sqlite3") as database:
+        projects = ProjectRegistry(database, resolved_home=home)
+        await projects.initialize()
+        project = await projects.resolve("channel-reload-crash")
+        configs = ExtensionConfigRepository(database)
+        first = await configs.publish(project, ProjectExtensionConfig())
+        bindings = SessionBindingRepository(database)
+        binding = await bindings.create(
+            thread_id="thread-reload-crash",
+            sdk_session_id=session_id,
+            cwd_snapshot=home,
+            project_source=project.source.value,
+            desired_session_config_version=first.version,
+            desired_session_config_hash=first.config_hash,
+        )
+        bridge = FakeBridge(session_id)
+        runtime = SessionRuntime(
+            database=database,
+            bridge=bridge,
+            bindings=bindings,
+            owner_leases=OwnerLeaseStore(database),
+            owner_id="process-reload-crash",
+            binding=binding,
+            extension_configs=configs,
+        )
+        await runtime.attach_create()
+        assert runtime.inbox is not None
+        original_commit = runtime.inbox.commit_internal
+
+        async def crash_at_pending_event(
+            payload: Any,
+            *,
+            source: str = "internal",
+            internal_event_id: str | None = None,
+        ) -> None:
+            if payload.get("type") == "copilotd.config.pending":
+                if persist_pending_event:
+                    await original_commit(
+                        payload,
+                        source=source,
+                        internal_event_id=internal_event_id,
+                    )
+                raise RuntimeError("simulated process crash")
+            await original_commit(
+                payload,
+                source=source,
+                internal_event_id=internal_event_id,
+            )
+
+        monkeypatch.setattr(runtime.inbox, "commit_internal", crash_at_pending_event)
+        second_config = ProjectExtensionConfig(disabled_skills=("after-crash",))
+        with pytest.raises(RuntimeError, match="simulated process crash"):
+            await runtime.reload_extension_config(
+                idempotency_key="reload-crash",
+                config=second_config,
+                expected_project_config_version=1,
+            )
+        pending = await bindings.by_thread(binding.thread_id)
+        claim = await database.fetchone("SELECT state, config_version FROM config_reload_claims")
+        generations_before = await database.fetchone(
+            "SELECT COUNT(*) AS count FROM project_extension_config_generations"
+        )
+        assert pending is not None
+        assert pending.pending_session_config_version == 2
+        assert dict(claim) == {"state": "started", "config_version": 2}
+        assert generations_before["count"] == 2
+
+        monkeypatch.setattr(runtime.inbox, "commit_internal", original_commit)
+        recovered = await runtime.reload_extension_config(
+            idempotency_key="reload-crash",
+            config=second_config,
+        )
+        generations_after = await database.fetchone(
+            "SELECT COUNT(*) AS count FROM project_extension_config_generations"
+        )
+        settled = await database.fetchone("SELECT state FROM config_reload_claims")
+
+        assert recovered.version == 2
+        assert generations_after["count"] == 2
+        assert settled["state"] == "confirmed"
+        assert bridge.resume_calls == 1
+        await runtime.close(idempotency_key="close-reload-crash")
+
+
+@pytest.mark.asyncio
+async def test_config_reload_takeover_reconciles_crash_after_disconnect(
+    tmp_path: Path,
+) -> None:
+    home = tmp_path / "home"
+    home.mkdir()
+    session_id = str(uuid4())
+    async with Database(tmp_path / "reload-disconnect-crash.sqlite3") as database:
+        projects = ProjectRegistry(database, resolved_home=home)
+        await projects.initialize()
+        project = await projects.resolve("channel-reload-disconnect-crash")
+        configs = ExtensionConfigRepository(database)
+        first = await configs.publish(project, ProjectExtensionConfig())
+        bindings = SessionBindingRepository(database)
+        binding = await bindings.create(
+            thread_id="thread-reload-disconnect-crash",
+            sdk_session_id=session_id,
+            cwd_snapshot=home,
+            project_source=project.source.value,
+            desired_session_config_version=first.version,
+            desired_session_config_hash=first.config_hash,
+        )
+        leases = OwnerLeaseStore(database)
+        bridge = FakeBridge(session_id)
+        crashed = SessionRuntime(
+            database=database,
+            bridge=bridge,
+            bindings=bindings,
+            owner_leases=leases,
+            owner_id="process-before-crash",
+            binding=binding,
+            extension_configs=configs,
+        )
+        await crashed.attach_create()
+        second_config = ProjectExtensionConfig(disabled_skills=("takeover",))
+        transition_id = str(uuid5(NAMESPACE_URL, f"copilotd:{session_id}:config:reload-takeover"))
+        assert crashed._lease is not None
+        claim, second, created = await ConfigReloadClaimStore(database).claim_and_publish(
+            sdk_session_id=session_id,
+            idempotency_key="reload-takeover",
+            project=project,
+            config=second_config,
+            owner_id=crashed._lease.owner_id,
+            runtime_generation=crashed.binding.runtime_generation,
+            owner_fence_token=crashed._lease.fence_token,
+            transition_id=transition_id,
+            minimum_headroom_seconds=40,
+        )
+        assert created and claim.state.value == "started"
+        await bridge.handle.disconnect()
+        await crashed.shutdown()
+
+        takeover_binding = await bindings.by_thread(binding.thread_id)
+        assert takeover_binding is not None
+        resumed = SessionRuntime(
+            database=database,
+            bridge=bridge,
+            bindings=bindings,
+            owner_leases=leases,
+            owner_id="process-after-crash",
+            binding=takeover_binding,
+            extension_configs=configs,
+        )
+        await resumed.attach_resume()
+        replayed = await resumed.reload_extension_config(
+            idempotency_key="reload-takeover",
+            config=second_config,
+        )
+        settled = await database.fetchone("SELECT state, config_version FROM config_reload_claims")
+        generations = await database.fetchone(
+            "SELECT COUNT(*) AS count FROM project_extension_config_generations"
+        )
+
+        assert replayed == second
+        assert dict(settled) == {"state": "confirmed", "config_version": second.version}
+        assert generations["count"] == 2
+        assert resumed.binding.desired_session_config_hash == second.config_hash
+        assert resumed.binding.runtime_session_config_hash == second.config_hash
+        await resumed.close(idempotency_key="close-reload-takeover")
 
 
 @pytest.mark.asyncio

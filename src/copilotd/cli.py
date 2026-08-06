@@ -8,7 +8,7 @@ import sys
 from importlib.metadata import version
 from typing import Any
 
-from copilotd.config import Settings
+from copilotd.config import load_settings
 from copilotd.discord_app import run_discord_bot
 from copilotd.logging import configure_logging
 from copilotd.ops.service import ServiceManager, status_dict
@@ -69,7 +69,14 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 async def run_command(args: argparse.Namespace) -> int:
-    settings = Settings()
+    settings = load_settings()
+    installing = args.command == "setup" or (
+        args.command == "service" and args.service_command == "install"
+    )
+    if installing and settings.discord_token is None:
+        raise ValueError("COPILOTD_DISCORD_TOKEN is required for service installation")
+    if installing and settings.github_token is None:
+        raise ValueError("COPILOTD_GITHUB_TOKEN is required for service installation")
     settings.ensure_directories()
     configure_logging(settings.log_level)
 
@@ -115,8 +122,6 @@ async def run_command(args: argparse.Namespace) -> int:
         return 0
 
     if args.command == "setup":
-        if settings.discord_token is None:
-            raise ValueError("COPILOTD_DISCORD_TOKEN is required for setup")
         manager = ServiceManager(settings)
         await asyncio.to_thread(manager.install)
         deadline = asyncio.get_running_loop().time() + 45
@@ -139,8 +144,6 @@ async def run_command(args: argparse.Namespace) -> int:
     if args.command == "service":
         manager = ServiceManager(settings)
         if args.service_command == "install":
-            if settings.discord_token is None:
-                raise ValueError("COPILOTD_DISCORD_TOKEN is required for service install")
             await asyncio.to_thread(manager.install)
             _print_json(status_dict(await asyncio.to_thread(manager.status)))
         elif args.service_command == "status":

@@ -1,4 +1,5 @@
 import asyncio
+import hashlib
 import sqlite3
 import time
 from importlib import resources
@@ -7,6 +8,28 @@ from pathlib import Path
 import pytest
 
 from copilotd.storage.database import Database
+
+
+@pytest.mark.parametrize(
+    ("name", "expected_sha256"),
+    [
+        (
+            "0015_extension_config_generations.sql",
+            "7b4a2d5c4d43e9dc3ce6a07e79313257170b483e601afbf4f129253e16944adc",
+        ),
+        (
+            "0017_hook_permission_audit.sql",
+            "60a2c024d8e336de03185159ae53bc8c2b47b571a03e8f19042f40816661818f",
+        ),
+    ],
+)
+def test_applied_protocol_migrations_remain_byte_immutable(
+    name: str,
+    expected_sha256: str,
+) -> None:
+    content = resources.files("copilotd.storage.migrations").joinpath(name).read_bytes()
+
+    assert hashlib.sha256(content).hexdigest() == expected_sha256
 
 
 @pytest.mark.asyncio
@@ -85,11 +108,13 @@ async def test_initial_migration_creates_full_schema(tmp_path: Path) -> None:
         )
         foreign_keys = await database.fetchone("PRAGMA foreign_keys")
         journal_mode = await database.fetchone("PRAGMA journal_mode")
+        agent_columns = await database.fetchall("PRAGMA table_info(agent_loop_projections)")
 
     assert {row["name"] for row in tables} == expected_tables
     assert dict(migration) == {"version": 1, "name": "0001_initial.sql"}
     assert foreign_keys[0] == 1
     assert journal_mode[0] == "wal"
+    assert "source_event_id" in {row["name"] for row in agent_columns}
 
 
 @pytest.mark.asyncio
@@ -101,7 +126,11 @@ async def test_migrations_are_idempotent(tmp_path: Path) -> None:
     async with Database(database_path) as database:
         rows = await database.fetchall("SELECT version FROM schema_migrations")
 
-    assert [row["version"] for row in rows] == [*range(1, 10), *range(15, 20)]
+    assert [row["version"] for row in rows] == [
+        *range(1, 10),
+        *range(15, 20),
+        25,
+    ]
 
 
 @pytest.mark.asyncio
@@ -138,7 +167,11 @@ async def test_foundation_migration_upgrades_existing_v7_database(tmp_path: Path
         event_columns = await database.fetchall("PRAGMA table_info(event_journal)")
         tables = await database.fetchall("SELECT name FROM sqlite_master WHERE type = 'table'")
 
-    assert [row["version"] for row in versions] == [*range(1, 10), *range(15, 20)]
+    assert [row["version"] for row in versions] == [
+        *range(1, 10),
+        *range(15, 20),
+        25,
+    ]
     assert "protocol_version" in {row["name"] for row in capability_columns}
     assert {
         "schema_version",
@@ -242,6 +275,71 @@ async def test_protocol_migration_preserves_legacy_response_planes(
             "response_state": "completed",
         },
     ]
+
+
+@pytest.mark.asyncio
+async def test_protocol_compatibility_upgrades_exact_6d00930_schema(
+    tmp_path: Path,
+) -> None:
+    database_path = tmp_path / "upgrade-6d00930.sqlite3"
+    connection = sqlite3.connect(database_path)
+    connection.execute(
+        """
+        CREATE TABLE schema_migrations (
+            version INTEGER PRIMARY KEY,
+            name TEXT NOT NULL,
+            applied_at REAL NOT NULL
+        )
+        """
+    )
+    migration_root = resources.files("copilotd.storage.migrations")
+    original_versions = {*range(1, 10), *range(15, 20)}
+    for migration in sorted(
+        item
+        for item in migration_root.iterdir()
+        if item.name.endswith(".sql") and int(item.name.partition("_")[0]) in original_versions
+    ):
+        connection.executescript(migration.read_text(encoding="utf-8"))
+        version = int(migration.name.partition("_")[0])
+        connection.execute(
+            "INSERT INTO schema_migrations VALUES (?, ?, ?)",
+            (version, migration.name, time.time()),
+        )
+    pre_tables = {
+        row[0] for row in connection.execute("SELECT name FROM sqlite_master WHERE type = 'table'")
+    }
+    pre_agent_columns = {
+        row[1] for row in connection.execute("PRAGMA table_info(agent_loop_projections)")
+    }
+    connection.commit()
+    connection.close()
+
+    assert "config_reload_claims" not in pre_tables
+    assert "source_event_id" not in pre_agent_columns
+
+    async with Database(database_path) as database:
+        versions = await database.fetchall(
+            "SELECT version, name FROM schema_migrations ORDER BY version"
+        )
+        tables = {
+            row["name"]
+            for row in await database.fetchall(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
+            )
+        }
+        agent_columns = {
+            row["name"]
+            for row in await database.fetchall("PRAGMA table_info(agent_loop_projections)")
+        }
+
+    assert [row["version"] for row in versions] == [
+        *range(1, 10),
+        *range(15, 20),
+        25,
+    ]
+    assert versions[-1]["name"] == "0025_protocol_compatibility.sql"
+    assert "config_reload_claims" in tables
+    assert "source_event_id" in agent_columns
 
 
 @pytest.mark.asyncio
