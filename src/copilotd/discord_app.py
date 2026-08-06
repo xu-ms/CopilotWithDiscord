@@ -17,7 +17,11 @@ from discord.ext import commands
 
 from copilotd.config import Settings
 from copilotd.core.attachments import AttachmentError, AttachmentService
-from copilotd.core.bindings import SessionBinding, SessionBindingRepository
+from copilotd.core.bindings import (
+    BindingIntent,
+    SessionBinding,
+    SessionBindingRepository,
+)
 from copilotd.core.lifecycle_commands import (
     DiscordParentType,
     ProjectLifecycleService,
@@ -345,13 +349,8 @@ class CopilotDiscordBot(commands.Bot):
 
     async def on_interaction(self, interaction: discord.Interaction) -> None:
         data = interaction.data
-        custom_id = (
-            str(data.get("custom_id", "")) if isinstance(data, dict) else ""
-        )
-        if (
-            interaction.type == discord.InteractionType.component
-            and custom_id.startswith("cdi:")
-        ):
+        custom_id = str(data.get("custom_id", "")) if isinstance(data, dict) else ""
+        if interaction.type == discord.InteractionType.component and custom_id.startswith("cdi:"):
             await self._handle_direct_interaction(interaction, custom_id)
             return
         if (
@@ -383,9 +382,7 @@ class CopilotDiscordBot(commands.Bot):
             return
         values = data.get("values")
         card_token = (
-            str(values[0])
-            if action == "select" and isinstance(values, list) and values
-            else None
+            str(values[0]) if action == "select" and isinstance(values, list) and values else None
         )
         await interaction.response.defer()
         runtime = await self._interaction_runtime(interaction)
@@ -425,9 +422,7 @@ class CopilotDiscordBot(commands.Bot):
             return
         _, interaction_id, action = parts
         if action == "freeform":
-            await interaction.response.send_modal(
-                InteractionResponseModal(self, interaction_id)
-            )
+            await interaction.response.send_modal(InteractionResponseModal(self, interaction_id))
             return
         data = interaction.data
         values = data.get("values") if isinstance(data, dict) else None
@@ -463,6 +458,13 @@ class CopilotDiscordBot(commands.Bot):
             binding = await self._require_bindings().by_thread(str(message.channel.id))
             if binding is None or (not prompt and not message.attachments):
                 return
+            if binding.binding_intent != BindingIntent.ACTIVE:
+                if binding.binding_intent == BindingIntent.CLOSED:
+                    await message.reply(
+                        "This Copilot session is closed. Use `/session resume` "
+                        "before sending another message."
+                    )
+                return
             runtime = self._require_sessions().for_thread(str(message.channel.id))
             if runtime is None:
                 runtime = await self._require_sessions().replace(binding)
@@ -483,9 +485,7 @@ class CopilotDiscordBot(commands.Bot):
                     prompt or "Please inspect the attached files.",
                     idempotency_key=f"discord-message:{message.id}",
                     attachments=sdk_attachments,
-                    attachment_manifest_id=(
-                        None if prepared is None else prepared.manifest_id
-                    ),
+                    attachment_manifest_id=(None if prepared is None else prepared.manifest_id),
                 )
             except AttachmentError as error:
                 await message.reply(f"copilotD could not prepare the attachments: `{error}`")
@@ -645,9 +645,7 @@ class CopilotDiscordBot(commands.Bot):
             if channel is None:
                 channel = await self.fetch_channel(int(channel_id))
             if not isinstance(channel, discord.Thread):
-                raise RenderPermanentError(
-                    f"schedule render thread is unavailable: {channel_id}"
-                )
+                raise RenderPermanentError(f"schedule render thread is unavailable: {channel_id}")
             if channel.archived and not channel.locked:
                 await channel.edit(archived=False)
             return channel
@@ -663,9 +661,7 @@ class CopilotDiscordBot(commands.Bot):
                 "Discord integration hook that supplies a status thread"
             )
         if destination_id == "ops:scheduler":
-            raise RenderPermanentError(
-                "schedule run has no durable Discord render destination"
-            )
+            raise RenderPermanentError("schedule run has no durable Discord render destination")
         try:
             return await self._thread_for_session(destination_id)
         except RuntimeError as error:
@@ -682,9 +678,7 @@ class CopilotDiscordBot(commands.Bot):
             except discord.NotFound:
                 continue
             return channel
-        raise RenderPermanentError(
-            f"Discord message is not mapped to a session: {message_id}"
-        )
+        raise RenderPermanentError(f"Discord message is not mapped to a session: {message_id}")
 
     def _register_application_commands(self) -> None:
         if self._commands_registered:
@@ -881,9 +875,7 @@ class CopilotDiscordBot(commands.Bot):
         @project.command(name="info", description="Show the channel project resolution")
         async def project_info(interaction: discord.Interaction) -> None:
             await interaction.response.defer(ephemeral=True)
-            info = await self._require_project_commands().info(
-                _parent_channel_id(interaction)
-            )
+            info = await self._require_project_commands().info(_parent_channel_id(interaction))
             text = (
                 f"source: `{info.project.source}`\n"
                 f"cwd: `{info.project.cwd}`\n"
@@ -1048,9 +1040,7 @@ class CopilotDiscordBot(commands.Bot):
             project_snapshot = await self._require_projects().resolve(
                 _parent_channel_id(interaction)
             )
-            items = await self._require_project_commands().mcp_list(
-                project_snapshot.project_id
-            )
+            items = await self._require_project_commands().mcp_list(project_snapshot.project_id)
             text = (
                 "No MCP servers."
                 if not items
@@ -1238,9 +1228,7 @@ class CopilotDiscordBot(commands.Bot):
             text = (
                 f"No {kind} directories."
                 if not items
-                else "\n".join(
-                    f"`{item.path}` · enabled `{item.enabled}`" for item in items
-                )
+                else "\n".join(f"`{item.path}` · enabled `{item.enabled}`" for item in items)
             )
             await interaction.followup.send(text, ephemeral=True)
 
@@ -1274,9 +1262,7 @@ class CopilotDiscordBot(commands.Bot):
             project_snapshot = await self._require_projects().resolve(
                 _parent_channel_id(interaction)
             )
-            items = await self._require_project_commands().agent_list(
-                project_snapshot.project_id
-            )
+            items = await self._require_project_commands().agent_list(project_snapshot.project_id)
             text = (
                 "No custom agents."
                 if not items
@@ -1345,9 +1331,7 @@ class CopilotDiscordBot(commands.Bot):
             )
             source_session_id = None
             if isinstance(interaction.channel, discord.Thread):
-                source_session_id = (
-                    await self._interaction_binding(interaction)
-                ).sdk_session_id
+                source_session_id = (await self._interaction_binding(interaction)).sdk_session_id
             projection = await self._require_worktree_commands().create(
                 project_id=project_snapshot.project_id,
                 name=name,
@@ -1358,11 +1342,7 @@ class CopilotDiscordBot(commands.Bot):
             await interaction.followup.send(
                 f"Worktree `{projection.name}` ready at `{projection.path}` "
                 f"on `{projection.branch_name}`"
-                + (
-                    ""
-                    if projection.thread_id is None
-                    else f" in <#{projection.thread_id}>"
-                ),
+                + ("" if projection.thread_id is None else f" in <#{projection.thread_id}>"),
                 ephemeral=True,
             )
 
@@ -1372,9 +1352,7 @@ class CopilotDiscordBot(commands.Bot):
             project_snapshot = await self._require_projects().resolve(
                 _parent_channel_id(interaction)
             )
-            items = await self._require_worktree_commands().list(
-                project_snapshot.project_id
-            )
+            items = await self._require_worktree_commands().list(project_snapshot.project_id)
             if not items:
                 await interaction.followup.send("No managed worktrees.", ephemeral=True)
                 return
@@ -1423,9 +1401,7 @@ class CopilotDiscordBot(commands.Bot):
                 ]
                 multiplier = billing.get("multiplier")
                 suffix = (
-                    f"; multiplier {multiplier:g}"
-                    if isinstance(multiplier, int | float)
-                    else ""
+                    f"; multiplier {multiplier:g}" if isinstance(multiplier, int | float) else ""
                 )
                 lines.append(
                     f"- `{item['id']}` — {item['name']}"
@@ -1607,9 +1583,7 @@ class CopilotDiscordBot(commands.Bot):
             item_id: str,
         ) -> None:
             await interaction.response.defer(ephemeral=True)
-            replacement = await (
-                await self._interaction_runtime(interaction)
-            ).resubmit_queue_item(
+            replacement = await (await self._interaction_runtime(interaction)).resubmit_queue_item(
                 item_id,
                 idempotency_key=f"interaction:{interaction.id}",
             )
@@ -1639,8 +1613,7 @@ class CopilotDiscordBot(commands.Bot):
                 channel_id=_parent_channel_id(interaction),
             )
             await interaction.followup.send(
-                f"Schedule `{definition.id}` enabled; next UTC run "
-                f"`{definition.next_run_at_utc}`.",
+                f"Schedule `{definition.id}` enabled; next UTC run `{definition.next_run_at_utc}`.",
                 ephemeral=True,
             )
 
@@ -1848,6 +1821,8 @@ class CopilotDiscordBot(commands.Bot):
 
     async def _interaction_runtime(self, interaction: discord.Interaction) -> SessionRuntime:
         binding = await self._interaction_binding(interaction)
+        if binding.binding_intent != BindingIntent.ACTIVE:
+            raise ValueError("this Copilot session is closed; use /session resume first")
         runtime = self._require_sessions().for_thread(binding.thread_id)
         if runtime is None:
             runtime = await self._require_sessions().replace(binding)
@@ -2102,8 +2077,7 @@ def _interaction_view(metadata: dict[str, Any]) -> discord.ui.View:
             )
         )
     if metadata.get("kind") == "user_input" and (
-        metadata.get("allowFreeform")
-        or (isinstance(choices, list) and len(choices) > 25)
+        metadata.get("allowFreeform") or (isinstance(choices, list) and len(choices) > 25)
     ):
         view.add_item(
             discord.ui.Button(
@@ -2184,10 +2158,7 @@ def _interaction_result_text(result: str) -> str:
 
 
 def _discord_files(assets: list[TableAsset]) -> list[discord.File]:
-    return [
-        discord.File(io.BytesIO(asset.content), filename=asset.filename)
-        for asset in assets
-    ]
+    return [discord.File(io.BytesIO(asset.content), filename=asset.filename) for asset in assets]
 
 
 def _prepare_discord_assets(
@@ -2215,9 +2186,7 @@ def _prepare_discord_assets(
             start = part_index * max_bytes
             prepared.append(
                 TableAsset(
-                    filename=(
-                        f"{stem}.part-{part_index + 1:03d}-of-{part_count:03d}{suffix}"
-                    ),
+                    filename=(f"{stem}.part-{part_index + 1:03d}-of-{part_count:03d}{suffix}"),
                     media_type=asset.media_type,
                     content=asset.content[start : start + max_bytes],
                 )

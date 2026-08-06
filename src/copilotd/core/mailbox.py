@@ -263,17 +263,21 @@ class CommandMailbox:
     def freeze(self) -> None:
         self._accepting = False
 
-    async def stop(self, *, timeout_seconds: float = 5) -> None:
-        if self._worker is None:
-            return
+    async def drain(self, *, timeout_seconds: float = 5) -> bool:
         async with self._submission_lock:
             self._accepting = False
-        worker = self._worker
         try:
             async with asyncio.timeout(timeout_seconds):
                 await self._queue.join()
         except TimeoutError:
-            pass
+            return False
+        return True
+
+    async def stop(self, *, timeout_seconds: float = 5) -> None:
+        if self._worker is None:
+            return
+        worker = self._worker
+        await self.drain(timeout_seconds=timeout_seconds)
         worker.cancel()
         try:
             async with asyncio.timeout(timeout_seconds):
@@ -287,9 +291,7 @@ class CommandMailbox:
                 break
             if item is not None and not item.future.done():
                 item.future.set_exception(
-                    OperationAmbiguous(
-                        f"operation {item.record.operation_id} was interrupted"
-                    )
+                    OperationAmbiguous(f"operation {item.record.operation_id} was interrupted")
                 )
             self._queue.task_done()
         await self._store.mark_unsettled_unknown(
@@ -464,9 +466,7 @@ class CommandMailbox:
                 error_code=type(error).__name__,
             )
             item.future.set_exception(
-                OperationAmbiguous(
-                    f"operation {record.operation_id} outcome is unknown: {error}"
-                )
+                OperationAmbiguous(f"operation {record.operation_id} outcome is unknown: {error}")
             )
         else:
             try:
@@ -514,8 +514,7 @@ class CommandMailbox:
             )
             item.future.set_exception(
                 OperationDeferred(
-                    f"owner fence prevented operation {record.operation_id} "
-                    f"from dispatch{detail}"
+                    f"owner fence prevented operation {record.operation_id} from dispatch{detail}"
                 )
             )
 

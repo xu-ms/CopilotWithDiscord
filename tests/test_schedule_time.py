@@ -123,9 +123,9 @@ def test_cron_applies_gap_and_fold_policies_explicitly() -> None:
     assert second.next_after(before_fold) == _timestamp("2026-11-01T06:30:00Z")
     with pytest.raises(AmbiguousLocalTime):
         rejected_fold.next_after(before_fold)
-    assert rejected_fold.next_after(
-        _timestamp("2026-11-01T07:00:00Z")
-    ) == _timestamp("2026-11-02T06:30:00Z")
+    assert rejected_fold.next_after(_timestamp("2026-11-01T07:00:00Z")) == _timestamp(
+        "2026-11-02T06:30:00Z"
+    )
     assert rejected_fold.latest_due(
         _timestamp("2026-10-31T05:30:00Z"),
         _timestamp("2026-11-01T04:00:00Z"),
@@ -187,9 +187,9 @@ def test_sparse_cron_jumps_directly_to_local_candidate(
         "America/New_York",
         anchor_utc=_timestamp("2026-03-08T07:00:00Z"),
     )
-    assert spring_dense.next_after(
-        _timestamp("2026-03-08T07:00:00Z")
-    ) == _timestamp("2026-03-08T07:01:00Z")
+    assert spring_dense.next_after(_timestamp("2026-03-08T07:00:00Z")) == _timestamp(
+        "2026-03-08T07:01:00Z"
+    )
     assert candidates - before_spring == 1
 
 
@@ -271,6 +271,23 @@ def test_interval_parsing_and_next_run_are_deterministic(
     assert parsed.latest_due(1_000.0 + seconds, 1_000.0 + 99.5 * seconds) == (
         1_000.0 + 99 * seconds
     )
+
+
+def test_fractional_interval_exact_boundary_strictly_advances() -> None:
+    anchor = 1_000.123456
+    parsed = parse_schedule("interval:1.3s", "UTC", anchor_utc=anchor)
+    third = anchor + 3 * 1.3
+
+    assert parsed.latest_due(anchor + 1.3, third) == third
+    assert parsed.next_after(third) == anchor + 4 * 1.3
+    assert parsed.next_after(third) > third
+
+
+def test_cron_latest_due_includes_current_floored_minute() -> None:
+    parsed = parse_schedule("cron:* * * * *", "UTC", anchor_utc=0)
+
+    assert parsed.latest_due(60, 90) == 60
+    assert parsed.latest_due(60, 60) == 60
 
 
 def test_timezone_error_explains_windows_tzdata_remediation(

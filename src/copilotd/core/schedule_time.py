@@ -4,6 +4,7 @@ import math
 import re
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
+from decimal import ROUND_FLOOR, Decimal
 from enum import StrEnum
 from typing import Literal
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
@@ -67,9 +68,19 @@ class ParsedSchedule:
             return self.at_utc if self.at_utc is not None and self.at_utc > after_utc else None
         if self.kind == ScheduleExpressionKind.INTERVAL:
             assert self.interval_seconds is not None
-            elapsed = after_utc - self.anchor_utc
-            multiplier = max(0, math.floor(elapsed / self.interval_seconds) + 1)
-            return self.anchor_utc + multiplier * self.interval_seconds
+            anchor = Decimal(str(self.anchor_utc))
+            interval = Decimal(str(self.interval_seconds))
+            after = Decimal(str(after_utc))
+            elapsed = after - anchor
+            multiplier = max(
+                0,
+                int((elapsed / interval).to_integral_value(rounding=ROUND_FLOOR)) + 1,
+            )
+            candidate = self.anchor_utc + multiplier * self.interval_seconds
+            while candidate <= after_utc:
+                multiplier += 1
+                candidate = self.anchor_utc + multiplier * self.interval_seconds
+            return candidate
         return _cron_next(
             self.normalized,
             self.zone,
@@ -84,14 +95,21 @@ class ParsedSchedule:
         if self.kind == ScheduleExpressionKind.AT:
             return (
                 self.at_utc
-                if self.at_utc is not None
-                and first_due_utc <= self.at_utc <= through_utc
+                if self.at_utc is not None and first_due_utc <= self.at_utc <= through_utc
                 else None
             )
         if self.kind == ScheduleExpressionKind.INTERVAL:
             assert self.interval_seconds is not None
-            multiplier = math.floor((through_utc - self.anchor_utc) / self.interval_seconds)
+            anchor = Decimal(str(self.anchor_utc))
+            interval = Decimal(str(self.interval_seconds))
+            through = Decimal(str(through_utc))
+            multiplier = int(
+                ((through - anchor) / interval).to_integral_value(rounding=ROUND_FLOOR)
+            )
             latest = self.anchor_utc + multiplier * self.interval_seconds
+            while latest > through_utc:
+                multiplier -= 1
+                latest = self.anchor_utc + multiplier * self.interval_seconds
             return latest if latest >= first_due_utc else None
         latest = _cron_previous_or_at(
             self.normalized,
@@ -231,8 +249,7 @@ def _parse_interval(value: str) -> float:
             "seconds": 1,
         }
         seconds = sum(
-            float(iso_match.group(name) or 0) * multiplier
-            for name, multiplier in units.items()
+            float(iso_match.group(name) or 0) * multiplier for name, multiplier in units.items()
         )
     else:
         position = 0
@@ -306,11 +323,7 @@ def _cron_next(
                 raise
             cursor = wall
             continue
-        future = [
-            candidate
-            for candidate in resolved
-            if candidate > after_utc
-        ]
+        future = [candidate for candidate in resolved if candidate > after_utc]
         if future:
             candidate = min(future)
             best = candidate if best is None else min(best, candidate)
@@ -346,7 +359,7 @@ def _cron_previous_or_at(
         microsecond=0,
     )
     window = _overlap_window(zone, through_utc)
-    cursor = local_through + window
+    cursor = local_through + window + timedelta(minutes=1)
     best: float | None = None
     iterator = croniter(expression, cursor)
     horizon_year = max(datetime.min.year, local_through.year - _CRON_SEARCH_YEARS)
@@ -382,11 +395,7 @@ def _cron_previous_or_at(
                 raise
             cursor = wall
             continue
-        previous = [
-            candidate
-            for candidate in resolved
-            if candidate <= through_utc
-        ]
+        previous = [candidate for candidate in resolved if candidate <= through_utc]
         if previous:
             candidate = max(previous)
             best = candidate if best is None else max(best, candidate)
@@ -435,23 +444,17 @@ def _resolve_wall_time(
         if fold_policy == "second":
             return candidates[1:]
         if fold_policy == "reject":
-            raise AmbiguousLocalTime(
-                f"{wall!s} occurs twice in timezone {zone.key}"
-            )
+            raise AmbiguousLocalTime(f"{wall!s} occurs twice in timezone {zone.key}")
         raise ScheduleTimeError(f"unsupported DST fold policy: {fold_policy}")
     if gap_policy == "skip":
         return []
     if gap_policy == "reject":
-        raise NonexistentLocalTime(
-            f"{wall!s} does not exist in timezone {zone.key}"
-        )
+        raise NonexistentLocalTime(f"{wall!s} does not exist in timezone {zone.key}")
     if gap_policy != "shift_forward":
         raise ScheduleTimeError(f"unsupported DST gap policy: {gap_policy}")
     probe = wall
     approximate = wall.replace(tzinfo=zone, fold=0).astimezone(UTC).timestamp()
-    search_minutes = int(
-        _transition_window(zone, approximate).total_seconds() // 60
-    ) + 60
+    search_minutes = int(_transition_window(zone, approximate).total_seconds() // 60) + 60
     for _ in range(search_minutes):
         probe += timedelta(minutes=1)
         shifted = _resolve_wall_time(
@@ -475,11 +478,7 @@ def _transition_window(zone: ZoneInfo, around_utc: float) -> timedelta:
         if observed is not None:
             offsets.append(observed.total_seconds())
     spread = 0 if not offsets else max(offsets) - min(offsets)
-    return (
-        timedelta(0)
-        if spread == 0
-        else timedelta(seconds=spread + 2 * 3_600)
-    )
+    return timedelta(0) if spread == 0 else timedelta(seconds=spread + 2 * 3_600)
 
 
 def _overlap_window(zone: ZoneInfo, around_utc: float) -> timedelta:

@@ -423,13 +423,9 @@ class JournalReducer:
             return {
                 "type": event.raw_type,
                 "content": f"**{title}**\n{_bounded_text(detail, 1600)}",
-                "finalized": event.raw_type
-                not in {"assistant.intent", "session.compaction_start"},
+                "finalized": event.raw_type not in {"assistant.intent", "session.compaction_start"},
             }
-        if (
-            _is_task_projection_event(event)
-            or event.raw_type in RenderPlanner._TASK_VIEW_TYPES
-        ):
+        if _is_task_projection_event(event) or event.raw_type in RenderPlanner._TASK_VIEW_TYPES:
             rows = await connection.execute(
                 """
                 SELECT panel_id, card_token, card_key, kind, title, state,
@@ -466,11 +462,7 @@ class JournalReducer:
             state_row = await state_cursor.fetchone()
             await state_cursor.close()
             page_count = max(1, (len(cards) + 7) // 8)
-            page = (
-                0
-                if state_row is None
-                else min(max(int(state_row["page"]), 0), page_count - 1)
-            )
+            page = 0 if state_row is None else min(max(int(state_row["page"]), 0), page_count - 1)
             visible = cards[page * 8 : (page + 1) * 8]
             selected = None if state_row is None else state_row["selected_card_token"]
             if selected not in {card["card_token"] for card in cards}:
@@ -706,9 +698,7 @@ class JournalReducer:
             changed = cursor.rowcount
             await cursor.close()
             if changed != 1:
-                raise RuntimeError(
-                    f"operation state changed concurrently: {data['operation_id']}"
-                )
+                raise RuntimeError(f"operation state changed concurrently: {data['operation_id']}")
         elif event.raw_type == "copilotd.operation.unsettled_unknown":
             await connection.execute(
                 """
@@ -876,9 +866,7 @@ class JournalReducer:
         }:
             interaction_id = str(data["interaction_id"])
             state = str(data["state"])
-            target_mode = data.get("target_mode") or interaction_target_mode(
-                data.get("response")
-            )
+            target_mode = data.get("target_mode") or interaction_target_mode(data.get("response"))
             await connection.execute(
                 """
                 UPDATE pending_interactions
@@ -1052,10 +1040,7 @@ class JournalReducer:
                     now,
                 ),
             )
-            if (
-                draining is not None
-                and draining["value"] == "1"
-            ) or ready is None:
+            if (draining is not None and draining["value"] == "1") or ready is None:
                 await connection.execute(
                     """
                     UPDATE message_queue
@@ -1377,9 +1362,7 @@ class JournalReducer:
             )
             transitioned_rows = await transitioned_cursor.fetchall()
             await transitioned_cursor.close()
-            transitioned_ids = [
-                str(row["submission_id"]) for row in transitioned_rows
-            ]
+            transitioned_ids = [str(row["submission_id"]) for row in transitioned_rows]
             await connection.execute(
                 """
                 UPDATE liveness_leases
@@ -1456,9 +1439,7 @@ class JournalReducer:
                     event,
                     submission_id=submission_id,
                     app_state="submitted",
-                    runtime_correlation_basis=(
-                        "acceptance_id_mismatch_runtime_observed"
-                    ),
+                    runtime_correlation_basis=("acceptance_id_mismatch_runtime_observed"),
                     incident_kind="provisional_user_event_acceptance_mismatch",
                     now=now,
                 )
@@ -1691,9 +1672,7 @@ class JournalReducer:
                         kind="submission_rejection_after_acceptance",
                         detail={
                             "submission_id": submission_id,
-                            "accepted_message_id": str(
-                                rejected["accepted_message_id"]
-                            ),
+                            "accepted_message_id": str(rejected["accepted_message_id"]),
                         },
                     )
                     await connection.execute(
@@ -2252,7 +2231,7 @@ class JournalReducer:
                     ),
                 )
                 await connection.execute(
-                   """
+                    """
                    UPDATE pending_interactions
                    SET consumed_at = ?
                    WHERE interaction_id = (
@@ -2266,14 +2245,14 @@ class JournalReducer:
                        LIMIT 1
                    )
                    """,
-                   (
-                       now,
-                       event.sdk_session_id,
-                       event.generation,
-                       event.fence_token,
-                       mode,
-                       now - 60,
-                   ),
+                    (
+                        now,
+                        event.sdk_session_id,
+                        event.generation,
+                        event.fence_token,
+                        mode,
+                        now - 60,
+                    ),
                 )
         elif event.raw_type == "session.shutdown":
             await connection.execute(
@@ -2472,9 +2451,7 @@ class JournalReducer:
                 ),
             )
         elif topic == "schedules" and (positive or (fresh and caught_up)):
-            schedules = [
-                item for item in values.get("schedules", []) if isinstance(item, dict)
-            ]
+            schedules = [item for item in values.get("schedules", []) if isinstance(item, dict)]
             seen_schedule_ids: list[str] = []
             for item in schedules:
                 schedule_id = str(item.get("id") or item.get("scheduleId") or "").strip()
@@ -2738,6 +2715,30 @@ class JournalReducer:
         observed_mode = _value(data, "agentMode")
         delivery = _value(data, "delivery")
         continuation = bool(data.get("isAutopilotContinuation"))
+        runtime_schedule_id = _runtime_schedule_id(event, data)
+
+        if runtime_schedule_id is not None:
+            await connection.execute(
+                """
+                UPDATE runtime_schedules
+                SET state = 'triggered', next_run_at = NULL, updated_at = ?
+                WHERE sdk_session_id = ? AND runtime_schedule_id = ?
+                  AND state IN ('active', 'unknown')
+                  AND (recurrence IS NULL OR TRIM(recurrence) = '')
+                """,
+                (now, event.sdk_session_id, runtime_schedule_id),
+            )
+            await self._create_runtime_observed_submission(
+                connection,
+                event,
+                data=data,
+                interaction_id=interaction_id,
+                observed_mode=observed_mode,
+                delivery=delivery,
+                continuation=continuation,
+                now=now,
+            )
+            return
 
         if continuation:
             cursor = await connection.execute(
@@ -2836,9 +2837,7 @@ class JournalReducer:
                 else None
             )
             raw_attachments = data.get("attachments")
-            attachment_count = (
-                len(raw_attachments) if isinstance(raw_attachments, list) else None
-            )
+            attachment_count = len(raw_attachments) if isinstance(raw_attachments, list) else None
             candidates = [
                 candidate
                 for candidate in raw_candidates
@@ -3010,7 +3009,7 @@ class JournalReducer:
         )
         content = str(data.get("content", ""))
         attachments = data.get("attachments")
-        runtime_schedule_id = _value(data, "runtimeScheduleId")
+        runtime_schedule_id = _runtime_schedule_id(event, data)
         parent_task_id = _value(data, "parentAgentTaskId")
         origin_hint = (
             "autopilot_continuation"
@@ -3593,11 +3592,8 @@ class JournalReducer:
         row = await cursor.fetchone()
         await cursor.close()
         return (
-            row is not None
-            and int(row["supported"]) == 1
-            and row["evidence_status"] != "unknown"
+            row is not None and int(row["supported"]) == 1 and row["evidence_status"] != "unknown"
         )
-
 
     async def _update_task_projection(
         self,
@@ -3747,10 +3743,7 @@ class JournalReducer:
             return False
         if submission["state"] != "semantic_complete":
             return True
-        if (
-            submission["terminal_at"] is None
-            or float(submission["terminal_at"]) > evidence_time
-        ):
+        if submission["terminal_at"] is None or float(submission["terminal_at"]) > evidence_time:
             await self._record_runtime_incident_once(
                 connection,
                 event,
@@ -3851,10 +3844,11 @@ class JournalReducer:
             correlation_basis = str(existing["correlation_basis"])
             if existing["terminal_at"] is not None:
                 incoming_state = str(task.get("status", "")).lower()
-                if (
-                    incoming_state not in {"completed", "failed", "cancelled"}
-                    and evidence_time > float(existing["terminal_at"])
-                ):
+                if incoming_state not in {
+                    "completed",
+                    "failed",
+                    "cancelled",
+                } and evidence_time > float(existing["terminal_at"]):
                     await self._record_runtime_incident_once(
                         connection,
                         event,
@@ -3876,19 +3870,15 @@ class JournalReducer:
                 correlation_basis=correlation_basis,
                 evidence_time=evidence_time,
             ):
-                return None, None, (
-                    None
-                    if existing["objective_id"] is None
-                    else str(existing["objective_id"])
+                return (
+                    None,
+                    None,
+                    (None if existing["objective_id"] is None else str(existing["objective_id"])),
                 )
             return (
                 submission_id,
                 correlation_basis,
-                (
-                    None
-                    if existing["objective_id"] is None
-                    else str(existing["objective_id"])
-                ),
+                (None if existing["objective_id"] is None else str(existing["objective_id"])),
             )
 
         explicit_submission_id = _value(task, "submissionId") or _value(
@@ -4098,8 +4088,7 @@ class JournalReducer:
             ):
                 continue
             settled_at = max(
-                float(snapshots[topic]["observed_at"])
-                for topic in ("activity", "queue", "tasks")
+                float(snapshots[topic]["observed_at"]) for topic in ("activity", "queue", "tasks")
             )
             cursor = await connection.execute(
                 """
@@ -4220,14 +4209,12 @@ class JournalReducer:
                 None,
             )
             card_key = f"task:{task_id}"
-            submission_id, correlation_basis, objective_id = (
-                await self._resolve_task_submission(
-                    connection,
-                    event,
-                    task=task,
-                    task_id=task_id,
-                    evidence_time=evidence_time,
-                )
+            submission_id, correlation_basis, objective_id = await self._resolve_task_submission(
+                connection,
+                event,
+                task=task,
+                task_id=task_id,
+                evidence_time=evidence_time,
             )
             card_token = str(
                 uuid.uuid5(
@@ -4598,10 +4585,7 @@ def _consume_task_result(task: asyncio.Task[Any]) -> None:
 
 def _snapshot_has_positive_evidence(topic: str, values: dict[str, Any]) -> bool:
     if topic == "activity":
-        return any(
-            bool(values.get(key))
-            for key in ("processing", "has_active_work", "abortable")
-        )
+        return any(bool(values.get(key)) for key in ("processing", "has_active_work", "abortable"))
     if topic == "queue":
         return bool(values.get("items") or values.get("steering_messages"))
     if topic == "tasks":
@@ -4618,6 +4602,16 @@ def _value(data: Any, key: str) -> str | None:
         return None
     value = data.get(key)
     return None if value is None else str(value)
+
+
+def _runtime_schedule_id(
+    event: AdaptedEvent,
+    data: dict[str, Any],
+) -> str | None:
+    return _value(data, "runtimeScheduleId") or _value(
+        event.raw_payload,
+        "runtimeScheduleId",
+    )
 
 
 def _is_task_projection_event(event: AdaptedEvent) -> bool:
@@ -4644,11 +4638,7 @@ def _task_projection_facts(
         card_id = tool_call_id or event.agent_id or event.event_id
         if card_id is None:
             return None
-        title = (
-            _value(data, "agentDisplayName")
-            or _value(data, "agentName")
-            or "Copilot subagent"
-        )
+        title = _value(data, "agentDisplayName") or _value(data, "agentName") or "Copilot subagent"
         if raw_type == "subagent.started":
             return (
                 f"agent:{card_id}",
@@ -4898,16 +4888,10 @@ def _tool_output_artifact(event: AdaptedEvent) -> dict[str, Any] | None:
         return None
     tool_call_id = str(data.get("toolCallId", "tool"))
     filename = (
-        f"tool-output-{tool_call_id[:12]}.txt"
-        if success
-        else f"tool-error-{tool_call_id[:12]}.txt"
+        f"tool-output-{tool_call_id[:12]}.txt" if success else f"tool-error-{tool_call_id[:12]}.txt"
     )
     line_count = text.count("\n") + 1
-    caveat = (
-        " Runtime fallback content may be truncated."
-        if source == "content"
-        else ""
-    )
+    caveat = " Runtime fallback content may be truncated." if source == "content" else ""
     status = "completed" if success else "failed"
     return {
         "type": "tool_output_artifact",
@@ -4981,9 +4965,7 @@ async def _finalize_schedule_run_from_reducer(
     )
     if row is None or row["render_intent_id"] is not None:
         return
-    render_id = str(
-        uuid.uuid5(uuid.NAMESPACE_URL, f"copilotd:schedule-run:{run_id}:final-render")
-    )
+    render_id = str(uuid.uuid5(uuid.NAMESPACE_URL, f"copilotd:schedule-run:{run_id}:final-render"))
     if row["result_session_id"] is not None and bool(row["result_session_bound"]):
         session_id = str(row["result_session_id"])
     elif row["result_thread_id"] is not None or row["schedule_thread_id"] is not None:

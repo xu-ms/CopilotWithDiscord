@@ -548,9 +548,7 @@ async def test_deferred_immediate_send_retries_with_new_dispatch_operation(
         )
 
         assert message_id == bridge.handle.message_id
-        operation_states = {
-            str(row["idempotency_key"]): str(row["state"]) for row in operations
-        }
+        operation_states = {str(row["idempotency_key"]): str(row["state"]) for row in operations}
         assert operation_states["send:immediate-retry"] == "rejected"
         assert list(operation_states.values()).count("confirmed") == 1
         assert len(bridge.handle.sent) == 1
@@ -751,9 +749,7 @@ async def test_mailbox_fence_failure_before_claim_requeues_without_unknown(
                 idempotency_key="pre-claim-fence",
                 mode="immediate",
             )
-        queue = await database.fetchone(
-            "SELECT state, dispatch_attempt FROM message_queue"
-        )
+        queue = await database.fetchone("SELECT state, dispatch_attempt FROM message_queue")
         operation = await database.fetchone(
             """
             SELECT state, error_code FROM session_operations
@@ -852,9 +848,7 @@ async def test_user_message_and_send_response_orderings_keep_one_submission(
     callback_before_response: bool,
 ) -> None:
     session_id = str(uuid4())
-    async with Database(
-        tmp_path / f"send-order-{callback_before_response}.sqlite3"
-    ) as database:
+    async with Database(tmp_path / f"send-order-{callback_before_response}.sqlite3") as database:
         bindings = SessionBindingRepository(database)
         binding = await bindings.create(
             thread_id="thread-send-order",
@@ -946,9 +940,7 @@ async def test_external_same_prompt_callback_before_acceptance_is_reclassified(
     external_event_id = str(uuid4())
     accepted_id = str(uuid4())
     async with Database(tmp_path / "external-before-acceptance.sqlite3") as database:
-        await CapabilityRegistry(
-            Settings(_env_file=None, data_dir=tmp_path)
-        ).activate(
+        await CapabilityRegistry(Settings(_env_file=None, data_dir=tmp_path)).activate(
             database,
             {
                 "runtime_version": "1.0.73",
@@ -988,10 +980,7 @@ async def test_external_same_prompt_callback_before_acceptance_is_reclassified(
             return accepted_id
 
         bridge.handle.send = external_callback_first  # type: ignore[method-assign]
-        assert (
-            await runtime.send("same prompt", idempotency_key="same-prompt")
-            == accepted_id
-        )
+        assert await runtime.send("same prompt", idempotency_key="same-prompt") == accepted_id
         provisional = await database.fetchall(
             """
             SELECT origin, state, accepted_message_id, observed_user_event_id,
@@ -1112,15 +1101,9 @@ async def test_runtime_routes_user_input_through_durable_interaction(
         assert pending is not None
         interaction_id = str(pending["interaction_id"])
 
-        assert (
-            await runtime.respond_interaction(interaction_id, selection=1)
-            == "resolved"
-        )
+        assert await runtime.respond_interaction(interaction_id, selection=1) == "resolved"
         assert await response_task == {"answer": "second", "wasFreeform": False}
-        assert (
-            await runtime.respond_interaction(interaction_id, selection=0)
-            == "expired"
-        )
+        assert await runtime.respond_interaction(interaction_id, selection=0) == "expired"
 
         settled = await database.fetchone(
             "SELECT state, response FROM pending_interactions WHERE interaction_id = ?",
@@ -1141,10 +1124,7 @@ async def test_runtime_routes_user_input_through_durable_interaction(
         assert '"answer": "second"' in str(settled["response"])
         assert lease is not None and lease["state"] == "released"
         assert [row["lane"] for row in render_rows] == ["interaction", "interaction"]
-        assert all(
-            row["coalesce_key"] == f"interaction:{interaction_id}"
-            for row in render_rows
-        )
+        assert all(row["coalesce_key"] == f"interaction:{interaction_id}" for row in render_rows)
 
         assert await runtime.set_mode("plan", idempotency_key="enter-plan") == "plan"
         plan_task = asyncio.create_task(
@@ -1266,9 +1246,7 @@ async def test_runtime_times_out_plan_interaction_with_typed_decline(
             {},
         )
         assert result == {"approved": False}
-        interaction = await database.fetchone(
-            "SELECT state FROM pending_interactions"
-        )
+        interaction = await database.fetchone("SELECT state FROM pending_interactions")
         lease = await database.fetchone(
             "SELECT state FROM liveness_leases WHERE kind = 'interaction'"
         )
@@ -1603,13 +1581,9 @@ async def test_close_freezes_send_admission_before_checking_detach_blockers(
             )
 
         monkeypatch.setattr(runtime.inbox, "commit_internal", delayed_commit)
-        send_task = asyncio.create_task(
-            runtime.send("racing send", idempotency_key="racing-send")
-        )
+        send_task = asyncio.create_task(runtime.send("racing send", idempotency_key="racing-send"))
         await admission_started.wait()
-        close_task = asyncio.create_task(
-            runtime.close(idempotency_key="racing-close")
-        )
+        close_task = asyncio.create_task(runtime.close(idempotency_key="racing-close"))
         await asyncio.sleep(0)
         assert not close_task.done()
 
@@ -1685,6 +1659,78 @@ async def test_shutdown_cancels_hung_sdk_send_with_unknown_outcome(
 
     assert runtime.state == RuntimeState.RECOVERY_UNKNOWN
     assert operation is not None and operation["state"] == "unknown"
+
+
+@pytest.mark.asyncio
+async def test_shutdown_drains_successful_send_acceptance_before_unknown_transition(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    session_id = str(uuid4())
+    async with Database(tmp_path / "shutdown-accepted-send.sqlite3") as database:
+        bindings = SessionBindingRepository(database)
+        binding = await bindings.create(
+            thread_id="thread-shutdown-accepted",
+            sdk_session_id=session_id,
+            cwd_snapshot=tmp_path,
+            project_source="implicit-home",
+        )
+        bridge = FakeBridge(session_id)
+        runtime = SessionRuntime(
+            database=database,
+            bridge=bridge,
+            bindings=bindings,
+            owner_leases=OwnerLeaseStore(database),
+            owner_id="process-shutdown-accepted",
+            binding=binding,
+            owner_renew_seconds=30,
+            shutdown_timeout_seconds=2,
+        )
+        await runtime.attach_create()
+        send_started = asyncio.Event()
+        allow_send_result = asyncio.Event()
+
+        async def delayed_success(_prompt: str, **_kwargs: Any) -> str:
+            send_started.set()
+            await allow_send_result.wait()
+            return "accepted-during-shutdown"
+
+        monkeypatch.setattr(bridge.handle, "send", delayed_success)
+        send_task = asyncio.create_task(
+            runtime.send(
+                "finish before shutdown",
+                idempotency_key="shutdown-accepted",
+                mode="immediate",
+            )
+        )
+        await send_started.wait()
+        shutdown_task = asyncio.create_task(runtime.shutdown())
+        await asyncio.sleep(0.05)
+        before_release = await database.fetchone(
+            "SELECT state, accepted_message_id FROM submissions"
+        )
+        assert not shutdown_task.done()
+        assert dict(before_release) == {
+            "state": "submitting",
+            "accepted_message_id": None,
+        }
+
+        allow_send_result.set()
+        message_id, _ = await asyncio.gather(send_task, shutdown_task)
+        persisted = await database.fetchone("SELECT state, accepted_message_id FROM submissions")
+        operation = await database.fetchone(
+            """
+            SELECT state FROM session_operations
+            WHERE idempotency_key = 'send:shutdown-accepted'
+            """
+        )
+
+    assert message_id == "accepted-during-shutdown"
+    assert dict(persisted) == {
+        "state": "outcome_unknown",
+        "accepted_message_id": "accepted-during-shutdown",
+    }
+    assert operation["state"] == "confirmed"
 
 
 @pytest.mark.asyncio
@@ -2021,9 +2067,7 @@ async def test_unsupported_optional_capabilities_do_not_create_unknown_gates(
             project_source="implicit-home",
         )
         bridge = FakeBridge(session_id)
-        manifest = CapabilityRegistry(
-            Settings(_env_file=None, data_dir=tmp_path)
-        ).load_checked()
+        manifest = CapabilityRegistry(Settings(_env_file=None, data_dir=tmp_path)).load_checked()
         capabilities = dict(manifest.capabilities)
         for name in ("native_schedule", "remote", "selected_agent", "task_snapshot"):
             capabilities[name] = replace(capabilities[name], supported=False)
@@ -2495,8 +2539,7 @@ async def test_permission_change_event_reconciles_allow_all_before_next_send(
             if (
                 bridge.allow_all_calls >= 2
                 and reconciled is not None
-                and reconciled.permission_posture
-                == PermissionPosture.VERIFIED_ALLOW_ALL
+                and reconciled.permission_posture == PermissionPosture.VERIFIED_ALLOW_ALL
             ):
                 break
             await asyncio.sleep(0.005)

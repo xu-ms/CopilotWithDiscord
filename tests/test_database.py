@@ -92,7 +92,15 @@ async def test_migrations_are_idempotent(tmp_path: Path) -> None:
     async with Database(database_path) as database:
         rows = await database.fetchall("SELECT version FROM schema_migrations")
 
-    assert [row["version"] for row in rows] == [*range(1, 10), 20, 21, 22, 23, 24]
+    assert [row["version"] for row in rows] == [
+        *range(1, 10),
+        20,
+        21,
+        22,
+        23,
+        24,
+        25,
+    ]
 
 
 @pytest.mark.asyncio
@@ -124,14 +132,11 @@ async def test_foundation_migration_upgrades_existing_v7_database(tmp_path: Path
     connection.close()
 
     async with Database(database_path) as database:
-        versions = await database.fetchall(
-            "SELECT version FROM schema_migrations ORDER BY version"
-        )
+        versions = await database.fetchall("SELECT version FROM schema_migrations ORDER BY version")
         capability_columns = await database.fetchall("PRAGMA table_info(capabilities)")
         event_columns = await database.fetchall("PRAGMA table_info(event_journal)")
-        tables = await database.fetchall(
-            "SELECT name FROM sqlite_master WHERE type = 'table'"
-        )
+        worktree_columns = await database.fetchall("PRAGMA table_info(worktree_intents)")
+        tables = await database.fetchall("SELECT name FROM sqlite_master WHERE type = 'table'")
 
     assert [row["version"] for row in versions] == [
         *range(1, 10),
@@ -140,6 +145,7 @@ async def test_foundation_migration_upgrades_existing_v7_database(tmp_path: Path
         22,
         23,
         24,
+        25,
     ]
     assert "protocol_version" in {row["name"] for row in capability_columns}
     assert {
@@ -149,6 +155,11 @@ async def test_foundation_migration_upgrades_existing_v7_database(tmp_path: Path
         "tool_call_id",
         "correlation_id",
     } <= {row["name"] for row in event_columns}
+    assert {
+        "git_create_holder",
+        "git_create_fence_token",
+        "git_create_lease_expires_at",
+    } <= {row["name"] for row in worktree_columns}
     assert {
         "execution_health",
         "snapshot_observations",

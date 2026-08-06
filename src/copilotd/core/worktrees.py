@@ -24,6 +24,12 @@ from copilotd.core.projects import (
 from copilotd.core.sessions import SessionCreationService, SessionCreationUnknown
 from copilotd.storage.database import Database
 
+WORKTREE_GIT_CREATE_LEASE_SECONDS = 300.0
+_RETRYABLE_GIT_PREFLIGHT_ERRORS = {
+    "worktree_branch_conflict",
+    "worktree_path_conflict",
+}
+
 
 class WorktreeHistoryMode(StrEnum):
     NONE = "none"
@@ -59,9 +65,7 @@ _INTENT_PREDECESSORS: dict[WorktreeIntentState, tuple[WorktreeIntentState, ...]]
         WorktreeIntentState.GIT_CREATED,
         WorktreeIntentState.PROJECT_REGISTERED,
     ),
-    WorktreeIntentState.TARGET_CREATING: (
-        WorktreeIntentState.PROJECT_REGISTERED,
-    ),
+    WorktreeIntentState.TARGET_CREATING: (WorktreeIntentState.PROJECT_REGISTERED,),
     WorktreeIntentState.TARGET_UNKNOWN: (
         WorktreeIntentState.TARGET_CREATING,
         WorktreeIntentState.TARGET_UNKNOWN,
@@ -173,6 +177,9 @@ class WorktreeIntent:
     state: WorktreeIntentState
     error_code: str | None
     error_detail: str | None
+    git_create_holder: str | None
+    git_create_fence_token: int
+    git_create_lease_expires_at: float | None
     created_at: float
     updated_at: float
 
@@ -511,9 +518,7 @@ class WorktreeManager:
             """,
             (parent_project_id,),
         )
-        return [
-            await self._projection_for_intent(str(row["intent_id"])) for row in rows
-        ]
+        return [await self._projection_for_intent(str(row["intent_id"])) for row in rows]
 
     async def blockers(self, name: str, *, parent_project_id: str) -> tuple[str, ...]:
         record = await self._worktree_row(name, parent_project_id=parent_project_id)
@@ -536,9 +541,7 @@ class WorktreeManager:
         if row["state"] == WorktreeIntentState.CLOSED.value:
             return await self._projection_for_intent(str(row["intent_id"]))
         if row["state"] != WorktreeIntentState.READY.value:
-            raise WorktreeConflict(
-                f"worktree can only close from ready state, not {row['state']}"
-            )
+            raise WorktreeConflict(f"worktree can only close from ready state, not {row['state']}")
         intent_id = str(row["intent_id"])
         await self._begin_close(row, now=timestamp)
         repo_root = Path(str(row["repo_root"]))
@@ -557,10 +560,14 @@ class WorktreeManager:
             ["git", "worktree", "remove", "--", str(target_path)],
             cwd=repo_root,
         )
-        if result.returncode != 0 and await self._worktree_metadata(
-            repo_root,
-            target_path,
-        ) is not None:
+        if (
+            result.returncode != 0
+            and await self._worktree_metadata(
+                repo_root,
+                target_path,
+            )
+            is not None
+        ):
             await self._set_close_state(
                 intent_id,
                 WorktreeIntentState.CLOSE_UNKNOWN,
@@ -622,10 +629,14 @@ class WorktreeManager:
                             ],
                             cwd=repo_root,
                         )
-                        if result.returncode != 0 and await self._worktree_metadata(
-                            repo_root,
-                            intent.target_path,
-                        ) is not None:
+                        if (
+                            result.returncode != 0
+                            and await self._worktree_metadata(
+                                repo_root,
+                                intent.target_path,
+                            )
+                            is not None
+                        ):
                             orphaned += 1
                             continue
                     if intent.project_id is not None:
@@ -671,28 +682,12 @@ class WorktreeManager:
                     )
                     recovered += 1
                 elif intent.state == WorktreeIntentState.GIT_CREATING:
-                    registration = await self._worktree_metadata(
-                        repo_root,
-                        intent.target_path,
+                    await self._resume_create(
+                        intent,
+                        repo_root=repo_root,
+                        now=timestamp,
                     )
-                    if registration is not None:
-                        _require_owned_worktree(registration, intent.branch_name)
-                        intent = await self._mark_intent(
-                            intent.intent_id,
-                            WorktreeIntentState.GIT_CREATED,
-                            now=timestamp,
-                            created_branch=True,
-                        )
-                        await self._resume_create(intent, repo_root=repo_root, now=timestamp)
-                        recovered += 1
-                    else:
-                        intent = await self._mark_intent(
-                            intent.intent_id,
-                            WorktreeIntentState.FAILED,
-                            now=timestamp,
-                            error_code="git_create_not_observed",
-                        )
-                        recovered += 1
+                    recovered += 1
                 else:
                     await self._resume_create(intent, repo_root=repo_root, now=timestamp)
                     recovered += 1
@@ -831,13 +826,8 @@ class WorktreeManager:
             WorktreeIntentState.TARGET_CREATING,
         }:
             await self._ensure_worktree_row(intent, repo_root=repo_root, now=now)
-            recovered_target_creation = (
-                intent.state == WorktreeIntentState.TARGET_CREATING
-            )
-            if (
-                recovered_target_creation
-                and intent.history_mode == WorktreeHistoryMode.FORK
-            ):
+            recovered_target_creation = intent.state == WorktreeIntentState.TARGET_CREATING
+            if recovered_target_creation and intent.history_mode == WorktreeHistoryMode.FORK:
                 target = await self._reconcile_target(intent)
                 if target is None:
                     await self._mark_intent(
@@ -970,31 +960,72 @@ class WorktreeManager:
         repo_root: Path,
         now: float,
     ) -> WorktreeIntent:
+        intent = await self._claim_git_creation(intent.intent_id, now=now)
+        holder = intent.git_create_holder
+        if holder is None:
+            raise WorktreeConflict("worktree Git creation claim has no holder")
+        fence_token = intent.git_create_fence_token
         registration = await self._worktree_metadata(repo_root, intent.target_path)
         if registration is not None:
-            _require_owned_worktree(registration, intent.branch_name)
-            return await self._mark_intent(
+            try:
+                _require_owned_worktree(registration, intent.branch_name)
+            except WorktreeConflict as error:
+                await self._settle_git_creation(
+                    intent.intent_id,
+                    holder=holder,
+                    fence_token=fence_token,
+                    state=WorktreeIntentState.FAILED,
+                    now=now,
+                    error_code="worktree_path_conflict",
+                    error_detail=str(error),
+                )
+                raise
+            return await self._settle_git_creation(
                 intent.intent_id,
-                WorktreeIntentState.GIT_CREATED,
+                holder=holder,
+                fence_token=fence_token,
+                state=WorktreeIntentState.GIT_CREATED,
                 now=now,
                 created_branch=True,
             )
-        if intent.target_path.exists():
-            raise WorktreeConflict(f"worktree path already exists: {intent.target_path}")
+        path_collision = await asyncio.to_thread(
+            _find_casefold_path_collision,
+            intent.target_path,
+        )
+        if path_collision is not None or intent.target_path.exists():
+            detail = (
+                f"worktree path conflicts with existing path: "
+                f"{path_collision or intent.target_path}"
+            )
+            await self._settle_git_creation(
+                intent.intent_id,
+                holder=holder,
+                fence_token=fence_token,
+                state=WorktreeIntentState.FAILED,
+                now=now,
+                error_code="worktree_path_conflict",
+                error_detail=detail,
+            )
+            raise WorktreeConflict(detail)
         branch = await self._git.run(
             ["git", "show-ref", "--verify", "--quiet", f"refs/heads/{intent.branch_name}"],
             cwd=repo_root,
         )
         if branch.returncode == 0:
-            raise WorktreeConflict(
+            detail = (
                 f"worktree branch already exists and is not owned by this intent: "
                 f"{intent.branch_name}"
             )
-        intent = await self._mark_intent(
-            intent.intent_id,
-            WorktreeIntentState.GIT_CREATING,
-            now=now,
-        )
+            await self._settle_git_creation(
+                intent.intent_id,
+                holder=holder,
+                fence_token=fence_token,
+                state=WorktreeIntentState.FAILED,
+                now=now,
+                error_code="worktree_branch_conflict",
+                error_detail=detail,
+            )
+            raise WorktreeConflict(detail)
         intent.target_path.parent.mkdir(parents=True, exist_ok=True)
         result = await self._git.run(
             [
@@ -1011,9 +1042,11 @@ class WorktreeManager:
         )
         registration = await self._worktree_metadata(repo_root, intent.target_path)
         if result.returncode != 0 and registration is None:
-            await self._mark_intent(
+            await self._settle_git_creation(
                 intent.intent_id,
-                WorktreeIntentState.FAILED,
+                holder=holder,
+                fence_token=fence_token,
+                state=WorktreeIntentState.FAILED,
                 now=now,
                 error_code="git_worktree_add_failed",
                 error_detail=result.stderr.strip(),
@@ -1023,13 +1056,171 @@ class WorktreeManager:
                 outcome_unknown=False,
             )
         if registration is not None:
-            _require_owned_worktree(registration, intent.branch_name)
-        return await self._mark_intent(
+            try:
+                _require_owned_worktree(registration, intent.branch_name)
+            except WorktreeConflict as error:
+                await self._settle_git_creation(
+                    intent.intent_id,
+                    holder=holder,
+                    fence_token=fence_token,
+                    state=WorktreeIntentState.FAILED,
+                    now=now,
+                    error_code="worktree_path_conflict",
+                    error_detail=str(error),
+                )
+                raise
+        return await self._settle_git_creation(
             intent.intent_id,
-            WorktreeIntentState.GIT_CREATED,
+            holder=holder,
+            fence_token=fence_token,
+            state=WorktreeIntentState.GIT_CREATED,
             now=now,
             created_branch=True,
         )
+
+    async def _claim_git_creation(
+        self,
+        intent_id: str,
+        *,
+        now: float,
+    ) -> WorktreeIntent:
+        holder = uuid.uuid4().hex
+        async with self._database.transaction() as connection:
+            row = await _fetchone(
+                connection,
+                "SELECT * FROM worktree_intents WHERE intent_id = ?",
+                (intent_id,),
+            )
+            if row is None:
+                raise WorktreeConflict("worktree intent disappeared before Git creation")
+            state = WorktreeIntentState(str(row["state"]))
+            lease_expires_at = row["git_create_lease_expires_at"]
+            claimable = state == WorktreeIntentState.RESERVED or (
+                state == WorktreeIntentState.GIT_CREATING
+                and (
+                    row["git_create_holder"] is None
+                    or lease_expires_at is None
+                    or float(lease_expires_at) <= now
+                )
+            )
+            if not claimable:
+                raise WorktreeConflict("another owner holds the worktree Git creation lease")
+            fence_token = int(row["git_create_fence_token"]) + 1
+            updated = await connection.execute(
+                """
+                UPDATE worktree_intents
+                SET state = 'git_creating', git_create_holder = ?,
+                    git_create_fence_token = ?,
+                    git_create_lease_expires_at = ?,
+                    error_code = NULL, error_detail = NULL, updated_at = ?
+                WHERE intent_id = ? AND state = ?
+                  AND git_create_fence_token = ?
+                """,
+                (
+                    holder,
+                    fence_token,
+                    now + WORKTREE_GIT_CREATE_LEASE_SECONDS,
+                    now,
+                    intent_id,
+                    state.value,
+                    int(row["git_create_fence_token"]),
+                ),
+            )
+            if updated.rowcount != 1:
+                await updated.close()
+                raise WorktreeConflict("worktree Git creation lease was claimed concurrently")
+            await updated.close()
+            await connection.execute(
+                """
+                INSERT INTO worktree_events(event_id, intent_id, state, detail, created_at)
+                VALUES (?, ?, 'git_creating', ?, ?)
+                """,
+                (
+                    str(uuid.uuid4()),
+                    intent_id,
+                    _canonical_json(
+                        {
+                            "git_create_holder": holder,
+                            "git_create_fence_token": fence_token,
+                        }
+                    ),
+                    now,
+                ),
+            )
+            claimed = await _fetchone(
+                connection,
+                "SELECT * FROM worktree_intents WHERE intent_id = ?",
+                (intent_id,),
+            )
+            assert claimed is not None
+            return _row_to_intent(claimed)
+
+    async def _settle_git_creation(
+        self,
+        intent_id: str,
+        *,
+        holder: str,
+        fence_token: int,
+        state: WorktreeIntentState,
+        now: float,
+        created_branch: bool | None = None,
+        error_code: str | None = None,
+        error_detail: str | None = None,
+    ) -> WorktreeIntent:
+        if state not in {WorktreeIntentState.GIT_CREATED, WorktreeIntentState.FAILED}:
+            raise ValueError(f"invalid Git creation settlement state: {state}")
+        async with self._database.transaction() as connection:
+            updated = await connection.execute(
+                """
+                UPDATE worktree_intents
+                SET state = ?, created_branch = COALESCE(?, created_branch),
+                    git_create_holder = NULL, git_create_lease_expires_at = NULL,
+                    error_code = ?, error_detail = ?, updated_at = ?
+                WHERE intent_id = ? AND state = 'git_creating'
+                  AND git_create_holder = ? AND git_create_fence_token = ?
+                """,
+                (
+                    state.value,
+                    None if created_branch is None else int(created_branch),
+                    error_code,
+                    error_detail,
+                    now,
+                    intent_id,
+                    holder,
+                    fence_token,
+                ),
+            )
+            if updated.rowcount != 1:
+                await updated.close()
+                raise WorktreeConflict("worktree Git creation lease was lost before settlement")
+            await updated.close()
+            await connection.execute(
+                """
+                INSERT INTO worktree_events(event_id, intent_id, state, detail, created_at)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (
+                    str(uuid.uuid4()),
+                    intent_id,
+                    state.value,
+                    _canonical_json(
+                        {
+                            "git_create_holder": holder,
+                            "git_create_fence_token": fence_token,
+                            "error_code": error_code,
+                            "error_detail": error_detail,
+                        }
+                    ),
+                    now,
+                ),
+            )
+            settled = await _fetchone(
+                connection,
+                "SELECT * FROM worktree_intents WHERE intent_id = ?",
+                (intent_id,),
+            )
+            assert settled is not None
+            return _row_to_intent(settled)
 
     async def _compensate(
         self,
@@ -1062,10 +1253,14 @@ class WorktreeManager:
                 ["git", "worktree", "remove", "--", str(intent.target_path)],
                 cwd=repo_root,
             )
-            if result.returncode != 0 and await self._worktree_metadata(
-                repo_root,
-                intent.target_path,
-            ) is not None:
+            if (
+                result.returncode != 0
+                and await self._worktree_metadata(
+                    repo_root,
+                    intent.target_path,
+                )
+                is not None
+            ):
                 await self._mark_intent(
                     intent.intent_id,
                     WorktreeIntentState.CLOSE_UNKNOWN,
@@ -1112,6 +1307,46 @@ class WorktreeManager:
                     raise WorktreeConflict(
                         "worktree name was reused with different immutable parameters"
                     )
+                if (
+                    intent.state == WorktreeIntentState.FAILED
+                    and intent.error_code in _RETRYABLE_GIT_PREFLIGHT_ERRORS
+                ):
+                    await connection.execute(
+                        """
+                        UPDATE worktree_intents
+                        SET state = 'reserved', git_create_holder = NULL,
+                            git_create_lease_expires_at = NULL,
+                            error_code = NULL, error_detail = NULL, updated_at = ?
+                        WHERE intent_id = ? AND state = 'failed'
+                          AND error_code = ?
+                        """,
+                        (now, intent.intent_id, intent.error_code),
+                    )
+                    await connection.execute(
+                        """
+                        INSERT INTO worktree_events(
+                            event_id, intent_id, state, detail, created_at
+                        ) VALUES (?, ?, 'reserved', ?, ?)
+                        """,
+                        (
+                            str(uuid.uuid4()),
+                            intent.intent_id,
+                            _canonical_json(
+                                {
+                                    "event": "retry_known_git_preflight_conflict",
+                                    "previous_error_code": intent.error_code,
+                                }
+                            ),
+                            now,
+                        ),
+                    )
+                    reset = await _fetchone(
+                        connection,
+                        "SELECT * FROM worktree_intents WHERE intent_id = ?",
+                        (intent.intent_id,),
+                    )
+                    assert reset is not None
+                    return _row_to_intent(reset)
                 return intent
             parent = await _fetchone(
                 connection,
@@ -1447,9 +1682,7 @@ class WorktreeManager:
             base_ref=str(row["base_ref"]),
             history_mode=WorktreeHistoryMode(str(row["history_mode"])),
             thread_id=None if row["thread_id"] is None else str(row["thread_id"]),
-            sdk_session_id=(
-                None if row["sdk_session_id"] is None else str(row["sdk_session_id"])
-            ),
+            sdk_session_id=(None if row["sdk_session_id"] is None else str(row["sdk_session_id"])),
             state=str(row["state"]),
             session_count=int(row["session_count"]),
             active_submission_count=int(row["active_submission_count"]),
@@ -1678,14 +1911,23 @@ def _safe_target_path(root: Path, name: str) -> Path:
     return target
 
 
+def _find_casefold_path_collision(target: Path) -> Path | None:
+    parent = target.parent
+    if not parent.exists():
+        return None
+    expected = unicodedata.normalize("NFC", target.name).casefold()
+    for child in parent.iterdir():
+        if unicodedata.normalize("NFC", child.name).casefold() == expected:
+            return child
+    return None
+
+
 def _resolve_path(path: Path) -> Path:
     return path.expanduser().resolve()
 
 
 def _branch_name(name: str, intent_id: str) -> str:
-    ascii_name = (
-        unicodedata.normalize("NFKD", name).encode("ascii", "ignore").decode().lower()
-    )
+    ascii_name = unicodedata.normalize("NFKD", name).encode("ascii", "ignore").decode().lower()
     slug = re.sub(r"[^a-z0-9]+", "-", ascii_name).strip("-") or "worktree"
     return f"copilotd/{slug[:40]}-{intent_id[:8]}"
 
@@ -1716,13 +1958,20 @@ def _row_to_intent(row: Row) -> WorktreeIntent:
         target_path=Path(str(row["target_path"])),
         project_id=None if row["project_id"] is None else str(row["project_id"]),
         thread_id=None if row["thread_id"] is None else str(row["thread_id"]),
-        sdk_session_id=(
-            None if row["sdk_session_id"] is None else str(row["sdk_session_id"])
-        ),
+        sdk_session_id=(None if row["sdk_session_id"] is None else str(row["sdk_session_id"])),
         created_branch=bool(row["created_branch"]),
         state=WorktreeIntentState(str(row["state"])),
         error_code=None if row["error_code"] is None else str(row["error_code"]),
         error_detail=None if row["error_detail"] is None else str(row["error_detail"]),
+        git_create_holder=(
+            None if row["git_create_holder"] is None else str(row["git_create_holder"])
+        ),
+        git_create_fence_token=int(row["git_create_fence_token"]),
+        git_create_lease_expires_at=(
+            None
+            if row["git_create_lease_expires_at"] is None
+            else float(row["git_create_lease_expires_at"])
+        ),
         created_at=float(row["created_at"]),
         updated_at=float(row["updated_at"]),
     )
@@ -1774,8 +2023,7 @@ async def _worktree_blockers(
     for row in sessions:
         if row["binding_intent"] != "closed" or row["attachment_state"] != "absent":
             blockers.append(
-                f"session:{row['thread_id']}:{row['binding_intent']}/"
-                f"{row['attachment_state']}"
+                f"session:{row['thread_id']}:{row['binding_intent']}/{row['attachment_state']}"
             )
         if row["runtime_remote_mode"] in {"on", "unknown"}:
             blockers.append(f"remote:{row['thread_id']}:{row['runtime_remote_mode']}")
@@ -1789,9 +2037,7 @@ async def _worktree_blockers(
         """,
         (project_id, now),
     )
-    blockers.extend(
-        f"owner_lease:{row['sdk_session_id']}:{row['owner_id']}" for row in leases
-    )
+    blockers.extend(f"owner_lease:{row['sdk_session_id']}:{row['owner_id']}" for row in leases)
     queued = await _fetchall(
         connection,
         """
@@ -1816,8 +2062,7 @@ async def _worktree_blockers(
         (project_id,),
     )
     blockers.extend(
-        f"liveness:{row['sdk_session_id']}:{row['kind']}:{row['source_id']}"
-        for row in live
+        f"liveness:{row['sdk_session_id']}:{row['kind']}:{row['source_id']}" for row in live
     )
     native = await _fetchall(
         connection,
@@ -1830,8 +2075,7 @@ async def _worktree_blockers(
         (project_id,),
     )
     blockers.extend(
-        f"native_schedule:{row['sdk_session_id']}:{row['runtime_schedule_id']}:"
-        f"{row['state']}"
+        f"native_schedule:{row['sdk_session_id']}:{row['runtime_schedule_id']}:{row['state']}"
         for row in native
     )
     schedules = await _fetchall(
@@ -1855,10 +2099,7 @@ async def _worktree_blockers(
         """,
         (project_id,),
     )
-    blockers.extend(
-        f"creation_intent:{row['creation_token']}:{row['state']}"
-        for row in creations
-    )
+    blockers.extend(f"creation_intent:{row['creation_token']}:{row['state']}" for row in creations)
     children = await _fetchall(
         connection,
         """
@@ -1868,7 +2109,5 @@ async def _worktree_blockers(
         """,
         (project_id,),
     )
-    blockers.extend(
-        f"child_worktree:{row['intent_id']}:{row['state']}" for row in children
-    )
+    blockers.extend(f"child_worktree:{row['intent_id']}:{row['state']}" for row in children)
     return tuple(blockers)

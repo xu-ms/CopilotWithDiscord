@@ -296,6 +296,7 @@ class SchedulerRepository:
                     timestamp,
                 ),
             )
+
         if connection is None:
             async with self._database.transaction() as active_connection:
                 await insert(active_connection)
@@ -928,10 +929,7 @@ class SchedulerRepository:
                 or binding["permission_posture"] != "verified_allow_all"
                 or not bool(binding["owner_current"])
                 or binding["project_state"] == "closing"
-                or (
-                    binding["project_kind"] == "worktree"
-                    and binding["project_state"] == "retired"
-                )
+                or (binding["project_kind"] == "worktree" and binding["project_state"] == "retired")
             ):
                 raise SchedulerDispatchError(
                     "scheduled target lost attached runtime ownership before enqueue",
@@ -1090,6 +1088,8 @@ class SchedulerRepository:
                 error_code=error.code,
                 detail=str(error),
                 now=now,
+                expected_owner_id=owner_id,
+                expected_fence_token=run.fence_token,
             )
             return state
         delay = SCHEDULE_RETRY_DELAYS[min(run.attempt - 1, len(SCHEDULE_RETRY_DELAYS) - 1)]
@@ -1137,9 +1137,13 @@ class SchedulerRepository:
         error_code: str | None = None,
         detail: str | None = None,
         now: float | None = None,
+        expected_owner_id: str | None = None,
+        expected_fence_token: int | None = None,
     ) -> ScheduleRun:
         if not status.terminal:
             raise ValueError(f"schedule final state must be terminal: {status}")
+        if (expected_owner_id is None) != (expected_fence_token is None):
+            raise ValueError("expected owner and fence must be provided together")
         timestamp = time.time() if now is None else now
         async with self._database.transaction() as connection:
             await self._finalize_in_transaction(
@@ -1151,6 +1155,8 @@ class SchedulerRepository:
                 error_code=error_code,
                 detail=detail,
                 now=timestamp,
+                expected_owner_id=expected_owner_id,
+                expected_fence_token=expected_fence_token,
             )
         return await self.get_run(run_id)
 
@@ -1165,6 +1171,8 @@ class SchedulerRepository:
         error_code: str | None,
         detail: str | None,
         now: float,
+        expected_owner_id: str | None = None,
+        expected_fence_token: int | None = None,
     ) -> None:
         row = await _fetchone(
             connection,
@@ -1192,13 +1200,15 @@ class SchedulerRepository:
         )
         if row is None:
             raise ScheduleNotFound(f"schedule run does not exist: {run_id}")
+        if expected_owner_id is not None and (
+            row["lease_owner"] != expected_owner_id
+            or int(row["fence_token"] or 0) != expected_fence_token
+        ):
+            raise ScheduleConflict("schedule run fence was lost before terminal finalization")
         if (
             error_code == "forced_restart"
             and status == ScheduleRunState.DISPATCH_UNKNOWN
-            and (
-                bool(row["dispatch_observed"])
-                or row["accepted_message_id"] is not None
-            )
+            and (bool(row["dispatch_observed"]) or row["accepted_message_id"] is not None)
         ):
             status = ScheduleRunState.OUTCOME_UNKNOWN
         current = ScheduleRunState(str(row["status"]))
@@ -1303,8 +1313,7 @@ class SchedulerRepository:
             )
             queue_state = (
                 "submitted_unknown"
-                if row["send_started_at"] is not None
-                or bool(row["dispatch_observed"])
+                if row["send_started_at"] is not None or bool(row["dispatch_observed"])
                 else "cancelled"
             )
             await connection.execute(
@@ -1487,9 +1496,7 @@ class SchedulerRepository:
                 _row_to_run(row),
                 ScheduledTarget(
                     project_id=(
-                        None
-                        if row["result_project_id"] is None
-                        else str(row["result_project_id"])
+                        None if row["result_project_id"] is None else str(row["result_project_id"])
                     ),
                     thread_id=str(row["result_thread_id"]),
                     sdk_session_id=str(row["result_session_id"]),
@@ -1755,9 +1762,7 @@ class SchedulerRepository:
 
     async def status(self, *, now: float | None = None) -> SchedulerStatus:
         timestamp = time.time() if now is None else now
-        state = await self._database.fetchone(
-            "SELECT * FROM scheduler_state WHERE singleton = 1"
-        )
+        state = await self._database.fetchone("SELECT * FROM scheduler_state WHERE singleton = 1")
         counts = await self._database.fetchone(
             """
             SELECT
@@ -1788,17 +1793,11 @@ class SchedulerRepository:
                 if state["recovery_completed_at"] is None
                 else float(state["recovery_completed_at"])
             ),
-            last_tick_at=(
-                None if state["last_tick_at"] is None else float(state["last_tick_at"])
-            ),
+            last_tick_at=(None if state["last_tick_at"] is None else float(state["last_tick_at"])),
             last_clock_utc=(
-                None
-                if state["last_clock_utc"] is None
-                else float(state["last_clock_utc"])
+                None if state["last_clock_utc"] is None else float(state["last_clock_utc"])
             ),
-            paused_reason=(
-                None if state["paused_reason"] is None else str(state["paused_reason"])
-            ),
+            paused_reason=(None if state["paused_reason"] is None else str(state["paused_reason"])),
             enabled_definitions=int(counts["enabled_definitions"]),
             due_definitions=int(counts["due_definitions"]),
             pending_runs=int(counts["pending_runs"]),
@@ -1824,8 +1823,7 @@ class SchedulerRepository:
             """
         )
         blockers.extend(
-            f"liveness:{row['sdk_session_id']}:{row['kind']}:{row['source_id']}"
-            for row in liveness
+            f"liveness:{row['sdk_session_id']}:{row['kind']}:{row['source_id']}" for row in liveness
         )
         remote = await self._database.fetchall(
             """
@@ -1835,8 +1833,7 @@ class SchedulerRepository:
             """
         )
         blockers.extend(
-            f"remote:{row['sdk_session_id']}:{row['runtime_remote_mode']}"
-            for row in remote
+            f"remote:{row['sdk_session_id']}:{row['runtime_remote_mode']}" for row in remote
         )
         native = await self._database.fetchall(
             """
@@ -1846,8 +1843,7 @@ class SchedulerRepository:
             """
         )
         blockers.extend(
-            f"native_schedule:{row['sdk_session_id']}:{row['runtime_schedule_id']}:"
-            f"{row['state']}"
+            f"native_schedule:{row['sdk_session_id']}:{row['runtime_schedule_id']}:{row['state']}"
             for row in native
         )
         interactions = await self._database.fetchall(
@@ -1857,8 +1853,7 @@ class SchedulerRepository:
             """
         )
         blockers.extend(
-            f"interaction:{row['sdk_session_id']}:{row['interaction_id']}"
-            for row in interactions
+            f"interaction:{row['sdk_session_id']}:{row['interaction_id']}" for row in interactions
         )
         creations = await self._database.fetchall(
             """
@@ -1868,8 +1863,7 @@ class SchedulerRepository:
             """
         )
         blockers.extend(
-            f"creation_intent:{row['creation_token']}:{row['state']}"
-            for row in creations
+            f"creation_intent:{row['creation_token']}:{row['state']}" for row in creations
         )
         return blockers
 
@@ -1942,8 +1936,7 @@ class SchedulerRepository:
                 current = str(row["status"])
                 target = (
                     ScheduleRunState.OUTCOME_UNKNOWN
-                    if current in {"accepted", "waiting"}
-                    or bool(row["dispatch_observed"])
+                    if current in {"accepted", "waiting"} or bool(row["dispatch_observed"])
                     else ScheduleRunState.DISPATCH_UNKNOWN
                 )
                 await self.finalize(
@@ -2076,8 +2069,7 @@ class SchedulerRepository:
                     str(
                         uuid.uuid5(
                             uuid.NAMESPACE_URL,
-                            f"copilotd:scheduler-clock-jump:{owner_id}:"
-                            f"{previous_clock}:{now}",
+                            f"copilotd:scheduler-clock-jump:{owner_id}:{previous_clock}:{now}",
                         )
                     ),
                     owner_id,
@@ -2369,9 +2361,7 @@ def _row_to_definition(row: Row) -> ScheduleDefinition:
         target_snapshot=json.loads(str(row["target_snapshot"])),
         misfire_policy=MisfirePolicy(str(row["misfire_policy"])),
         state=ScheduleState(str(row["state"])),
-        next_run_at_utc=(
-            None if row["next_run_at_utc"] is None else float(row["next_run_at_utc"])
-        ),
+        next_run_at_utc=(None if row["next_run_at_utc"] is None else float(row["next_run_at_utc"])),
         planner_fence_token=int(row["planner_fence_token"]),
         created_at=float(row["created_at"]),
         updated_at=float(row["updated_at"]),
@@ -2401,13 +2391,9 @@ def _row_to_run(row: Row) -> ScheduleRun:
             if row["session_create_started_at"] is None
             else float(row["session_create_started_at"])
         ),
-        send_started_at=(
-            None if row["send_started_at"] is None else float(row["send_started_at"])
-        ),
+        send_started_at=(None if row["send_started_at"] is None else float(row["send_started_at"])),
         accepted_message_id=(
-            None
-            if row["accepted_message_id"] is None
-            else str(row["accepted_message_id"])
+            None if row["accepted_message_id"] is None else str(row["accepted_message_id"])
         ),
         completion_basis=(
             None if row["completion_basis"] is None else str(row["completion_basis"])
@@ -2422,21 +2408,15 @@ def _row_to_run(row: Row) -> ScheduleRun:
             None if row["result_session_id"] is None else str(row["result_session_id"])
         ),
         result_submission_id=(
-            None
-            if row["result_submission_id"] is None
-            else str(row["result_submission_id"])
+            None if row["result_submission_id"] is None else str(row["result_submission_id"])
         ),
         render_intent_id=(
             None if row["render_intent_id"] is None else str(row["render_intent_id"])
         ),
         retry_at=None if row["retry_at"] is None else float(row["retry_at"]),
-        error_category=(
-            None if row["error_category"] is None else str(row["error_category"])
-        ),
+        error_category=(None if row["error_category"] is None else str(row["error_category"])),
         error_code=None if row["error_code"] is None else str(row["error_code"]),
-        error_detail=(
-            None if row["error_detail"] is None else str(row["error_detail"])
-        ),
+        error_detail=(None if row["error_detail"] is None else str(row["error_detail"])),
         created_at=float(row["created_at"]),
         updated_at=float(row["updated_at"]),
     )

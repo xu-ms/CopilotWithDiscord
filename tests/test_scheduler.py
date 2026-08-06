@@ -197,8 +197,7 @@ async def test_backward_clock_jump_never_replans_same_instant(tmp_path: Path) ->
         await worker.tick()
         runs = await repository.list_runs(definition.id)
         jumps = await database.fetchall(
-            "SELECT event_type FROM scheduler_events "
-            "WHERE event_type = 'clock_jump_backward'"
+            "SELECT event_type FROM scheduler_events WHERE event_type = 'clock_jump_backward'"
         )
 
     assert len(runs) == 1
@@ -239,10 +238,31 @@ async def test_skip_misfire_policy_advances_without_catchup(tmp_path: Path) -> N
     assert advanced.next_run_at_utc == 120
     assert len(due) == 1
     assert due[0].planned_at_utc == 120
-    current_run = next(
-        run for run in current if run.schedule_id == current_definition.id
-    )
+    current_run = next(run for run in current if run.schedule_id == current_definition.id)
     assert current_run.planned_at_utc == 120
+
+
+@pytest.mark.asyncio
+async def test_cron_planning_at_subminute_time_keeps_current_due_minute(
+    tmp_path: Path,
+) -> None:
+    async with Database(tmp_path / "subminute-cron.sqlite3") as database:
+        repository = SchedulerRepository(database)
+        await repository.recover(now=0)
+        definition = await repository.create(
+            kind=ScheduleKind.NEW_SESSION,
+            expression="cron:* * * * *",
+            timezone="UTC",
+            payload={"text": "scheduled"},
+            target_snapshot={},
+            now=0,
+        )
+
+        planned = await repository.plan_due("planner", now=90)
+        advanced = await repository.require(definition.id)
+
+    assert [run.planned_at_utc for run in planned] == [60]
+    assert advanced.next_run_at_utc == 120
 
 
 @pytest.mark.asyncio
@@ -269,6 +289,64 @@ async def test_expired_run_claim_reassigns_monotonic_fence_without_new_attempt(
     assert first.attempt == second.attempt == 1
     assert second.fence_token == first.fence_token + 1
     assert definition.id == first.schedule_id
+
+
+@pytest.mark.asyncio
+async def test_stale_dispatch_worker_cannot_terminalize_reclaimed_run(
+    tmp_path: Path,
+) -> None:
+    async with Database(tmp_path / "terminal-fence.sqlite3") as database:
+        repository = SchedulerRepository(database)
+        await repository.recover(now=0)
+        await repository.create(
+            kind=ScheduleKind.NEW_SESSION,
+            expression="interval:60s",
+            timezone="UTC",
+            payload={"text": "scheduled"},
+            target_snapshot={},
+            now=0,
+        )
+        await repository.plan_due("planner", now=60)
+        first = await repository.claim_next("worker-a", now=60, lease_seconds=10)
+        assert first is not None
+        first = await repository.mark_target_started(
+            first,
+            "worker-a",
+            new_session=True,
+            now=60,
+        )
+        second = await repository.claim_next("worker-b", now=71, lease_seconds=10)
+        assert second is not None
+        failure = SchedulerDispatchError(
+            "terminal failure",
+            category=SchedulerErrorCategory.TARGET,
+            code="terminal_failure",
+        )
+
+        with pytest.raises(ScheduleConflict, match="terminal finalization"):
+            await repository.retry_or_fail(
+                first,
+                "worker-a",
+                failure,
+                now=72,
+            )
+        reclaimed = await repository.get_run(first.run_id)
+        stale_render = await database.fetchone(
+            "SELECT 1 FROM scheduler_render_intents WHERE run_id = ?",
+            (first.run_id,),
+        )
+        final_state = await repository.retry_or_fail(
+            second,
+            "worker-b",
+            failure,
+            now=73,
+        )
+
+    assert reclaimed.status == ScheduleRunState.CLAIMED
+    assert reclaimed.lease_owner == "worker-b"
+    assert reclaimed.fence_token == second.fence_token
+    assert stale_render is None
+    assert final_state == ScheduleRunState.FAILED
 
 
 @pytest.mark.asyncio
@@ -1009,10 +1087,7 @@ async def test_recovery_classifies_every_dispatch_boundary_without_reenqueue(
         )
 
         counts = await repository.recover(now=10)
-        states = {
-            run.run_id: run.status
-            for run in await repository.list_runs(definition.id)
-        }
+        states = {run.run_id: run.status for run in await repository.list_runs(definition.id)}
         queue_count = await database.fetchone(
             "SELECT COUNT(*) FROM message_queue WHERE schedule_run_id = ?",
             (queued.run_id,),
@@ -1199,9 +1274,7 @@ async def test_new_session_target_and_queue_are_not_duplicated_after_notificatio
         await worker.tick()
         await worker.tick()
         runs = await repository.list_runs(definition.id)
-        queue = await database.fetchall(
-            "SELECT id, schedule_run_id FROM message_queue"
-        )
+        queue = await database.fetchall("SELECT id, schedule_run_id FROM message_queue")
 
     assert len(adapter.new_session_targets) == 1
     assert len(adapter.prepare_calls) == 1

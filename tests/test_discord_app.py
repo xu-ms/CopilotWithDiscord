@@ -9,6 +9,7 @@ import pytest
 from discord.ext import commands
 
 from copilotd.config import Settings
+from copilotd.core.bindings import SessionBindingRepository
 from copilotd.core.task_registry import TaskFailure
 from copilotd.discord_app import (
     CopilotDiscordBot,
@@ -45,20 +46,23 @@ def test_discord_command_manifest_has_core_modes_and_no_deleted_roots(tmp_path: 
         "steer",
         "queue",
     } <= roots
-    assert not {
-        "copilot",
-        "workflow",
-        "max-turns",
-        "mode",
-        "goal",
-        "bare",
-        "tools",
-        "cost",
-        "budget",
-        "limits",
-        "pr",
-        "delegate",
-    } & roots
+    assert (
+        not {
+            "copilot",
+            "workflow",
+            "max-turns",
+            "mode",
+            "goal",
+            "bare",
+            "tools",
+            "cost",
+            "budget",
+            "limits",
+            "pr",
+            "delegate",
+        }
+        & roots
+    )
 
 
 def test_discord_registration_omits_commands_without_capability_evidence(
@@ -88,9 +92,7 @@ def test_administrative_commands_require_explicit_operator_allowlist(
     with pytest.raises(discord.app_commands.CheckFailure):
         denied._require_operator(interaction)
 
-    allowed = CopilotDiscordBot(
-        Settings(data_dir=tmp_path, discord_operator_ids="41,42")
-    )
+    allowed = CopilotDiscordBot(Settings(data_dir=tmp_path, discord_operator_ids="41,42"))
     allowed._require_operator(interaction)
 
 
@@ -105,6 +107,60 @@ async def test_bot_teardown_is_idempotent(tmp_path: Path) -> None:
 
     bot.bridge.stop.assert_awaited_once()
     bot.database.close.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_ordinary_message_does_not_resume_closed_session_after_restart(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FakeThread:
+        def __init__(self, thread_id: str) -> None:
+            self.id = thread_id
+
+    async with Database(tmp_path / "closed-message.sqlite3") as database:
+        bindings = SessionBindingRepository(database)
+        await bindings.create(
+            thread_id="thread-1",
+            sdk_session_id="session-1",
+            cwd_snapshot=tmp_path,
+            project_source="implicit-home",
+        )
+        await database.execute(
+            """
+            UPDATE session_bindings
+            SET binding_intent = 'closed', attachment_state = 'absent'
+            WHERE thread_id = 'thread-1'
+            """
+        )
+        bot = CopilotDiscordBot(Settings(data_dir=tmp_path))
+        bot.bindings = bindings
+        bot.sessions = SimpleNamespace(
+            for_thread=lambda _thread_id: pytest.fail(
+                "ordinary ingress must not instantiate a closed runtime"
+            )
+        )
+        monkeypatch.setattr(discord, "Thread", FakeThread)
+        monkeypatch.setattr(
+            bot,
+            "_is_restart_draining",
+            AsyncMock(return_value=False),
+        )
+        message = SimpleNamespace(
+            author=SimpleNamespace(bot=False),
+            guild=object(),
+            channel=FakeThread("thread-1"),
+            content="do not resume implicitly",
+            attachments=[],
+            mentions=[],
+            reply=AsyncMock(),
+        )
+
+        await bot.on_message(message)
+
+    message.reply.assert_awaited_once()
+    assert "closed" in message.reply.await_args.args[0]
+    assert "/session resume" in message.reply.await_args.args[0]
 
 
 @pytest.mark.asyncio
@@ -212,9 +268,7 @@ before
 after
 """.strip()
 
-    rendered, assets = await _discord_render(
-        {"content": content, "finalized": True}
-    )
+    rendered, assets = await _discord_render({"content": content, "finalized": True})
 
     assert "before" in rendered
     assert "alpha" in rendered
@@ -310,9 +364,7 @@ def test_taskdeck_view_uses_short_in_place_controls() -> None:
                 "page_count": 2,
                 "selected_card_token": "card-a",
                 "expanded": False,
-                "options": [
-                    {"label": "Worker A", "value": "card-a", "state": "running"}
-                ],
+                "options": [{"label": "Worker A", "value": "card-a", "state": "running"}],
             }
         }
     )

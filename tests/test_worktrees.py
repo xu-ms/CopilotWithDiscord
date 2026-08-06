@@ -1,6 +1,7 @@
 import asyncio
 import subprocess
 import time
+import uuid
 from pathlib import Path
 
 import pytest
@@ -20,6 +21,7 @@ from copilotd.core.scheduler import (
 )
 from copilotd.core.worktrees import (
     DeterministicWorktreeAdapter,
+    SubprocessGitRunner,
     WorktreeCapabilityError,
     WorktreeConflict,
     WorktreeHistoryMode,
@@ -29,6 +31,7 @@ from copilotd.core.worktrees import (
     WorktreeManager,
     WorktreeOperationError,
     WorktreeTarget,
+    _branch_name,
 )
 from copilotd.storage.database import Database
 from copilotd.storage.leases import OwnerLeaseStore
@@ -503,12 +506,18 @@ async def test_ready_intent_repairs_projection_atomically_on_recovery(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    "intent_state",
-    ["git_creating", "git_created", "target_unknown", "ready"],
+    ("intent_state", "expected_state"),
+    [
+        ("git_creating", "failed"),
+        ("git_created", "git_created"),
+        ("target_unknown", "target_unknown"),
+        ("ready", "ready"),
+    ],
 )
 async def test_recovery_never_adopts_foreign_branch_at_reserved_path(
     tmp_path: Path,
     intent_state: str,
+    expected_state: str,
 ) -> None:
     async with Database(tmp_path / "foreign-worktree.sqlite3") as database:
         manager, project_id = await _manager(
@@ -541,7 +550,7 @@ async def test_recovery_never_adopts_foreign_branch_at_reserved_path(
         )
 
     assert report.orphaned_intents == 1
-    assert intent["state"] == intent_state
+    assert intent["state"] == expected_state
     assert target.exists()
 
 
@@ -856,6 +865,181 @@ async def test_concurrent_history_fork_has_one_exclusive_creation_claim(
     assert projection.state == "ready"
     assert len(adapter.create_calls) == 1
     assert sum(not isinstance(result, Exception) for result in results) >= 1
+
+
+@pytest.mark.asyncio
+async def test_concurrent_git_creation_has_one_fenced_side_effect_holder(
+    tmp_path: Path,
+) -> None:
+    entered = asyncio.Event()
+    release = asyncio.Event()
+
+    class SlowGitRunner:
+        def __init__(self) -> None:
+            self.delegate = SubprocessGitRunner()
+            self.add_calls = 0
+
+        async def run(self, argv: list[str], *, cwd: Path) -> object:
+            if argv[1:3] == ["worktree", "add"]:
+                self.add_calls += 1
+                entered.set()
+                await release.wait()
+            return await self.delegate.run(argv, cwd=cwd)
+
+    slow_git = SlowGitRunner()
+    async with Database(tmp_path / "git-create-exclusive.sqlite3") as database:
+        manager, project_id = await _manager(
+            database,
+            tmp_path,
+            DeterministicWorktreeAdapter(),
+        )
+        manager._git = slow_git
+        first = asyncio.create_task(
+            manager.create(parent_project_id=project_id, name="exclusive git")
+        )
+        await entered.wait()
+        second = asyncio.create_task(
+            manager.create(parent_project_id=project_id, name="exclusive git")
+        )
+        try:
+            second_result = (
+                await asyncio.wait_for(
+                    asyncio.gather(second, return_exceptions=True),
+                    timeout=2,
+                )
+            )[0]
+        finally:
+            release.set()
+        first_result = await first
+        results = [first_result, second_result]
+        projection = (await manager.list(parent_project_id=project_id))[0]
+        intent = await database.fetchone(
+            """
+            SELECT state, git_create_holder, git_create_fence_token
+            FROM worktree_intents WHERE intent_id = ?
+            """,
+            (projection.intent_id,),
+        )
+        failed_events = await database.fetchone(
+            """
+            SELECT COUNT(*) FROM worktree_events
+            WHERE intent_id = ? AND state = 'failed'
+            """,
+            (projection.intent_id,),
+        )
+
+    assert slow_git.add_calls == 1
+    assert sum(not isinstance(result, Exception) for result in results) == 1
+    assert any(isinstance(result, WorktreeConflict) for result in results)
+    assert projection.state == "ready"
+    assert dict(intent) == {
+        "state": "ready",
+        "git_create_holder": None,
+        "git_create_fence_token": 1,
+    }
+    assert failed_events[0] == 0
+
+
+@pytest.mark.asyncio
+async def test_casefold_path_conflict_is_terminal_and_retryable_after_cleanup(
+    tmp_path: Path,
+) -> None:
+    async with Database(tmp_path / "casefold-path-retry.sqlite3") as database:
+        manager, project_id = await _manager(
+            database,
+            tmp_path,
+            DeterministicWorktreeAdapter(),
+        )
+        conflicting = tmp_path / "managed worktrees" / project_id / "CASEFOLD COLLISION"
+        conflicting.parent.mkdir(parents=True)
+        conflicting.mkdir()
+
+        with pytest.raises(WorktreeConflict, match="conflicts with existing path"):
+            await manager.create(
+                parent_project_id=project_id,
+                name="casefold collision",
+            )
+        failed = await database.fetchone(
+            """
+            SELECT state, error_code, git_create_holder, git_create_fence_token
+            FROM worktree_intents
+            WHERE parent_project_id = ? AND name = 'casefold collision'
+            """,
+            (project_id,),
+        )
+        conflicting.rmdir()
+
+        retried = await manager.create(
+            parent_project_id=project_id,
+            name="casefold collision",
+        )
+        recovered = await database.fetchone(
+            """
+            SELECT state, error_code, git_create_holder, git_create_fence_token
+            FROM worktree_intents WHERE intent_id = ?
+            """,
+            (retried.intent_id,),
+        )
+
+    assert dict(failed) == {
+        "state": "failed",
+        "error_code": "worktree_path_conflict",
+        "git_create_holder": None,
+        "git_create_fence_token": 1,
+    }
+    assert retried.state == "ready"
+    assert dict(recovered) == {
+        "state": "ready",
+        "error_code": None,
+        "git_create_holder": None,
+        "git_create_fence_token": 2,
+    }
+
+
+@pytest.mark.asyncio
+async def test_branch_conflict_is_terminal_and_retryable_after_cleanup(
+    tmp_path: Path,
+) -> None:
+    async with Database(tmp_path / "branch-retry.sqlite3") as database:
+        manager, project_id = await _manager(
+            database,
+            tmp_path,
+            DeterministicWorktreeAdapter(),
+        )
+        parent = await database.fetchone(
+            "SELECT root_path FROM projects WHERE id = ?",
+            (project_id,),
+        )
+        repo_root = Path(str(parent["root_path"]))
+        name = "branch collision"
+        intent_id = str(
+            uuid.uuid5(
+                uuid.NAMESPACE_URL,
+                f"copilotd:worktree:{project_id}:{name}",
+            )
+        )
+        branch_name = _branch_name(name, intent_id)
+        _git(repo_root, "branch", branch_name)
+
+        with pytest.raises(WorktreeConflict, match="branch already exists"):
+            await manager.create(parent_project_id=project_id, name=name)
+        failed = await database.fetchone(
+            """
+            SELECT state, error_code, git_create_holder
+            FROM worktree_intents WHERE intent_id = ?
+            """,
+            (intent_id,),
+        )
+        _git(repo_root, "branch", "-D", branch_name)
+
+        retried = await manager.create(parent_project_id=project_id, name=name)
+
+    assert dict(failed) == {
+        "state": "failed",
+        "error_code": "worktree_branch_conflict",
+        "git_create_holder": None,
+    }
+    assert retried.state == "ready"
 
 
 @pytest.mark.asyncio

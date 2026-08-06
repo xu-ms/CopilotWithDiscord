@@ -2,6 +2,7 @@ import asyncio
 import hashlib
 import json
 import threading
+from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
@@ -78,9 +79,7 @@ def _adapted(
         event_id=event_id,
         internal_event_id=None if source == "sdk" else f"{raw_type}:{inbox_seq}",
         turn_id=None if data.get("turnId") is None else str(data["turnId"]),
-        interaction_id=(
-            None if data.get("interactionId") is None else str(data["interactionId"])
-        ),
+        interaction_id=(None if data.get("interactionId") is None else str(data["interactionId"])),
     )
 
 
@@ -441,9 +440,7 @@ async def test_reducer_materializes_full_stream_content_for_each_outbox_edit(
         ]
 
         assert await JournalReducer(database).persist(adapted) == 3
-        rows = await database.fetchall(
-            "SELECT payload FROM render_outbox ORDER BY logical_seq"
-        )
+        rows = await database.fetchall("SELECT payload FROM render_outbox ORDER BY logical_seq")
         stream = await database.fetchone(
             "SELECT content, finalized FROM render_streams WHERE message_id = 'message-1'"
         )
@@ -829,9 +826,7 @@ async def test_user_message_correlation_retains_facts_and_creates_runtime_observ
             4,
             session_id=session_id,
         )
-        assert await JournalReducer(database).persist(
-            [queued, accepted, observed, external]
-        ) == 4
+        assert await JournalReducer(database).persist([queued, accepted, observed, external]) == 4
         submissions = await database.fetchall(
             """
             SELECT origin, state, observed_user_event_id, correlation_basis
@@ -865,6 +860,141 @@ async def test_user_message_correlation_retains_facts_and_creates_runtime_observ
         observed.event_id,
         external.event_id,
     ]
+
+
+@pytest.mark.asyncio
+async def test_exact_runtime_schedule_event_bypasses_app_correlation_and_settles_one_shot(
+    tmp_path: Path,
+) -> None:
+    session_id = "session-native-schedule"
+    prompt = "same scheduled prompt"
+    async with Database(tmp_path / "native-schedule-correlation.sqlite3") as database:
+        await _insert_projection_binding(database, session_id)
+        await database.execute(
+            """
+            INSERT INTO runtime_schedules(
+                sdk_session_id, runtime_schedule_id, builtin_name,
+                invocation_input, recurrence, next_run_at, state, updated_at
+            ) VALUES (?, 'native-once', 'after', 'once', NULL, 100,
+                      'active', 1)
+            """,
+            (session_id,),
+        )
+        queued = _adapted(
+            "copilotd.submission.queued",
+            {
+                "submission_id": "submission-app",
+                "thread_id": "thread-projection",
+                "origin": "app_message",
+                "prompt": prompt,
+                "prompt_hash": hashlib.sha256(prompt.encode()).hexdigest(),
+                "requested_mode": "interactive",
+                "requested_delivery": "enqueue",
+                "attachment_count": 0,
+            },
+            1,
+            source="internal",
+            session_id=session_id,
+        )
+        accepted = _adapted(
+            "copilotd.submission.accepted",
+            {"submission_id": "submission-app", "message_id": "accepted-app"},
+            2,
+            source="internal",
+            session_id=session_id,
+        )
+        native = _adapted(
+            "user.message",
+            {"content": prompt, "agentMode": "interactive", "delivery": "queued"},
+            3,
+            session_id=session_id,
+        )
+        native = replace(
+            native,
+            raw_payload={
+                "type": "user.message",
+                "runtimeScheduleId": "native-once",
+                "data": native.raw_payload["data"],
+            },
+        )
+        snapshot_requested = _adapted(
+            "copilotd.snapshot.requested",
+            {"topic": "schedules"},
+            4,
+            source="internal",
+            session_id=session_id,
+        )
+        snapshot_omission = _adapted(
+            "copilotd.snapshot.observed",
+            {
+                "topic": "schedules",
+                "epoch": 1,
+                "snapshot_id": "schedule-snapshot-1",
+                "query_start_sdk_receive_seq": 0,
+                "query_end_sdk_receive_seq": 0,
+                "payload": {"schedules": []},
+                "observed_at": 105,
+            },
+            5,
+            source="snapshot",
+            session_id=session_id,
+        )
+
+        assert (
+            await JournalReducer(database).persist(
+                [
+                    queued,
+                    accepted,
+                    native,
+                    snapshot_requested,
+                    snapshot_omission,
+                ]
+            )
+            == 5
+        )
+        app_submission = await database.fetchone(
+            """
+            SELECT state, observed_user_event_id
+            FROM submissions WHERE submission_id = 'submission-app'
+            """
+        )
+        runtime_submission = await database.fetchone(
+            """
+            SELECT origin, runtime_schedule_id, observed_user_event_id
+            FROM submissions
+            WHERE sdk_session_id = ? AND origin = 'runtime_observed'
+            """,
+            (session_id,),
+        )
+        native_schedule = await database.fetchone(
+            """
+            SELECT state, next_run_at FROM runtime_schedules
+            WHERE sdk_session_id = ? AND runtime_schedule_id = 'native-once'
+            """,
+            (session_id,),
+        )
+        close_blockers = await database.fetchone(
+            """
+            SELECT COUNT(*) FROM runtime_schedules
+            WHERE sdk_session_id = ? AND state IN ('active', 'unknown')
+            """,
+            (session_id,),
+        )
+
+    assert dict(app_submission) == {
+        "state": "submitted",
+        "observed_user_event_id": None,
+    }
+    assert dict(runtime_submission) == {
+        "origin": "runtime_observed",
+        "runtime_schedule_id": "native-once",
+        "observed_user_event_id": native.event_id,
+    }
+    assert dict(native_schedule) == {
+        "state": "triggered",
+        "next_run_at": None,
+    }
+    assert close_blockers[0] == 0
 
 
 @pytest.mark.asyncio
@@ -1086,9 +1216,7 @@ async def test_acceptance_receipts_are_monotonic_across_unknown_and_duplicates(
             FROM submissions WHERE submission_id = 'submission-1'
             """
         )
-        queue = await database.fetchone(
-            "SELECT state FROM message_queue WHERE id = 'submission-1'"
-        )
+        queue = await database.fetchone("SELECT state FROM message_queue WHERE id = 'submission-1'")
         lease = await database.fetchone(
             """
             SELECT state FROM liveness_leases
@@ -1338,9 +1466,7 @@ async def test_definitive_acceptance_and_rejection_conflicts_are_monotonic(
             """,
             (session_id,),
         )
-        queue = await database.fetchall(
-            "SELECT id, state FROM message_queue ORDER BY id"
-        )
+        queue = await database.fetchall("SELECT id, state FROM message_queue ORDER BY id")
         incidents = await database.fetchall(
             """
             SELECT kind, COUNT(*) AS count FROM runtime_incidents
@@ -1379,9 +1505,7 @@ async def test_unknown_acceptance_mapping_capability_is_not_treated_as_supported
     session_id = "session-unknown-mapping"
     accepted_id = str(uuid4())
     async with Database(tmp_path / "unknown-mapping.sqlite3") as database:
-        await CapabilityRegistry(
-            Settings(_env_file=None, data_dir=tmp_path)
-        ).activate(
+        await CapabilityRegistry(Settings(_env_file=None, data_dir=tmp_path)).activate(
             database,
             {
                 "runtime_version": "1.0.73",
@@ -1576,9 +1700,7 @@ async def test_model_turn_projection_and_interactive_idle_are_semantically_termi
             """,
             (session_id,),
         )
-        segment = await database.fetchone(
-            "SELECT state, idle_at FROM submission_segments"
-        )
+        segment = await database.fetchone("SELECT state, idle_at FROM submission_segments")
         lease = await database.fetchone(
             "SELECT state FROM liveness_leases WHERE sdk_session_id = ?",
             (session_id,),
@@ -1921,38 +2043,41 @@ async def test_linked_task_terminal_waits_for_late_activity_and_queue_quiet_snap
     async with Database(tmp_path / "linked-task-quiet.sqlite3") as database:
         await _insert_projection_binding(database, session_id)
         reducer = JournalReducer(database)
-        assert await reducer.persist(
-            [
-                _adapted(
-                    "user.message",
-                    {"content": "start worker", "agentMode": "interactive"},
-                    1,
-                    session_id=session_id,
-                ),
-                requested("tasks", 2),
-                observed(
-                    "tasks",
-                    3,
-                    1,
-                    {
-                        "tasks": [
-                            {
-                                "id": "task-1",
-                                "status": "running",
-                                "type": "agent",
-                                "description": "Worker",
-                            }
-                        ]
-                    },
-                ),
-                _adapted(
-                    "session.idle",
-                    {"aborted": False},
-                    4,
-                    session_id=session_id,
-                ),
-            ]
-        ) == 4
+        assert (
+            await reducer.persist(
+                [
+                    _adapted(
+                        "user.message",
+                        {"content": "start worker", "agentMode": "interactive"},
+                        1,
+                        session_id=session_id,
+                    ),
+                    requested("tasks", 2),
+                    observed(
+                        "tasks",
+                        3,
+                        1,
+                        {
+                            "tasks": [
+                                {
+                                    "id": "task-1",
+                                    "status": "running",
+                                    "type": "agent",
+                                    "description": "Worker",
+                                }
+                            ]
+                        },
+                    ),
+                    _adapted(
+                        "session.idle",
+                        {"aborted": False},
+                        4,
+                        session_id=session_id,
+                    ),
+                ]
+            )
+            == 4
+        )
         initial = await database.fetchone(
             """
             SELECT state FROM submissions WHERE sdk_session_id = ?
@@ -1969,64 +2094,73 @@ async def test_linked_task_terminal_waits_for_late_activity_and_queue_quiet_snap
         assert link["state"] == "running"
         assert link["correlation_basis"] == "single_active_submission"
 
-        assert await reducer.persist(
-            [
-                requested("tasks", 5),
-                observed(
-                    "tasks",
-                    6,
-                    2,
-                    {
-                        "tasks": [
-                            {
-                                "id": "task-1",
-                                "status": "completed",
-                                "type": "agent",
-                                "description": "Worker",
-                            }
-                        ]
-                    },
-                ),
-            ]
-        ) == 2
+        assert (
+            await reducer.persist(
+                [
+                    requested("tasks", 5),
+                    observed(
+                        "tasks",
+                        6,
+                        2,
+                        {
+                            "tasks": [
+                                {
+                                    "id": "task-1",
+                                    "status": "completed",
+                                    "type": "agent",
+                                    "description": "Worker",
+                                }
+                            ]
+                        },
+                    ),
+                ]
+            )
+            == 2
+        )
         after_task = await database.fetchone(
             "SELECT state FROM submissions WHERE sdk_session_id = ?",
             (session_id,),
         )
         assert after_task["state"] == "loop_idle"
 
-        assert await reducer.persist(
-            [
-                requested("activity", 7),
-                observed(
-                    "activity",
-                    8,
-                    1,
-                    {
-                        "processing": False,
-                        "has_active_work": False,
-                        "abortable": False,
-                    },
-                ),
-            ]
-        ) == 2
+        assert (
+            await reducer.persist(
+                [
+                    requested("activity", 7),
+                    observed(
+                        "activity",
+                        8,
+                        1,
+                        {
+                            "processing": False,
+                            "has_active_work": False,
+                            "abortable": False,
+                        },
+                    ),
+                ]
+            )
+            == 2
+        )
         after_activity = await database.fetchone(
             "SELECT state FROM submissions WHERE sdk_session_id = ?",
             (session_id,),
         )
         assert after_activity["state"] == "loop_idle"
 
-        assert await reducer.persist(
-            [
-                requested("queue", 9),
-                observed(
-                    "queue",
-                    10,
-                    1,
-                    {"items": [], "steering_messages": []},
-                ),
-            ]
-        ) == 2
+        assert (
+            await reducer.persist(
+                [
+                    requested("queue", 9),
+                    observed(
+                        "queue",
+                        10,
+                        1,
+                        {"items": [], "steering_messages": []},
+                    ),
+                ]
+            )
+            == 2
+        )
         terminal = await database.fetchone(
             """
             SELECT state, completion_basis FROM submissions
@@ -2214,9 +2348,7 @@ async def test_task_discovered_after_quiet_completion_reopens_latest_submission(
             observed("queue", 16, 2, {"items": [], "steering_messages": []}),
         ]
         assert await reducer.persist(terminal) == len(terminal)
-        settled = await database.fetchone(
-            "SELECT state, completion_basis FROM submissions"
-        )
+        settled = await database.fetchone("SELECT state, completion_basis FROM submissions")
 
     assert dict(settled) == {
         "state": "semantic_complete",
@@ -2270,9 +2402,7 @@ async def test_explicit_late_task_links_reopen_and_reacquire_submission(
             session_id=session_id,
         )
 
-    async with Database(
-        tmp_path / f"explicit-task-{link_field}.sqlite3"
-    ) as database:
+    async with Database(tmp_path / f"explicit-task-{link_field}.sqlite3") as database:
         await _insert_projection_binding(database, session_id)
         reducer = JournalReducer(database)
         initial = [
@@ -2320,9 +2450,7 @@ async def test_explicit_late_task_links_reopen_and_reacquire_submission(
                 (objective_id, submission["submission_id"]),
             )
         link_value = (
-            str(submission["submission_id"])
-            if link_field == "submissionId"
-            else objective_id
+            str(submission["submission_id"]) if link_field == "submissionId" else objective_id
         )
         running_task = {
             "id": "explicit-task",
@@ -2331,12 +2459,15 @@ async def test_explicit_late_task_links_reopen_and_reacquire_submission(
             "description": "Explicit worker",
             link_field: link_value,
         }
-        assert await reducer.persist(
-            [
-                requested("tasks", 9),
-                observed("tasks", 10, 2, {"tasks": [running_task]}),
-            ]
-        ) == 2
+        assert (
+            await reducer.persist(
+                [
+                    requested("tasks", 9),
+                    observed("tasks", 10, 2, {"tasks": [running_task]}),
+                ]
+            )
+            == 2
+        )
         reopened = await database.fetchone(
             "SELECT state, terminal_at FROM submissions WHERE submission_id = ?",
             (submission["submission_id"],),
@@ -2405,9 +2536,7 @@ async def test_stale_explicit_task_snapshot_cannot_reopen_completed_submission(
     session_id = f"session-stale-explicit-{link_field}"
     submission_id = "completed-submission"
     objective_id = "completed-objective"
-    async with Database(
-        tmp_path / f"stale-explicit-{link_field}.sqlite3"
-    ) as database:
+    async with Database(tmp_path / f"stale-explicit-{link_field}.sqlite3") as database:
         await _insert_projection_binding(database, session_id)
         await database.execute(
             """
