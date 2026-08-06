@@ -103,8 +103,10 @@ def test_design_html_generator_is_reproducible(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     markdown = tmp_path / "design.md"
+    stylesheet = tmp_path / "design.css"
     output = tmp_path / "design.html"
     markdown.write_text("# Design\n", encoding="utf-8")
+    stylesheet.write_text(".custom-design { color: purple; }\n", encoding="utf-8")
     monkeypatch.setattr("copilotd.ops.design_html.shutil.which", lambda _: "/fake/pandoc")
 
     def fake_run(command: list[str], **_: object) -> SimpleNamespace:
@@ -113,9 +115,10 @@ def test_design_html_generator_is_reproducible(
             "\n".join(
                 [
                     "<!doctype html>",
+                    "<html><head>",
                     '<meta name="generator" content="pandoc 9.9" />',
-                    "<style>base { color: black; }</style>",
-                    '<body><h1 id="design">Design</h1></body>',
+                    "<style>base { color: black; }  </style>",
+                    '</head><body><h1 id="design">Design</h1></body></html>',
                 ]
             ),
             encoding="utf-8",
@@ -130,6 +133,8 @@ def test_design_html_generator_is_reproducible(
     assert output.read_bytes() == first
     assert b"copilotd-design-generator-v1" in first
     assert b"max-width: 100rem" in first
+    assert b".custom-design { color: purple; }" in first
+    assert not any(line.endswith(b" ") for line in first.splitlines())
 
 
 def test_design_html_generator_fails_when_pandoc_is_not_selected(

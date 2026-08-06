@@ -2,7 +2,7 @@
 <html xmlns="http://www.w3.org/1999/xhtml" lang="zh-CN" xml:lang="zh-CN">
 <head>
   <meta charset="utf-8" />
-  <meta name="generator" content="pandoc" />
+  <meta name="generator" content="copilotd-design-generator-v1" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=yes" />
   <title>copilotD 详细设计 v2.5</title>
   <style>
@@ -234,241 +234,284 @@
     code span.va { color: #19177c; } /* Variable */
     code span.vs { color: #4070a0; } /* VerbatimString */
     code span.wa { color: #60a0b0; font-weight: bold; font-style: italic; } /* Warning */
-  </style>
-  <style type="text/css">:root {
-    color-scheme: light dark;
-    --bg: #f7f9fc;
-    --surface: #ffffff;
-    --surface-alt: #f0f4f9;
-    --text: #172033;
-    --muted: #596780;
-    --border: #d8e0eb;
-    --accent: #0969da;
-    --accent-soft: #ddf4ff;
-    --code-bg: #eef2f7;
-    --purple: #8250df;
-    --shadow: 0 8px 28px rgba(27, 39, 51, 0.08);
-    }
-    * {
-    box-sizing: border-box;
-    }
-    html {
-    scroll-behavior: smooth;
-    scroll-padding-top: 1.25rem;
-    }
-    body {
-    max-width: 100rem;
-    margin: 0 auto;
-    padding: 3rem 2.5rem 7rem 22rem;
-    background: var(--bg);
-    color: var(--text);
-    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial,
+
+body { max-width: 100rem; margin: 0 auto; padding: 2rem; overflow-wrap: anywhere; }
+table { display: block; width: 100%; overflow-x: auto; border-collapse: collapse; }
+th { position: sticky; top: 0; background: Canvas; }
+th, td { min-width: 9rem; max-width: 36rem; padding: .6rem; border: 1px solid #9ca3af; }
+pre { max-width: 100%; overflow: auto; }
+@media print { table, pre { break-inside: avoid; } h2, h3, h4 { break-after: avoid; } }
+</style>
+<style type="text/css">
+:root {
+  color-scheme: light dark;
+  --bg: #f7f9fc;
+  --surface: #ffffff;
+  --surface-alt: #f0f4f9;
+  --text: #172033;
+  --muted: #596780;
+  --border: #d8e0eb;
+  --accent: #0969da;
+  --accent-soft: #ddf4ff;
+  --code-bg: #eef2f7;
+  --purple: #8250df;
+  --shadow: 0 8px 28px rgba(27, 39, 51, 0.08);
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html {
+  scroll-behavior: smooth;
+  scroll-padding-top: 1.25rem;
+}
+
+body {
+  max-width: 100rem;
+  margin: 0 auto;
+  padding: 3rem 2.5rem 7rem 22rem;
+  background: var(--bg);
+  color: var(--text);
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial,
     "Apple Color Emoji", "Segoe UI Emoji", sans-serif;
-    font-size: 16px;
-    line-height: 1.68;
-    }
-    body > h1 {
-    margin-top: 0;
-    padding-bottom: 1rem;
-    border-bottom: 1px solid var(--border);
-    font-size: clamp(2rem, 4vw, 3rem);
-    line-height: 1.18;
-    letter-spacing: -0.035em;
-    }
-    body > h1::after {
-    display: block;
-    width: fit-content;
-    max-width: 100%;
-    margin-top: 0.9rem;
-    padding: 0.3rem 0.7rem;
-    border: 1px solid #b6d7f2;
-    border-radius: 999px;
-    background: var(--accent-soft);
-    color: var(--accent);
-    content: "DESIGN V2.5 · COPILOT SDK · $HOME DEFAULT · ALWAYS-ON MAC/WIN · LIVE SESSIONS · TABLE PNG · CAPABILITY-GATED · --YOLO · 实现中";
-    font-size: 0.76rem;
-    font-weight: 800;
-    line-height: 1.45;
-    letter-spacing: 0.08em;
-    }
-    nav#TOC {
-    position: fixed;
-    inset: 0 auto 0 0;
-    width: 19.5rem;
-    overflow-y: auto;
-    padding: 2rem 1.25rem 3rem;
-    border-right: 1px solid var(--border);
-    background: var(--surface);
-    box-shadow: var(--shadow);
-    }
-    nav#TOC::before {
-    display: block;
-    margin-bottom: 0.9rem;
-    color: var(--muted);
-    content: "COPILOTD DESIGN V2.5";
-    font-size: 0.72rem;
-    font-weight: 800;
-    letter-spacing: 0.14em;
-    }
-    nav#TOC > ul {
-    padding-left: 0;
-    }
-    nav#TOC ul {
-    list-style: none;
-    }
-    nav#TOC li {
-    margin: 0.3rem 0;
-    }
-    nav#TOC ul ul {
-    padding-left: 0.95rem;
-    border-left: 1px solid var(--border);
-    }
-    nav#TOC a {
-    color: var(--muted);
-    text-decoration: none;
-    }
-    nav#TOC a:hover,
-    nav#TOC a:focus {
-    color: var(--accent);
-    text-decoration: underline;
-    text-underline-offset: 0.18em;
-    }
-    h2 {
-    margin-top: 3.5rem;
-    padding: 0.75rem 1rem;
-    border-left: 0.3rem solid var(--accent);
-    border-radius: 0 0.45rem 0.45rem 0;
-    background: var(--surface-alt);
-    font-size: 1.65rem;
-    line-height: 1.3;
-    }
-    h3 {
-    margin-top: 2.75rem;
-    padding-bottom: 0.35rem;
-    border-bottom: 1px solid var(--border);
-    font-size: 1.3rem;
-    }
-    h4 {
-    margin-top: 2rem;
-    color: var(--accent);
-    font-size: 1.08rem;
-    }
-    h1,
-    h2,
-    h3,
-    h4 {
-    font-weight: 720;
-    }
-    p,
-    li {
-    max-width: 105ch;
-    }
-    a {
-    color: var(--accent);
-    overflow-wrap: anywhere;
-    }
-    blockquote {
-    margin: 1.5rem 0 2rem;
-    padding: 1rem 1.25rem;
-    border: 1px solid #b6d7f2;
-    border-left: 0.35rem solid var(--accent);
-    border-radius: 0.55rem;
-    background: var(--accent-soft);
-    color: #17365d;
-    }
-    blockquote p {
-    margin: 0.25rem 0;
-    }
-    code {
-    padding: 0.12em 0.35em;
-    border: 1px solid var(--border);
-    border-radius: 0.3rem;
-    background: var(--code-bg);
-    color: #7a2e8e;
-    font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas,
+  font-size: 16px;
+  line-height: 1.68;
+}
+
+body > h1 {
+  margin-top: 0;
+  padding-bottom: 1rem;
+  border-bottom: 1px solid var(--border);
+  font-size: clamp(2rem, 4vw, 3rem);
+  line-height: 1.18;
+  letter-spacing: -0.035em;
+}
+
+body > h1::after {
+  display: block;
+  width: fit-content;
+  max-width: 100%;
+  margin-top: 0.9rem;
+  padding: 0.3rem 0.7rem;
+  border: 1px solid #b6d7f2;
+  border-radius: 999px;
+  background: var(--accent-soft);
+  color: var(--accent);
+  content: "DESIGN V2.5 · COPILOT SDK · $HOME DEFAULT · ALWAYS-ON MAC/WIN · LIVE SESSIONS · TABLE PNG · CAPABILITY-GATED · --YOLO · 实现中";
+  font-size: 0.76rem;
+  font-weight: 800;
+  line-height: 1.45;
+  letter-spacing: 0.08em;
+}
+
+nav#TOC {
+  position: fixed;
+  inset: 0 auto 0 0;
+  width: 19.5rem;
+  overflow-y: auto;
+  padding: 2rem 1.25rem 3rem;
+  border-right: 1px solid var(--border);
+  background: var(--surface);
+  box-shadow: var(--shadow);
+}
+
+nav#TOC::before {
+  display: block;
+  margin-bottom: 0.9rem;
+  color: var(--muted);
+  content: "COPILOTD DESIGN V2.5";
+  font-size: 0.72rem;
+  font-weight: 800;
+  letter-spacing: 0.14em;
+}
+
+nav#TOC > ul {
+  padding-left: 0;
+}
+
+nav#TOC ul {
+  list-style: none;
+}
+
+nav#TOC li {
+  margin: 0.3rem 0;
+}
+
+nav#TOC ul ul {
+  padding-left: 0.95rem;
+  border-left: 1px solid var(--border);
+}
+
+nav#TOC a {
+  color: var(--muted);
+  text-decoration: none;
+}
+
+nav#TOC a:hover,
+nav#TOC a:focus {
+  color: var(--accent);
+  text-decoration: underline;
+  text-underline-offset: 0.18em;
+}
+
+h2 {
+  margin-top: 3.5rem;
+  padding: 0.75rem 1rem;
+  border-left: 0.3rem solid var(--accent);
+  border-radius: 0 0.45rem 0.45rem 0;
+  background: var(--surface-alt);
+  font-size: 1.65rem;
+  line-height: 1.3;
+}
+
+h3 {
+  margin-top: 2.75rem;
+  padding-bottom: 0.35rem;
+  border-bottom: 1px solid var(--border);
+  font-size: 1.3rem;
+}
+
+h4 {
+  margin-top: 2rem;
+  color: var(--accent);
+  font-size: 1.08rem;
+}
+
+h1,
+h2,
+h3,
+h4 {
+  font-weight: 720;
+}
+
+p,
+li {
+  max-width: 105ch;
+}
+
+a {
+  color: var(--accent);
+  overflow-wrap: anywhere;
+}
+
+blockquote {
+  margin: 1.5rem 0 2rem;
+  padding: 1rem 1.25rem;
+  border: 1px solid #b6d7f2;
+  border-left: 0.35rem solid var(--accent);
+  border-radius: 0.55rem;
+  background: var(--accent-soft);
+  color: #17365d;
+}
+
+blockquote p {
+  margin: 0.25rem 0;
+}
+
+code {
+  padding: 0.12em 0.35em;
+  border: 1px solid var(--border);
+  border-radius: 0.3rem;
+  background: var(--code-bg);
+  color: #7a2e8e;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas,
     "Liberation Mono", monospace;
-    font-size: 0.9em;
-    overflow-wrap: anywhere;
-    }
-    pre {
-    max-width: 100%;
-    overflow: auto;
-    padding: 1rem 1.1rem;
-    border: 1px solid var(--border);
-    border-radius: 0.55rem;
-    background: #111827;
-    color: #e5edf8;
-    line-height: 1.5;
-    }
-    pre code {
-    padding: 0;
-    border: 0;
-    background: transparent;
-    color: inherit;
-    overflow-wrap: normal;
-    }
-    pre.mermaid {
-    border-left: 0.3rem solid var(--purple);
-    background: #19152b;
-    }
-    pre.mermaid::before {
-    display: block;
-    margin-bottom: 0.65rem;
-    color: #c4a7ff;
-    content: "MERMAID FLOW";
-    font-size: 0.72rem;
-    font-weight: 800;
-    letter-spacing: 0.11em;
-    }
-    table {
-    display: block;
-    width: 100%;
-    max-width: 100%;
-    margin: 1.25rem 0 2rem;
-    overflow-x: auto;
-    border: 1px solid var(--border);
-    border-collapse: separate;
-    border-spacing: 0;
-    border-radius: 0.55rem;
-    background: var(--surface);
-    box-shadow: var(--shadow);
-    scrollbar-gutter: stable;
-    }
-    thead {
-    background: var(--surface-alt);
-    }
-    th,
-    td {
-    min-width: 9rem;
-    max-width: 36rem;
-    padding: 0.7rem 0.8rem;
-    border-right: 1px solid var(--border);
-    border-bottom: 1px solid var(--border);
-    text-align: left;
-    vertical-align: top;
-    overflow-wrap: anywhere;
-    }
-    th {
-    position: sticky;
-    top: 0;
-    z-index: 1;
-    background: var(--surface-alt);
-    }
-    th:last-child,
-    td:last-child {
-    border-right: 0;
-    }
-    tbody tr:last-child td {
-    border-bottom: 0;
-    }
-    tbody tr:nth-child(even) {
-    background: rgba(240, 244, 249, 0.55);
-    }
-    td code {
-    white-space: normal;
-    }
-    @media (prefers-color-scheme: dark) {
-    :root {
+  font-size: 0.9em;
+  overflow-wrap: anywhere;
+}
+
+pre {
+  max-width: 100%;
+  overflow: auto;
+  padding: 1rem 1.1rem;
+  border: 1px solid var(--border);
+  border-radius: 0.55rem;
+  background: #111827;
+  color: #e5edf8;
+  line-height: 1.5;
+}
+
+pre code {
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: inherit;
+  overflow-wrap: normal;
+}
+
+pre.mermaid {
+  border-left: 0.3rem solid var(--purple);
+  background: #19152b;
+}
+
+pre.mermaid::before {
+  display: block;
+  margin-bottom: 0.65rem;
+  color: #c4a7ff;
+  content: "MERMAID FLOW";
+  font-size: 0.72rem;
+  font-weight: 800;
+  letter-spacing: 0.11em;
+}
+
+table {
+  display: block;
+  width: 100%;
+  max-width: 100%;
+  margin: 1.25rem 0 2rem;
+  overflow-x: auto;
+  border: 1px solid var(--border);
+  border-collapse: separate;
+  border-spacing: 0;
+  border-radius: 0.55rem;
+  background: var(--surface);
+  box-shadow: var(--shadow);
+  scrollbar-gutter: stable;
+}
+
+thead {
+  background: var(--surface-alt);
+}
+
+th,
+td {
+  min-width: 9rem;
+  max-width: 36rem;
+  padding: 0.7rem 0.8rem;
+  border-right: 1px solid var(--border);
+  border-bottom: 1px solid var(--border);
+  text-align: left;
+  vertical-align: top;
+  overflow-wrap: anywhere;
+}
+
+th {
+  position: sticky;
+  top: 0;
+  z-index: 1;
+  background: var(--surface-alt);
+}
+
+th:last-child,
+td:last-child {
+  border-right: 0;
+}
+
+tbody tr:last-child td {
+  border-bottom: 0;
+}
+
+tbody tr:nth-child(even) {
+  background: rgba(240, 244, 249, 0.55);
+}
+
+td code {
+  white-space: normal;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
     --bg: #0d1117;
     --surface: #161b22;
     --surface-alt: #202834;
@@ -479,34 +522,40 @@
     --accent-soft: #12263a;
     --code-bg: #202834;
     --shadow: none;
-    }
-    blockquote {
+  }
+
+  blockquote {
     border-color: #244d73;
     background: #12263a;
     color: #c9e6ff;
-    }
-    code {
+  }
+
+  code {
     color: #d2a8ff;
-    }
-    tbody tr:nth-child(even) {
+  }
+
+  tbody tr:nth-child(even) {
     background: rgba(32, 40, 52, 0.65);
-    }
-    }
-    @media (max-width: 1100px) {
-    body {
+  }
+}
+
+@media (max-width: 1100px) {
+  body {
     padding: 1.5rem 1rem 4rem;
-    }
-    nav#TOC {
+  }
+
+  nav#TOC {
     position: static;
     width: auto;
     max-height: 28rem;
     margin-bottom: 2rem;
     border: 1px solid var(--border);
     border-radius: 0.55rem;
-    }
-    }
-    @media print {
-    :root {
+  }
+}
+
+@media print {
+  :root {
     color-scheme: light;
     --bg: #fff;
     --surface: #fff;
@@ -518,50 +567,54 @@
     --accent-soft: #eef5ff;
     --code-bg: #f3f3f3;
     --shadow: none;
-    }
-    body {
+  }
+
+  body {
     max-width: none;
     padding: 0;
     background: #fff;
     color: #111;
     font-size: 9pt;
-    }
-    nav#TOC {
+  }
+
+  nav#TOC {
     position: static;
     width: auto;
     box-shadow: none;
     page-break-after: always;
-    }
-    h2,
-    h3,
-    h4 {
+  }
+
+  h2,
+  h3,
+  h4 {
     break-after: avoid;
-    }
-    table {
+  }
+
+  table {
     display: table;
     width: 100%;
     overflow: visible;
     box-shadow: none;
     break-inside: auto;
     font-size: 7.5pt;
-    }
-    th {
+  }
+
+  th {
     position: static;
-    }
-    tr {
+  }
+
+  tr,
+  pre,
+  blockquote {
     break-inside: avoid;
-    }
-    pre,
-    blockquote {
-    break-inside: avoid;
-    box-shadow: none;
-    }
-    a {
+  }
+
+  a {
     color: inherit;
     text-decoration: none;
-    }
-    }
-    </style>
+  }
+}
+</style>
 </head>
 <body>
 <header id="title-block-header">
@@ -615,17 +668,76 @@ turn 与 schedule 状态</a></li>
 <li><a href="#通用命令契约" id="toc-通用命令契约">通用命令契约</a></li>
 <li><a href="#命令设计原则" id="toc-命令设计原则">命令设计原则</a></li>
 <li><a href="#copilot-原生命令" id="toc-copilot-原生命令">Copilot
-原生命令</a></li>
+原生命令</a>
+<ul>
+<li><a href="#core稳定或-compatibility-supported-sdk-面"
+id="toc-core稳定或-compatibility-supported-sdk-面">Core：稳定或
+compatibility-supported SDK 面</a></li>
+<li><a href="#projection官方事件的只读-app-视图"
+id="toc-projection官方事件的只读-app-视图">Projection：官方事件的只读
+app 视图</a></li>
+<li><a href="#native-gated有明确-typed-rpc-的-copilot-能力"
+id="toc-native-gated有明确-typed-rpc-的-copilot-能力">Native-Gated：有明确
+typed RPC 的 Copilot 能力</a></li>
+</ul></li>
 <li><a href="#copilotd-扩展命令" id="toc-copilotd-扩展命令">copilotD
-扩展命令</a></li>
+扩展命令</a>
+<ul>
+<li><a href="#project" id="toc-project"><code>/project</code></a></li>
+<li><a href="#queue-与-schedule"
+id="toc-queue-与-schedule"><code>/queue</code> 与
+<code>/schedule</code></a></li>
+<li><a href="#ops-与-context-menu"
+id="toc-ops-与-context-menu"><code>/ops</code> 与 context menu</a></li>
+</ul></li>
 <li><a href="#明确删除不做机械映射"
 id="toc-明确删除不做机械映射">明确删除，不做机械映射</a></li>
-<li><a href="#事件适配" id="toc-事件适配">事件适配</a></li>
+<li><a href="#事件适配" id="toc-事件适配">事件适配</a>
+<ul>
+<li><a href="#完整-raw-event-处置" id="toc-完整-raw-event-处置">完整 raw
+event 处置</a></li>
+<li><a href="#hooks-与事件边界" id="toc-hooks-与事件边界">Hooks
+与事件边界</a></li>
+</ul></li>
 <li><a href="#discord-renderer" id="toc-discord-renderer">Discord
-Renderer</a></li>
+Renderer</a>
+<ul>
+<li><a href="#render-pipeline" id="toc-render-pipeline">Render
+pipeline</a></li>
+<li><a href="#表格显示协议" id="toc-表格显示协议">表格显示协议</a></li>
+<li><a href="#其他内容" id="toc-其他内容">其他内容</a></li>
+</ul></li>
 <li><a href="#clauded-issues-避雷矩阵"
 id="toc-clauded-issues-避雷矩阵">claudeD issues 避雷矩阵</a></li>
-<li><a href="#关键事件流程" id="toc-关键事件流程">关键事件流程</a></li>
+<li><a href="#关键事件流程" id="toc-关键事件流程">关键事件流程</a>
+<ul>
+<li><a href="#启动" id="toc-启动">启动</a></li>
+<li><a href="#新-threadsession-与普通-turn"
+id="toc-新-threadsession-与普通-turn">新 thread/session 与普通
+turn</a></li>
+<li><a href="#--yolosession-permission-posture-与-typed-request"
+id="toc---yolosession-permission-posture-与-typed-request"><code>--yolo</code>、session
+permission posture 与 typed request</a></li>
+<li><a href="#后台-task-与-autopilot-continuation-evidence"
+id="toc-后台-task-与-autopilot-continuation-evidence">后台 task 与
+Autopilot continuation evidence</a></li>
+<li><a href="#ask-userelicitation-与-plan"
+id="toc-ask-userelicitation-与-plan">Ask-user、elicitation 与
+plan</a></li>
+<li><a href="#autopilot" id="toc-autopilot">Autopilot</a></li>
+<li><a href="#附件" id="toc-附件">附件</a></li>
+<li><a href="#abortcloseresumedelete"
+id="toc-abortcloseresumedelete">Abort、close、resume、delete</a></li>
+<li><a href="#model-与-session-config-generation"
+id="toc-model-与-session-config-generation">Model 与 session config
+generation</a></li>
+<li><a href="#compactforkworktree"
+id="toc-compactforkworktree">Compact、fork、worktree</a></li>
+<li><a href="#subagentfleet-与-scheduler"
+id="toc-subagentfleet-与-scheduler">Subagent/fleet 与 scheduler</a></li>
+<li><a href="#runtime-crash" id="toc-runtime-crash">Runtime
+crash</a></li>
+</ul></li>
 <li><a href="#超时重试与错误分类"
 id="toc-超时重试与错误分类">超时、重试与错误分类</a></li>
 <li><a href="#会话存活保证与边界"
@@ -662,20 +774,21 @@ copilotD 扩展</a></li>
 </nav>
 <h1 id="copilotd-详细设计与实施计划">copilotD 详细设计与实施计划</h1>
 <blockquote>
-<p>当前阶段：详细设计 v2.5 已批准，durable/capability foundation、Discord
-core、interaction router 与 background-task reconciliation
-已实现；当前继续按 capability gate 补齐产品能力并做真实平台验收。</p>
+<p>当前阶段：详细设计 v2.5 已批准，durable/capability
+foundation、Discord core、 interaction router 与 background-task
+reconciliation 已实现；当前继续按 capability gate
+补齐产品能力并做真实平台验收。</p>
 <p>本版固定前提：单用户、私有部署、Copilot runtime 全程
 <code>--yolo</code>，不设计多用户共享、
 工具确认流程、安全沙箱或租户隔离。</p>
 <p>2026-08-05 实测 SDK 1.0.8 / runtime 1.0.73 / protocol 3，generated
 event 为 <strong>114</strong> 个；<code>factory.run_updated</code> 与
-<code>session.context_cleared</code> 仅存在于 main branch，不归入
-1.0.8。stdio <code>--yolo</code>、full allow-all、 create/resume 预注册 callback、跨
-idle 回调、history/eventLog、usage/context、native <code>/after</code>
-和 1/5/10 MiB frame 可用；sidecar client transport 断开后 session
-retention 不成立，因此 当前固定 bundled-runtime topology，不宣称
-detached continuation。</p>
+<code>session.context_cleared</code> 仅存在于 main branch， 不归入
+1.0.8。stdio <code>--yolo</code>、full allow-all、 create/resume 预注册
+callback、跨 idle 回调、history/eventLog、usage/context、native
+<code>/after</code> 和 1/5/10 MiB frame 可用；sidecar client transport
+断开后 session retention 不成立，因此 当前固定 bundled-runtime
+topology，不宣称 detached continuation。</p>
 <p>交付格式：仓库 <code>docs/</code> 内同时提交 Markdown 内容源和
 standalone HTML。</p>
 </blockquote>
@@ -697,9 +810,9 @@ Claude 专属功能的一比一复刻；Agent 能力、
 <li>架构：Python SDK 通过 JSON-RPC 驱动 Copilot CLI Agent Runtime</li>
 <li>Runtime：Python wheel 对应的 CLI runtime 可自动下载，也可连接独立
 headless runtime</li>
-<li>鉴权：本地已登录的 Copilot CLI 用户即可；GitHub token/OAuth、GitHub App 或
-BYOK 是 SDK 可选路径。本产品仅把显式 GitHub token 用于启用 managed-settings
-session options。</li>
+<li>鉴权：本地已登录的 Copilot CLI 用户即可；GitHub token/OAuth、GitHub
+App 或 BYOK 是 SDK 可选路径。本产品仅把显式 GitHub token 用于启用
+managed-settings session options。</li>
 <li>主要能力：流式输出、工具调用、文件编辑、持久会话、权限回调、MCP、Hooks、
 自定义
 Agent、Skills、Plugins、图片输入、模型切换、上下文压缩、用量指标</li>
@@ -927,7 +1040,7 @@ ID，禁止第二次 create</td>
 <code>factory.run_updated</code>、<code>session.context_cleared</code></td>
 <td><code>ephemeral is True</code> 才归 ephemeral，否则归
 durable；unknown type 保留 raw_type/raw payload；升级必须全量 diff
-enum</td>
+enum，不能把 main-only 事件计入 1.0.8</td>
 </tr>
 <tr>
 <td><code>parentId</code></td>
@@ -1105,9 +1218,10 @@ exactly-once 与 TaskRegistry 管理。</li>
 后、首次 send 前验证 session 的 full allow-all/approve-all 已生效。普通
 typed permission request 自动批准，不生成 Discord
 审批卡，也不存在任何可切换配置。</li>
-<li><code>setup</code>、service install、session create/resume 和 Discord
-thread creation 都接受本地 Copilot CLI 登录态；<code>COPILOTD_GITHUB_TOKEN</code>
-可选。仅当显式 token 存在时才传递
+<li><code>setup</code>、service install、session create/resume 和
+Discord thread creation 都接受本地 Copilot CLI
+登录态；<code>COPILOTD_GITHUB_TOKEN</code> 可选。仅当显式 token
+存在时才传递
 <code>github_token</code>/<code>enable_managed_settings</code>，缺失时省略这两个
 option，使用正常 runtime 登录态。</li>
 <li>不实现 guild/user/role allowlist、Owner/Admin
@@ -1189,28 +1303,29 @@ outcome unknown</td>
 <li>manager 写 <code>requested</code> fence，同时记录 PID、OS process
 start、generation 和 event-journal high-water mark；</li>
 <li>bot 关闭全局 create/resume/send admission，停止并 await
-queue/task/permission/owner-renew producer，冻结并 await mailbox，再 drain
-reducer inbox；</li>
+queue/task/permission/owner-renew producer，冻结并 await mailbox，再
+drain reducer inbox；</li>
 <li><code>acknowledged</code> 通过 producer counter + journal high-water
 的同一条 CAS 提交；任何 SDK callback 或 internal producer 在
-requested/acknowledged/prepared/committed 阶段都持久计数，ACK
+requested/acknowledged/prepared/committed 阶段都持久计数， ACK
 后到达则令可逆阶段 violated；</li>
 <li>normal restart 只在 fenced snapshot 无 blocker 时进入 owner
-handoff；force 先原子提交 <code>prepared</code>，只把真实 in-flight 结果置
-unknown，并保持 local queued/cancelled/terminal；</li>
-<li><code>committed</code> 与 owner lease expiry、binding recovery_unknown
-同事务；此后失败只能 fail-closed terminate，不能 release/reopen。新
-PID/generation/process-start 在启动 attach 前完成 committed fence
-adoption，随后 queued claim 以新 generation/fence 重建 submission lease。</li>
+handoff；force 先原子提交 <code>prepared</code>，只把真实 in-flight
+结果置 unknown，并保持 local queued/cancelled/terminal；</li>
+<li><code>committed</code> 与 owner lease expiry、binding
+recovery_unknown 同事务；此后失败只能 fail-closed terminate，不能
+release/reopen。新 PID/generation/process-start 在启动 attach 前完成
+committed fence adoption，随后 queued claim 以新 generation/fence 重建
+submission lease。</li>
 </ol>
-<p>schema 11 将 service-control protocol 固定为 v2：旧 v1 worker 在建立 v2
-fence 前必须由 OS manager 停止并证明原 PID/process-start 已退出；新 worker
-通过私有 handoff token、effective manager PID/start 和 generation
-三重证明后才能 adoption。inbox observer 安装与 reserve 共用 barrier；overflow
-或非阻塞 SQLite accounting 失败写 0600 durable watermark，任何 watermark
-都会阻止 ACK/commit。rollback 有 persisted pending/attempts/complete 状态并有界重试；
-prepared/committed worker 自行退出，避免 fresh heartbeat 掩盖 stranded
-transaction。</p>
+<p>schema 11 将 service-control protocol 固定为 v2：旧 v1 worker 在建立
+v2 fence 前必须由 OS manager 停止并证明原 PID/process-start 已退出；新
+worker 通过私有 handoff token、effective manager PID/start 和 generation
+三重证明后才能 adoption。inbox observer 安装与 reserve 共用
+barrier；overflow 或非阻塞 SQLite accounting 失败写 0600 durable
+watermark，任何 watermark 都会阻止 ACK/commit。rollback 有 persisted
+pending/attempts/complete 状态并有界重试； prepared/committed worker
+自行退出，避免 fresh heartbeat 掩盖 stranded transaction。</p>
 <h3 id="heartbeat-协议">Heartbeat 协议</h3>
 <p>bot 每 30 秒原子写入 heartbeat JSON；不是只 touch mtime：</p>
 <div class="sourceCode" id="cb3"><pre
@@ -1377,7 +1492,8 @@ current-user Scheduled Task：</p>
 <tbody>
 <tr>
 <td><code>copilotD Runtime</code></td>
-<td>AtLogOn；失败每 1 分钟重启；<code>ExecutionTimeLimit=PT0S</code></td>
+<td>AtLogOn；失败每 1
+分钟重启；<code>ExecutionTimeLimit=PT0S</code></td>
 </tr>
 <tr>
 <td><code>copilotD Bot</code></td>
@@ -1530,8 +1646,8 @@ idle。</li>
 <p>这里没有权限层：没有配置对象、审批状态机、session/project
 级切换或相关命令。唯一行为 就是 runtime 启动时启用
 <code>--yolo</code>，并在每个 session attach 后证明有效权限 posture 确为
-full allow-all。SDK 若仍发送普通 typed permission request 则返回 owner-fenced
-<code>ApproveOnce</code>。</p>
+full allow-all。SDK 若仍发送普通 typed permission request 则返回
+owner-fenced <code>ApproveOnce</code>。</p>
 <table>
 <thead>
 <tr>
@@ -1546,7 +1662,8 @@ full allow-all。SDK 若仍发送普通 typed permission request 则返回 owner
 </tr>
 <tr>
 <td>Runtime 鉴权</td>
-<td>本地 Copilot CLI 登录态有效；显式 GitHub token 可选，仅存在时启用 managed settings</td>
+<td>本地 Copilot CLI 登录态有效；显式 GitHub token 可选，仅存在时启用
+managed settings</td>
 </tr>
 <tr>
 <td>Session attach</td>
@@ -2019,10 +2136,10 @@ session（官方对 concurrent access 不提供定义）。
 close 已在进行时才提交 <code>binding_intent=CLOSED</code>，其他
 routine/error shutdown 均先进入 recovery/diagnostics，不能从
 <code>shutdownType</code> 猜用户意图。</p>
-<p>owner lease TTL 固定 60 秒、每 15 秒续租，保留 40 秒 mutation headroom
-与至少 5 秒调度抖动余量；每次 takeover 在 SQLite transaction 内分配严格
-递增的 <code>fence_token</code>。所有 mutating
-RPC dispatch、snapshot commit 和 callback reduction 都
+<p>owner lease TTL 固定 60 秒、每 15 秒续租，保留 40 秒 mutation
+headroom 与至少 5 秒调度抖动 余量；每次 takeover 在 SQLite transaction
+内分配严格 递增的 <code>fence_token</code>。所有 mutating RPC
+dispatch、snapshot commit 和 callback reduction 都
 必须携带并重新校验当前 token，不能只在 attach
 时检查一次。续租失败后立即暂停新 mutating RPC；一旦发现 token
 已被替换，旧 runtime 进入 fenced/quarantined，旧 callback 只计
@@ -2930,15 +3047,18 @@ thread 组织，不叫 Copilot mode</td>
 </tr>
 <tr>
 <td><code>/project variable set name value</code></td>
-<td>保存项目进程环境变量；显式 project only</td>
+<td>保存 future-session reference value；显式 project only；只解析到
+typed MCP/environment reference，不批量注入 runtime process
+environment</td>
 </tr>
 <tr>
 <td><code>/project variable list reveal=false</code></td>
-<td>项目进程环境变量视图</td>
+<td>项目 reference value 视图</td>
 </tr>
 <tr>
 <td><code>/project variable remove name</code></td>
-<td>删除项目环境变量；已有 session snapshot 不热变更</td>
+<td>删除项目 reference value；被 MCP/environment binding 引用时 fail
+closed；已有 session snapshot 不热变更</td>
 </tr>
 <tr>
 <td><code>/project mcp action</code></td>
@@ -3305,13 +3425,12 @@ session-wide idle handler。</li>
 <li>Fallback：<code>UnknownSdkEvent</code></li>
 </ul>
 <h4 id="完整-raw-event-处置">完整 raw event 处置</h4>
-<p>下表逐项覆盖 SDK 1.0.8 Python generated
-<code>SessionEventType</code> 的 <strong>114</strong> 个 enum value（含
-<code>unknown</code>）；main branch 额外的
-<code>factory.run_updated</code> 与
-<code>session.context_cleared</code> 单独跟踪，不计入 pinned SDK。只有官方 streaming
-文档事件作为首版 稳定渲染契约；generated-only 事件需 fixture
-后再提升。“UI 无”仍会更新状态或审计。</p>
+<p>下表逐项覆盖 SDK 1.0.8 Python generated <code>SessionEventType</code>
+的 <strong>114</strong> 个 enum value（含 <code>unknown</code>）；main
+branch 额外的 <code>factory.run_updated</code> 与
+<code>session.context_cleared</code> 单独跟踪，不计入 pinned
+SDK。只有官方 streaming 文档事件作为首版 稳定渲染契约；generated-only
+事件需 fixture 后再提升。“UI 无”仍会更新状态或审计。</p>
 <table>
 <thead>
 <tr>
@@ -4397,10 +4516,10 @@ permission posture 与 typed request</h4>
     end</code></pre>
 <p>该流程没有 Discord 按钮、timeout 或可选 permission
 profile。<code>--yolo</code>/allow-all 无法确认时 session 保持 degraded
-并拒绝 dispatch；不能偷偷退回逐次审批。<code>--yolo</code> 不等于能绕过 GitHub
-组织托管策略；runtime 报告的 managed policy/request 无论是否配置显式 token，都返回
-<code>UserNotAvailable</code>，只显示真实 platform limitation
-并确定性失败，不无限 pending。</p>
+并拒绝 dispatch；不能偷偷退回逐次审批。<code>--yolo</code> 不等于能绕过
+GitHub 组织托管策略；runtime 报告的 managed policy/request
+无论是否配置显式 token，都返回 <code>UserNotAvailable</code>，只显示真实
+platform limitation 并确定性失败，不无限 pending。</p>
 <h4 id="后台-task-与-autopilot-continuation-evidence">后台 task 与
 Autopilot continuation evidence</h4>
 <pre class="mermaid"><code>sequenceDiagram
@@ -5332,25 +5451,27 @@ unknown</td>
 <code>0010</code>–<code>0014</code>、Protocol
 <code>0015</code>–<code>0019</code>、Scheduler
 <code>0020</code>–<code>0028</code>、Protocol compatibility
-<code>0029</code>、Discord surface <code>0030</code>–<code>0037</code>、保留
+<code>0029</code>、Discord surface
+<code>0030</code>–<code>0037</code>、保留
 <code>0038</code>–<code>0039</code>、Operations forward migrations
 <code>0040</code>–<code>0044</code>、session deletion cleanup
-<code>0045</code>；project
-<code>$HOME</code>
-fallback/cwd snapshot、owner fence、creation saga、strict-UUID event
+<code>0045</code>；project <code>$HOME</code> fallback/cwd
+snapshot、owner fence、creation saga、strict-UUID event
 journal、reducer-owned operation/submission/native-command
 receipts、submission-task links、liveness leases、startup recovery
 inventory 与 eager resume；attach 时按 current state 结算 pending
-agent、强制 uncertain remote off；force restart 使用 producer/journal dual
-epoch、loss watermark admission fence 与 owner handoff</td>
+agent、强制 uncertain remote off；force restart 使用 producer/journal
+dual epoch、loss watermark admission fence 与 owner handoff</td>
 <td>bundled runtime 进程死亡后的 in-flight execution 仍只能标 outcome
-unknown；真实 fixture 无 current-promotable task，task promote 保持 gated</td>
+unknown；真实 fixture 无 current-promotable task，task promote 保持
+gated</td>
 </tr>
 <tr>
 <td>eventLog <code>read/tail</code> durable backfill（固定过滤
 ephemeral）、cursor epoch/rebase/predecessor-gap diagnostics、overflow
-freeze/backfill/generation replacement；activity/queue/task/remote/schedule
-snapshot requested/applied epoch 与 query watermark；crossing command/agent
+freeze/backfill/generation
+replacement；activity/queue/task/remote/schedule snapshot
+requested/applied epoch 与 query watermark；crossing command/agent
 snapshot 禁止 merge 并强制 requery</td>
 <td>ephemeral idle/delta 离开 live window 后不可恢复，不从 transcript 猜
 terminal；compaction 无 completion evidence 时保持 unknown 并阻塞普通
@@ -5358,21 +5479,20 @@ submission</td>
 </tr>
 <tr>
 <td>durable app FIFO；fresh readiness snapshot、reducer
-caught-up、config/agent/remote/schedule/task known gate 后只派发队首；attachment
-manifest READY + hash/size 复验，无 attachment-free
-fallback；<code>/queue add/list/remove/clear</code></td>
-<td>native queue entry 没有 stable opaque ID 时只以 snapshot-local opaque key
-诊断；transport
-ambiguity 不自动重放</td>
+caught-up、config/agent/remote/schedule/task known gate
+后只派发队首；attachment manifest READY + hash/size 复验，无
+attachment-free
+fallback；<code>/queue add/list/remove/clear</code>；project variables
+只解析到 typed MCP/environment reference，不作为任意 process environment
+注入</td>
+<td>native queue entry 没有 stable opaque ID 时只以 snapshot-local
+opaque key 诊断；transport ambiguity 不自动重放</td>
 </tr>
 <tr>
 <td>Discord core 命令；strict dynamic builtin manifest；Native-Gated
-<code>/ask</code>、<code>/session compact</code>、<code>/fleet</code>、<code>/tasks</code>、<code>/agent list|current</code>、<code>/after|every list|cancel</code>、<code>/remote status|off</code>、<code>/review</code>、<code>/security-review</code>、<code>/research</code>、<code>/rubber-duck</code>；thread-first
-<code>/session delete session-id?</code>；全部 action 由 exact capability 决定</td>
-<td>current-runtime fork 仍 capability-gated 且不注册；<code>/after|every create</code>
-因 real invoke 返回 <code>text</code> 而非 required <code>completed</code>
-不注册；agent select/deselect、task promote、remote on/export 的 real gate
-未通过；elicitation/MCP OAuth 仍待接入</td>
+<code>/ask</code>、<code>/session compact</code>、<code>/fleet</code>、<code>/tasks</code>、`/agent
+list</td>
+<td>current<code>、</code>/after</td>
 </tr>
 <tr>
 <td>durable input attachment manifest、hash/size 复验、图片 blob
@@ -5385,32 +5505,38 @@ retry-after 仍需真实 gateway fixture</td>
 <tr>
 <td>tool/subagent/agent-scoped output 归并为原 thread 的单条 TaskDeck；4
 秒 cadence、pending coalescing、terminal
-flush、select/expand/collapse/prev/next；<code>assistant.reasoning_delta</code>
-仅进入 coalesced thinking status、final reasoning 仅显示 configured concise
-summary、<code>assistant.streaming_delta</code> 不进入 Discord UI；typed task
-list/show/progress/message/cancel-all/remove/wait 与 Fleet
-projection；&gt;=8000 字符 tool result/error 逐字附件化；零 child-thread 路径</td>
+flush、select/expand/collapse/prev/next；reasoning delta/coalesced
+thinking 与 configured final concise reasoning summary
+已实现，<code>assistant.streaming_delta</code> 不进入 Discord
+UI；structured tool diff 与 local workspace diff artifact lane；typed
+task list/show/progress/message/cancel-all/remove/wait 与 Fleet
+projection；&gt;=8000 字符 tool result/error 逐字附件化；零 child-thread
+路径</td>
 <td>real current-promotable fixture 未通过，promote action
-不注册；完整 diff artifact lane 尚未实现</td>
+不注册；Discord 上的 diff 附件/图片 delivery 仍受 upload limit 与
+archived/locked thread 约束</td>
 </tr>
 <tr>
-<td>durable <code>DELETING → DELETE_UNKNOWN/DELETED</code> permanent-delete
-saga；stable SDK <code>delete_session(session_id)</code> + metadata not-found
-reconcile；non-deleted app schedule reference fail-closed；active target force
-teardown、15 秒 bounded native task/schedule/queue/remote cleanup、unprovable result
-unknown；confirmed delete 后才清 attachment/worktree metadata；abort 等 correlated
-abort + aborted-idle；unexpected <code>session.shutdown</code> terminalizes current
-handle and enters recovery</td>
-<td>SDK response loss 仍需显式 retry，同一 mapping/session ID 保留；缺失 native
-capability 明确记录 unknown；只有 explicit close 可完成 CLOSED</td>
+<td>durable <code>DELETING → DELETE_UNKNOWN/DELETED</code>
+permanent-delete saga；stable SDK
+<code>delete_session(session_id)</code> + metadata not-found
+reconcile；non-deleted app schedule reference fail-closed；active target
+force teardown、15 秒 bounded native task/schedule/queue/remote
+cleanup、unprovable result unknown；confirmed delete 后才清
+attachment/worktree metadata；abort 等 correlated abort +
+aborted-idle；unexpected <code>session.shutdown</code> terminalizes
+current handle and enters recovery</td>
+<td>SDK response loss 仍需显式 retry，同一 mapping/session ID 保留；缺失
+native capability 明确记录 unknown；只有 explicit close 可完成
+CLOSED</td>
 </tr>
 <tr>
-<td>共享 TaskRegistry、failure consumer、10 分钟 active-execution SUSPECT +
-non-destructive ping、结构化 heartbeat、完整 setup preflight、fresh
-PID/generation/current-fence status、bounded restart saga、restart-storm
-alert、10 MiB × 7 JSON log、macOS LaunchAgent 与 Windows Scheduled Task 的
-bundled 2-unit / sidecar 3-unit install/status/uninstall/effective-definition
-contract</td>
+<td>共享 TaskRegistry、failure consumer、10 分钟 active-execution
+SUSPECT + non-destructive ping、结构化 heartbeat、完整 setup
+preflight、fresh PID/generation/current-fence status、bounded restart
+saga、restart-storm alert、10 MiB × 7 JSON log、macOS LaunchAgent 与
+Windows Scheduled Task 的 bundled 2-unit / sidecar 3-unit
+install/status/uninstall/effective-definition contract</td>
 <td>默认 bundled runtime 没有独立 runtime service；sidecar
 三组件需要显式 runtime argv/URI/connection token；真实 credentialed
 install、sleep/wake、macOS soak 与 Windows 实机未在 deterministic suite
@@ -5418,15 +5544,18 @@ install、sleep/wake、macOS soak 与 Windows 实机未在 deterministic suite
 </tr>
 </tbody>
 </table>
-<p>当前 deterministic 验证基线包括 <code>ruff check src tests scripts</code>、完整
-pytest、CLI JSON/error contract、service definition/effective-state simulations
-与 wheel/sdist isolated install。仓库内 hash-checked fixture 固定 SDK 1.0.8 / runtime 1.0.73 /
-protocol 3、114-event inventory 与 capability evidence；<code>copilotd
-native-acceptance --real</code> 还要求 exact 环境确认，按 suite 创建 disposable
-repo/session、执行 supported mutation（包括 model set/readback/restore）、清理
-remote/schedule/session，并生成 sanitized JSON
-evidence；unsupported action 保存 real discovery/gate，不由 deterministic fixture
-冒充。这个快照用于区分“已验证实现”和后续设计，不降低以下章节对最终产品的契约要求。</p>
+<p>当前 deterministic 验证基线包括
+<code>ruff check src tests scripts</code>、完整 pytest、CLI JSON/error
+contract、service definition/effective-state simulations 与 wheel/sdist
+isolated install。仓库内 hash-checked fixture 固定 SDK 1.0.8 / runtime
+1.0.73 / protocol 3、114-event inventory 与 capability
+evidence；<code>copilotd native-acceptance --real</code> 还要求 exact
+环境确认，按 suite 创建 disposable repo/session、执行 supported
+mutation（包括 model set/readback/restore）、清理
+remote/schedule/session，并生成 sanitized JSON evidence；unsupported
+action 保存 real discovery/gate，不由 deterministic fixture
+冒充。这个快照用于区分“已验证实现”和后续
+设计，不降低以下章节对最终产品的契约要求。</p>
 <h3 id="html-交付要求">HTML 交付要求</h3>
 <ul>
 <li>以本文件“目标、调研结论、详细设计、实施阶段、风险和官方依据”为唯一内容源。</li>
@@ -5553,8 +5682,9 @@ restart-storm alert。</li>
 </ul>
 <h2 id="待办">待办</h2>
 <ol type="1">
-<li>补齐 eventLog backfill、elicitation/MCP OAuth、reasoning
-summary/diff artifact lane 与 crash/reconnect reconciliation。</li>
+<li>继续加固 eventLog backfill 与 crash/reconnect
+reconciliation；elicitation/MCP OAuth、 reasoning summary 及
+structured/local diff artifact lane 已进入 deterministic baseline。</li>
 <li>按 capability fixture 逐项实现 Native-Gated
 ask/Fleet/Tasks/agents/after/every/remote/
 review/security-review/research/rubber-duck；fixture

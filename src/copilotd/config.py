@@ -132,7 +132,6 @@ class Settings(BaseSettings):
         ),
     )
     discord_guild_id: int | None = None
-    discord_operator_ids: str = ""
     mention_required: bool = False
     log_level: str = "INFO"
     sdk_log_level: str = "info"
@@ -731,17 +730,6 @@ class Settings(BaseSettings):
     @property
     def heartbeat_path(self) -> Path:
         return self.cache_dir / "heartbeat.json"
-
-    @property
-    def operator_user_ids(self) -> frozenset[int]:
-        try:
-            return frozenset(
-                int(item.strip()) for item in self.discord_operator_ids.split(",") if item.strip()
-            )
-        except ValueError as error:
-            raise ValueError(
-                "COPILOTD_DISCORD_OPERATOR_IDS must contain comma-separated user IDs"
-            ) from error
 
 
 def load_settings() -> Settings:

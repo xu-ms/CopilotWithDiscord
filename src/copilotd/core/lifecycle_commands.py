@@ -461,6 +461,10 @@ class WorktreeCommandService:
     def __init__(self, manager: WorktreeManager) -> None:
         self._manager = manager
 
+    @property
+    def history_fork_available(self) -> bool:
+        return self._manager.history_fork_available
+
     async def create(
         self,
         *,

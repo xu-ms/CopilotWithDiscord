@@ -595,6 +595,10 @@ class WorktreeManager:
         self._recovery_retry_tasks: dict[str, asyncio.Task[None]] = {}
         self._active_git_holders: set[str] = set()
 
+    @property
+    def history_fork_available(self) -> bool:
+        return self._adapter.history_fork_available
+
     async def create(
         self,
         *,

@@ -176,6 +176,19 @@ class LocalOpsSurface:
             "truncated": remaining <= 0,
         }
 
+    async def log_dump(self, *, correlation_id: str | None = None) -> dict[str, Any]:
+        logs, timeline = await asyncio.gather(
+            self.log_tail(correlation_id=correlation_id),
+            self.event_dump(),
+        )
+        return _redact_structure(
+            {
+                "correlation_id": correlation_id,
+                "logs": logs,
+                "event_timeline": timeline,
+            }
+        )
+
     async def event_dump(self, *, session_id: str | None = None) -> dict[str, Any]:
         rows = await self._database.fetchall(
             """

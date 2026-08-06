@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import inspect
 from collections.abc import Awaitable, Callable, Mapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any, Protocol
 
 
@@ -123,6 +123,8 @@ class CommandResponse:
     content: str
     ephemeral: bool = True
     followup: bool = False
+    attachment: bytes | None = None
+    filename: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -147,6 +149,15 @@ class CommandResponder(Protocol):
     async def send_inline(self, content: str, *, ephemeral: bool = True) -> None: ...
 
     async def send_followup(self, content: str, *, ephemeral: bool = True) -> None: ...
+
+    async def send_file(
+        self,
+        message: str,
+        *,
+        content: bytes,
+        filename: str,
+        ephemeral: bool = True,
+    ) -> None: ...
 
     def warn(self, message: str, **fields: Any) -> None: ...
 
@@ -350,6 +361,8 @@ class OpsSurfaceAdapter(Protocol):
 
     async def log_tail(self, *, correlation_id: str | None = None) -> Mapping[str, Any]: ...
 
+    async def log_dump(self, *, correlation_id: str | None = None) -> Mapping[str, Any]: ...
+
     async def event_dump(self, *, session_id: str | None = None) -> Mapping[str, Any]: ...
 
 
@@ -513,6 +526,14 @@ class CommandExecutor:
         *,
         force_followup: bool = False,
     ) -> None:
+        if response.attachment is not None:
+            await responder.send_file(
+                response.content,
+                content=response.attachment,
+                filename=response.filename or "copilotd-command-result.txt",
+                ephemeral=response.ephemeral,
+            )
+            return
         if response.followup or force_followup:
             await responder.send_followup(response.content, ephemeral=response.ephemeral)
             return
@@ -532,10 +553,11 @@ def command_error_code(error: CDCommandError) -> str:
 
 def _normalize_response(result: ResponseLike) -> CommandResponse | None:
     if result is None:
-        return None
+        return CommandResponse(content="Command completed.")
     if isinstance(result, CommandResponse):
-        return result
-    return CommandResponse(content=str(result))
+        return result if result.content.strip() else replace(result, content="Command completed.")
+    content = str(result)
+    return CommandResponse(content=content if content.strip() else "Command completed.")
 
 
 def _bounded_error_text(error: CDCommandError, limit: int) -> str:

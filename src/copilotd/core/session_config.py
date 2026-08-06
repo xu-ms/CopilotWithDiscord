@@ -45,6 +45,7 @@ class SessionLaunchOptions:
         variables = {str(item["name"]): str(item["value"]) for item in payload.get("variables", [])}
         cwd = str(payload["cwd"])
         mcp_servers: list[tuple[str, McpServerOptions]] = []
+        resolved_environment_references: set[str] = set()
         for item in payload.get("mcp_servers", []):
             if not item.get("enabled", True):
                 continue
@@ -62,6 +63,7 @@ class SessionLaunchOptions:
                         f"MCP server {name!r} references missing project variables: "
                         + ", ".join(missing)
                     )
+                resolved_environment_references.update(references)
                 options.update(
                     {
                         "type": "stdio",
@@ -102,7 +104,9 @@ class SessionLaunchOptions:
             if item.get("enabled", True)
         )
         return cls(
-            environment=tuple(sorted(variables.items())),
+            environment=tuple(
+                (name, variables[name]) for name in sorted(resolved_environment_references)
+            ),
             mcp_servers=tuple(mcp_servers),
             skill_directories=tuple(
                 str(Path(str(item["path"])))

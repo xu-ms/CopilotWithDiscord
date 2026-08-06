@@ -55,6 +55,16 @@ class FakeResponder:
         if self.followup_error is not None:
             raise self.followup_error
 
+    async def send_file(
+        self,
+        message: str,
+        *,
+        content: bytes,
+        filename: str,
+        ephemeral: bool = True,
+    ) -> None:
+        self.calls.append(("file", message, content, filename, ephemeral))
+
     def warn(self, message: str, **fields: object) -> None:
         payload = {"message": message, **fields}
         self.warnings.append(payload)
@@ -101,6 +111,49 @@ async def test_command_executor_defer_then_inline_send() -> None:
     assert outcome.deferred is True
     assert outcome.followup_used is False
     assert outcome.response is not None and outcome.response.content == "done"
+
+
+@pytest.mark.asyncio
+async def test_command_executor_always_acknowledges_empty_success_and_supports_attachment() -> None:
+    responder = FakeResponder()
+    executor = CommandExecutor()
+
+    none_result = await executor.execute(
+        responder,
+        CommandInvocation(name="/empty", source="discord"),
+        lambda _invocation: None,
+    )
+    empty_text = await executor.execute(
+        responder,
+        CommandInvocation(name="/empty-text", source="discord"),
+        lambda _invocation: "",
+    )
+    empty_response = await executor.execute(
+        responder,
+        CommandInvocation(name="/empty-response", source="discord"),
+        lambda _invocation: CommandResponse(""),
+    )
+    attached = await executor.execute(
+        responder,
+        CommandInvocation(name="/dump", source="discord"),
+        lambda _invocation: CommandResponse(
+            "attached",
+            attachment=b"redacted",
+            filename="diagnostics.json",
+        ),
+    )
+
+    assert none_result.response is not None
+    assert empty_text.response is not None
+    assert empty_response.response is not None
+    assert {
+        none_result.response.content,
+        empty_text.response.content,
+        empty_response.response.content,
+    } == {"Command completed."}
+    assert responder.calls.count(("inline", "Command completed.", True)) == 3
+    assert ("file", "attached", b"redacted", "diagnostics.json", True) in responder.calls
+    assert attached.response is not None and attached.response.filename == "diagnostics.json"
 
 
 @pytest.mark.asyncio

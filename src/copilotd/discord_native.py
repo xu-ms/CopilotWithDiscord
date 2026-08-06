@@ -1,12 +1,12 @@
 from __future__ import annotations
 
-import io
 import json
 from typing import Any, Protocol
 
 import discord
 from discord import app_commands
 
+from copilotd.core.commands import CommandInvocation, CommandOperation
 from copilotd.core.native import NativeTaskAction
 from copilotd.core.session_runtime import SessionRuntime
 from copilotd.sdk.capabilities import CapabilityManifest
@@ -19,6 +19,13 @@ class NativeDiscordHost(Protocol):
         self,
         interaction: discord.Interaction,
     ) -> SessionRuntime: ...
+
+    async def _run_command(
+        self,
+        interaction: discord.Interaction,
+        name: str,
+        operation: CommandOperation,
+    ) -> None: ...
 
 
 class NativeDiscordRegistrar:
@@ -42,18 +49,19 @@ class NativeDiscordRegistrar:
                 interaction: discord.Interaction,
                 focus: str | None = None,
             ) -> None:
-                await interaction.response.defer(ephemeral=True)
-                result = await (await self._runtime(interaction)).compact(
-                    focus,
-                    idempotency_key=f"interaction:{interaction.id}",
-                )
-                compacted = result["result"]
-                await interaction.followup.send(
-                    "Compaction confirmed: "
-                    f"`{int(compacted.get('messagesRemoved', 0))}` messages and "
-                    f"`{int(compacted.get('tokensRemoved', 0))}` tokens removed.",
-                    ephemeral=True,
-                )
+                async def operation(_: CommandInvocation) -> str:
+                    result = await (await self._runtime(interaction)).compact(
+                        focus,
+                        idempotency_key=f"interaction:{interaction.id}",
+                    )
+                    compacted = result["result"]
+                    return (
+                        "Compaction confirmed: "
+                        f"`{int(compacted.get('messagesRemoved', 0))}` messages and "
+                        f"`{int(compacted.get('tokensRemoved', 0))}` tokens removed."
+                    )
+
+                await self._host._run_command(interaction, "session compact", operation)
 
         if "ask" in roots:
 
@@ -62,12 +70,13 @@ class NativeDiscordRegistrar:
                 description="Ask a no-tools side question without changing history",
             )
             async def ask(interaction: discord.Interaction, question: str) -> None:
-                await interaction.response.defer(ephemeral=True)
-                answer = await (await self._runtime(interaction)).ask_ephemeral(
-                    question,
-                    idempotency_key=f"interaction:{interaction.id}",
-                )
-                await _send_ephemeral(interaction, answer, "copilot-ask.txt")
+                async def operation(_: CommandInvocation) -> str:
+                    return await (await self._runtime(interaction)).ask_ephemeral(
+                        question,
+                        idempotency_key=f"interaction:{interaction.id}",
+                    )
+
+                await self._host._run_command(interaction, "ask", operation)
 
         if "fleet" in roots:
 
@@ -76,16 +85,17 @@ class NativeDiscordRegistrar:
                 description="Start Copilot Fleet in this session",
             )
             async def fleet(interaction: discord.Interaction, prompt: str) -> None:
-                await interaction.response.defer(ephemeral=True)
-                result = await (await self._runtime(interaction)).start_fleet(
-                    prompt,
-                    idempotency_key=f"interaction:{interaction.id}",
-                )
-                await interaction.followup.send(
-                    f"Fleet started as `{result['fleet_run_id']}`; "
-                    "workers remain in this thread's TaskDeck.",
-                    ephemeral=True,
-                )
+                async def operation(_: CommandInvocation) -> str:
+                    result = await (await self._runtime(interaction)).start_fleet(
+                        prompt,
+                        idempotency_key=f"interaction:{interaction.id}",
+                    )
+                    return (
+                        f"Fleet started as `{result['fleet_run_id']}`; "
+                        "workers remain in this thread's TaskDeck."
+                    )
+
+                await self._host._run_command(interaction, "fleet", operation)
 
         if "tasks" in roots:
             choices = [
@@ -105,19 +115,17 @@ class NativeDiscordRegistrar:
                 message: str | None = None,
                 wait_seconds: float = 30.0,
             ) -> None:
-                await interaction.response.defer(ephemeral=True)
-                result = await (await self._runtime(interaction)).task_action(
-                    NativeTaskAction(action.value),
-                    task_id=task_id,
-                    message=message,
-                    wait_seconds=wait_seconds,
-                    idempotency_key=f"interaction:{interaction.id}",
-                )
-                await _send_ephemeral(
-                    interaction,
-                    _task_result_text(result),
-                    "copilot-tasks.json",
-                )
+                async def operation(_: CommandInvocation) -> str:
+                    result = await (await self._runtime(interaction)).task_action(
+                        NativeTaskAction(action.value),
+                        task_id=task_id,
+                        message=message,
+                        wait_seconds=wait_seconds,
+                        idempotency_key=f"interaction:{interaction.id}",
+                    )
+                    return _task_result_text(result)
+
+                await self._host._run_command(interaction, "tasks", operation)
 
         if "agent" in roots:
             choices = [
@@ -135,32 +143,35 @@ class NativeDiscordRegistrar:
                 action: app_commands.Choice[str],
                 name: str | None = None,
             ) -> None:
-                await interaction.response.defer(ephemeral=True)
-                runtime = await self._runtime(interaction)
-                if action.value == "list":
-                    result = await runtime.list_agents()
-                elif action.value == "current":
-                    result = await runtime.current_agent()
-                elif action.value == "select":
-                    if name is None:
-                        raise ValueError("name is required for agent select")
-                    result = {
-                        "selected": await runtime.select_agent(
-                            name,
-                            idempotency_key=f"interaction:{interaction.id}",
-                        )
-                    }
-                else:
-                    result = {
-                        "selected": await runtime.deselect_agent(
-                            idempotency_key=f"interaction:{interaction.id}",
-                        )
-                    }
-                await _send_ephemeral(
-                    interaction,
-                    json.dumps(result, ensure_ascii=False, indent=2, sort_keys=True),
-                    "copilot-agents.json",
-                )
+                async def operation(_: CommandInvocation) -> str:
+                    runtime = await self._runtime(interaction)
+                    if action.value == "list":
+                        result = await runtime.list_agents()
+                    elif action.value == "current":
+                        result = await runtime.current_agent()
+                    elif action.value == "select":
+                        if name is None:
+                            raise ValueError("name is required for agent select")
+                        result = {
+                            "selected": await runtime.select_agent(
+                                name,
+                                idempotency_key=f"interaction:{interaction.id}",
+                            )
+                        }
+                    else:
+                        result = {
+                            "selected": await runtime.deselect_agent(
+                                idempotency_key=f"interaction:{interaction.id}",
+                            )
+                        }
+                    return json.dumps(
+                        result,
+                        ensure_ascii=False,
+                        indent=2,
+                        sort_keys=True,
+                    )
+
+                await self._host._run_command(interaction, "agent", operation)
 
         for schedule_kind in ("after", "every"):
             if schedule_kind in roots:
@@ -181,21 +192,24 @@ class NativeDiscordRegistrar:
                 interaction: discord.Interaction,
                 action: app_commands.Choice[str],
             ) -> None:
-                await interaction.response.defer(ephemeral=True)
-                runtime = await self._runtime(interaction)
-                result = (
-                    await runtime.remote_status()
-                    if action.value == "status"
-                    else await runtime.set_remote(
-                        action.value,
-                        idempotency_key=f"interaction:{interaction.id}",
+                async def operation(_: CommandInvocation) -> str:
+                    runtime = await self._runtime(interaction)
+                    result = (
+                        await runtime.remote_status()
+                        if action.value == "status"
+                        else await runtime.set_remote(
+                            action.value,
+                            idempotency_key=f"interaction:{interaction.id}",
+                        )
                     )
-                )
-                await _send_ephemeral(
-                    interaction,
-                    json.dumps(result, ensure_ascii=False, indent=2, sort_keys=True),
-                    "copilot-remote.json",
-                )
+                    return json.dumps(
+                        result,
+                        ensure_ascii=False,
+                        indent=2,
+                        sort_keys=True,
+                    )
+
+                await self._host._run_command(interaction, "remote", operation)
 
         if "review" in roots:
 
@@ -295,32 +309,30 @@ class NativeDiscordRegistrar:
             prompt: str | None = None,
             schedule_id: str | None = None,
         ) -> None:
-            await interaction.response.defer(ephemeral=True)
-            runtime = await self._runtime(interaction)
-            if action.value == "create":
-                if expression is None or prompt is None:
-                    raise ValueError("expression and prompt are required for create")
-                result: Any = await runtime.create_runtime_schedule(
-                    kind,
-                    expression,
-                    prompt,
-                    idempotency_key=f"interaction:{interaction.id}",
-                )
-            elif action.value == "cancel":
-                if schedule_id is None:
-                    raise ValueError("schedule_id is required for cancel")
-                result = await runtime.cancel_runtime_schedule(
-                    kind,
-                    schedule_id,
-                    idempotency_key=f"interaction:{interaction.id}",
-                )
-            else:
-                result = await runtime.runtime_schedules(kind=kind)
-            await _send_ephemeral(
-                interaction,
-                json.dumps(result, ensure_ascii=False, indent=2, sort_keys=True),
-                f"copilot-{kind}.json",
-            )
+            async def operation(_: CommandInvocation) -> str:
+                runtime = await self._runtime(interaction)
+                if action.value == "create":
+                    if expression is None or prompt is None:
+                        raise ValueError("expression and prompt are required for create")
+                    result: Any = await runtime.create_runtime_schedule(
+                        kind,
+                        expression,
+                        prompt,
+                        idempotency_key=f"interaction:{interaction.id}",
+                    )
+                elif action.value == "cancel":
+                    if schedule_id is None:
+                        raise ValueError("schedule_id is required for cancel")
+                    result = await runtime.cancel_runtime_schedule(
+                        kind,
+                        schedule_id,
+                        idempotency_key=f"interaction:{interaction.id}",
+                    )
+                else:
+                    result = await runtime.runtime_schedules(kind=kind)
+                return json.dumps(result, ensure_ascii=False, indent=2, sort_keys=True)
+
+            await self._host._run_command(interaction, kind, operation)
 
     async def _run_builtin(
         self,
@@ -330,29 +342,27 @@ class NativeDiscordRegistrar:
         selection_token: str | None,
         selection: str | None,
     ) -> None:
-        await interaction.response.defer(ephemeral=True)
-        runtime = await self._runtime(interaction)
-        if selection_token is None:
-            if selection is not None:
-                raise ValueError("selection_token is required with selection")
-            result = await runtime.invoke_native_command(
-                command,
-                input_text,
-                idempotency_key=f"interaction:{interaction.id}",
-            )
-        else:
-            if selection is None:
-                raise ValueError("selection is required with selection_token")
-            result = await runtime.continue_native_command(
-                selection_token,
-                selection,
-                idempotency_key=f"interaction:{interaction.id}:selection",
-            )
-        await _send_ephemeral(
-            interaction,
-            _builtin_result_text(result),
-            f"copilot-{command}.txt",
-        )
+        async def operation(_: CommandInvocation) -> str:
+            runtime = await self._runtime(interaction)
+            if selection_token is None:
+                if selection is not None:
+                    raise ValueError("selection_token is required with selection")
+                result = await runtime.invoke_native_command(
+                    command,
+                    input_text,
+                    idempotency_key=f"interaction:{interaction.id}",
+                )
+            else:
+                if selection is None:
+                    raise ValueError("selection is required with selection_token")
+                result = await runtime.continue_native_command(
+                    selection_token,
+                    selection,
+                    idempotency_key=f"interaction:{interaction.id}:selection",
+                )
+            return _builtin_result_text(result)
+
+        await self._host._run_command(interaction, command, operation)
 
     async def _runtime(self, interaction: discord.Interaction) -> SessionRuntime:
         return await self._host._interaction_runtime(interaction)
@@ -382,17 +392,3 @@ def _builtin_result_text(result: dict[str, Any]) -> str:
 
 def _task_result_text(result: dict[str, Any]) -> str:
     return json.dumps(result, ensure_ascii=False, indent=2, sort_keys=True)
-
-
-async def _send_ephemeral(
-    interaction: discord.Interaction,
-    text: str,
-    filename: str,
-) -> None:
-    if len(text) <= 1900:
-        await interaction.followup.send(text or "No content.", ephemeral=True)
-        return
-    await interaction.followup.send(
-        file=discord.File(io.BytesIO(text.encode()), filename=filename),
-        ephemeral=True,
-    )

@@ -85,7 +85,6 @@ sessions use normal logged-in runtime authentication.
 python3.11 -m venv .venv
 .venv/bin/pip install -e '.[dev]'
 export COPILOTD_DISCORD_TOKEN='...'
-export COPILOTD_DISCORD_OPERATOR_IDS='123456789012345678'
 # Optional: export COPILOTD_GITHUB_TOKEN='...'
 .venv/bin/copilotd setup
 ```
@@ -102,10 +101,11 @@ A runtime-reported managed policy/request fails deterministically with
 `UserNotAvailable` and never creates a Discord permission UI; ordinary typed requests
 remain owner-fenced `ApproveOnce`.
 
-`COPILOTD_DISCORD_OPERATOR_IDS` is a comma-separated allowlist. Administrative
-`/project` (including MCP, variables, agents, and worktrees) and runtime restart
-commands fail closed when the caller is not listed. Discord never reveals stored
-project variable values. For local development, use the explicit foreground entrypoint:
+copilotD is a private single-user deployment. It has no guild/user/role allowlist and no
+owner/admin command distinction. Project variables are resolved only through typed
+future-session MCP/environment references; they are never copied wholesale into the
+Copilot runtime process environment. For local development, use the explicit foreground
+entrypoint:
 
 ```bash
 .venv/bin/copilotd run --foreground

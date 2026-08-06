@@ -122,6 +122,7 @@ def test_discord_command_manifest_has_core_modes_and_no_deleted_roots(tmp_path: 
         "scheduler",
         "diagnostics",
         "debug",
+        "log-dump",
         "log-tail",
         "event-dump",
         "restart-runtime",
@@ -132,6 +133,14 @@ def test_discord_command_manifest_has_core_modes_and_no_deleted_roots(tmp_path: 
     assert mcp_add is not None
     assert "project_env_refs" in {parameter.name for parameter in mcp_add.parameters}
     assert "config-reload" in {command.name for command in project.commands}
+    worktree = project.get_command("worktree")
+    assert isinstance(worktree, discord.app_commands.Group)
+    worktree_create = worktree.get_command("create")
+    assert worktree_create is not None
+    history = next(
+        parameter for parameter in worktree_create.parameters if parameter.name == "history"
+    )
+    assert {choice.value for choice in history.choices} == {"none"}
 
 
 class _SummaryCapability:
@@ -324,6 +333,112 @@ def test_native_discord_adapter_registers_only_exact_supported_actions(
     assert "compact" in {command.name for command in session.commands}
 
 
+@pytest.mark.asyncio
+async def test_native_and_direct_command_handlers_use_shared_invocation_path(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    bot = CopilotDiscordBot(Settings(data_dir=tmp_path))
+    bot._register_application_commands()
+    routed: list[str] = []
+
+    async def run_command(
+        _interaction: object,
+        name: str,
+        _operation: object,
+    ) -> None:
+        routed.append(name)
+
+    monkeypatch.setattr(bot, "_run_command", run_command)
+    interaction = SimpleNamespace(id=1, channel=object(), channel_id=1)
+    project = bot.tree.get_command("project")
+    schedule = bot.tree.get_command("schedule")
+    ops = bot.tree.get_command("ops")
+    assert isinstance(project, discord.app_commands.Group)
+    assert isinstance(schedule, discord.app_commands.Group)
+    assert isinstance(ops, discord.app_commands.Group)
+    worktree = project.get_command("worktree")
+    assert isinstance(worktree, discord.app_commands.Group)
+    ask = bot.tree.get_command("ask")
+    timezone = project.get_command("timezone")
+    config_reload = project.get_command("config-reload")
+    worktree_list = worktree.get_command("list")
+    schedule_list = schedule.get_command("list")
+    scheduler = ops.get_command("scheduler")
+    assert all(
+        command is not None
+        for command in (
+            ask,
+            timezone,
+            config_reload,
+            worktree_list,
+            schedule_list,
+            scheduler,
+        )
+    )
+
+    await ask.callback(interaction, "question")
+    await timezone.callback(interaction, "UTC")
+    await config_reload.callback(interaction)
+    await worktree_list.callback(interaction)
+    await schedule_list.callback(interaction)
+    await scheduler.callback(interaction)
+
+    assert routed == [
+        "ask",
+        "project timezone",
+        "project config-reload",
+        "project worktree list",
+        "schedule list",
+        "ops scheduler",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_variable_unset_and_remove_share_protected_lifecycle_path(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    bot = CopilotDiscordBot(Settings(data_dir=tmp_path))
+    bot._register_application_commands()
+    bot.projects = SimpleNamespace(
+        resolve=AsyncMock(return_value=SimpleNamespace(project_id="project-1")),
+        remove_project_env=AsyncMock(side_effect=AssertionError("weaker path used")),
+    )
+    bot.project_commands = SimpleNamespace(variable_remove=AsyncMock(return_value=9))
+    results: list[str] = []
+
+    async def run_command(
+        _interaction: object,
+        _name: str,
+        operation: object,
+    ) -> None:
+        results.append(await operation(SimpleNamespace()))
+
+    monkeypatch.setattr(bot, "_run_command", run_command)
+    interaction = SimpleNamespace(channel=object(), channel_id=42)
+    project = bot.tree.get_command("project")
+    assert isinstance(project, discord.app_commands.Group)
+    variable = project.get_command("variable")
+    assert isinstance(variable, discord.app_commands.Group)
+    remove = variable.get_command("remove")
+    unset = variable.get_command("unset")
+    assert remove is not None and unset is not None
+
+    await remove.callback(interaction, "TOKEN")
+    await unset.callback(interaction, "TOKEN")
+
+    assert bot.project_commands.variable_remove.await_args_list == [
+        ((("project-1", "TOKEN")),),
+        ((("project-1", "TOKEN")),),
+    ]
+    bot.projects.remove_project_env.assert_not_awaited()
+    assert results == [
+        "Variable `TOKEN` removed in project config version `9`.",
+        "Variable `TOKEN` removed in project config version `9`.",
+    ]
+
+
 def test_model_group_omits_set_when_mutation_is_not_verified(
     tmp_path: Path,
 ) -> None:
@@ -342,16 +457,16 @@ def test_model_group_omits_set_when_mutation_is_not_verified(
     assert {command.name for command in model.commands} == {"list"}
 
 
-def test_administrative_commands_require_explicit_operator_allowlist(
+def test_single_user_commands_have_no_operator_allowlist(
     tmp_path: Path,
 ) -> None:
-    denied = CopilotDiscordBot(Settings(data_dir=tmp_path))
-    interaction = SimpleNamespace(user=SimpleNamespace(id=42))
-    with pytest.raises(discord.app_commands.CheckFailure):
-        denied._require_operator(interaction)
+    settings = Settings(data_dir=tmp_path)
+    bot = CopilotDiscordBot(settings)
+    bot._register_application_commands()
 
-    allowed = CopilotDiscordBot(Settings(data_dir=tmp_path, discord_operator_ids="41,42"))
-    allowed._require_operator(interaction)
+    assert "discord_operator_ids" not in type(settings).model_fields
+    assert not hasattr(bot, "_require_operator")
+    assert type(bot.tree.get_command("project")) is discord.app_commands.Group
 
 
 @pytest.mark.asyncio
@@ -457,6 +572,7 @@ async def test_ordinary_message_does_not_resume_closed_session_after_restart(
             author=SimpleNamespace(bot=False),
             guild=object(),
             channel=FakeThread("thread-1"),
+            type=discord.MessageType.default,
             content="do not resume implicitly",
             attachments=[],
             mentions=[],
@@ -468,6 +584,82 @@ async def test_ordinary_message_does_not_resume_closed_session_after_restart(
     message.reply.assert_awaited_once()
     assert "closed" in message.reply.await_args.args[0]
     assert "/session resume" in message.reply.await_args.args[0]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "message_type",
+    [
+        discord.MessageType.thread_starter_message,
+        discord.MessageType.pins_add,
+        discord.MessageType.recipient_add,
+        discord.MessageType.call,
+        discord.MessageType.auto_moderation_action,
+    ],
+)
+async def test_system_message_types_are_ignored_before_session_lookup(
+    tmp_path: Path,
+    message_type: discord.MessageType,
+) -> None:
+    bot = CopilotDiscordBot(Settings(data_dir=tmp_path))
+    bot.bindings = SimpleNamespace(
+        by_thread=AsyncMock(side_effect=AssertionError("must not look up a session"))
+    )
+    bot.sessions = SimpleNamespace(
+        ensure_attached=AsyncMock(side_effect=AssertionError("must not attach"))
+    )
+    message = SimpleNamespace(type=message_type)
+
+    await bot.on_message(message)
+
+    bot.bindings.by_thread.assert_not_awaited()
+    bot.sessions.ensure_attached.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "message_type",
+    [discord.MessageType.default, discord.MessageType.reply],
+)
+async def test_real_prompt_types_submit_once_without_thread_starter_duplicate(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    message_type: discord.MessageType,
+) -> None:
+    class FakeThread:
+        def __init__(self, thread_id: int) -> None:
+            self.id = thread_id
+
+    binding = SimpleNamespace(binding_intent=BindingIntent.ACTIVE, sdk_session_id="session-1")
+    runtime = SimpleNamespace(binding=binding, send=AsyncMock())
+    bot = CopilotDiscordBot(Settings(data_dir=tmp_path))
+    bot.bindings = SimpleNamespace(by_thread=AsyncMock(return_value=binding))
+    bot.sessions = SimpleNamespace(ensure_attached=AsyncMock(return_value=runtime))
+    bot.attachment_service.prepare = AsyncMock(return_value=None)
+    monkeypatch.setattr(discord, "Thread", FakeThread)
+    monkeypatch.setattr(bot, "_is_restart_draining", AsyncMock(return_value=False))
+    starter = SimpleNamespace(type=discord.MessageType.thread_starter_message)
+    prompt = SimpleNamespace(
+        id=71,
+        type=message_type,
+        author=SimpleNamespace(bot=False),
+        guild=object(),
+        channel=FakeThread(10),
+        content="hello",
+        attachments=[],
+        mentions=[],
+        reply=AsyncMock(),
+    )
+
+    await bot.on_message(starter)
+    await bot.on_message(prompt)
+
+    runtime.send.assert_awaited_once_with(
+        "hello",
+        idempotency_key="discord-message:71",
+        attachments=None,
+        attachment_manifest_id=None,
+    )
 
 
 @pytest.mark.asyncio

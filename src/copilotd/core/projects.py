@@ -1506,7 +1506,11 @@ class ProjectRegistry:
             references = [
                 str(row["name"])
                 for row in mcp_rows
-                if name in json.loads(str(row["config_json"])).get("env_refs", [])
+                if name
+                in (
+                    json.loads(str(row["config_json"])).get("env_refs", [])
+                    + json.loads(str(row["config_json"])).get("project_env_refs", [])
+                )
             ]
             if references:
                 raise ProjectConfigError(

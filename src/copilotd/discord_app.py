@@ -44,7 +44,9 @@ from copilotd.core.commands import (
     CDSessionStateError,
     CommandExecutor,
     CommandInvocation,
+    CommandOperation,
     CommandResponder,
+    CommandResponse,
     ModelReasoningSummaryAdapter,
     OpsSurfaceAdapter,
     ScheduleOriginAdapter,
@@ -120,16 +122,6 @@ from copilotd.storage.leases import OwnerLeaseStore
 
 logger = structlog.get_logger(__name__)
 _TABLE_DELIMITER = re.compile(r"^\s*\|?\s*:?-{3,}:?\s*(?:\|\s*:?-{3,}:?\s*)+\|?\s*$")
-
-
-class _OperatorCommandGroup(app_commands.Group):
-    def __init__(self, bot: CopilotDiscordBot, **kwargs: Any) -> None:
-        super().__init__(**kwargs)
-        self._bot = bot
-
-    async def interaction_check(self, interaction: discord.Interaction) -> bool:
-        self._bot._require_operator(interaction)
-        return True
 
 
 class CopilotDiscordBot(commands.Bot):
@@ -805,6 +797,8 @@ class CopilotDiscordBot(commands.Bot):
             self._admitted_handlers.discard(task)
 
     async def _on_message_admitted(self, message: discord.Message) -> None:
+        if message.type not in {discord.MessageType.default, discord.MessageType.reply}:
+            return
         if message.author.bot or message.guild is None:
             return
         if await self._is_restart_draining():
@@ -1658,10 +1652,7 @@ class CopilotDiscordBot(commands.Bot):
         self,
         interaction: discord.Interaction,
         name: str,
-        operation: Callable[
-            [CommandInvocation],
-            str | Awaitable[str | None] | None,
-        ],
+        operation: CommandOperation,
     ) -> None:
         responder = DiscordInteractionResponder(self, interaction, name=name)
         outcome = await self.command_executor.execute(
@@ -1734,75 +1725,201 @@ class CopilotDiscordBot(commands.Bot):
         )
         if row is None:
             raise CDSessionNotFoundError("session binding disappeared")
+
+        async def state_counts(
+            table: str,
+            key: str,
+            value: str,
+        ) -> str:
+            if table not in {
+                "submissions",
+                "message_queue",
+                "task_card_projections",
+                "schedules",
+                "runtime_schedules",
+                "liveness_leases",
+            }:
+                raise ValueError(f"unsupported session-info table: {table}")
+            rows = await self.database.fetchall(
+                f"""
+                SELECT state, COUNT(*) AS count
+                FROM {table}
+                WHERE {key} = ?
+                GROUP BY state
+                ORDER BY state
+                LIMIT 20
+                """,
+                (value,),
+            )
+            if not rows:
+                return "none"
+            return ", ".join(f"{item['state']}={int(item['count'])}" for item in rows)
+
         counts: dict[str, int] = {}
-        for name, query, parameters in (
+        for name, query in (
             (
                 "inbox",
                 "SELECT COUNT(*) FROM event_journal WHERE sdk_session_id = ?",
-                (binding.sdk_session_id,),
-            ),
-            (
-                "active_liveness",
-                "SELECT COUNT(*) FROM liveness_leases "
-                "WHERE sdk_session_id = ? AND state = 'active'",
-                (binding.sdk_session_id,),
-            ),
-            (
-                "submissions",
-                "SELECT COUNT(*) FROM submissions WHERE sdk_session_id = ?",
-                (binding.sdk_session_id,),
-            ),
-            (
-                "tasks",
-                "SELECT COUNT(*) FROM task_card_projections WHERE sdk_session_id = ?",
-                (binding.sdk_session_id,),
-            ),
-            (
-                "queue",
-                "SELECT COUNT(*) FROM message_queue "
-                "WHERE thread_id = ? AND state NOT IN ('cancelled','submitted','failed')",
-                (binding.thread_id,),
             ),
             (
                 "outbox",
                 "SELECT COUNT(*) FROM render_outbox "
                 "WHERE session_id = ? AND state IN ('pending','sending','blocked')",
-                (binding.sdk_session_id,),
             ),
         ):
-            count = await self.database.fetchone(query, parameters)
+            count = await self.database.fetchone(query, (binding.sdk_session_id,))
             counts[name] = 0 if count is None else int(count[0])
+
+        owner = await self.database.fetchone(
+            """
+            SELECT owner_id, fence_token, acquired_at, renewed_at, expires_at
+            FROM session_owner_leases
+            WHERE sdk_session_id = ?
+            """,
+            (binding.sdk_session_id,),
+        )
+        context_projection = await self.database.fetchone(
+            """
+            SELECT runtime_generation, owner_fence_token, source_type, payload_json,
+                   observed_at, reconciled_at, stale, stale_reason
+            FROM context_projections
+            WHERE sdk_session_id = ?
+            """,
+            (binding.sdk_session_id,),
+        )
+        usage_projection = await self.database.fetchone(
+            """
+            SELECT runtime_generation, owner_fence_token, source_type, payload_json,
+                   observed_at, reconciled_at, stale, stale_reason
+            FROM usage_projections
+            WHERE sdk_session_id = ?
+            """,
+            (binding.sdk_session_id,),
+        )
+        submission_states = await state_counts(
+            "submissions",
+            "sdk_session_id",
+            binding.sdk_session_id,
+        )
+        queue_states = await state_counts("message_queue", "thread_id", binding.thread_id)
+        task_states = await state_counts(
+            "task_card_projections",
+            "sdk_session_id",
+            binding.sdk_session_id,
+        )
+        app_schedule_states = await state_counts("schedules", "thread_id", binding.thread_id)
+        runtime_schedule_states = await state_counts(
+            "runtime_schedules",
+            "sdk_session_id",
+            binding.sdk_session_id,
+        )
+        liveness_states = await state_counts(
+            "liveness_leases",
+            "sdk_session_id",
+            binding.sdk_session_id,
+        )
+
         desired_model = _json_object(row["desired_model_config"])
+        pending_model = _json_object(row["pending_model_config"])
         runtime_model = _json_object(row["runtime_model_config"])
-        return "\n".join(
-            (
-                f"**{row['display_name'] or 'Copilot session'}**",
-                f"SDK session: `{binding.sdk_session_id}`",
-                f"Discord: thread <#{binding.thread_id}> · parent "
-                f"`{row['parent_channel_id'] or 'unknown'}`",
-                f"binding: `{binding.binding_intent}/{binding.attachment_state}` · "
-                f"generation `{binding.runtime_generation}` · fence "
-                f"`{binding.owner_fence_token or 'none'}`",
-                f"cwd snapshot: `{binding.cwd_snapshot}` · source `{binding.project_source}`",
-                f"mode: desired `{binding.desired_mode}` · pending "
-                f"`{binding.pending_mode or 'none'}` · runtime `{binding.runtime_mode}`",
-                f"model: desired `{json.dumps(desired_model, sort_keys=True)}` · runtime "
-                f"`{json.dumps(runtime_model, sort_keys=True) if runtime_model else 'unknown'}`",
-                f"agent: desired `{row['desired_agent']}` · pending "
-                f"`{row['pending_agent'] or 'none'}` · runtime `{row['runtime_agent']}`",
-                f"remote: `{row['runtime_remote_mode']}` · permission "
-                f"`{binding.permission_posture}` · native name "
-                f"`{row['native_name_state'] or 'unknown'}`",
-                f"activity: processing `{_bool_unknown(row['runtime_processing'])}` · active "
-                f"`{_bool_unknown(row['runtime_has_active_work'])}` · abortable "
-                f"`{_bool_unknown(row['runtime_abortable'])}`",
-                f"durable: inbox `{counts['inbox']}` · submissions `{counts['submissions']}` · "
-                f"tasks `{counts['tasks']}` · queue `{counts['queue']}` · "
-                f"liveness `{counts['active_liveness']}` · outbox `{counts['outbox']}`",
-                f"cursor: inbox `{binding.last_inbox_seq}` · SDK receive "
-                f"`{binding.last_sdk_receive_seq or 'none'}`",
+        now = time.time()
+        owner_text = (
+            "unavailable (no durable owner lease)"
+            if owner is None
+            else (
+                f"id `{_bounded_discord_text(str(owner['owner_id']), 100)}` · fence "
+                f"`{owner['fence_token']}` · expires `{_age_or_future(owner['expires_at'], now)}` "
+                f"· renewed `{_age_label(owner['renewed_at'], now)}`"
             )
         )
+        context_text = _session_projection_summary(
+            context_projection,
+            kind="context",
+            now=now,
+        )
+        usage_text = _session_projection_summary(
+            usage_projection,
+            kind="usage",
+            now=now,
+        )
+        pending_model_text = (
+            "none" if row["pending_model_config"] is None else _compact_json(pending_model)
+        )
+        runtime_model_text = (
+            "unknown" if row["runtime_model_config"] is None else _compact_json(runtime_model)
+        )
+        pending_project_config = row["pending_project_config_version"]
+        runtime_project_config = row["runtime_project_config_version"]
+        pending_session_config = row["pending_session_config_version"]
+        runtime_session_config = row["runtime_session_config_version"]
+        native_queue_count = row["native_queue_count"]
+        native_steering_count = row["native_steering_count"]
+        last_sdk_receive_seq = binding.last_sdk_receive_seq
+        lines = [
+            f"**{row['display_name'] or 'Copilot session'}**",
+            f"SDK session: `{binding.sdk_session_id}`",
+            f"Discord: thread <#{binding.thread_id}> · parent "
+            f"`{row['parent_channel_id'] or 'unknown'}`",
+            f"cwd snapshot: `{binding.cwd_snapshot}` · source `{binding.project_source}`",
+            f"binding/attachment: `{binding.binding_intent}/{binding.attachment_state}` · "
+            f"reason `{binding.attachment_reason or 'none'}` · runtime generation "
+            f"`{binding.runtime_generation}`",
+            f"owner: {owner_text}",
+            f"mode desired/pending/runtime: `{binding.desired_mode}` / "
+            f"`{binding.pending_mode or 'none'}` / `{binding.runtime_mode}`",
+            f"model desired/pending/runtime: `{_compact_json(desired_model)}` / "
+            f"`{pending_model_text}` / `{runtime_model_text}`",
+            f"agent desired/pending/runtime: `{row['desired_agent']}` / "
+            f"`{row['pending_agent'] or 'none'}` / `{row['runtime_agent'] or 'unknown'}`",
+            f"project config desired/pending/runtime: "
+            f"`{row['desired_project_config_version']}` / "
+            f"`{pending_project_config if pending_project_config is not None else 'none'}` / "
+            f"`{runtime_project_config if runtime_project_config is not None else 'unknown'}`",
+            f"session config desired/pending/runtime: "
+            f"`{row['desired_session_config_version']}` / "
+            f"`{pending_session_config if pending_session_config is not None else 'none'}` / "
+            f"`{runtime_session_config if runtime_session_config is not None else 'unknown'}`",
+            f"session config hashes desired/pending/runtime: "
+            f"`{_short_hash(row['desired_session_config_hash'])}` / "
+            f"`{_short_hash(row['pending_session_config_hash'], missing='none')}` / "
+            f"`{_short_hash(row['runtime_session_config_hash'])}`",
+            f"remote runtime/pending/steerable: `{row['runtime_remote_mode'] or 'unknown'}` / "
+            f"`{row['pending_remote_target'] or 'none'}` / "
+            f"`{_bool_unknown(row['remote_steerable'])}` · observed "
+            f"`{_age_label(row['remote_observed_at'], now)}`",
+            f"permission: `{binding.permission_posture}` · verified "
+            f"`{_age_label(row['permission_verified_at'], now)}` · managed blocked "
+            f"`{bool(row['managed_permissions_blocked'])}` · managed settings "
+            f"`{row['managed_settings_state'] or 'unknown'}`",
+            f"activity processing/active/abortable: "
+            f"`{_bool_unknown(row['runtime_processing'])}` / "
+            f"`{_bool_unknown(row['runtime_has_active_work'])}` / "
+            f"`{_bool_unknown(row['runtime_abortable'])}` · observed "
+            f"`{_age_label(row['activity_observed_at'], now)}`",
+            f"submissions: `{submission_states}`",
+            f"queue app/native/steering: `{queue_states}` / "
+            f"`{native_queue_count if native_queue_count is not None else 'unknown'}` / "
+            f"`{native_steering_count if native_steering_count is not None else 'unknown'}` "
+            f"· observed `{_age_label(row['queue_observed_at'], now)}`",
+            f"tasks: `{task_states}`",
+            f"schedules app/runtime: `{app_schedule_states}` / `{runtime_schedule_states}`",
+            f"liveness: `{liveness_states}` · render outbox pending `{counts['outbox']}`",
+            f"context: {context_text}",
+            f"usage: {usage_text}",
+            f"reconciliation mode/model/config: `{row['mode_reconciliation_state']}` "
+            f"(drift={bool(row['mode_drift'])}) / "
+            f"`{row['model_reconciliation_state']}` (drift={bool(row['model_drift'])}, "
+            f"confirmed={_compact_json(_json_list(row['model_confirmation_mask']))}) / "
+            f"`{row['session_config_state']}` (drift={bool(row['session_config_drift'])})",
+            f"snapshot/cursor diagnostics: config `{row['config_snapshot_state']}` · "
+            f"cursor `{row['cursor_status'] or 'unknown'}` · inbox `{binding.last_inbox_seq}` "
+            f"· SDK receive "
+            f"`{last_sdk_receive_seq if last_sdk_receive_seq is not None else 'none'}`",
+            f"freshness: last event `{_age_label(row['last_event_at'], now)}` · "
+            f"binding updated `{_age_label(row['updated_at'], now)}` · inbox rows "
+            f"`{counts['inbox']}` · native name `{row['native_name_state'] or 'unknown'}`",
+        ]
+        return _bounded_discord_text("\n".join(lines), 16_000)
 
     async def _project_info_projection(self, channel_id: str) -> str:
         snapshot = await self._require_projects().resolve(channel_id)
@@ -1842,8 +1959,7 @@ class CopilotDiscordBot(commands.Bot):
             return
         self._commands_registered = True
         session = app_commands.Group(name="session", description="Manage Copilot sessions")
-        project = _OperatorCommandGroup(
-            self,
+        project = app_commands.Group(
             name="project",
             description="Manage channel projects",
         )
@@ -1851,33 +1967,27 @@ class CopilotDiscordBot(commands.Bot):
         queue = app_commands.Group(name="queue", description="Manage the durable message queue")
         schedule = app_commands.Group(name="schedule", description="Manage app-owned schedules")
         ops = app_commands.Group(name="ops", description="Inspect copilotD operations")
-        worktree = _OperatorCommandGroup(
-            self,
+        worktree = app_commands.Group(
             name="worktree",
             description="Manage project Git worktrees",
         )
-        variable = _OperatorCommandGroup(
-            self,
+        variable = app_commands.Group(
             name="variable",
             description="Manage future-session project variables",
         )
-        mcp = _OperatorCommandGroup(
-            self,
+        mcp = app_commands.Group(
             name="mcp",
             description="Manage typed future-session MCP servers",
         )
-        skill = _OperatorCommandGroup(
-            self,
+        skill = app_commands.Group(
             name="skill",
             description="Manage future-session skill directories",
         )
-        plugin = _OperatorCommandGroup(
-            self,
+        plugin = app_commands.Group(
             name="plugin",
             description="Manage future-session plugin directories",
         )
-        custom_agent = _OperatorCommandGroup(
-            self,
+        custom_agent = app_commands.Group(
             name="agent",
             description="Manage future-session custom agents",
         )
@@ -2117,55 +2227,51 @@ class CopilotDiscordBot(commands.Bot):
             interaction: discord.Interaction,
             value: str,
         ) -> None:
-            await interaction.response.defer(ephemeral=True)
-            await self._require_project_commands().set_timezone(
-                _parent_channel_id(interaction),
-                value,
-            )
-            await interaction.followup.send(
-                f"Project timezone is `{value}`.",
-                ephemeral=True,
-            )
+            async def operation(_: CommandInvocation) -> str:
+                await self._require_project_commands().set_timezone(
+                    _parent_channel_id(interaction),
+                    value,
+                )
+                return f"Project timezone is `{value}`."
+
+            await self._run_command(interaction, "project timezone", operation)
 
         @project.command(
             name="config-reload",
             description="Publish .copilotd/extensions.json and reattach this session",
         )
         async def project_config_reload(interaction: discord.Interaction) -> None:
-            await interaction.response.defer(ephemeral=True)
-            runtime = await self._interaction_runtime(interaction)
-            binding = runtime.binding
-            project_snapshot = ProjectSnapshot(
-                project_id=binding.project_id,
-                channel_id=f"session:{binding.thread_id}",
-                source=(
-                    ProjectSource.EXPLICIT
-                    if binding.project_id is not None
-                    else ProjectSource.IMPLICIT_HOME
-                ),
-                root_path=binding.cwd_snapshot,
-                cwd=binding.cwd_snapshot,
-                config_version=binding.desired_project_config_version,
-            )
-            config = await self.extension_config_source.load(project_snapshot)
-            snapshot = await runtime.reload_extension_config(
-                idempotency_key=f"interaction:{interaction.id}",
-                config=config,
-            )
-            await interaction.followup.send(
-                (
+            async def operation(_: CommandInvocation) -> str:
+                runtime = await self._interaction_runtime(interaction)
+                binding = runtime.binding
+                project_snapshot = ProjectSnapshot(
+                    project_id=binding.project_id,
+                    channel_id=f"session:{binding.thread_id}",
+                    source=(
+                        ProjectSource.EXPLICIT
+                        if binding.project_id is not None
+                        else ProjectSource.IMPLICIT_HOME
+                    ),
+                    root_path=binding.cwd_snapshot,
+                    cwd=binding.cwd_snapshot,
+                    config_version=binding.desired_project_config_version,
+                )
+                config = await self.extension_config_source.load(project_snapshot)
+                snapshot = await runtime.reload_extension_config(
+                    idempotency_key=f"interaction:{interaction.id}",
+                    config=config,
+                )
+                return (
                     f"Extension config `{snapshot.version}` reattached "
                     f"(`{snapshot.config_hash[:12]}`)."
-                ),
-                ephemeral=True,
-            )
+                )
 
-        @variable.command(name="remove", description="Remove a future-session variable")
-        async def project_variable_remove(
+            await self._run_command(interaction, "project config-reload", operation)
+
+        async def remove_project_variable(
             interaction: discord.Interaction,
             name: str,
-        ) -> None:
-            await interaction.response.defer(ephemeral=True)
+        ) -> str:
             project_snapshot = await self._require_projects().resolve(
                 _parent_channel_id(interaction)
             )
@@ -2173,81 +2279,92 @@ class CopilotDiscordBot(commands.Bot):
                 project_snapshot.project_id,
                 name,
             )
-            await interaction.followup.send(
-                f"Variable removed in project config version `{version}`.",
-                ephemeral=True,
+            return f"Variable `{name}` removed in project config version `{version}`."
+
+        @variable.command(name="remove", description="Remove a future-session variable")
+        async def project_variable_remove(
+            interaction: discord.Interaction,
+            name: str,
+        ) -> None:
+            await self._run_command(
+                interaction,
+                "project variable remove",
+                lambda _: remove_project_variable(interaction, name),
             )
 
+        worktree_history_choices = [app_commands.Choice(name="none", value="none")]
+        if self.worktree_commands is not None and self.worktree_commands.history_fork_available:
+            worktree_history_choices.append(app_commands.Choice(name="fork", value="fork"))
+
         @worktree.command(name="create", description="Create a managed Git worktree")
-        @app_commands.choices(
-            history=[
-                app_commands.Choice(name="none", value="none"),
-                app_commands.Choice(name="fork", value="fork"),
-            ]
-        )
+        @app_commands.choices(history=worktree_history_choices)
         async def project_worktree_create(
             interaction: discord.Interaction,
             name: str,
             base: str = "HEAD",
             history: app_commands.Choice[str] | None = None,
         ) -> None:
-            await interaction.response.defer(ephemeral=True)
-            project_snapshot = await self._require_projects().resolve(
-                _parent_channel_id(interaction)
-            )
-            source_session_id = None
-            if isinstance(interaction.channel, discord.Thread):
-                source_session_id = (await self._interaction_binding(interaction)).sdk_session_id
-            projection = await self._require_worktree_commands().create(
-                project_id=project_snapshot.project_id,
-                name=name,
-                base_ref=base,
-                history="none" if history is None else history.value,
-                source_session_id=source_session_id,
-            )
-            await interaction.followup.send(
-                f"Worktree `{projection.name}` ready at `{projection.path}` "
-                f"on `{projection.branch_name}`"
-                + ("" if projection.thread_id is None else f" in <#{projection.thread_id}>"),
-                ephemeral=True,
-            )
+            async def operation(_: CommandInvocation) -> str:
+                project_snapshot = await self._require_projects().resolve(
+                    _parent_channel_id(interaction)
+                )
+                source_session_id = None
+                if isinstance(interaction.channel, discord.Thread):
+                    source_session_id = (
+                        await self._interaction_binding(interaction)
+                    ).sdk_session_id
+                projection = await self._require_worktree_commands().create(
+                    project_id=project_snapshot.project_id,
+                    name=name,
+                    base_ref=base,
+                    history="none" if history is None else history.value,
+                    source_session_id=source_session_id,
+                )
+                return (
+                    f"Worktree `{projection.name}` ready at `{projection.path}` "
+                    f"on `{projection.branch_name}`"
+                    + ("" if projection.thread_id is None else f" in <#{projection.thread_id}>")
+                )
+
+            await self._run_command(interaction, "project worktree create", operation)
 
         @worktree.command(name="list", description="List managed Git worktrees")
         async def project_worktree_list(interaction: discord.Interaction) -> None:
-            await interaction.response.defer(ephemeral=True)
-            project_snapshot = await self._require_projects().resolve(
-                _parent_channel_id(interaction)
-            )
-            items = await self._require_worktree_commands().list(project_snapshot.project_id)
-            if not items:
-                await interaction.followup.send("No managed worktrees.", ephemeral=True)
-                return
-            text = "\n".join(
-                f"`{item.name}` · `{item.state}` · `{item.branch_name}` · "
-                f"sessions `{item.session_count}` · schedules `{item.schedule_count}` · "
-                f"`{item.path}`"
-                for item in items
-            )
-            await _send_ephemeral_text(interaction, text, "copilotd-worktrees.txt")
+            async def operation(_: CommandInvocation) -> str:
+                project_snapshot = await self._require_projects().resolve(
+                    _parent_channel_id(interaction)
+                )
+                items = await self._require_worktree_commands().list(project_snapshot.project_id)
+                if not items:
+                    return "No managed worktrees."
+                return "\n".join(
+                    f"`{item.name}` · `{item.state}` · `{item.branch_name}` · "
+                    f"sessions `{item.session_count}` · schedules `{item.schedule_count}` · "
+                    f"`{item.path}`"
+                    for item in items
+                )
+
+            await self._run_command(interaction, "project worktree list", operation)
 
         @worktree.command(name="close", description="Close a managed Git worktree")
         async def project_worktree_close(
             interaction: discord.Interaction,
             name: str,
         ) -> None:
-            await interaction.response.defer(ephemeral=True)
-            project_snapshot = await self._require_projects().resolve(
-                _parent_channel_id(interaction)
-            )
-            projection = await self._require_worktree_commands().close(
-                project_snapshot.project_id,
-                name=name,
-            )
-            await interaction.followup.send(
-                f"Worktree `{projection.name}` closed; branch "
-                f"`{projection.branch_name}` was preserved.",
-                ephemeral=True,
-            )
+            async def operation(_: CommandInvocation) -> str:
+                project_snapshot = await self._require_projects().resolve(
+                    _parent_channel_id(interaction)
+                )
+                projection = await self._require_worktree_commands().close(
+                    project_snapshot.project_id,
+                    name=name,
+                )
+                return (
+                    f"Worktree `{projection.name}` closed; branch "
+                    f"`{projection.branch_name}` was preserved."
+                )
+
+            await self._run_command(interaction, "project worktree close", operation)
 
         @project.command(name="layout", description="Set future Discord thread organization")
         @app_commands.choices(
@@ -2307,16 +2424,11 @@ class CopilotDiscordBot(commands.Bot):
             interaction: discord.Interaction,
             name: str,
         ) -> None:
-            async def operation(_: CommandInvocation) -> str:
-                removed = await self._require_projects().remove_project_env(
-                    _parent_channel_id(interaction),
-                    name=name,
-                )
-                if not removed:
-                    raise CDInputError(f"project variable not found: {name}")
-                return f"Variable `{name}` removed."
-
-            await self._run_command(interaction, "project variable unset", operation)
+            await self._run_command(
+                interaction,
+                "project variable unset",
+                lambda _: remove_project_variable(interaction, name),
+            )
 
         @variable.command(name="list", description="List project environment variables")
         async def project_variable_list(
@@ -2963,6 +3075,26 @@ class CopilotDiscordBot(commands.Bot):
                 ),
             )
 
+        @ops.command(
+            name="log-dump",
+            description="Attach bounded redacted logs and the durable event timeline",
+        )
+        async def ops_log_dump(
+            interaction: discord.Interaction,
+            correlation_id: str | None = None,
+        ) -> None:
+            async def operation(_: CommandInvocation) -> CommandResponse:
+                text = await _json_text_async(
+                    self.ops_service.log_dump(correlation_id=correlation_id)
+                )
+                return CommandResponse(
+                    content="Bounded redacted diagnostic log dump attached.",
+                    attachment=text.encode("utf-8"),
+                    filename="copilotd-log-dump.json",
+                )
+
+            await self._run_command(interaction, "ops log-dump", operation)
+
         @ops.command(name="event-dump", description="Dump a bounded durable event timeline")
         async def ops_event_dump(
             interaction: discord.Interaction,
@@ -3077,20 +3209,22 @@ class CopilotDiscordBot(commands.Bot):
             text: str,
             timezone: str | None = None,
         ) -> None:
-            await interaction.response.defer(ephemeral=True)
-            binding = await self._interaction_binding(interaction)
-            definition = await self._require_scheduler_commands().create_message(
-                thread_id=binding.thread_id,
-                expression=when,
-                text=text,
-                timezone=timezone,
-                created_by=str(interaction.user.id),
-                channel_id=_parent_channel_id(interaction),
-            )
-            await interaction.followup.send(
-                f"Schedule `{definition.id}` enabled; next UTC run `{definition.next_run_at_utc}`.",
-                ephemeral=True,
-            )
+            async def operation(_: CommandInvocation) -> str:
+                binding = await self._interaction_binding(interaction)
+                definition = await self._require_scheduler_commands().create_message(
+                    thread_id=binding.thread_id,
+                    expression=when,
+                    text=text,
+                    timezone=timezone,
+                    created_by=str(interaction.user.id),
+                    channel_id=_parent_channel_id(interaction),
+                )
+                return (
+                    f"Schedule `{definition.id}` enabled; next UTC run "
+                    f"`{definition.next_run_at_utc}`."
+                )
+
+            await self._run_command(interaction, "schedule message", operation)
 
         @schedule.command(
             name="new-session",
@@ -3102,75 +3236,75 @@ class CopilotDiscordBot(commands.Bot):
             text: str,
             timezone: str | None = None,
         ) -> None:
-            await interaction.response.defer(ephemeral=True)
-            definition = await self._require_scheduler_commands().create_new_session(
-                channel_id=_parent_channel_id(interaction),
-                expression=when,
-                text=text,
-                timezone=timezone,
-                created_by=str(interaction.user.id),
-                thread_name=_thread_name(text),
-            )
-            await interaction.followup.send(
-                f"New-session schedule `{definition.id}` enabled; next UTC run "
-                f"`{definition.next_run_at_utc}`.",
-                ephemeral=True,
-            )
+            async def operation(_: CommandInvocation) -> str:
+                definition = await self._require_scheduler_commands().create_new_session(
+                    channel_id=_parent_channel_id(interaction),
+                    expression=when,
+                    text=text,
+                    timezone=timezone,
+                    created_by=str(interaction.user.id),
+                    thread_name=_thread_name(text),
+                )
+                return (
+                    f"New-session schedule `{definition.id}` enabled; next UTC run "
+                    f"`{definition.next_run_at_utc}`."
+                )
+
+            await self._run_command(interaction, "schedule new-session", operation)
 
         @schedule.command(name="list", description="List app-owned schedules")
         async def schedule_list(interaction: discord.Interaction) -> None:
-            await interaction.response.defer(ephemeral=True)
-            thread_id = (
-                str(interaction.channel.id)
-                if isinstance(interaction.channel, discord.Thread)
-                else None
-            )
-            project_snapshot = await self._require_projects().resolve(
-                _parent_channel_id(interaction)
-            )
-            definitions = await self._require_scheduler_commands().list(
-                project_id=None if thread_id is not None else project_snapshot.project_id,
-                thread_id=thread_id,
-                channel_id=(
-                    None
-                    if thread_id is not None or project_snapshot.project_id is not None
-                    else _parent_channel_id(interaction)
-                ),
-            )
-            if not definitions:
-                await interaction.followup.send("No app-owned schedules.", ephemeral=True)
-                return
-            lines = [
-                f"`{item.id}` · `{item.kind.value}` · `{item.state.value}` · "
-                f"`{item.expression}` @ `{item.timezone}` · next `{item.next_run_at_utc}`"
-                for item in definitions
-            ]
-            await _send_ephemeral_text(interaction, "\n".join(lines), "copilotd-schedules.txt")
+            async def operation(_: CommandInvocation) -> str:
+                thread_id = (
+                    str(interaction.channel.id)
+                    if isinstance(interaction.channel, discord.Thread)
+                    else None
+                )
+                project_snapshot = await self._require_projects().resolve(
+                    _parent_channel_id(interaction)
+                )
+                definitions = await self._require_scheduler_commands().list(
+                    project_id=None if thread_id is not None else project_snapshot.project_id,
+                    thread_id=thread_id,
+                    channel_id=(
+                        None
+                        if thread_id is not None or project_snapshot.project_id is not None
+                        else _parent_channel_id(interaction)
+                    ),
+                )
+                if not definitions:
+                    return "No app-owned schedules."
+                return "\n".join(
+                    f"`{item.id}` · `{item.kind.value}` · `{item.state.value}` · "
+                    f"`{item.expression}` @ `{item.timezone}` · next "
+                    f"`{item.next_run_at_utc}`"
+                    for item in definitions
+                )
+
+            await self._run_command(interaction, "schedule list", operation)
 
         @schedule.command(name="show", description="Show a schedule and recent runs")
         async def schedule_show(
             interaction: discord.Interaction,
             schedule_id: str,
         ) -> None:
-            await interaction.response.defer(ephemeral=True)
-            detail = await self._require_scheduler_commands().show(schedule_id)
-            lines = [
-                f"`{detail.definition.id}` · `{detail.definition.kind.value}` · "
-                f"`{detail.definition.state.value}`",
-                f"`{detail.definition.expression}` @ `{detail.definition.timezone}`",
-                f"next UTC: `{detail.definition.next_run_at_utc}`",
-            ]
-            lines.extend(
-                f"`{run.run_id}` · `{run.status.value}` · attempt `{run.attempt}` · "
-                f"fence `{run.fence_token}` · basis `{run.completion_basis or '-'}` · "
-                f"error `{run.error_code or '-'}`"
-                for run in detail.runs[:20]
-            )
-            await _send_ephemeral_text(
-                interaction,
-                "\n".join(lines),
-                "copilotd-schedule-detail.txt",
-            )
+            async def operation(_: CommandInvocation) -> str:
+                detail = await self._require_scheduler_commands().show(schedule_id)
+                lines = [
+                    f"`{detail.definition.id}` · `{detail.definition.kind.value}` · "
+                    f"`{detail.definition.state.value}`",
+                    f"`{detail.definition.expression}` @ `{detail.definition.timezone}`",
+                    f"next UTC: `{detail.definition.next_run_at_utc}`",
+                ]
+                lines.extend(
+                    f"`{run.run_id}` · `{run.status.value}` · attempt `{run.attempt}` · "
+                    f"fence `{run.fence_token}` · basis `{run.completion_basis or '-'}` · "
+                    f"error `{run.error_code or '-'}`"
+                    for run in detail.runs[:20]
+                )
+                return "\n".join(lines)
+
+            await self._run_command(interaction, "schedule show", operation)
 
         @schedule.command(name="toggle", description="Enable or disable future claims")
         async def schedule_toggle(
@@ -3178,75 +3312,80 @@ class CopilotDiscordBot(commands.Bot):
             schedule_id: str,
             enabled: bool,
         ) -> None:
-            await interaction.response.defer(ephemeral=True)
-            definition = await self._require_scheduler_commands().toggle(
-                schedule_id,
-                enabled=enabled,
-            )
-            await interaction.followup.send(
-                f"Schedule `{definition.id}` is `{definition.state.value}`.",
-                ephemeral=True,
-            )
+            async def operation(_: CommandInvocation) -> str:
+                definition = await self._require_scheduler_commands().toggle(
+                    schedule_id,
+                    enabled=enabled,
+                )
+                return f"Schedule `{definition.id}` is `{definition.state.value}`."
+
+            await self._run_command(interaction, "schedule toggle", operation)
 
         @schedule.command(name="delete", description="Soft-delete a terminal schedule")
         async def schedule_delete(
             interaction: discord.Interaction,
             schedule_id: str,
         ) -> None:
-            await interaction.response.defer(ephemeral=True)
-            await self._require_scheduler_commands().delete(schedule_id)
-            await interaction.followup.send("Schedule deleted.", ephemeral=True)
+            async def operation(_: CommandInvocation) -> str:
+                await self._require_scheduler_commands().delete(schedule_id)
+                return "Schedule deleted."
+
+            await self._run_command(interaction, "schedule delete", operation)
 
         @schedule.command(name="run-now", description="Create an independent manual run")
         async def schedule_run_now(
             interaction: discord.Interaction,
             schedule_id: str,
         ) -> None:
-            await interaction.response.defer(ephemeral=True)
-            run = await self._require_scheduler_commands().run_now(schedule_id)
-            await interaction.followup.send(
-                f"Manual run `{run.run_id}` is `{run.status.value}`.",
-                ephemeral=True,
-            )
+            async def operation(_: CommandInvocation) -> str:
+                run = await self._require_scheduler_commands().run_now(schedule_id)
+                return f"Manual run `{run.run_id}` is `{run.status.value}`."
+
+            await self._run_command(interaction, "schedule run-now", operation)
 
         @ops.command(name="scheduler", description="Show scheduler and runtime health")
         async def ops_scheduler(interaction: discord.Interaction) -> None:
-            await interaction.response.defer(ephemeral=True)
-            status = await self._require_scheduler_commands().status()
-            heartbeat = await self.heartbeat.snapshot()
-            text = (
-                f"scheduler: `{status.worker_state}`; enabled "
-                f"`{status.enabled_definitions}`; due `{status.due_definitions}`\n"
-                f"runs: pending `{status.pending_runs}`; claimed `{status.claimed_runs}`; "
-                f"waiting `{status.waiting_runs}`; unknown `{status.unknown_runs}`\n"
-                f"sessions: attached `{heartbeat.attached_sessions}`; protected work "
-                f"`{heartbeat.protected_work}`\n"
-                f"restart blockers: `{len(status.restart_blockers)}`"
-            )
-            await interaction.followup.send(text, ephemeral=True)
+            async def operation(_: CommandInvocation) -> str:
+                status = await self._require_scheduler_commands().status()
+                heartbeat = await self.heartbeat.snapshot()
+                return (
+                    f"scheduler: `{status.worker_state}`; enabled "
+                    f"`{status.enabled_definitions}`; due `{status.due_definitions}`\n"
+                    f"runs: pending `{status.pending_runs}`; claimed "
+                    f"`{status.claimed_runs}`; waiting `{status.waiting_runs}`; unknown "
+                    f"`{status.unknown_runs}`\n"
+                    f"sessions: attached `{heartbeat.attached_sessions}`; protected work "
+                    f"`{heartbeat.protected_work}`\n"
+                    f"restart blockers: `{len(status.restart_blockers)}`"
+                )
+
+            await self._run_command(interaction, "ops scheduler", operation)
 
         @ops.command(name="restart-runtime", description="Restart with durable outcome semantics")
         async def ops_restart_runtime(
             interaction: discord.Interaction,
             force: bool = False,
         ) -> None:
-            self._require_operator(interaction)
-            await interaction.response.defer(ephemeral=True)
-            restart_id = await self._require_scheduler_repository().prepare_restart(
-                requested_by=str(interaction.user.id),
-                force=force,
-            )
+            restart_id: str | None = None
+
+            async def operation(_: CommandInvocation) -> str:
+                nonlocal restart_id
+                restart_id = await self._require_scheduler_repository().prepare_restart(
+                    requested_by=str(interaction.user.id),
+                    force=force,
+                )
+                return f"Runtime restart `{restart_id}` prepared" + (
+                    " with unknown outcomes fenced." if force else "."
+                )
+
             try:
-                await interaction.followup.send(
-                    f"Runtime restart `{restart_id}` prepared"
-                    + (" with unknown outcomes fenced." if force else "."),
-                    ephemeral=True,
-                )
+                await self._run_command(interaction, "ops restart-runtime", operation)
             finally:
-                self._restart_task = asyncio.create_task(
-                    self._restart_after_ack(),
-                    name="discord-runtime-restart",
-                )
+                if restart_id is not None:
+                    self._restart_task = asyncio.create_task(
+                        self._restart_after_ack(),
+                        name="discord-runtime-restart",
+                    )
 
         @self.tree.error
         async def application_command_error(
@@ -3423,13 +3562,6 @@ class CopilotDiscordBot(commands.Bot):
         ]:
             await asyncio.gather(*admitted, return_exceptions=True)
 
-    def _require_operator(self, interaction: discord.Interaction) -> None:
-        operators = self.settings.operator_user_ids
-        if not operators or interaction.user.id not in operators:
-            raise app_commands.CheckFailure(
-                "this administrative command requires an explicitly configured operator"
-            )
-
 
 class DiscordThreadGateway:
     def __init__(self, bot: CopilotDiscordBot) -> None:
@@ -3515,6 +3647,8 @@ class DiscordInteractionResponder(CommandResponder):
         self._unknown_interaction = False
 
     async def defer(self, *, ephemeral: bool = True) -> None:
+        if self._interaction.response.is_done():
+            return
         try:
             await self._interaction.response.defer(ephemeral=ephemeral)
         except discord.HTTPException as error:
@@ -4544,6 +4678,94 @@ def _json_object(value: Any) -> dict[str, Any]:
     return parsed if isinstance(parsed, dict) else {}
 
 
+def _json_list(value: Any) -> list[Any]:
+    if value is None:
+        return []
+    if isinstance(value, list):
+        return list(value)
+    try:
+        parsed = json.loads(str(value))
+    except (json.JSONDecodeError, TypeError, ValueError):
+        return []
+    return parsed if isinstance(parsed, list) else []
+
+
+def _compact_json(value: Any, limit: int = 320) -> str:
+    rendered = json.dumps(value, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
+    return _bounded_discord_text(rendered, limit)
+
+
+def _short_hash(value: Any, *, missing: str = "unknown") -> str:
+    if value is None:
+        return missing
+    return _bounded_discord_text(str(value), 16)
+
+
+def _age_label(value: Any, now: float) -> str:
+    if value is None:
+        return "unknown"
+    try:
+        age = max(0, int(now - float(value)))
+    except (TypeError, ValueError):
+        return "unknown"
+    return f"{age}s ago"
+
+
+def _age_or_future(value: Any, now: float) -> str:
+    if value is None:
+        return "unknown"
+    try:
+        delta = int(float(value) - now)
+    except (TypeError, ValueError):
+        return "unknown"
+    if delta >= 0:
+        return f"in {delta}s"
+    return f"expired {-delta}s ago"
+
+
+def _projection_number(payload: Mapping[str, Any], key: str) -> str:
+    value = payload.get(key)
+    if not isinstance(value, int | float) or isinstance(value, bool):
+        return "unknown"
+    return f"{value:,}" if isinstance(value, int) else f"{value:.3f}"
+
+
+def _session_projection_summary(
+    row: Any,
+    *,
+    kind: str,
+    now: float,
+) -> str:
+    if row is None:
+        return "unavailable (no durable projection)"
+    payload = _json_object(row["payload_json"])
+    stale = bool(row["stale"])
+    stale_reason = str(row["stale_reason"] or "unspecified") if stale else "none"
+    common = (
+        f"source `{row['source_type'] or 'unknown'}` · generation "
+        f"`{row['runtime_generation']}` · fence `{row['owner_fence_token']}` · observed "
+        f"`{_age_label(row['observed_at'], now)}` · reconciled "
+        f"`{_age_label(row['reconciled_at'], now)}` · stale `{stale}` "
+        f"(reason `{_bounded_discord_text(stale_reason, 120)}`)"
+    )
+    if kind == "context":
+        return (
+            f"tokens `{_projection_number(payload, 'totalTokens')}` / "
+            f"`{_projection_number(payload, 'limit')}` · model "
+            f"`{_bounded_discord_text(str(payload.get('modelName', 'unknown')), 80)}` · "
+            f"{common}"
+        )
+    if kind == "usage":
+        return (
+            f"requests `{_projection_number(payload, 'totalUserRequests')}` · last call "
+            f"`{_projection_number(payload, 'lastCallInputTokens')}` input / "
+            f"`{_projection_number(payload, 'lastCallOutputTokens')}` output · model "
+            f"`{_bounded_discord_text(str(payload.get('currentModel', 'unknown')), 80)}` · "
+            f"{common}"
+        )
+    raise ValueError(f"unsupported projection kind: {kind}")
+
+
 def _bool_unknown(value: Any) -> str:
     return "unknown" if value is None else str(bool(value)).lower()
 
@@ -4607,21 +4829,6 @@ def _key_value_options(value: str | None) -> dict[str, str]:
             raise ValueError("key/value options must use comma-separated NAME=VALUE pairs")
         result[name.strip()] = option
     return result
-
-
-async def _send_ephemeral_text(
-    interaction: discord.Interaction,
-    text: str,
-    filename: str,
-) -> None:
-    if len(text) <= 1900:
-        await interaction.followup.send(text, ephemeral=True)
-        return
-    await interaction.followup.send(
-        "The result is attached.",
-        file=discord.File(io.BytesIO(text.encode("utf-8")), filename=filename),
-        ephemeral=True,
-    )
 
 
 async def run_discord_bot(settings: Settings) -> bool:

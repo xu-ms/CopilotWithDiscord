@@ -112,7 +112,20 @@ def generate_design_html(
             f"\n{_FIXED_STYLE}\n</style>",
             1,
         )
-        normalized = generated.replace("\r\n", "\n").rstrip() + "\n"
+        stylesheet_path = markdown_path.with_suffix(".css")
+        if stylesheet_path.is_file():
+            stylesheet = stylesheet_path.read_text(encoding="utf-8").strip()
+            generated = generated.replace(
+                "</head>",
+                f'<style type="text/css">\n{stylesheet}\n</style>\n</head>',
+                1,
+            )
+        normalized = (
+            "\n".join(
+                line.rstrip() for line in generated.replace("\r\n", "\n").splitlines()
+            ).rstrip()
+            + "\n"
+        )
         target = output_path.with_name(f".{output_path.name}.tmp")
         target.write_text(normalized, encoding="utf-8")
         os.replace(target, output_path)
