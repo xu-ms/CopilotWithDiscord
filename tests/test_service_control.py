@@ -32,6 +32,7 @@ class FakeSessions:
         self.produce_during_begin = False
         self.produce_during_first_drain = False
         self.produce_during_first_metrics = False
+        self.produce_during_every_metrics = False
         self.drain_calls = 0
         self.metrics_calls = 0
         self.begin_gate: asyncio.Event | None = None
@@ -83,6 +84,8 @@ class FakeSessions:
             and self.on_violation is not None
         ):
             self.on_violation("producer_during_depth_snapshot")
+        if self.produce_during_every_metrics and self.on_violation is not None:
+            self.on_violation("producer_during_every_depth_snapshot")
         return self.depth, self.violations
 
 
@@ -687,6 +690,139 @@ async def test_ack_snapshots_producer_count_before_depth_and_drain(
             worker.cancel()
             with pytest.raises(asyncio.CancelledError):
                 await worker
+
+
+@pytest.mark.asyncio
+async def test_pre_ack_violation_rolls_back_instead_of_retrying_forever(
+    tmp_path: Path,
+) -> None:
+    database_path = tmp_path / "permanent-pre-ack-violation.sqlite3"
+    sessions = FakeSessions()
+    sessions.violations = 1
+    generation = "generation-1"
+    started_at = time.time() - 1
+    async with Database(database_path) as database:
+        coordinator = SqliteRestartCoordinator(database_path)
+        fence = coordinator.request_quiesce(
+            expected_pid=os.getpid(),
+            expected_generation=generation,
+            expected_process_started_at=started_at,
+            now=time.time(),
+        )
+        control = ServiceControlWorker(
+            database,
+            sessions,
+            process_generation=generation,
+            process_started_at=started_at,
+            poll_seconds=0.001,
+        )
+
+        await asyncio.wait_for(control._poll_once(), timeout=1)
+
+        row = await database.fetchone(
+            """
+            SELECT state, rollback_state, rollback_attempts
+            FROM service_admission_fences WHERE fence_id = ?
+            """,
+            (fence.fence_id,),
+        )
+        assert tuple(row) == ("released", "complete", 1)
+        assert sessions.ended == 1
+        assert control._active_fence_id is None
+
+
+@pytest.mark.asyncio
+async def test_unstable_pre_ack_epoch_honors_quiesce_deadline(
+    tmp_path: Path,
+) -> None:
+    database_path = tmp_path / "unstable-pre-ack-epoch.sqlite3"
+    sessions = FakeSessions()
+    sessions.produce_during_every_metrics = True
+    generation = "generation-1"
+    started_at = time.time() - 1
+    async with Database(database_path) as database:
+        coordinator = SqliteRestartCoordinator(database_path)
+        fence = coordinator.request_quiesce(
+            expected_pid=os.getpid(),
+            expected_generation=generation,
+            expected_process_started_at=started_at,
+            now=time.time(),
+        )
+        control = ServiceControlWorker(
+            database,
+            sessions,
+            process_generation=generation,
+            process_started_at=started_at,
+            poll_seconds=0.001,
+            quiesce_timeout_seconds=0.03,
+        )
+
+        await asyncio.wait_for(control._poll_once(), timeout=1)
+
+        row = await database.fetchone(
+            """
+            SELECT state, rollback_state, rollback_attempts, detail
+            FROM service_admission_fences WHERE fence_id = ?
+            """,
+            (fence.fence_id,),
+        )
+        assert tuple(row)[:3] == ("released", "complete", 1)
+        assert "rollback_complete" in str(row["detail"])
+        assert sessions.metrics_calls > 1
+
+
+@pytest.mark.asyncio
+async def test_disappearing_pending_marker_directory_does_not_kill_worker(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database_path = tmp_path / "pending-marker-directory-race.sqlite3"
+    sessions = FakeSessions()
+    generation = "generation-1"
+    started_at = time.time() - 1
+    async with Database(database_path) as database:
+        coordinator = SqliteRestartCoordinator(database_path)
+        fence = coordinator.request_quiesce(
+            expected_pid=os.getpid(),
+            expected_generation=generation,
+            expected_process_started_at=started_at,
+            now=time.time(),
+        )
+        pending = fence_pending_marker_directory(
+            database_path,
+            fence.fence_id,
+        )
+        pending.mkdir()
+        original_iterdir = Path.iterdir
+
+        def disappearing_iterdir(path: Path):
+            if path == pending:
+                pending.rmdir()
+                raise FileNotFoundError(path)
+            return original_iterdir(path)
+
+        monkeypatch.setattr(Path, "iterdir", disappearing_iterdir)
+        control = ServiceControlWorker(
+            database,
+            sessions,
+            process_generation=generation,
+            process_started_at=started_at,
+        )
+
+        await control._poll_once()
+
+        row = await database.fetchone(
+            "SELECT state FROM service_admission_fences WHERE fence_id = ?",
+            (fence.fence_id,),
+        )
+        assert row["state"] == "acknowledged"
+        coordinator.release_quiesce(
+            fence,
+            now=time.time(),
+            reason="test_complete",
+        )
+        await control._poll_once()
+        assert sessions.ended == 1
 
 
 @pytest.mark.asyncio

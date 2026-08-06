@@ -8,6 +8,7 @@ from contextlib import asynccontextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass
 from enum import StrEnum
+from functools import partial
 from pathlib import Path
 from typing import Protocol
 
@@ -230,6 +231,7 @@ class SessionRegistry:
         self._admission_condition = asyncio.Condition()
         self._transition_lock = asyncio.Lock()
         self._transitions: dict[str, _AttachmentTransition] = {}
+        self._transition_cleanup_tasks: set[asyncio.Task[None]] = set()
 
     def for_thread(self, thread_id: str) -> SessionRuntime | None:
         return self._runtimes.get(thread_id)
@@ -290,6 +292,13 @@ class SessionRegistry:
         for attempt in range(2):
             async with self._transition_lock:
                 transition = self._transitions.get(binding.thread_id)
+                if (
+                    transition is not None
+                    and transition.task is not None
+                    and transition.task.done()
+                ):
+                    self._transitions.pop(binding.thread_id, None)
+                    transition = None
                 if transition is None:
                     transition = _AttachmentTransition(
                         reactivate_requested=reactivate,
@@ -302,6 +311,13 @@ class SessionRegistry:
                         name=f"session-attach:{binding.thread_id}",
                     )
                     self._transitions[binding.thread_id] = transition
+                    transition.task.add_done_callback(
+                        partial(
+                            self._schedule_transition_cleanup,
+                            binding.thread_id,
+                            transition,
+                        )
+                    )
                 elif reactivate:
                     transition.reactivate_requested = True
                 task = transition.task
@@ -318,6 +334,39 @@ class SessionRegistry:
                             self._transitions.pop(binding.thread_id, None)
             binding = await self._bindings.by_thread(binding.thread_id) or binding
         raise AssertionError("explicit reactivation retry did not settle")
+
+    def _schedule_transition_cleanup(
+        self,
+        thread_id: str,
+        transition: _AttachmentTransition,
+        task: asyncio.Task[SessionRuntime],
+    ) -> None:
+        if not task.cancelled():
+            task.exception()
+        cleanup = asyncio.create_task(
+            self._discard_completed_transition(
+                thread_id,
+                transition,
+                task,
+            ),
+            name=f"session-attach-cleanup:{thread_id}",
+        )
+        self._transition_cleanup_tasks.add(cleanup)
+        cleanup.add_done_callback(self._transition_cleanup_tasks.discard)
+
+    async def _discard_completed_transition(
+        self,
+        thread_id: str,
+        transition: _AttachmentTransition,
+        task: asyncio.Task[SessionRuntime],
+    ) -> None:
+        async with self._transition_lock:
+            if (
+                task.done()
+                and transition.task is task
+                and self._transitions.get(thread_id) is transition
+            ):
+                self._transitions.pop(thread_id, None)
 
     async def _ensure_attached_transition(
         self,

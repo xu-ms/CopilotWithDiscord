@@ -112,7 +112,8 @@ On first Windows upgrade, only `setup` or `service install` may adopt a legacy
 `%LOCALAPPDATA%\copilotD\` state tree. The installer disables service triggers, proves the
 old process trees exited, holds SQLite exclusion while staging a durable unknown-outcome
 handoff, atomically swaps the tree, and verifies the reinstalled tasks. Other commands
-refuse to create split state until that migration completes.
+refuse to create split state until that migration completes; only the expected OS-managed
+bot/runtime carrying the journal-bound handoff token may start for install verification.
 
 `copilotd.log` is rotating JSON (10 MiB with seven backups); `boot.log`,
 `watchdog.log`, and `alerts.log` have distinct destinations. Override paths with

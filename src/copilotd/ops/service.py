@@ -1587,7 +1587,11 @@ class SqliteRestartCoordinator:
             fence_id,
         )
         if pending.is_dir():
-            for marker in pending.iterdir():
+            try:
+                markers = list(pending.iterdir())
+            except FileNotFoundError:
+                markers = []
+            for marker in markers:
                 if marker.is_file():
                     marker.unlink(missing_ok=True)
             try:
@@ -1840,11 +1844,16 @@ class _WindowsLegacyMigrationGuard(LegacyLayoutMigrationGuard):
             if _file_digest(source) != _file_digest(target):
                 raise ServiceError("Windows state changed after migration conflict validation")
             return
-        shutil.copy2(source, target)
-        with target.open("rb") as stream:
-            os.fsync(stream.fileno())
-        if _file_digest(source) != _file_digest(target):
-            raise ServiceError("Windows database staging copy was not exact")
+        temporary = target.with_name(f".{target.name}.{uuid.uuid4().hex}.staging")
+        try:
+            shutil.copy2(source, temporary)
+            with temporary.open("rb") as stream:
+                os.fsync(stream.fileno())
+            if _file_digest(source) != _file_digest(temporary):
+                raise ServiceError("Windows database staging copy was not exact")
+            os.replace(temporary, target)
+        finally:
+            temporary.unlink(missing_ok=True)
 
     def finalize_database(self, database: Path) -> None:
         if self._released or self._swap_prepared:
@@ -1961,6 +1970,10 @@ class ServiceManager:
         if self.topology == "sidecar":
             names.insert(0, "runtime")
         return tuple(names)
+
+    @property
+    def handoff_token_hash(self) -> str:
+        return _token_hash(self._handoff_token)
 
     def macos_plists(self) -> dict[str, bytes]:
         environment = self._service_environment()
@@ -2246,12 +2259,19 @@ class ServiceManager:
                 "} elseif ($Action -eq 'DisableBot') {",
                 "  Disable-ScheduledTask -TaskName 'copilotD Bot' -ErrorAction Stop | Out-Null",
                 "} elseif ($Action -eq 'StopBot') {",
+                "  $disableError = $null",
                 "  $botTask = Get-ScheduledTask -TaskName 'copilotD Bot' "
                 "-ErrorAction SilentlyContinue",
-                "  if ($null -ne $botTask) {",
-                "    Disable-ScheduledTask -TaskName 'copilotD Bot' -ErrorAction Stop | Out-Null",
+                "  try {",
+                "    if ($null -ne $botTask) {",
+                "      Disable-ScheduledTask -TaskName 'copilotD Bot' -ErrorAction Stop | Out-Null",
+                "    }",
+                "  } catch {",
+                "    $disableError = $_",
+                "  } finally {",
+                "    Stop-CopilotDTasks @('copilotD Bot')",
                 "  }",
-                "  Stop-CopilotDTasks @('copilotD Bot')",
+                "  if ($null -ne $disableError) { throw $disableError }",
                 "} elseif ($Action -eq 'EnableBot') {",
                 "  Enable-ScheduledTask -TaskName 'copilotD Bot' -ErrorAction Stop | Out-Null",
                 "} elseif ($Action -eq 'StartBot') {",
@@ -4447,7 +4467,10 @@ def _fence_failure_markers_exist(
     paths = list(fence_marker_paths(database_path, fence_id))
     pending = fence_pending_marker_directory(database_path, fence_id)
     if pending.is_dir():
-        paths.extend(pending.iterdir())
+        try:
+            paths.extend(pending.iterdir())
+        except FileNotFoundError:
+            pass
     for marker in paths:
         try:
             if marker.is_file() and marker.stat().st_size > 0:

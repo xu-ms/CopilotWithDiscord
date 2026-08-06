@@ -781,6 +781,10 @@ def test_windows_fail_closed_termination_runs_verified_stop_bot(
     )[1].split("} elseif", maxsplit=1)[0]
     assert "Disable-ScheduledTask -TaskName 'copilotD Bot'" in stop_bot
     assert "Stop-CopilotDTasks @('copilotD Bot')" in stop_bot
+    assert "$disableError = $_" in stop_bot
+    assert "} finally {" in stop_bot
+    assert stop_bot.index("} finally {") < stop_bot.index("Stop-CopilotDTasks")
+    assert stop_bot.index("Stop-CopilotDTasks") < stop_bot.index("throw $disableError")
     assert "Get-CopilotDProcessTreeIds" in installer
     assert "copilotD process tree did not exit before task unregister" in installer
 
@@ -909,6 +913,43 @@ def test_windows_legacy_migration_guard_holds_lock_and_records_handoff(
     assert "HashSet[int]" in script
     assert "Add-CopilotDProcessTree $processes" in script
     assert "$remainingTracked.Count -eq 0" in script
+
+
+def test_windows_legacy_database_stage_never_exposes_partial_target(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    settings = _settings(tmp_path)
+
+    async def initialize() -> None:
+        async with Database(settings.database_path):
+            pass
+
+    asyncio.run(initialize())
+    manager = _manager(settings, FakeRunner(), platform_name="win32")
+    guard = manager.quiesce_windows_legacy_layout((settings.database_path,))
+    staged = tmp_path / "staged" / "copilotd.sqlite3"
+
+    def interrupted_copy(
+        _source: str | Path,
+        destination: str | Path,
+        *_args: object,
+        **_kwargs: object,
+    ) -> None:
+        Path(destination).write_bytes(b"partial")
+        raise OSError("simulated interrupted database copy")
+
+    monkeypatch.setattr(
+        "copilotd.ops.service.shutil.copy2",
+        interrupted_copy,
+    )
+    try:
+        with pytest.raises(OSError, match="interrupted database copy"):
+            guard.stage_database(settings.database_path, staged)
+        assert not staged.exists()
+        assert not list(staged.parent.glob(".copilotd.sqlite3.*.staging"))
+    finally:
+        guard.release()
 
 
 def test_windows_partial_install_reports_missing_task_without_crashing(

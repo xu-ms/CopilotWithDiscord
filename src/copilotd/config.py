@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import hmac
 import json
 import os
 import stat
@@ -235,6 +236,47 @@ class Settings(BaseSettings):
             or (local_app_data / ".copilotd-layout-migration.json").exists()
         )
 
+    def windows_migration_replacement_authorized(
+        self,
+        *,
+        platform_name: str | None = None,
+        environ: Mapping[str, str] | None = None,
+        home: Path | None = None,
+    ) -> bool:
+        effective_platform = sys.platform if platform_name is None else platform_name
+        effective_environ = os.environ if environ is None else environ
+        if (
+            effective_platform != "win32"
+            or effective_environ.get("COPILOTD_MANAGED_SERVICE") != "1"
+            or self.service_handoff_token is None
+        ):
+            return False
+        effective_home = self.resolved_home if home is None else home
+        expected_data, _, _ = platform_default_paths(
+            "win32",
+            environ=effective_environ,
+            home=effective_home,
+        )
+        expected_data = expected_data.expanduser().resolve()
+        if self.data_dir != expected_data:
+            return False
+        journal = expected_data.parent.parent / ".copilotd-layout-migration.json"
+        migration = _read_private_json(journal)
+        if migration is None or migration.get("phase") != "swapped_pending_install":
+            return False
+        target = migration.get("target")
+        expected_hash = migration.get("managed_replacement_token_hash")
+        if not isinstance(target, str) or not isinstance(expected_hash, str):
+            return False
+        target_key = str(Path(target).expanduser().resolve()).replace("/", "\\").casefold()
+        expected_key = str(expected_data).replace("/", "\\").casefold()
+        if target_key != expected_key:
+            return False
+        actual_hash = hashlib.sha256(
+            self.service_handoff_token.get_secret_value().encode()
+        ).hexdigest()
+        return hmac.compare_digest(actual_hash, expected_hash)
+
     def ensure_directories(self) -> None:
         directories = [
             self.data_dir,
@@ -263,6 +305,7 @@ class Settings(BaseSettings):
         environ: Mapping[str, str] | None = None,
         home: Path | None = None,
         service_quiescer: (Callable[[tuple[Path, ...]], LegacyLayoutMigrationGuard] | None) = None,
+        managed_replacement_token_hash: str | None = None,
     ) -> LegacyLayoutAdoption | None:
         effective_platform = sys.platform if platform_name is None else platform_name
         if effective_platform != "win32":
@@ -301,6 +344,30 @@ class Settings(BaseSettings):
             )
             migration = _read_private_json(journal)
             migration_phase = None if migration is None else str(migration.get("phase"))
+            effective_replacement_token_hash = (
+                managed_replacement_token_hash
+                if managed_replacement_token_hash is not None
+                else (
+                    str(migration["managed_replacement_token_hash"])
+                    if migration is not None
+                    and isinstance(
+                        migration.get("managed_replacement_token_hash"),
+                        str,
+                    )
+                    else None
+                )
+            )
+            staged_database = staging / "copilotd.sqlite3"
+            source_database_exists = any(
+                path.exists()
+                for path in {
+                    legacy_source / "copilotd.sqlite3",
+                    expected_data / "copilotd.sqlite3",
+                }
+            )
+            staged_copy_incomplete = (
+                migration_phase == "staged" and staged_database.exists() and source_database_exists
+            )
             if (
                 migration_phase
                 in {
@@ -322,18 +389,18 @@ class Settings(BaseSettings):
                 )
                 guard = service_quiescer(databases)
                 guard.prepare_swap()
-                if migration_phase == "swap_started":
-                    _atomic_private_json(
-                        journal,
-                        {
-                            "schema_version": 1,
-                            "phase": "swapped_pending_install",
-                            "target": str(expected_data),
-                            "service_quiesced": True,
-                            "durable_handoff": True,
-                            "swap_recovered": True,
-                        },
-                    )
+                _atomic_private_json(
+                    journal,
+                    {
+                        "schema_version": 1,
+                        "phase": "swapped_pending_install",
+                        "target": str(expected_data),
+                        "service_quiesced": True,
+                        "durable_handoff": True,
+                        "swap_recovered": migration_phase == "swap_started",
+                        "managed_replacement_token_hash": effective_replacement_token_hash,
+                    },
+                )
                 adoption = LegacyLayoutAdoption(journal, guard)
                 guard = None
                 return adoption
@@ -342,6 +409,7 @@ class Settings(BaseSettings):
                     "prepared",
                     "staged",
                     "database_staging",
+                    "database_finalizing",
                     "handoff_staged",
                     "swap_started",
                 }:
@@ -351,6 +419,7 @@ class Settings(BaseSettings):
                     "prepared",
                     "staged",
                     "database_staging",
+                    "database_finalizing",
                     "handoff_staged",
                     "swap_started",
                 }:
@@ -363,9 +432,11 @@ class Settings(BaseSettings):
                     ignore_database=migration_phase
                     in {
                         "database_staging",
+                        "database_finalizing",
                         "handoff_staged",
                         "swap_started",
-                    },
+                    }
+                    or staged_copy_incomplete,
                 )
             elif not legacy_entries:
                 if migration is not None:
@@ -379,9 +450,10 @@ class Settings(BaseSettings):
                     "Windows legacy state migration is restricted to "
                     "`copilotd setup` or `copilotd service install`"
                 )
-            if staging.exists() and migration_phase == "database_staging":
-                for path in _sqlite_family(staging / "copilotd.sqlite3"):
-                    path.unlink(missing_ok=True)
+            if staging.exists() and (
+                migration_phase == "database_staging" or staged_copy_incomplete
+            ):
+                _remove_incomplete_staged_database(staging / "copilotd.sqlite3")
             databases = tuple(
                 path
                 for path in {
@@ -404,21 +476,40 @@ class Settings(BaseSettings):
                     },
                 )
                 staging.mkdir(parents=True, exist_ok=False)
-            _atomic_private_json(
-                journal,
-                {
-                    "schema_version": 1,
-                    "phase": "staged",
-                    "legacy": str(legacy_source),
-                    "staging": str(staging),
-                    "target": str(expected_data),
-                    "service_quiesced": True,
-                },
-            )
-            authoritative_staged = migration_phase in {
+            if migration_phase not in {
+                "database_staging",
+                "database_finalizing",
+                "handoff_staged",
+                "swap_started",
+            }:
+                _atomic_private_json(
+                    journal,
+                    {
+                        "schema_version": 1,
+                        "phase": "staged",
+                        "legacy": str(legacy_source),
+                        "staging": str(staging),
+                        "target": str(expected_data),
+                        "service_quiesced": True,
+                    },
+                )
+            handoff_staged = migration_phase in {
                 "handoff_staged",
                 "swap_started",
             }
+            authoritative_staged = handoff_staged or (migration_phase == "database_finalizing")
+            if databases and not authoritative_staged:
+                _atomic_private_json(
+                    journal,
+                    {
+                        "schema_version": 1,
+                        "phase": "database_staging",
+                        "legacy": str(legacy_source),
+                        "staging": str(staging),
+                        "target": str(expected_data),
+                        "service_quiesced": True,
+                    },
+                )
             deferred: list[Path] = []
             if expected_data.exists():
                 for entry in sorted(
@@ -449,13 +540,12 @@ class Settings(BaseSettings):
                     deferred=deferred,
                     authoritative_staged=authoritative_staged,
                 )
-            staged_database = staging / "copilotd.sqlite3"
-            if not authoritative_staged and staged_database.exists():
+            if not handoff_staged and staged_database.exists():
                 _atomic_private_json(
                     journal,
                     {
                         "schema_version": 1,
-                        "phase": "database_staging",
+                        "phase": "database_finalizing",
                         "legacy": str(legacy_source),
                         "staging": str(staging),
                         "target": str(expected_data),
@@ -491,6 +581,7 @@ class Settings(BaseSettings):
                     "target": str(expected_data),
                     "service_quiesced": True,
                     "durable_handoff": True,
+                    "managed_replacement_token_hash": effective_replacement_token_hash,
                 },
             )
             os.replace(staging, expected_data)
@@ -502,6 +593,7 @@ class Settings(BaseSettings):
                     "target": str(expected_data),
                     "service_quiesced": True,
                     "durable_handoff": True,
+                    "managed_replacement_token_hash": effective_replacement_token_hash,
                 },
             )
             adoption = LegacyLayoutAdoption(journal, guard)
@@ -797,6 +889,14 @@ def _sqlite_family(database: Path) -> tuple[Path, Path, Path]:
         database.with_name(database.name + "-wal"),
         database.with_name(database.name + "-shm"),
     )
+
+
+def _remove_incomplete_staged_database(database: Path) -> None:
+    for path in _sqlite_family(database):
+        path.unlink(missing_ok=True)
+    if database.parent.is_dir():
+        for path in database.parent.glob(f".{database.name}.*.staging"):
+            path.unlink(missing_ok=True)
 
 
 def _prune_empty_directories(root: Path) -> None:

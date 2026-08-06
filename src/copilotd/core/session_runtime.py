@@ -2024,25 +2024,48 @@ class SessionRuntime:
             await cleanup
 
     async def _cleanup_attachment_failure(self, *, mark_unknown: bool) -> None:
+        lease = self._lease
         if mark_unknown:
-            lease = self._lease
-            fence_token = lease.fence_token if lease is not None else self.binding.owner_fence_token
-            current = await self._bindings.by_thread(self.binding.thread_id)
-            if (
-                current is not None
-                and current.sdk_session_id == self.binding.sdk_session_id
-                and fence_token is not None
-                and current.owner_fence_token == fence_token
-                and current.attachment_state in {AttachmentState.CREATING, AttachmentState.RESUMING}
-            ):
-                self.binding = await self._bindings.mark_attach_unknown(current)
             self.state = RuntimeState.RECOVERY_UNKNOWN
-        if self._inbox is not None or self._lease is not None:
-            await self._stop_components(release_owner=True)
-            if not mark_unknown:
-                self.state = RuntimeState.DETACHED
-        else:
-            self.state = RuntimeState.RECOVERY_UNKNOWN if mark_unknown else RuntimeState.DETACHED
+        try:
+            if self._inbox is not None or self._lease is not None:
+                await self._stop_components(release_owner=True)
+        except BaseException:
+            self.state = RuntimeState.RECOVERY_UNKNOWN
+            _LOGGER.exception(
+                "attachment failure component cleanup failed for %s",
+                self.binding.sdk_session_id,
+            )
+            if lease is not None:
+                try:
+                    await self._owner_leases.release(lease)
+                except BaseException:
+                    _LOGGER.exception(
+                        "attachment failure owner release failed for %s",
+                        self.binding.sdk_session_id,
+                    )
+        if mark_unknown:
+            try:
+                fence_token = (
+                    lease.fence_token if lease is not None else self.binding.owner_fence_token
+                )
+                current = await self._bindings.by_thread(self.binding.thread_id)
+                if (
+                    current is not None
+                    and current.sdk_session_id == self.binding.sdk_session_id
+                    and fence_token is not None
+                    and current.owner_fence_token == fence_token
+                    and current.attachment_state
+                    in {AttachmentState.CREATING, AttachmentState.RESUMING}
+                ):
+                    self.binding = await self._bindings.mark_attach_unknown(current)
+            except BaseException:
+                _LOGGER.exception(
+                    "attachment failure recovery marking failed for %s",
+                    self.binding.sdk_session_id,
+                )
+        elif self.state != RuntimeState.RECOVERY_UNKNOWN:
+            self.state = RuntimeState.DETACHED
 
     async def _acquire_owner_for_attachment(self) -> OwnerLease:
         error: OwnerConflict | None = None

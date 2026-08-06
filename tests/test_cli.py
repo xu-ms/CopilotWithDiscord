@@ -5,6 +5,7 @@ import sqlite3
 from pathlib import Path
 
 import pytest
+from pydantic import SecretStr
 
 from copilotd.cli import CLI_SCHEMA_VERSION, build_parser, main, run_command
 from copilotd.config import Settings
@@ -178,6 +179,48 @@ async def test_unmanaged_command_refuses_pending_windows_layout(
 
 
 @pytest.mark.asyncio
+async def test_authenticated_managed_replacement_can_start_during_install(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    settings = _settings(tmp_path).model_copy(update={"discord_token": SecretStr("test-token")})
+    started = False
+
+    async def run_replacement(selected: Settings) -> None:
+        nonlocal started
+        assert selected is settings
+        started = True
+
+    monkeypatch.setattr(
+        Settings,
+        "windows_legacy_layout_pending",
+        lambda _self: True,
+    )
+    monkeypatch.setattr(
+        Settings,
+        "windows_migration_replacement_authorized",
+        lambda _self: True,
+    )
+    monkeypatch.setattr(
+        "copilotd.cli.run_discord_bot",
+        run_replacement,
+    )
+    args = argparse.Namespace(command="run", foreground=True)
+
+    assert await run_command(args, settings=settings) == 0
+    assert started is True
+    with pytest.raises(ValueError, match=r"setup.*service install"):
+        await run_command(
+            argparse.Namespace(
+                command="service",
+                service_command="status",
+            ),
+            settings=settings,
+            manager=ServiceManager(settings, platform="win32"),
+        )
+
+
+@pytest.mark.asyncio
 async def test_install_command_is_only_cli_path_that_adopts_legacy_layout(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -203,6 +246,7 @@ async def test_install_command_is_only_cli_path_that_adopts_legacy_layout(
     def adopt(_self: Settings, **kwargs: object) -> bool:
         assert kwargs["platform_name"] == "win32"
         assert kwargs["service_quiescer"] == (manager.quiesce_windows_legacy_layout)
+        assert kwargs["managed_replacement_token_hash"] == (manager.handoff_token_hash)
         raise AdoptionReached
 
     monkeypatch.setattr(Settings, "adopt_legacy_windows_layout", adopt)

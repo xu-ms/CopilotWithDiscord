@@ -106,7 +106,16 @@ async def run_command(
     install_request = args.command == "setup" or (
         args.command == "service" and args.service_command == "install"
     )
-    if not install_request and settings.windows_legacy_layout_pending():
+    replacement_command = (args.command == "run" and getattr(args, "foreground", False)) or (
+        args.command == "service" and args.service_command == "runtime"
+    )
+    legacy_layout_pending = settings.windows_legacy_layout_pending()
+    managed_replacement = (
+        legacy_layout_pending
+        and replacement_command
+        and settings.windows_migration_replacement_authorized()
+    )
+    if legacy_layout_pending and not install_request and not managed_replacement:
         raise ValueError(
             "legacy Windows state requires `copilotd setup` or "
             "`copilotd service install` before this command"
@@ -308,6 +317,7 @@ async def _adopt_windows_legacy_layout(
         settings.adopt_legacy_windows_layout,
         platform_name="win32",
         service_quiescer=manager.quiesce_windows_legacy_layout,
+        managed_replacement_token_hash=manager.handoff_token_hash,
     )
     settings.ensure_directories()
     return adoption

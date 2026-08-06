@@ -136,8 +136,17 @@ class ServiceControlWorker:
         if not await self._await_or_abort(begin, fence_id, deadline):
             return
         while True:
+            if not await self._retry_requested_fence(fence_id, deadline):
+                return
             producer_before = await self._producer_count(fence_id)
             depth_before, violations_before = self._sessions.service_quiesce_metrics()
+            if violations_before:
+                await self._mark_quiesce_failed(
+                    fence_id,
+                    "post_quiesce_producer",
+                )
+                await self._rollback_quiesce(fence_id)
+                return
             journal_before = await self._journal_id()
             markers_before = self._failure_marker_epoch(fence_id)
             if markers_before:
@@ -155,9 +164,15 @@ class ServiceControlWorker:
                 return
             producer_after = await self._producer_count(fence_id)
             depth_after, violations_after = self._sessions.service_quiesce_metrics()
-            if depth_after:
-                self._record_producer_sync("drain_depth")
-                continue
+            if depth_after or violations_after:
+                if depth_after:
+                    self._record_producer_sync("drain_depth")
+                await self._mark_quiesce_failed(
+                    fence_id,
+                    "post_quiesce_activity",
+                )
+                await self._rollback_quiesce(fence_id)
+                return
             journal_after = await self._journal_id()
             markers_after = self._failure_marker_epoch(fence_id)
             if markers_after:
@@ -169,12 +184,12 @@ class ServiceControlWorker:
                 return
             if (
                 depth_before != 0
-                or violations_before != 0
-                or violations_after != 0
                 or producer_before != producer_after
                 or journal_before != journal_after
                 or markers_before != markers_after
             ):
+                if not await self._retry_requested_fence(fence_id, deadline):
+                    return
                 continue
             async with self._database.transaction() as connection:
                 cursor = await connection.execute(
@@ -218,14 +233,26 @@ class ServiceControlWorker:
                 await cursor.close()
             if changed:
                 return
-            state = await self._fence_state(fence_id)
-            if state != "requested":
-                await self._rollback_quiesce(fence_id)
+            if not await self._retry_requested_fence(fence_id, deadline):
                 return
-            if time.monotonic() >= deadline:
-                await self._mark_quiesce_failed(fence_id, "quiesce_timeout")
-                await self._rollback_quiesce(fence_id)
-                return
+
+    async def _retry_requested_fence(
+        self,
+        fence_id: str,
+        deadline: float,
+    ) -> bool:
+        state = await self._fence_state(fence_id)
+        if state in {"prepared", "committed"}:
+            self._terminate_process(75)
+            return False
+        if state != "requested":
+            await self._rollback_quiesce(fence_id)
+            return False
+        if time.monotonic() < deadline:
+            return True
+        await self._mark_quiesce_failed(fence_id, "quiesce_timeout")
+        await self._rollback_quiesce(fence_id)
+        return False
 
     async def _await_or_abort(
         self,
@@ -236,7 +263,11 @@ class ServiceControlWorker:
         try:
             while not task.done():
                 state = await self._fence_state(fence_id)
-                if state == "released":
+                if state in {"prepared", "committed"}:
+                    await self._cancel_bounded(task)
+                    self._terminate_process(75)
+                    return False
+                if state != "requested":
                     await self._cancel_bounded(task)
                     await self._rollback_quiesce(fence_id)
                     return False
@@ -482,7 +513,10 @@ class ServiceControlWorker:
             fence_id,
         )
         if pending.is_dir():
-            paths.extend(pending.iterdir())
+            try:
+                paths.extend(pending.iterdir())
+            except FileNotFoundError:
+                pass
         epoch: list[tuple[str, int, int]] = []
         for path in paths:
             try:
