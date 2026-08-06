@@ -234,6 +234,40 @@ async def test_broad_cleanup_fails_closed_and_still_stops_bridge(tmp_path: Path)
     assert live["session_absence_confirmed"] is False
 
 
+@pytest.mark.asyncio
+async def test_broad_cleanup_marks_retained_session_deletion_unprobed(tmp_path: Path) -> None:
+    class FakeBridge:
+        def __init__(self) -> None:
+            self.disconnected = False
+            self.stopped = False
+
+        async def disconnect(self, _session: object) -> None:
+            self.disconnected = True
+
+        async def delete_session(self, _session_id: str) -> None:
+            raise AssertionError("retained session must not be deleted")
+
+        async def stop(self) -> None:
+            self.stopped = True
+
+    bridge = FakeBridge()
+    live: dict[str, object] = {}
+
+    await SdkProbe(Settings(_env_file=None, data_dir=tmp_path))._cleanup_live_resources(
+        bridge,
+        session_id="session-1",
+        active_sessions=(("session", object()),),
+        bridge_started=True,
+        keep_session=True,
+        live=live,
+    )
+
+    assert bridge.disconnected
+    assert bridge.stopped
+    assert live["session_deletion_skipped"] is True
+    assert live["session_deleted"] is None
+
+
 def test_checked_fixture_hash_and_identity_are_valid(tmp_path: Path) -> None:
     manifest = CapabilityRegistry(Settings(_env_file=None, data_dir=tmp_path)).load_checked()
 
@@ -433,6 +467,45 @@ def test_unprobed_live_capabilities_merge_checked_facts_without_erasing_support(
     preserved_unknown = CapabilityRegistry(settings).resolve(live["runtime"])
     assert not preserved_unknown.supports("remote")
     assert preserved_unknown.capabilities["remote"].evidence_kind == "live-rpc-error"
+
+
+def test_keep_session_marks_lifecycle_deletion_unprobed(tmp_path: Path) -> None:
+    probe = SdkProbe(Settings(_env_file=None, data_dir=tmp_path))
+    fixture = tmp_path / "retained-session.events.jsonl"
+    fixture.write_text("{}\n", encoding="utf-8")
+    live = {
+        "runtime": {
+            "runtime_version": "1.0.73",
+            "protocol_version": 3,
+            "ping_protocol_version": 3,
+        },
+        "session_id_matches": True,
+        "session_exists_immediately_after_create": True,
+        "session_exists_after_activity": True,
+        "resume_session_id_matches": True,
+        "session_deletion_skipped": True,
+        "session_deleted": None,
+    }
+
+    matrix = probe._live_matrix(
+        live,
+        fixture,
+        hashlib.sha256(fixture.read_bytes()).hexdigest(),
+    )
+    lifecycle = matrix["capabilities"]["session_lifecycle_wrappers"]
+
+    assert lifecycle["supported"] is None
+    assert lifecycle["evidence_kind"] == "unprobed"
+    assert lifecycle["detail"]["deletion_skipped"] is True
+
+    live["session_exists_immediately_after_create"] = False
+    failed = probe._live_matrix(
+        live,
+        fixture,
+        hashlib.sha256(fixture.read_bytes()).hexdigest(),
+    )["capabilities"]["session_lifecycle_wrappers"]
+    assert failed["supported"] is False
+    assert failed["evidence_kind"] == "live-bridge-wrapper-probe"
 
 
 def test_failed_broad_live_probe_blocks_exact_capability_fallback(

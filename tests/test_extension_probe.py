@@ -1,3 +1,4 @@
+import asyncio
 import json
 from pathlib import Path
 from types import SimpleNamespace
@@ -13,6 +14,7 @@ from copilotd.sdk.extension_probe import (
     _correlate_mcp_tool_evidence,
     _delete_session,
     _protocol_response_evidence,
+    _send_and_wait_for_message,
 )
 
 
@@ -62,6 +64,26 @@ def test_cli_exposes_explicit_live_extension_acceptance_selector() -> None:
 
     assert args.command == "sdk-probe"
     assert args.live_extensions is True
+
+
+@pytest.mark.asyncio
+async def test_extension_turn_rejects_session_error_before_idle() -> None:
+    event_queue: asyncio.Queue[object] = asyncio.Queue()
+
+    class FakeBridge:
+        async def send(self, *_args, **_kwargs) -> str:
+            for event_type in ("assistant.message", "session.error", "session.idle"):
+                await event_queue.put(SimpleNamespace(type=SimpleNamespace(value=event_type)))
+            return "accepted-message"
+
+    with pytest.raises(RuntimeError, match="reported an error"):
+        await _send_and_wait_for_message(
+            FakeBridge(),
+            object(),
+            event_queue,
+            "probe",
+            wait_seconds=1,
+        )
 
 
 @pytest.mark.asyncio

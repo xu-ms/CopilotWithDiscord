@@ -2409,10 +2409,10 @@ core send/abort/disconnect/history、transport、Native、protocol/extension 与
 调用全部走 typed wrapper。67 个 public operation 均在 `BRIDGE_ACCEPTANCE_LANES` 中分档，
 新增未分类 operation 会令 deterministic gate 失败。
 
-当前 deterministic 验证基线为 812 个 pytest case、`ruff check .`、`ruff format --check .`、
+当前 deterministic 验证基线为 815 个 pytest case、`ruff check .`、`ruff format --check .`、
 `compileall`、ops/design audit、CLI JSON/error contract、service definition/effective-state
 simulations，以及 wheel/sdist 的 isolated build/install；全量 pytest 还把
-`PytestUnhandledThreadExceptionWarning` 升级为 error，已修复 failure-path test 遗留的
+`PytestUnhandledThreadExceptionWarning` 升级为 error，已修复 failure-path tests 遗留的
 aiosqlite worker。`copilotd doctor` 已真实启动 bundled runtime并确认 SDK 1.0.8 /
 runtime 1.0.73 / protocol 3、authentication 与 migration 46。
 

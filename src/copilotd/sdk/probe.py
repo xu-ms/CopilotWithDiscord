@@ -425,6 +425,18 @@ class SdkProbe:
         commands = live.get("commands")
         event_log_read = live.get("event_log_read")
         event_log_tail = live.get("event_log_tail")
+        lifecycle_deletion_skipped = live.get("session_deletion_skipped") is True
+        lifecycle_core_supported = (
+            live.get("session_id_matches") is True
+            and live.get("session_exists_immediately_after_create") is True
+            and live.get("session_exists_after_activity") is True
+            and live.get("resume_session_id_matches") is True
+        )
+        lifecycle_supported = (
+            None
+            if lifecycle_core_supported and lifecycle_deletion_skipped
+            else lifecycle_core_supported and live.get("session_deleted") is True
+        )
         capabilities = {
             "abort_recovery": _evidence(
                 (
@@ -549,11 +561,8 @@ class SdkProbe:
                 },
             ),
             "session_lifecycle_wrappers": _evidence(
-                live.get("session_id_matches") is True
-                and live.get("session_exists_after_activity") is True
-                and live.get("resume_session_id_matches") is True
-                and live.get("session_deleted") is True,
-                "live-bridge-wrapper-probe",
+                lifecycle_supported,
+                "unprobed" if lifecycle_supported is None else "live-bridge-wrapper-probe",
                 {
                     "create_id_matches": live.get("session_id_matches"),
                     "exists_immediately_after_create": live.get(
@@ -562,6 +571,7 @@ class SdkProbe:
                     "exists_after_activity": live.get("session_exists_after_activity"),
                     "resume_id_matches": live.get("resume_session_id_matches"),
                     "deleted_and_absent": live.get("session_deleted"),
+                    "deletion_skipped": lifecycle_deletion_skipped,
                 },
             ),
             "protocol_elicitation": _evidence(
@@ -899,6 +909,9 @@ class SdkProbe:
             except Exception as error:
                 cleanup_errors.append(error)
                 live[f"{label}_disconnect_error"] = _error_detail(error)
+        if bridge_started and keep_session:
+            live["session_deletion_skipped"] = True
+            live["session_deleted"] = None
         if bridge_started and not keep_session:
             delete_error: Exception | None = None
             try:

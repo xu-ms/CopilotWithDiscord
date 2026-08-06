@@ -1026,13 +1026,18 @@ async def _send_and_wait_for_message(
         agent_mode="interactive",
     )
     final_message = None
+    session_error = None
     async with asyncio.timeout(wait_seconds):
         while True:
             event = await event_queue.get()
             event_queue.task_done()
             if event.type.value == "assistant.message":
                 final_message = event
+            if event.type.value == "session.error":
+                session_error = event
             if event.type.value == "session.idle":
+                if session_error is not None:
+                    raise RuntimeError("Copilot session reported an error before becoming idle")
                 if final_message is None:
                     raise RuntimeError("session became idle without a final assistant message")
                 return final_message
