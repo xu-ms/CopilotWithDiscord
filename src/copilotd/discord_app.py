@@ -4695,9 +4695,9 @@ def _taskdeck_view(
             placeholder="Select a task",
             options=[
                 discord.SelectOption(
-                    label=str(option["label"]),
+                    label=str(option.get("label") or "Untitled task"),
                     value=str(option["value"]),
-                    description=str(option["state"]),
+                    description=str(option.get("state") or "unknown"),
                     default=str(option["value"]) == selected,
                 )
                 for option in options[:25]

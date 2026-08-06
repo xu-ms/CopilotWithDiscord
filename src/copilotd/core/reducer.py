@@ -6810,6 +6810,18 @@ class JournalReducer:
                 f"copilotd:{event.sdk_session_id}:taskdeck",
             )
         )[:16]
+        if not title:
+            title_cursor = await connection.execute(
+                """
+                SELECT title FROM task_card_projections
+                WHERE sdk_session_id = ? AND panel_id = ? AND card_key = ?
+                """,
+                (event.sdk_session_id, panel_id, card_key),
+            )
+            title_row = await title_cursor.fetchone()
+            await title_cursor.close()
+            existing_title = None if title_row is None else str(title_row["title"]).strip()
+            title = existing_title or _task_projection_default_title(kind)
         card_token = str(
             uuid.uuid5(
                 uuid.NAMESPACE_URL,
@@ -8015,6 +8027,14 @@ def _task_projection_facts(
             event.agent_id,
         )
     return None
+
+
+def _task_projection_default_title(kind: str) -> str:
+    return {
+        "agent": "Copilot subagent",
+        "orphan": "Copilot agent",
+        "tool": "Copilot tool",
+    }.get(kind, "Copilot task")
 
 
 def _metric_summary(data: dict[str, Any]) -> str:

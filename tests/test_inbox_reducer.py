@@ -2024,6 +2024,41 @@ async def test_subagent_output_stays_in_one_collapsed_taskdeck(tmp_path: Path) -
 
 
 @pytest.mark.asyncio
+async def test_terminal_tool_event_creates_a_named_taskdeck_card(tmp_path: Path) -> None:
+    event = _adapted(
+        "tool.execution_complete",
+        {
+            "toolCallId": "terminal-only-tool",
+            "success": True,
+            "result": {"detailedContent": "done"},
+        },
+        1,
+        source="internal",
+        session_id="session-terminal-tool",
+    )
+
+    async with Database(tmp_path / "terminal-tool.sqlite3") as database:
+        await _insert_projection_binding(database, "session-terminal-tool")
+        assert await JournalReducer(database).persist([event]) == 1
+        card = await database.fetchone(
+            """
+            SELECT title, state FROM task_card_projections
+            WHERE sdk_session_id = 'session-terminal-tool'
+            """
+        )
+        outbox = await database.fetchone(
+            """
+            SELECT payload FROM render_outbox
+            WHERE session_id = 'session-terminal-tool' AND lane = 'taskdeck'
+            """
+        )
+
+    payload = json.loads(outbox["payload"])
+    assert dict(card) == {"title": "Copilot tool", "state": "completed"}
+    assert payload["taskdeck"]["options"][0]["label"] == "Copilot tool"
+
+
+@pytest.mark.asyncio
 async def test_agent_deltas_assemble_before_taskdeck_projection(tmp_path: Path) -> None:
     started = SessionEvent(
         data=SubagentStartedData(

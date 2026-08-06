@@ -1112,6 +1112,27 @@ def test_taskdeck_view_uses_short_in_place_controls() -> None:
     assert all(len(custom_id) < 100 for custom_id in custom_ids)
 
 
+def test_taskdeck_view_normalizes_empty_option_text() -> None:
+    view = _taskdeck_view(
+        {
+            "taskdeck": {
+                "panel_id": "panel-token",
+                "revision": 1,
+                "page": 0,
+                "page_count": 1,
+                "selected_card_token": "card-a",
+                "expanded": False,
+                "options": [{"label": "", "value": "card-a", "state": ""}],
+            }
+        }
+    )
+
+    assert view is not None
+    select = view.children[0]
+    assert select.options[0].label == "Untitled task"
+    assert select.options[0].description == "unknown"
+
+
 @pytest.mark.asyncio
 async def test_taskdeck_render_plan_uses_bounded_embeds_and_preserves_them_across_assets() -> None:
     cards = [

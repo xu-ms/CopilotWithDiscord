@@ -1,8 +1,8 @@
 # copilotD 详细设计与实施计划
 
 > 当前阶段：详细设计 v2.5 已批准，设计承诺的 repository implementation 已完成对齐；
-> 完整 deterministic gate 与真实 Copilot Bridge 功能矩阵已通过，剩余顺序为真实 Discord
-> 消息 gallery、macOS 长时/服务验收和 Windows 实机验收。
+> 完整 deterministic gate、真实 Copilot Bridge 功能矩阵和真实 Discord 消息 gallery 已通过；
+> 剩余外部平台工作为 macOS 长时/服务验收和 Windows 实机验收。
 >
 > 本版固定前提：单用户、私有部署、Copilot runtime 全程 `--yolo`，不设计多用户共享、
 > 工具确认流程、安全沙箱或租户隔离。
@@ -2388,8 +2388,8 @@ claudeD issue 回归门禁：
 
 ### 当前实现快照（2026-08-06）
 
-repository implementation 已按本设计完成对齐，credentialed Bridge 全矩阵已完成；
-剩余工作是真实 Discord、macOS/Windows 实机与长时稳定性验收，不再以 mock/fixture
+repository implementation 已按本设计完成对齐，credentialed Bridge 全矩阵与真实 Discord
+gallery 均已完成；剩余工作是 macOS/Windows 实机与长时稳定性验收，不再以 mock/fixture
 结果替代真实 gate：
 
 | 已实现 | 当前边界 |
@@ -2399,8 +2399,8 @@ repository implementation 已按本设计完成对齐，credentialed Bridge 全�
 | eventLog `read/tail` durable backfill（固定过滤 ephemeral）、cursor epoch/rebase/predecessor-gap diagnostics、overflow freeze/backfill/generation replacement；activity/queue/task/remote/schedule snapshot requested/applied epoch 与 query watermark；crossing command/agent snapshot 禁止 merge 并强制 requery | ephemeral idle/delta 离开 live window 后不可恢复，不从 transcript 猜 terminal；compaction 无 completion evidence 时保持 unknown 并阻塞普通 submission |
 | durable app FIFO；fresh readiness snapshot、reducer caught-up、config/agent/remote/schedule/task known gate 后只派发队首；attachment manifest READY + hash/size 复验，无 attachment-free fallback；`/queue add/list/remove/clear`；project variables 只解析到 typed MCP/environment reference，不作为任意 process environment 注入 | native queue entry 没有 stable opaque ID 时只以 snapshot-local opaque key 诊断；transport ambiguity 不自动重放 |
 | Discord core 命令；strict dynamic builtin manifest；Native-Gated `/ask`、`/session compact`、`/fleet`、`/tasks`（含真实 promote）、`/agent list`、`/agent current`、`/after list`、`/after cancel`、`/every list`、`/every cancel`、`/remote status`、`/remote off`、`/review`、`/security-review`、`/research`、`/rubber-duck`；thread-first `/session delete session-id?`；JSON-Schema elicitation 与 MCP OAuth typed/exactly-once response plane；全部 action 由 exact capability 决定 | current-runtime fork 仍 capability-gated 且不注册；`/after create` 与 `/every create` 因 real invoke 返回 `text` 而非 required `completed` 不注册；agent select/deselect、remote on/export 的 real gate 未通过 |
-| durable input attachment manifest、hash/size 复验、图片 blob 压缩；中断的 `preparing` 可按 Discord channel/message locator 重启恢复，ready orphan 幂等重提，引用释放后默认保留 7 天再 GC；stream/final RenderOutbox；table hold 与 code/PNG/MD/CSV assets；Discord HTTP/rate-limit 错误分类，超上限 artifact 按序无损分片 | Discord archived/locked thread、attachment edit、exact 429 retry-after 仍需真实 gateway fixture |
-| tool/subagent/agent-scoped output 归并为原 thread 的单条 embed-backed TaskDeck；每页最多 8 张 embed、总字符受 Discord 6000 限制，4 秒 cadence、pending coalescing、terminal flush、select/expand/collapse/prev/next，embed/asset hash 与 crash recovery 保持原位 edit；reasoning delta/coalesced thinking 与 configured final concise reasoning summary 已实现，`assistant.streaming_delta` 不进入 Discord UI；structured tool diff 与 local workspace diff artifact lane；typed task list/show/progress/message/promote/cancel-all/remove/wait 与 Fleet projection；>=8000 字符 tool result/error 逐字附件化；零 child-thread 路径 | Discord 上的 diff 附件/图片 delivery 仍受 upload limit 与 archived/locked thread 约束 |
+| durable input attachment manifest、hash/size 复验、图片 blob 压缩；中断的 `preparing` 可按 Discord channel/message locator 重启恢复，ready orphan 幂等重提，引用释放后默认保留 7 天再 GC；stream/final RenderOutbox；table hold 与 code/PNG/MD/CSV assets；Discord HTTP/rate-limit 错误分类，超上限 artifact 按序无损分片；真实 gallery 已验证三个 outbox intent、附件上传及主 CDN 逐字节回读 | Discord archived/locked thread、attachment edit、exact 429 retry-after 仍需真实 gateway fixture；Discord cached-media 代理在当前网络不可达，不影响主 CDN 原件 |
+| tool/subagent/agent-scoped output 归并为原 thread 的单条 embed-backed TaskDeck；每页最多 8 张 embed、总字符受 Discord 6000 限制，4 秒 cadence、pending coalescing、terminal flush、select/expand/collapse/prev/next，embed/asset hash 与 crash recovery 保持原位 edit；terminal-first tool event 会恢复既有标题或生成稳定默认标题，Discord select 对空 label/description 有合法回退；reasoning delta/coalesced thinking 与 configured final concise reasoning summary 已实现，`assistant.streaming_delta` 不进入 Discord UI；structured tool diff 与 local workspace diff artifact lane；typed task list/show/progress/message/promote/cancel-all/remove/wait 与 Fleet projection；>=8000 字符 tool result/error 逐字附件化；零 child-thread 路径 | Discord 上的 diff 附件/图片 delivery 仍受 upload limit 与 archived/locked thread 约束；81 项 slash/component 操作保留给人工 driver review |
 | durable `DELETING → DELETE_UNKNOWN/DELETED` permanent-delete saga；stable SDK `delete_session(session_id)` + metadata not-found reconcile；non-deleted app schedule reference fail-closed；active target force teardown、15 秒 bounded native task/schedule/queue/remote cleanup、unprovable result unknown；confirmed delete 后才清 attachment/worktree metadata；abort 等 correlated abort + aborted-idle；unexpected `session.shutdown` terminalizes current handle and enters recovery | SDK response loss 仍需显式 retry，同一 mapping/session ID 保留；缺失 native capability 明确记录 unknown；只有 explicit close 可完成 CLOSED |
 | 共享 TaskRegistry、failure consumer、app scheduler fatal-loop supervision、10 分钟 active-execution SUSPECT + non-destructive ping、结构化 heartbeat、完整 setup preflight、fresh PID/generation/current-fence status、bounded restart saga、restart-storm alert、10 MiB × 7 JSON log、macOS LaunchAgent 与 Windows Scheduled Task 的 bundled 2-unit / sidecar 3-unit install/status/uninstall/effective-definition contract；owned Git 在 POSIX 使用 inherited `flock`，Windows 使用 `msvcrt` byte lock、独立进程组与 `taskkill /T /F` | 默认 bundled runtime 没有独立 runtime service；sidecar 三组件需要显式 runtime argv/URI/connection token；真实 credentialed install、sleep/wake、macOS soak 与 Windows 实机未在 deterministic suite 中验证 |
 
@@ -2409,7 +2409,7 @@ core send/abort/disconnect/history、transport、Native、protocol/extension 与
 调用全部走 typed wrapper。67 个 public operation 均在 `BRIDGE_ACCEPTANCE_LANES` 中分档，
 新增未分类 operation 会令 deterministic gate 失败。
 
-当前 deterministic 验证基线为 815 个 pytest case、`ruff check .`、`ruff format --check .`、
+当前 deterministic 验证基线为 817 个 pytest case、`ruff check .`、`ruff format --check .`、
 `compileall`、ops/design audit、CLI JSON/error contract、service definition/effective-state
 simulations，以及 wheel/sdist 的 isolated build/install；全量 pytest 还把
 `PytestUnhandledThreadExceptionWarning` 升级为 error，已修复 failure-path tests 遗留的
@@ -2425,6 +2425,7 @@ cleanup 已确认：
 | Native RPC | passed；45 exact gates = 33 supported / 12 unsupported | model/effort/context 改写、readback 与完整恢复通过；同一显式 model 的 optional fields 需经 `Auto` 中转清理；专用 synchronous-agent fixture 连续两次真实 promote 通过；after/every create 返回 `text`，agent select/deselect 与 remote on/export 保持 unsupported | `fca1b96b4f1e823f458fe3ec52983f62cf078dc59d7e98e24d1b048135002e07` |
 | Protocol/extensions | passed；11 features = 8 passed / 3 unprobed | permission、registered external tool、MCP/config reattach、isolated missing-auth fail-closed 等只走 Bridge；无双响应；session/workspace cleanup 完成 | `57f69511525274051d6d34c9bdbdb24fff129314978713d1febc707fb1eddac7` |
 | App scheduler/worktree | passed；6 product features passed / 1 history-fork gated；authentication 与 cleanup 通过 | scheduled message、closed-session resume、crash recovery、new session、blank worktree 全部通过；真正 history fork 继续按 capability fail closed | `497059e7472f8878b446c8edb631dad58e480328dbcc2df5e42722e83863f2bc` |
+| Discord gallery | passed；run `cd-e2e-1786056421-c7f7429a`；93 项自动证据通过；现场保留 | text/stream/reasoning/tool/diff/table/image/file/interaction/TaskDeck/error/usage、三个 outbox intent、附件上传和主 CDN byte readback 均成功；81 项 slash/component 操作为 `pending_human_driver`；Pin message 因 bot 缺少 Manage Messages 不可用，未强制触发 429 | `2d8191d9ebe8511891442cdc99530e3cbe320db487ddab2bd5b0d9fd7f3251d5` |
 | Checked capability fixture | exact supported flags 与本次 45-gate Native evidence 零差异 | 固定 114-event inventory；`tasks_promote=true` | `3120c690ea9e8a1943d4ad17871b2d1c48db54eb87b50bb244d910090af7699a` |
 
 Broad event fixture SHA-256 为
@@ -2434,6 +2435,8 @@ Broad event fixture SHA-256 为
 其中 unclassified/uncovered 均为 0。
 unsupported/unprobed action 保存真实 discovery/gate，不由 deterministic fixture 冒充。
 这个快照用于区分“已验证实现”和后续设计，不降低以下章节对最终产品的契约要求。
+真实 Discord 人工 review 现场：
+<https://discord.com/channels/1499415073838600454/1535056664141504674>。
 
 ### HTML 交付要求
 
@@ -2441,7 +2444,7 @@ unsupported/unprobed action 保存真实 discovery/gate，不由 deterministic f
 - 输出 UTF-8、standalone HTML，内嵌响应式 CSS、目录、打印样式和代码/表格样式。
 - 不依赖远程字体、CSS、JavaScript 或图片；Mermaid 源码在无本地 renderer 时以可读
   流程块保留，避免把设计内容发送给第三方。
-- 页面头部标记“设计 v2.5、实现中、single-user --yolo”，突出 Copilot-backed commands、
+- 页面头部标记“设计 v2.5、核心实现完成、single-user --yolo”，突出 Copilot-backed commands、
   `$HOME` 默认 cwd、macOS/Windows always-on、session liveness、table rendering、
   claudeD issue lessons 和 capability gate。
 - 文档 body 最大宽度至少 90rem；表格使用独立横向滚动容器、sticky header、长单元格
@@ -2528,8 +2531,9 @@ unsupported/unprobed action 保存真实 discovery/gate，不由 deterministic f
 1. [完成] 运行完整 Ruff/pytest/compile/ops/design deterministic gate。
 2. [完成] 对真实 Copilot 逐项执行 Bridge broad/Native/protocol/scheduler-worktree 功能矩阵和
    负能力门禁，保存脱敏 evidence；未执行或未观测结果继续标 unsupported/unprobed。
-3. 向真实 Discord 发送 text/stream/reasoning/tool/diff/table/image/file/interaction/TaskDeck/
-   error/usage 等完整 gallery，保留消息供人工 review，并记录稳定 Discord ID。
+3. [完成] 向真实 Discord 发送 text/stream/reasoning/tool/diff/table/image/file/interaction/
+   TaskDeck/error/usage 等完整 gallery；93 项自动证据通过，消息现场与稳定 Discord ID 已保留供
+   人工 review，81 项 slash/component 操作明确标为 `pending_human_driver`。
 4. 实机验证 macOS LaunchAgent 与 Windows Scheduled Task 的 install/login/sleep/wake/crash/
    restart-storm；完成 90 分钟 liveness soak 与平台字体/时区检查。
 5. 将通过上述 gate 的提交集中到默认 `master`；不得把未通过的真实能力提升为 supported。
@@ -2544,8 +2548,8 @@ unsupported/unprobed action 保存真实 discovery/gate，不由 deterministic f
   Copilot fixtures 修正 reducer，不能复制 Claude message 假设。
 - 长期 attached handle + callback/reducer 消除了应用 reader 交接，但会增加连接、queue、内存
   和 fd；必须做 backpressure、callback overflow 和 90 分钟以上 soak。
-- Discord 不原生显示 GFM table；PNG 生成的 CJK/emoji 字体、图片尺寸和附件限制需要真实
-  Discord snapshot 测试。
+- Discord 不原生显示 GFM table；真实 gallery 已验证当前 macOS 的 PNG/MD/CSV、图片尺寸与附件
+  传输，Windows CJK 字体、archived/locked thread 和真实 429 retry-after 仍需平台验收。
 - Copilot 计费单位与 Claude USD 成本不同；只读呈现 usage、AI Credits 和 account quota。
 - Autopilot 与 runtime 固定 `--yolo` 可能持续消耗 AI Credits 并修改宿主文件；这是用户明确
   接受的 single-user 行为。bare `/autopilot` 只切 mode，停止当前执行始终使用可达的
