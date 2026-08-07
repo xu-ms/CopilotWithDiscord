@@ -781,6 +781,73 @@ async def test_compact_fleet_and_task_surface_are_durable_and_idempotent(
 
 
 @pytest.mark.asyncio
+async def test_task_read_and_priority_actions_ignore_submission_config_gates(
+    tmp_path: Path,
+) -> None:
+    async with native_runtime(
+        tmp_path,
+        capabilities={
+            "tasks_cancel",
+            "tasks_list",
+            "tasks_message",
+            "tasks_promote",
+        },
+    ) as (runtime, bridge, database):
+        bridge.tasks = [
+            {
+                "id": "task-running",
+                "type": "agent",
+                "status": "running",
+                "description": "Running task",
+            }
+        ]
+        await database.execute(
+            """
+            UPDATE session_bindings
+            SET permission_posture = 'unknown',
+                pending_mode = 'plan',
+                pending_mode_transition_id = 'pending-mode',
+                pending_model_config = '{"modelId":"pending"}',
+                pending_model_transition_id = 'pending-model'
+            WHERE sdk_session_id = ?
+            """,
+            (runtime.binding.sdk_session_id,),
+        )
+
+        listed = await runtime.task_action(
+            NativeTaskAction.LIST,
+            idempotency_key="degraded-task-list",
+        )
+        messaged = await runtime.task_action(
+            NativeTaskAction.MESSAGE,
+            task_id="task-running",
+            message="status please",
+            idempotency_key="degraded-task-message",
+        )
+        promoted = await runtime.task_action(
+            NativeTaskAction.PROMOTE,
+            task_id="task-running",
+            idempotency_key="degraded-task-promote",
+        )
+        cancelled = await runtime.task_action(
+            NativeTaskAction.CANCEL,
+            task_id="task-running",
+            idempotency_key="degraded-task-cancel",
+        )
+
+        assert listed["result"] == {"listed": 1}
+        assert messaged["result"] == {"sent": True}
+        assert promoted["result"] == {
+            "promoted": True,
+            "task_id": "task-running",
+        }
+        assert cancelled["result"] == {"cancelled": ["task-running"]}
+        assert bridge.task_messages == [("task-running", "status please")]
+        assert bridge.task_promotions == ["task-running"]
+        assert bridge.task_cancels == ["task-running"]
+
+
+@pytest.mark.asyncio
 async def test_agent_schedule_and_remote_transitions_reconcile_projections(
     tmp_path: Path,
 ) -> None:

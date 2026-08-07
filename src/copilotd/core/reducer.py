@@ -629,7 +629,8 @@ class JournalReducer:
             background_cursor = await connection.execute(
                 """
                 SELECT COUNT(*) FROM liveness_leases
-                WHERE sdk_session_id = ? AND kind = 'background' AND state = 'active'
+                WHERE sdk_session_id = ?
+                  AND kind = 'observed_background' AND state = 'active'
                 """,
                 (event.sdk_session_id,),
             )
@@ -6996,10 +6997,39 @@ class JournalReducer:
                     sdk_session_id, lease_id, kind, source_id,
                     runtime_generation, owner_fence_token, state,
                     acquired_at, refreshed_at
-                ) VALUES (?, ?, 'background', ?, ?, ?, 'active', ?, ?)
+                ) VALUES (?, ?, 'observed_background', ?, ?, ?, 'active', ?, ?)
                 ON CONFLICT(sdk_session_id, lease_id) DO UPDATE SET
-                    state = 'active', refreshed_at = excluded.refreshed_at,
-                    released_at = NULL
+                    kind = excluded.kind,
+                    source_id = excluded.source_id,
+                    runtime_generation = excluded.runtime_generation,
+                    owner_fence_token = excluded.owner_fence_token,
+                    state = CASE
+                        WHEN liveness_leases.runtime_generation =
+                             excluded.runtime_generation
+                         AND liveness_leases.owner_fence_token =
+                             excluded.owner_fence_token
+                         AND liveness_leases.state = 'released'
+                        THEN 'released'
+                        ELSE 'active'
+                    END,
+                    acquired_at = CASE
+                        WHEN liveness_leases.runtime_generation =
+                             excluded.runtime_generation
+                         AND liveness_leases.owner_fence_token =
+                             excluded.owner_fence_token
+                        THEN liveness_leases.acquired_at
+                        ELSE excluded.acquired_at
+                    END,
+                    refreshed_at = excluded.refreshed_at,
+                    released_at = CASE
+                        WHEN liveness_leases.runtime_generation =
+                             excluded.runtime_generation
+                         AND liveness_leases.owner_fence_token =
+                             excluded.owner_fence_token
+                         AND liveness_leases.state = 'released'
+                        THEN liveness_leases.released_at
+                        ELSE NULL
+                    END
                 """,
                 (
                     event.sdk_session_id,
@@ -7713,16 +7743,36 @@ class JournalReducer:
                         sdk_session_id, lease_id, kind, source_id,
                         runtime_generation, owner_fence_token, state,
                         acquired_at, refreshed_at
-                    ) VALUES (?, ?, 'background', ?, ?, ?, 'active', ?, ?)
+                    ) VALUES (?, ?, 'observed_background', ?, ?, ?, 'active', ?, ?)
                     ON CONFLICT(sdk_session_id, lease_id) DO UPDATE SET
+                        kind = excluded.kind,
+                        source_id = excluded.source_id,
+                        runtime_generation = excluded.runtime_generation,
+                        owner_fence_token = excluded.owner_fence_token,
                         state = CASE
-                            WHEN liveness_leases.state = 'released'
+                            WHEN liveness_leases.runtime_generation =
+                                 excluded.runtime_generation
+                             AND liveness_leases.owner_fence_token =
+                                 excluded.owner_fence_token
+                             AND liveness_leases.state = 'released'
                             THEN 'released'
                             ELSE 'active'
                         END,
+                        acquired_at = CASE
+                            WHEN liveness_leases.runtime_generation =
+                                 excluded.runtime_generation
+                             AND liveness_leases.owner_fence_token =
+                                 excluded.owner_fence_token
+                            THEN liveness_leases.acquired_at
+                            ELSE excluded.acquired_at
+                        END,
                         refreshed_at = excluded.refreshed_at,
                         released_at = CASE
-                            WHEN liveness_leases.state = 'released'
+                            WHEN liveness_leases.runtime_generation =
+                                 excluded.runtime_generation
+                             AND liveness_leases.owner_fence_token =
+                                 excluded.owner_fence_token
+                             AND liveness_leases.state = 'released'
                             THEN liveness_leases.released_at
                             ELSE NULL
                         END

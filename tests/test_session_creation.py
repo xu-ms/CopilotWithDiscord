@@ -1,5 +1,6 @@
 import asyncio
 import json
+import time
 from pathlib import Path
 from typing import Any
 from uuid import uuid4
@@ -19,9 +20,10 @@ from copilotd.core.projects import (
     ProjectValidationError,
 )
 from copilotd.core.session_config import SessionConfigSnapshotError
-from copilotd.core.session_runtime import SessionRuntime
+from copilotd.core.session_runtime import RuntimeState, SessionRuntime
 from copilotd.core.sessions import (
     CreationIntentRepository,
+    CreationState,
     SessionCreationService,
     SessionCreationUnknown,
     SessionRegistry,
@@ -129,11 +131,17 @@ class FakeThreads:
         return self.reference
 
 
+class SimulatedProcessCrash(BaseException):
+    pass
+
+
 async def _build_service(
     database: Database,
     home: Path,
     bridge: FakeBridge,
     threads: FakeThreads,
+    *,
+    eager_retry_delays: tuple[float, ...] = (1, 2, 5, 10, 15, 15, 15),
 ) -> tuple[SessionCreationService, SessionRegistry]:
     projects = ProjectRegistry(database, resolved_home=home)
     await projects.initialize()
@@ -153,7 +161,11 @@ async def _build_service(
             extension_configs=extension_configs,
         )
 
-    sessions = SessionRegistry(bindings, runtime_factory)
+    sessions = SessionRegistry(
+        bindings,
+        runtime_factory,
+        eager_retry_delays=eager_retry_delays,
+    )
     service = SessionCreationService(
         projects=projects,
         intents=CreationIntentRepository(database),
@@ -543,6 +555,127 @@ async def test_concurrent_duplicate_delivery_creates_exactly_one_thread(
         assert bridge.handle is not None and bridge.handle.send_calls == 1
         assert service._source_locks == {}
         await sessions.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_crash_after_thread_create_before_persist_never_creates_duplicate(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    home = tmp_path / "home"
+    await asyncio.to_thread(home.mkdir)
+    async with Database(tmp_path / "thread-create-crash.sqlite3") as database:
+        bridge = FakeBridge()
+        threads = FakeThreads()
+        service, sessions = await _build_service(database, home, bridge, threads)
+        original_set_thread = service._intents.set_thread
+        crashed = False
+
+        async def crash_before_persist(*args: Any, **kwargs: Any) -> Any:
+            nonlocal crashed
+            if not crashed:
+                crashed = True
+                raise SimulatedProcessCrash()
+            return await original_set_thread(*args, **kwargs)
+
+        monkeypatch.setattr(service._intents, "set_thread", crash_before_persist)
+        with pytest.raises(SimulatedProcessCrash):
+            await service.create_from_source(
+                channel_id="channel-1",
+                source_kind="message",
+                source_id="message-crash",
+                prompt="hello",
+                thread_name="hello",
+            )
+
+        intent = await service._intents.by_source(
+            source_kind="message",
+            source_id="message-crash",
+        )
+        assert intent is not None and intent.state == CreationState.THREAD_CREATING
+        assert threads.create_calls == 1
+
+        threads.reference = None
+        with pytest.raises(SessionCreationUnknown, match="remains unknown"):
+            await service.create_from_source(
+                channel_id="channel-1",
+                source_kind="message",
+                source_id="message-crash",
+                prompt="hello",
+                thread_name="hello",
+            )
+
+        assert threads.create_calls == 1
+        await sessions.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_eager_resume_retries_after_stale_owner_lease_expires(
+    tmp_path: Path,
+) -> None:
+    home = tmp_path / "home"
+    await asyncio.to_thread(home.mkdir)
+    async with Database(tmp_path / "eager-owner-retry.sqlite3") as database:
+        bridge = FakeBridge()
+        service, sessions = await _build_service(
+            database,
+            home,
+            bridge,
+            FakeThreads(),
+            eager_retry_delays=(0.1, 0.2),
+        )
+        session_id = str(uuid4())
+        await service._bindings.create(
+            thread_id="thread-eager-owner-retry",
+            sdk_session_id=session_id,
+            cwd_snapshot=home,
+            project_source="implicit-home",
+        )
+        await OwnerLeaseStore(database).acquire(session_id, "crashed-owner")
+        await database.execute(
+            """
+            UPDATE session_owner_leases SET expires_at = ?
+            WHERE sdk_session_id = ?
+            """,
+            (time.time() + 1.05, session_id),
+        )
+
+        failures = await sessions.eager_resume()
+        assert "thread-eager-owner-retry" in failures
+        assert "thread-eager-owner-retry" in sessions._eager_retry_tasks
+
+        for _ in range(50):
+            runtime = sessions.for_thread("thread-eager-owner-retry")
+            if runtime is not None and runtime.state == RuntimeState.READY:
+                break
+            await asyncio.sleep(0.02)
+        else:
+            raise AssertionError("eager resume did not retry after owner lease expiry")
+
+        await sessions.shutdown()
+        assert sessions._eager_retry_tasks == {}
+
+
+@pytest.mark.asyncio
+async def test_session_registry_shutdown_cancels_pending_eager_retry(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    await asyncio.to_thread(home.mkdir)
+    async with Database(tmp_path / "eager-retry-shutdown.sqlite3") as database:
+        bridge = FakeBridge()
+        _service, sessions = await _build_service(
+            database,
+            home,
+            bridge,
+            FakeThreads(),
+            eager_retry_delays=(60,),
+        )
+        sessions._schedule_eager_retry("thread-pending-retry")
+        task = sessions._eager_retry_tasks["thread-pending-retry"]
+
+        await sessions.shutdown()
+
+        assert task.cancelled()
+        assert sessions._eager_retry_tasks == {}
 
 
 @pytest.mark.asyncio

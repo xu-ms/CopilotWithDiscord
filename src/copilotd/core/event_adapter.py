@@ -28,12 +28,7 @@ class EventAdapter:
             if not isinstance(envelope.payload, SessionEvent):
                 raise TypeError("SDK envelope payload must be SessionEvent")
             event = envelope.payload
-            event_id = _strict_uuid(event.id, field="event_id")
-            parent_id = (
-                None
-                if event.parent_id is None
-                else _strict_uuid(event.parent_id, field="parent_id")
-            )
+            event_id, parent_id = validate_sdk_event_identity(event)
             raw_payload = event.to_dict()
             raw_type = event.raw_type or event.type.value
             data = raw_payload.get("data", {})
@@ -105,6 +100,14 @@ class EventAdapter:
             reducer_hash=_payload_hash(raw_payload),
             received_at=envelope.received_at,
         )
+
+
+def validate_sdk_event_identity(event: SessionEvent) -> tuple[str, str | None]:
+    event_id = _strict_uuid(event.id, field="event_id")
+    parent_id = (
+        None if event.parent_id is None else _strict_uuid(event.parent_id, field="parent_id")
+    )
+    return event_id, parent_id
 
 
 def _strict_uuid(value: Any, *, field: str) -> str:

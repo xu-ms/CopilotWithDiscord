@@ -41,7 +41,12 @@ try:
 except Exception:
     certifi = None
 
-DEFAULT_ENV_FILE = Path("/Users/xu/Downloads/.testbot.env.txt")
+DEFAULT_ENV_FILE = Path(
+    os.environ.get(
+        "COPILOTD_DISCORD_E2E_ENV_FILE",
+        Path.home() / "Downloads" / ".testbot.env.txt",
+    )
+).expanduser()
 REQUIRED_ENV_KEY = "testbot"
 REQUIRED_GUILD_ID_KEY = "testbot_guild_id"
 REQUIRED_APPLICATION_ID_KEY = "testbot_application_id"

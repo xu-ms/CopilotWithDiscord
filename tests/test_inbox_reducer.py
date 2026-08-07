@@ -38,6 +38,7 @@ from copilotd.core.reducer import (
     _diff_stats,
 )
 from copilotd.discord_app import _discord_render_plan
+from copilotd.ops.heartbeat import HeartbeatWriter
 from copilotd.sdk.capabilities import CapabilityRegistry
 from copilotd.storage.database import Database
 
@@ -3583,6 +3584,114 @@ async def test_abort_projection_waits_for_aborted_idle_and_closes_turn(
 
 
 @pytest.mark.asyncio
+async def test_reducer_background_lease_is_counted_by_heartbeat(tmp_path: Path) -> None:
+    session_id = "session-background-heartbeat"
+    async with Database(tmp_path / "background-heartbeat.sqlite3") as database:
+        bindings = SessionBindingRepository(database)
+        await bindings.create(
+            thread_id="thread-background-heartbeat",
+            sdk_session_id=session_id,
+            cwd_snapshot=tmp_path,
+            project_source="implicit-home",
+        )
+        await database.execute(
+            """
+            UPDATE session_bindings
+            SET attachment_state = 'attached', runtime_generation = 2,
+                owner_fence_token = 8
+            WHERE sdk_session_id = ?
+            """,
+            (session_id,),
+        )
+        await database.execute(
+            """
+            INSERT INTO liveness_leases(
+                sdk_session_id, lease_id, kind, source_id,
+                runtime_generation, owner_fence_token, state,
+                acquired_at, refreshed_at, released_at
+            ) VALUES (
+                ?, 'background:task:task-heartbeat', 'background',
+                'task:task-heartbeat', 1, 7, 'orphaned', 100, 150, 150
+            )
+            """,
+            (session_id,),
+        )
+        events = [
+            _adapted(
+                "copilotd.snapshot.requested",
+                {"topic": "tasks"},
+                1,
+                source="internal",
+                session_id=session_id,
+                generation=2,
+                fence_token=8,
+            ),
+            _adapted(
+                "copilotd.snapshot.observed",
+                {
+                    "topic": "tasks",
+                    "epoch": 1,
+                    "snapshot_id": "background-heartbeat-snapshot",
+                    "query_start_sdk_receive_seq": 0,
+                    "query_end_sdk_receive_seq": 0,
+                    "payload": {
+                        "tasks": [
+                            {
+                                "id": "task-heartbeat",
+                                "status": "running",
+                                "type": "agent",
+                                "description": "Long-running worker",
+                            }
+                        ]
+                    },
+                },
+                2,
+                source="internal",
+                session_id=session_id,
+                generation=2,
+                fence_token=8,
+            ),
+        ]
+        assert await JournalReducer(database).persist(events) == 2
+        writer = HeartbeatWriter(
+            database,
+            tmp_path / "heartbeat.json",
+            resume_provider=lambda: None,
+        )
+        snapshot = await writer.snapshot(now=200)
+        lease = await database.fetchone(
+            """
+            SELECT kind, source_id, runtime_generation, owner_fence_token,
+                   state, acquired_at, released_at
+            FROM liveness_leases
+            WHERE sdk_session_id = ?
+            """,
+            (session_id,),
+        )
+
+    assert {
+        key: lease[key]
+        for key in (
+            "kind",
+            "source_id",
+            "runtime_generation",
+            "owner_fence_token",
+            "state",
+            "released_at",
+        )
+    } == {
+        "kind": "observed_background",
+        "source_id": "task:task-heartbeat",
+        "runtime_generation": 2,
+        "owner_fence_token": 8,
+        "state": "active",
+        "released_at": None,
+    }
+    assert lease["acquired_at"] > 150
+    assert snapshot.observed_background_tasks == 1
+
+
+@pytest.mark.asyncio
 async def test_snapshot_epochs_suppress_stale_negative_and_keep_terminal_monotonic(
     tmp_path: Path,
 ) -> None:
@@ -3924,7 +4033,7 @@ async def test_linked_task_terminal_waits_for_late_activity_and_queue_quiet_snap
     }
     assert segment["state"] == "semantic_complete"
     assert [dict(row) for row in leases] == [
-        {"kind": "background", "state": "released"},
+        {"kind": "observed_background", "state": "released"},
         {"kind": "submission", "state": "released"},
     ]
 

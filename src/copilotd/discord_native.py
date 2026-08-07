@@ -6,7 +6,7 @@ from typing import Any, Protocol
 import discord
 from discord import app_commands
 
-from copilotd.core.commands import CommandInvocation, CommandOperation
+from copilotd.core.commands import CommandInvocation, CommandOperation, fenced_code_block
 from copilotd.core.native import NativeTaskAction
 from copilotd.core.session_runtime import SessionRuntime
 from copilotd.sdk.capabilities import CapabilityManifest
@@ -164,12 +164,7 @@ class NativeDiscordRegistrar:
                                 idempotency_key=f"interaction:{interaction.id}",
                             )
                         }
-                    return json.dumps(
-                        result,
-                        ensure_ascii=False,
-                        indent=2,
-                        sort_keys=True,
-                    )
+                    return _json_result_text(result)
 
                 await self._host._run_command(interaction, "agent", operation)
 
@@ -202,12 +197,7 @@ class NativeDiscordRegistrar:
                             idempotency_key=f"interaction:{interaction.id}",
                         )
                     )
-                    return json.dumps(
-                        result,
-                        ensure_ascii=False,
-                        indent=2,
-                        sort_keys=True,
-                    )
+                    return _json_result_text(result)
 
                 await self._host._run_command(interaction, "remote", operation)
 
@@ -330,7 +320,7 @@ class NativeDiscordRegistrar:
                     )
                 else:
                     result = await runtime.runtime_schedules(kind=kind)
-                return json.dumps(result, ensure_ascii=False, indent=2, sort_keys=True)
+                return _json_result_text(result)
 
             await self._host._run_command(interaction, kind, operation)
 
@@ -391,4 +381,11 @@ def _builtin_result_text(result: dict[str, Any]) -> str:
 
 
 def _task_result_text(result: dict[str, Any]) -> str:
-    return json.dumps(result, ensure_ascii=False, indent=2, sort_keys=True)
+    return _json_result_text(result)
+
+
+def _json_result_text(result: Any) -> str:
+    return fenced_code_block(
+        json.dumps(result, ensure_ascii=False, indent=2, sort_keys=True),
+        language="json",
+    )
