@@ -24,8 +24,9 @@ The implementation follows [`docs/copilotD-detailed-design.md`](docs/copilotD-de
 - Forty-four applied migrations use unique reserved namespaces: Foundation
   `0001`-`0009`, Native `0010`-`0014`, Protocol `0015`-`0019`, Scheduler
   `0020`-`0028`, Protocol compatibility `0029`, and Discord `0030`-`0037`;
-  `0038`-`0039` are reserved, Operations uses forward-only `0040`-`0044`, and
-  session deletion and attachment lifecycle recovery are `0045`-`0046`.
+  `0038`-`0039` are reserved, Operations uses forward-only `0040`-`0044`,
+  session deletion and attachment lifecycle recovery are `0045`-`0046`, and
+  background-liveness compatibility is `0047`.
 - Durable event-log backfill with cursor rebase/gap diagnostics and ingress-overflow
   freeze/backfill/generation replacement; unrecoverable ephemeral gaps remain
   explicitly outcome-unknown.
@@ -207,6 +208,17 @@ Runtime paths are fixed by platform:
 | macOS | `~/Library/Application Support/copilotd/` | `~/Library/Caches/copilotd/heartbeat.json` | `~/Library/Logs/copilotd/` |
 | Windows | `%LOCALAPPDATA%\copilotd\state\` | `%LOCALAPPDATA%\copilotd\cache\heartbeat.json` | `%LOCALAPPDATA%\copilotd\logs\` |
 
+The production Discord gateway also holds a per-OS-user non-blocking lock at the
+OS account's fixed cache location for its entire lifetime. It resolves the account home from
+the POSIX account database or Windows process token and deliberately ignores `HOME`,
+`XDG_CACHE_HOME`, `LOCALAPPDATA`, `COPILOTD_DATA_DIR`, `COPILOTD_CACHE_DIR`, and
+`COPILOTD_LOG_DIR`. A second foreground or managed gateway fails
+before connecting to Discord with
+`another copilotD gateway is already running for this OS user`; it never kills or replaces
+the first process. The empty/sentinel lock file contains no token, token hash, PID, or other
+identity. POSIX uses `flock`; Windows uses `msvcrt.locking`, and process exit releases the
+kernel lock automatically.
+
 On first Windows upgrade, only `setup` or `service install` may adopt a legacy
 `%LOCALAPPDATA%\copilotD\` state tree. The installer disables service triggers, proves the
 old process trees exited, holds SQLite exclusion while staging a durable unknown-outcome
@@ -217,7 +229,39 @@ bot/runtime carrying the journal-bound handoff token may start for install verif
 `copilotd.log` is rotating JSON (10 MiB with seven backups); `boot.log`,
 `watchdog.log`, and `alerts.log` have distinct destinations. Override paths with
 `COPILOTD_DATA_DIR`, `COPILOTD_CACHE_DIR`, and `COPILOTD_LOG_DIR`. A guild-scoped
-development command sync can be selected with `COPILOTD_DISCORD_GUILD_ID`.
+development command sync can be selected with `COPILOTD_DISCORD_GUILD_ID`. Copilot
+input and Plan interactions expire after 15 minutes by default; deployments can tune
+that wait with `COPILOTD_INTERACTION_TIMEOUT_SECONDS` without imposing a session lifetime.
+
+Authentication follows the SDK token precedence
+`COPILOTD_GITHUB_TOKEN` > `COPILOT_GITHUB_TOKEN` > `GH_TOKEN` > `GITHUB_TOKEN`.
+Any token found through that precedence is treated as an explicit token and enables
+managed-settings session options; unset all four to force normal logged-in-user auth.
+
+Operational bounds are deliberately finite at transport and queue boundaries, not at the
+session lifetime:
+
+| Boundary | Default |
+|---|---|
+| Owner lease / renewal / mutation headroom | 60 s / 15 s / 40 s; renewal starts before create/resume RPCs |
+| Reducer ingress / reducer batch / command mailbox | 4096 events / 64 events / 1024 operations |
+| Generic SDK operation / compact / abort evidence | 30 s / 360 s / 15 s |
+| SDK graceful stop, then forced stop | 10 s + 10 s |
+| Input attachment file / message / inline-or-frame | 25 MiB / 100 MiB / 7 MiB |
+| Extension configuration file | 1 MiB |
+| Durable event-log read page | 500 events |
+| SQLite busy wait | 5 s |
+| App scheduler | 1 s poll, at most 100 due runs per tick; pre-dispatch retries at 5 s, 30 s, 2 m, 10 m, and 30 m |
+
+Input attachment preparation and eager session resume are intentionally conservative.
+Attachment files within one manifest are processed serially to bound memory. Eager resume
+retries owner conflicts through the prior 60-second lease window and is cancelled during
+shutdown. The app scheduler currently dispatches claimed runs serially; per-session durable
+fences preserve correctness, but one slow target can delay unrelated due runs.
+Runtime command discovery requests builtins only (`include_client_commands=false`,
+`include_skills=false`); configured skills remain available to the Agent rather than being
+mirrored as Discord commands. Model option input is limited to runtime-confirmable values:
+context tier `default|long_context` and reasoning summary `none|concise|detailed`.
 
 The opt-in hardware/credential lanes are `scripts/acceptance-macos.sh` and
 `scripts/acceptance-windows.ps1`. They intentionally exit with failure when selected on

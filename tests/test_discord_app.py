@@ -156,6 +156,87 @@ def test_discord_command_manifest_has_core_modes_and_no_deleted_roots(tmp_path: 
 
 
 @pytest.mark.asyncio
+async def test_every_registered_slash_command_routes_through_its_exact_shared_path(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    bot = CopilotDiscordBot(Settings(data_dir=tmp_path))
+    bot._register_application_commands()
+    routed: list[str] = []
+
+    async def run_command(
+        _interaction: object,
+        name: str,
+        _operation: object,
+    ) -> None:
+        routed.append(name)
+
+    monkeypatch.setattr(bot, "_run_command", run_command)
+    interaction = SimpleNamespace(
+        id=1,
+        channel=object(),
+        channel_id=1,
+        user=SimpleNamespace(id=2),
+    )
+
+    def leaf_commands(
+        commands_to_walk: list[object],
+        *,
+        prefix: str = "",
+    ):
+        for candidate in commands_to_walk:
+            path = f"{prefix} {candidate.name}".strip()
+            if isinstance(candidate, discord.app_commands.Group):
+                yield from leaf_commands(candidate.commands, prefix=path)
+            elif isinstance(candidate, discord.app_commands.Command):
+                yield path, candidate
+
+    def representative_value(parameter: object) -> object:
+        choices = list(parameter.choices)
+        if choices:
+            return choices[0]
+        if parameter.type is discord.AppCommandOptionType.boolean:
+            return True
+        if parameter.type is discord.AppCommandOptionType.integer:
+            return 1
+        if parameter.type is discord.AppCommandOptionType.number:
+            return 1.0
+        return f"{parameter.name}-value"
+
+    commands = list(leaf_commands(bot.tree.get_commands()))
+    context_menus = [
+        candidate
+        for candidate in bot.tree.get_commands()
+        if isinstance(candidate, discord.app_commands.ContextMenu)
+    ]
+    assert len(commands) == 77
+    assert {candidate.name for candidate in context_menus} == {
+        "Ask Copilot",
+        "Pin message",
+    }
+    for path, command in commands:
+        arguments = {
+            parameter.name: representative_value(parameter)
+            for parameter in command.parameters
+            if parameter.required
+        }
+        before = len(routed)
+        await command.callback(interaction, **arguments)
+        assert routed[before:] == [path], path
+
+    target = SimpleNamespace()
+    for command in context_menus:
+        before = len(routed)
+        await command.callback(interaction, target)
+        assert routed[before:] == [command.name], command.name
+
+    assert routed == [
+        *[path for path, _command in commands],
+        *[command.name for command in context_menus],
+    ]
+
+
+@pytest.mark.asyncio
 async def test_ready_attachment_orphan_is_resubmitted_after_gateway_recovery(
     tmp_path: Path,
 ) -> None:
@@ -1385,6 +1466,53 @@ async def test_component_and_modal_unknown_interaction_fall_back_in_thread(
 
     assert "durable component result" in channel.messages[0]
     assert "form opened" in channel.messages[1]
+
+
+@pytest.mark.asyncio
+async def test_direct_interaction_choice_defers_and_reports_runtime_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class Response:
+        def __init__(self) -> None:
+            self.deferred = False
+
+        def is_done(self) -> bool:
+            return self.deferred
+
+        async def defer(self, **_kwargs: Any) -> None:
+            self.deferred = True
+
+    class Followup:
+        def __init__(self) -> None:
+            self.messages: list[str] = []
+
+        async def send(self, content: str, **_kwargs: Any) -> None:
+            self.messages.append(content)
+
+    class Runtime:
+        async def respond_interaction(self, *_args: Any, **_kwargs: Any) -> dict[str, Any]:
+            raise RuntimeError("runtime unavailable")
+
+    bot = CopilotDiscordBot(Settings(data_dir=tmp_path))
+    response = Response()
+    followup = Followup()
+    interaction = SimpleNamespace(
+        response=response,
+        followup=followup,
+        channel=_FallbackChannel(),
+        data={"custom_id": "cdi:interaction-1:choice-0"},
+    )
+    monkeypatch.setattr(bot, "_interaction_runtime", AsyncMock(return_value=Runtime()))
+
+    await bot._handle_direct_interaction(
+        interaction,
+        "cdi:interaction-1:choice-0",
+    )
+
+    assert response.deferred is True
+    assert len(followup.messages) == 1
+    assert "runtime unavailable" in followup.messages[0]
 
 
 def test_discord_http_errors_map_to_outbox_delivery_classes() -> None:

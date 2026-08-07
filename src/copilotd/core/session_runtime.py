@@ -31,6 +31,7 @@ from copilotd.core.commands import (
     ModelReasoningSummaryAdapter,
     TaskActionAdapter,
 )
+from copilotd.core.event_adapter import InvalidSdkEvent, validate_sdk_event_identity
 from copilotd.core.extensions import (
     ConfigReloadClaim,
     ConfigReloadClaimStore,
@@ -99,6 +100,7 @@ OAuthAuthorizer = Callable[
 ]
 T = TypeVar("T")
 _LOGGER = logging.getLogger(__name__)
+COMPACT_OPERATION_TIMEOUT_SECONDS = 6 * 60
 
 
 class SessionHandle(Protocol):
@@ -417,7 +419,7 @@ class SessionRuntime:
         owner_renew_seconds: float = OWNER_LEASE_RENEW_SECONDS,
         queue_poll_seconds: float = 1,
         attachment_resolver: AttachmentResolver | None = None,
-        interaction_timeout_seconds: float = 24 * 60 * 60,
+        interaction_timeout_seconds: float = 15 * 60,
         sdk_operation_timeout_seconds: float = 30,
         abort_evidence_timeout_seconds: float = 15,
         shutdown_timeout_seconds: float = 5,
@@ -576,7 +578,10 @@ class SessionRuntime:
                 (submission_id, self.binding.thread_id),
             )
             if snapshot is None:
-                await self._assert_dispatchable()
+                if mode == "immediate":
+                    await self._assert_dispatchable()
+                else:
+                    await self._assert_intake_allowed(requested_origin=origin)
                 effective_agent_mode = agent_mode or self.binding.desired_mode
                 if effective_agent_mode not in {
                     "interactive",
@@ -886,23 +891,26 @@ class SessionRuntime:
                     "blocked_attachment_manifest_missing",
                 )
                 raise SessionNotReady("attachments require a durable manifest")
-            message_id = await self._dispatch_submission(
-                submission_id=str(row["id"]),
-                idempotency_key=(f"queue:{row['id']}:{int(row['dispatch_attempt'])}"),
-                prompt=str(row["prompt"]),
-                prompt_hash=str(row["prompt_hash"]),
-                attachment_manifest_id=(None if manifest_id is None else str(manifest_id)),
-                attachments=attachments,
-                mode=cast(DeliveryMode, str(row["requested_delivery"])),
-                agent_mode=cast(AgentMode, str(row["requested_mode_snapshot"])),
-                dispatch_attempt=int(row["dispatch_attempt"]),
-                requested_model_config=requested_model,
-                requested_agent=str(row["requested_agent_snapshot"]),
-                requested_session_config_version=int(row["requested_session_config_version"]),
-                requested_attachment_count=int(row["attachment_count"]),
-                requested_origin=str(row["origin"]),
-                allow_mode_override=False,
-            )
+            try:
+                message_id = await self._dispatch_submission(
+                    submission_id=str(row["id"]),
+                    idempotency_key=(f"queue:{row['id']}:{int(row['dispatch_attempt'])}"),
+                    prompt=str(row["prompt"]),
+                    prompt_hash=str(row["prompt_hash"]),
+                    attachment_manifest_id=(None if manifest_id is None else str(manifest_id)),
+                    attachments=attachments,
+                    mode=cast(DeliveryMode, str(row["requested_delivery"])),
+                    agent_mode=cast(AgentMode, str(row["requested_mode_snapshot"])),
+                    dispatch_attempt=int(row["dispatch_attempt"]),
+                    requested_model_config=requested_model,
+                    requested_agent=str(row["requested_agent_snapshot"]),
+                    requested_session_config_version=int(row["requested_session_config_version"]),
+                    requested_attachment_count=int(row["attachment_count"]),
+                    requested_origin=str(row["origin"]),
+                    allow_mode_override=False,
+                )
+            except (OperationDeferred, MailboxNotAccepting, SessionNotReady):
+                return None
             return str(row["id"]), message_id
 
     async def _dispatch_submission(
@@ -2203,6 +2211,10 @@ class SessionRuntime:
             )
 
     def _on_sdk_event_accepted(self, event: Any) -> None:
+        try:
+            validate_sdk_event_identity(event)
+        except (InvalidSdkEvent, TypeError):
+            return
         event_type = getattr(event, "type", None)
         raw_type = getattr(event_type, "value", event_type)
         loop = self._loop
@@ -3340,7 +3352,10 @@ class SessionRuntime:
                 },
                 internal_event_id=f"compaction:{compaction_id}:pending",
             )
-            result = await self._sdk_call(self._bridge.compact_history(handle, focus=focus))
+            result = await self._sdk_call(
+                self._bridge.compact_history(handle, focus=focus),
+                timeout_seconds=COMPACT_OPERATION_TIMEOUT_SECONDS,
+            )
             if not result.get("success"):
                 raise OperationRejected(str(result.get("error") or "runtime rejected compaction"))
             await self._require_inbox().join()
@@ -3569,7 +3584,7 @@ class SessionRuntime:
             NativeTaskAction.WAIT: "tasks_wait",
         }[selected]
         self._require_capability(capability)
-        await self._assert_dispatchable()
+        await self._assert_task_action_allowed(selected)
         if (
             selected
             in {
@@ -3596,7 +3611,7 @@ class SessionRuntime:
         }
 
         async def dispatch() -> dict[str, Any]:
-            await self._assert_owned_handle()
+            await self._assert_task_action_allowed(selected)
             handle = self._require_handle()
             operation_id = await self._operation_id(operation_key)
             await self._require_inbox().commit_internal(
@@ -3791,6 +3806,23 @@ class SessionRuntime:
             for card in cards
         ]
         return result
+
+    async def _assert_task_action_allowed(self, action: NativeTaskAction) -> None:
+        if action in {
+            NativeTaskAction.LIST,
+            NativeTaskAction.SHOW,
+            NativeTaskAction.PROGRESS,
+            NativeTaskAction.WAIT,
+        }:
+            await self._assert_task_read_allowed()
+            return
+        await self._assert_task_priority_allowed()
+
+    async def _assert_task_read_allowed(self) -> None:
+        await self._assert_owned_handle(allow_degraded=True)
+
+    async def _assert_task_priority_allowed(self) -> None:
+        await self._assert_owned_handle(allow_degraded=True)
 
     async def list_agents(self) -> dict[str, Any]:
         self._require_capability("agents_list")
@@ -5828,6 +5860,7 @@ class SessionRuntime:
                 if not await self._owner_leases.is_current(self._lease):
                     self.state = RuntimeState.FENCED
                     raise FenceLost(f"owner fence lost for session {self.binding.sdk_session_id}")
+                self._ensure_owner_renewal_started()
                 self.binding = await self._bindings.begin_reattach(
                     thread_id=self.binding.thread_id,
                     lease=self._lease,
@@ -5846,6 +5879,7 @@ class SessionRuntime:
                         await cleanup
                     self.state = RuntimeState.DETACHED
                     raise
+            self._ensure_owner_renewal_started()
             try:
                 if not reuse_owner:
                     self.binding = await self._bindings.begin_attachment(
@@ -6376,14 +6410,7 @@ class SessionRuntime:
             session_id=self.binding.sdk_session_id,
             runtime_generation=self.binding.runtime_generation,
         )
-        self._renewal_stop.clear()
-        self._renewal_task = self._tasks.create(
-            self._renew_owner(),
-            name=f"owner-renew:{self.binding.sdk_session_id}",
-            source="owner-renewal",
-            session_id=self.binding.sdk_session_id,
-            runtime_generation=self.binding.runtime_generation,
-        )
+        self._ensure_owner_renewal_started()
 
     async def _recover_event_log(
         self,
@@ -6416,7 +6443,7 @@ class SessionRuntime:
         seen_ids: set[str] = set()
         if predecessor_id is not None:
             seen_ids.add(str(predecessor_id))
-        for _ in range(1000):
+        while True:
             previous_cursor = cursor
             batch = await self._bridge.read_event_log(
                 handle,
@@ -6477,7 +6504,7 @@ class SessionRuntime:
                     {"cursor": cursor, "cursor_epoch": cursor_epoch},
                 )
                 raise RuntimeError("event-log cursor did not advance while has_more was true")
-        raise RuntimeError("event-log recovery exceeded the bounded page limit")
+            await asyncio.sleep(0)
 
     async def _advance_event_cursor(
         self,
@@ -6720,15 +6747,19 @@ class SessionRuntime:
             session_id=self.binding.sdk_session_id,
             runtime_generation=self.binding.runtime_generation,
         )
-        if self._renewal_task is None:
-            self._renewal_stop.clear()
-            self._renewal_task = self._tasks.create(
-                self._renew_owner(),
-                name=f"owner-renew:{self.binding.sdk_session_id}",
-                source="owner-renewal",
-                session_id=self.binding.sdk_session_id,
-                runtime_generation=self.binding.runtime_generation,
-            )
+        self._ensure_owner_renewal_started()
+
+    def _ensure_owner_renewal_started(self) -> None:
+        if self._renewal_task is not None:
+            return
+        self._renewal_stop.clear()
+        self._renewal_task = self._tasks.create(
+            self._renew_owner(),
+            name=f"owner-renew:{self.binding.sdk_session_id}",
+            source="owner-renewal",
+            session_id=self.binding.sdk_session_id,
+            runtime_generation=self.binding.runtime_generation,
+        )
 
     async def _renew_owner(self) -> None:
         while not self._renewal_stop.is_set():
@@ -6835,6 +6866,43 @@ class SessionRuntime:
         blockers = await self._readiness_blockers(require_quiet=False)
         if blockers:
             raise SessionNotReady("session readiness is blocked: " + ", ".join(blockers))
+
+    async def _assert_intake_allowed(self, *, requested_origin: str) -> None:
+        if self.state not in {RuntimeState.READY, RuntimeState.DEGRADED}:
+            raise SessionNotReady(f"session runtime is {self.state}")
+        draining = await self._database.fetchone(
+            "SELECT value FROM global_config WHERE key = 'restart_draining'"
+        )
+        if draining is not None and draining["value"] == "1":
+            raise SessionNotReady("copilotD is draining for restart")
+        await self._assert_owned_handle(allow_degraded=True)
+        binding = await self._bindings.by_thread(self.binding.thread_id)
+        if binding is None:
+            raise SessionNotReady("session binding no longer exists")
+        typed_attachment_reason = (
+            "scheduler_run"
+            if requested_origin == "app_schedule"
+            else (
+                "recovery_cleanup" if requested_origin in {"recovery", "recovery_cleanup"} else None
+            )
+        )
+        intake_allowed = binding.binding_intent == BindingIntent.ACTIVE or (
+            binding.binding_intent == BindingIntent.CLOSED
+            and typed_attachment_reason is not None
+            and binding.attachment_reason == typed_attachment_reason
+        )
+        if not intake_allowed:
+            raise SessionNotReady("session binding does not accept durable message intake")
+        if binding.attachment_state != AttachmentState.ATTACHED:
+            raise SessionNotReady(f"session attachment is {binding.attachment_state}")
+        if binding.project_id is not None:
+            project = await self._database.fetchone(
+                "SELECT state FROM projects WHERE id = ?",
+                (binding.project_id,),
+            )
+            if project is None or project["state"] == "closing":
+                raise SessionNotReady("session project is closing")
+        self.binding = binding
 
     async def _assert_claimed_dispatchable(
         self,
@@ -6974,6 +7042,7 @@ class SessionRuntime:
         *,
         allow_closing: bool = False,
         allow_attaching: bool = False,
+        allow_degraded: bool = False,
     ) -> None:
         if self._service_quiesced and not allow_closing:
             raise SessionNotReady("session admission is quiesced for service restart")
@@ -6982,6 +7051,8 @@ class SessionRuntime:
             allowed.add(RuntimeState.CLOSING)
         if allow_attaching:
             allowed.add(RuntimeState.ATTACHING)
+        if allow_degraded:
+            allowed.add(RuntimeState.DEGRADED)
         if self.state not in allowed:
             raise SessionNotReady(f"session runtime is {self.state}")
         if self._handle is None or not await self._is_current_owner():
@@ -7098,7 +7169,15 @@ class SessionRuntime:
             self._mailbox = None
         self._renewal_stop.set()
         if self._renewal_task is not None:
-            await self._cancel_component_task(self._renewal_task)
+            renewal_task = self._renewal_task
+            try:
+                async with asyncio.timeout(self._shutdown_timeout_seconds):
+                    await asyncio.shield(renewal_task)
+            except TimeoutError:
+                await self._cancel_component_task(renewal_task)
+            except Exception as error:
+                if self.state != RuntimeState.FENCED:
+                    errors.append(error)
             self._renewal_task = None
         if self._reducer is not None:
             reducer = self._reducer

@@ -10,7 +10,7 @@ import pytest
 
 from copilotd.storage.database import Database
 
-EXPECTED_MIGRATION_VERSIONS = [*range(1, 38), *range(40, 47)]
+EXPECTED_MIGRATION_VERSIONS = [*range(1, 38), *range(40, 48)]
 
 
 def _create_migration_fixture(path: Path, *, through_version: int) -> None:
@@ -835,6 +835,37 @@ async def test_protocol_compatibility_upgrades_exact_6d00930_schema(
     )
     assert "config_reload_claims" in tables
     assert "source_event_id" in agent_columns
+
+
+@pytest.mark.asyncio
+async def test_background_liveness_kind_migrates_from_release_0046(tmp_path: Path) -> None:
+    database_path = tmp_path / "upgrade-background-kind.sqlite3"
+    async with Database(database_path) as database:
+        await database.execute(
+            """
+            INSERT INTO liveness_leases(
+                sdk_session_id, lease_id, kind, source_id,
+                runtime_generation, owner_fence_token, state,
+                acquired_at, refreshed_at
+            ) VALUES (
+                'session-background', 'background:task:1', 'background',
+                'task:1', 1, 1, 'active', 1, 1
+            )
+            """
+        )
+        await database.execute("DELETE FROM schema_migrations WHERE version = 47")
+
+    async with Database(database_path) as database:
+        lease = await database.fetchone(
+            """
+            SELECT kind FROM liveness_leases
+            WHERE sdk_session_id = 'session-background'
+            """
+        )
+        versions = await database.fetchall("SELECT version FROM schema_migrations ORDER BY version")
+
+    assert lease["kind"] == "observed_background"
+    assert [row["version"] for row in versions] == EXPECTED_MIGRATION_VERSIONS
 
 
 @pytest.mark.asyncio

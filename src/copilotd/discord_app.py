@@ -53,6 +53,7 @@ from copilotd.core.commands import (
     SessionNamingAdapter,
     TaskActionAdapter,
     UnknownInteractionError,
+    fenced_code_block,
 )
 from copilotd.core.extensions import (
     ExtensionConfigFileSource,
@@ -96,6 +97,7 @@ from copilotd.core.task_registry import TaskRegistry
 from copilotd.core.worktrees import SessionCreationWorktreeAdapter, WorktreeManager
 from copilotd.discord_native import NativeDiscordRegistrar
 from copilotd.ops.control import ServiceControlWorker
+from copilotd.ops.gateway_lock import GatewayInstanceLock
 from copilotd.ops.heartbeat import HeartbeatWriter
 from copilotd.ops.service import ServiceManager, SqliteRestartCoordinator
 from copilotd.ops.surface import LocalOpsSurface
@@ -295,6 +297,7 @@ class CopilotDiscordBot(commands.Bot):
                 ingress_capacity=self.settings.ingress_capacity,
                 reducer_batch_size=self.settings.reducer_batch_size,
                 owner_renew_seconds=self.settings.owner_lease_renew_seconds,
+                interaction_timeout_seconds=self.settings.interaction_timeout_seconds,
                 attachment_resolver=self.attachment_service.sdk_attachments_for_send,
                 capabilities=self.capabilities,
                 task_registry=self._tasks,
@@ -864,39 +867,24 @@ class CopilotDiscordBot(commands.Bot):
                 )
                 return
             form = ElicitationForm.from_dict(json.loads(str(row["form_schema"])))
-            await interaction.response.send_modal(
-                ElicitationResponseModal(self, interaction_id, form)
-            )
-            return
-        runtime = await self._interaction_runtime(interaction)
-        if action in {"decline", "cancel"}:
-            result = await runtime.respond_interaction(
-                interaction_id,
-                action=action,
-            )
-            await interaction.response.send_message(
-                _interaction_result_text(result),
-                ephemeral=True,
-            )
-            return
-        if action.startswith("choice-") and action.removeprefix("choice-").isdigit():
-            result = await runtime.respond_interaction(
-                interaction_id,
-                selection=int(action.removeprefix("choice-")),
-            )
-            await interaction.response.send_message(
-                _interaction_result_text(result),
-                ephemeral=True,
-            )
+            await DiscordInteractionResponder(
+                self,
+                interaction,
+                name="Copilot form",
+            ).send_modal(ElicitationResponseModal(self, interaction_id, form))
             return
         data = interaction.data
         values = data.get("values") if isinstance(data, dict) else None
-        if (
-            action != "select"
-            or not isinstance(values, list)
-            or not values
-            or not str(values[0]).isdigit()
+        response_kwargs: dict[str, Any]
+        if action in {"decline", "cancel"}:
+            response_kwargs = {"action": action}
+        elif action.startswith("choice-") and action.removeprefix("choice-").isdigit():
+            response_kwargs = {"selection": int(action.removeprefix("choice-"))}
+        elif (
+            action == "select" and isinstance(values, list) and values and str(values[0]).isdigit()
         ):
+            response_kwargs = {"selection": int(values[0])}
+        else:
             await self._send_component_text(
                 interaction,
                 "Copilot input",
@@ -912,7 +900,7 @@ class CopilotDiscordBot(commands.Bot):
             runtime = await self._interaction_runtime(interaction)
             result = await runtime.respond_interaction(
                 interaction_id,
-                selection=int(values[0]),
+                **response_kwargs,
             )
         except Exception as error:
             mapped = _map_command_error(error)
@@ -5641,7 +5629,10 @@ def _parse_json_list(value: str, *, field: str) -> list[Any]:
 
 async def _json_text_async(operation: Awaitable[Mapping[str, Any]]) -> str:
     value = await operation
-    return json.dumps(dict(value), ensure_ascii=False, indent=2, sort_keys=True)
+    return fenced_code_block(
+        json.dumps(dict(value), ensure_ascii=False, indent=2, sort_keys=True),
+        language="json",
+    )
 
 
 def _freshness_label(snapshot: Mapping[str, Any]) -> str:
@@ -5821,12 +5812,13 @@ def _key_value_options(value: str | None) -> dict[str, str]:
 async def run_discord_bot(settings: Settings) -> bool:
     if settings.discord_token is None:
         raise RuntimeError("COPILOTD_DISCORD_TOKEN is required")
-    bot = CopilotDiscordBot(settings)
-    try:
-        await bot.start(settings.discord_token.get_secret_value(), reconnect=True)
-        if bot._fatal_worker_error is not None:
-            raise RuntimeError("critical copilotD worker failed") from bot._fatal_worker_error
-    finally:
-        if not bot.is_closed():
-            await bot.close()
-    return bot.restart_requested
+    with GatewayInstanceLock():
+        bot = CopilotDiscordBot(settings)
+        try:
+            await bot.start(settings.discord_token.get_secret_value(), reconnect=True)
+            if bot._fatal_worker_error is not None:
+                raise RuntimeError("critical copilotD worker failed") from bot._fatal_worker_error
+        finally:
+            if not bot.is_closed():
+                await bot.close()
+        return bot.restart_requested

@@ -40,6 +40,7 @@ from copilotd.core.session_runtime import (
     SessionRuntime,
 )
 from copilotd.storage.database import Database
+from copilotd.storage.leases import OwnerConflict
 
 RuntimeFactory = Callable[[SessionBinding], SessionRuntime]
 _creation_admitted: ContextVar[bool] = ContextVar(
@@ -54,6 +55,7 @@ class SessionRegistryNotAccepting(RuntimeError):
 
 class CreationState(StrEnum):
     RESERVED = "reserved"
+    THREAD_CREATING = "thread_creating"
     THREAD_CREATED = "thread_created"
     CREATING = "creating"
     ATTACHED = "attached"
@@ -358,6 +360,8 @@ class SessionRegistry:
         self,
         bindings: SessionBindingRepository,
         runtime_factory: RuntimeFactory,
+        *,
+        eager_retry_delays: tuple[float, ...] = (1, 2, 5, 10, 15, 15, 15),
     ) -> None:
         self._bindings = bindings
         self._runtime_factory = runtime_factory
@@ -374,6 +378,8 @@ class SessionRegistry:
         self._transition_lock = asyncio.Lock()
         self._transitions: dict[str, _AttachmentTransition] = {}
         self._transition_cleanup_tasks: set[asyncio.Task[None]] = set()
+        self._eager_retry_delays = eager_retry_delays
+        self._eager_retry_tasks: dict[str, asyncio.Task[None]] = {}
 
     def for_thread(self, thread_id: str) -> SessionRuntime | None:
         runtime = self._runtimes.get(thread_id)
@@ -584,9 +590,56 @@ class SessionRegistry:
                             failures[binding.thread_id] = (
                                 f"{error}; cleanup failed: {cleanup_error}"
                             )
+                        if isinstance(error, OwnerConflict):
+                            self._schedule_eager_retry(binding.thread_id)
             except SessionRegistryNotAccepting:
                 break
         return failures
+
+    def _schedule_eager_retry(self, thread_id: str) -> None:
+        existing = self._eager_retry_tasks.get(thread_id)
+        if existing is not None and not existing.done():
+            return
+        task = asyncio.create_task(
+            self._retry_eager_resume(thread_id),
+            name=f"session-eager-retry:{thread_id}",
+        )
+        self._eager_retry_tasks[thread_id] = task
+        task.add_done_callback(
+            partial(self._eager_retry_done, thread_id),
+        )
+
+    def _eager_retry_done(self, thread_id: str, task: asyncio.Task[None]) -> None:
+        if self._eager_retry_tasks.get(thread_id) is task:
+            self._eager_retry_tasks.pop(thread_id, None)
+        if not task.cancelled():
+            task.exception()
+
+    async def _retry_eager_resume(self, thread_id: str) -> None:
+        for delay in self._eager_retry_delays:
+            await asyncio.sleep(delay)
+            if not self._accepting:
+                return
+            binding = await self._bindings.by_thread(thread_id)
+            if binding is None or binding.binding_intent != BindingIntent.ACTIVE:
+                return
+            try:
+                await self.ensure_attached(binding)
+            except OwnerConflict:
+                continue
+            except SessionRegistryNotAccepting:
+                return
+            except Exception:
+                return
+            return
+
+    async def _cancel_eager_retries(self) -> None:
+        tasks = list(self._eager_retry_tasks.values())
+        self._eager_retry_tasks.clear()
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
 
     async def begin_service_quiesce(
         self,
@@ -670,6 +723,7 @@ class SessionRegistry:
         *,
         emergency_session_id: str | None = None,
     ) -> None:
+        await self._cancel_eager_retries()
         await self.close_admission()
         async with self._mutation_lock:
             runtimes = list(self._runtimes.values())
@@ -844,11 +898,18 @@ class SessionCreationService:
                 creation_token=intent.creation_token,
             )
             if reference is None:
-                if intent.state == CreationState.UNKNOWN:
+                if intent.state in {
+                    CreationState.THREAD_CREATING,
+                    CreationState.UNKNOWN,
+                }:
                     raise SessionCreationUnknown(
                         "Discord thread creation remains unknown; "
                         "the original token did not reconcile"
                     )
+                intent = await self._intents.mark(
+                    intent,
+                    CreationState.THREAD_CREATING,
+                )
                 try:
                     reference = await self._threads.create_thread(
                         channel_id=channel_id,

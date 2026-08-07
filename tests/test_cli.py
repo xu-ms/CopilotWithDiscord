@@ -11,6 +11,7 @@ from copilotd import cli
 from copilotd.cli import CLI_SCHEMA_VERSION, build_parser, main, run_command
 from copilotd.config import Settings
 from copilotd.ops.contracts import EXPECTED_MIGRATION_VERSIONS
+from copilotd.ops.gateway_lock import GatewayAlreadyRunning
 from copilotd.ops.service import ServiceManager
 from copilotd.storage.database import Database
 
@@ -72,6 +73,30 @@ def test_configuration_failure_has_no_traceback(
     error = capsys.readouterr().err
     payload = json.loads(error)
     assert payload["error"]["code"] == "configuration_error"
+    assert "Traceback" not in error
+
+
+def test_gateway_conflict_has_stable_operational_error(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    async def conflict(_args: argparse.Namespace) -> int:
+        raise GatewayAlreadyRunning()
+
+    monkeypatch.setattr(cli, "run_command", conflict)
+
+    with pytest.raises(SystemExit) as exit_info:
+        main(["run", "--foreground"])
+
+    assert exit_info.value.code == 4
+    error = capsys.readouterr().err
+    payload = json.loads(error)
+    assert payload["error"] == {
+        "code": "gateway_already_running",
+        "detail": {},
+        "exit_code": 4,
+        "message": "another copilotD gateway is already running for this OS user",
+    }
     assert "Traceback" not in error
 
 

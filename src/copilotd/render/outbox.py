@@ -154,7 +154,7 @@ class RenderOutboxDispatcher:
     async def drain(
         self,
         *,
-        deadline_seconds: float = 10,
+        deadline_seconds: float = 30,
         limit: int = 50,
     ) -> int:
         if deadline_seconds <= 0:

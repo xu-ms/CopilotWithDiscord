@@ -1612,6 +1612,14 @@ prompt。<code>/plan</code> 使用 optional
 <code>action=enter|exit|show</code> 而不是 Discord subcommand，因而 bare
 <code>/plan</code> 可默认 enter；optional prompt 仅是确认 Plan mode
 后的便利提交。普通消息保存 mode snapshot。</li>
+<li>同一 OS 用户最多一个 production Discord
+gateway。<code>run_discord_bot</code> 在构造/连接 bot 前对 OS account
+fixed cache 下的 <code>gateway.lock</code> 做 non-blocking per-user
+lock，并持有到完整 shutdown；account home 从 POSIX account database 或
+Windows process token 取得，<code>HOME</code>、
+<code>XDG_CACHE_HOME</code>、<code>LOCALAPPDATA</code> 与
+<code>COPILOTD_DATA_DIR/CACHE_DIR/LOG_DIR</code> override 都不改变
+该位置。竞争者明确失败，不 kill、不抢锁。</li>
 </ol>
 <h3 id="产品范围与非目标">产品范围与非目标</h3>
 <p>首版包括可选项目绑定、未绑定 <code>$HOME</code> 默认 cwd、thread
@@ -1900,8 +1908,10 @@ snapshot 不删除；layout/mention 只由 channel_settings 持有</td>
 creation_token, project_source, cwd_snapshot,
 sdk_session_id(preallocated UUID), thread_id?, starter_message_id?,
 attachment_manifest_id?,
-state(reserved/thread_created/creating/attached/unknown/failed),
-created_at；<code>source_kind+source_id</code> 唯一</td>
+state(reserved/thread_creating/thread_created/creating/attached/unknown/failed),
+created_at；<code>source_kind+source_id</code>
+唯一；<code>thread_creating</code> 在 Discord side effect
+前提交，重启后只按 token 对账，不自动创建第二个 thread</td>
 </tr>
 <tr>
 <td><code>session_bindings</code></td>
@@ -2100,6 +2110,19 @@ background/ submission terminal/shutdown/recovery unknown/runtime error
   worktrees/&lt;project-id&gt;/&lt;session-id&gt;/
   logs/copilotd.jsonl
   cache/event-fixtures/</code></pre>
+<p>Discord gateway 的单实例锁不放在上述可 override tree，而固定放在 OS
+account 的 cache root： macOS
+<code>&lt;account-home&gt;/Library/Caches/copilotd/gateway.lock</code>、POSIX
+<code>&lt;account-home&gt;/.cache/copilotd/gateway.lock</code>、Windows
+<code>&lt;token-profile&gt;/AppData/Local/copilotd/cache/gateway.lock</code>。POSIX
+使用 <code>flock(LOCK_EX|LOCK_NB)</code>，Windows 使用
+<code>msvcrt.locking(LK_NBLCK)</code>；锁文件为空或只有 Windows locking
+所需 sentinel byte， 不保存 Discord token、token hash、PID
+或用户标识。目录沿用 private per-user 约定（POSIX <code>0700</code> 且
+lock file <code>0600</code>，Windows 位于 current-user
+<code>%LOCALAPPDATA%</code>）。进程退出由 OS 自动释放锁； 第二个 gateway
+在连接 Discord 前返回
+<code>another copilotD gateway is already running for this OS user</code>。</p>
 <p>启动时将 <code>Path.home().expanduser().resolve()</code> 保存为
 <code>global_config.resolved_home</code>。每次 创建 session 都把最终 cwd
 写入 <code>cwd_snapshot</code>；之后 channel binding 变化不会漂移既有
@@ -5003,7 +5026,9 @@ session</td>
 </tr>
 <tr>
 <td>Input/plan</td>
-<td>默认 15 分钟；超时 cancel；SDK callback/ReducerWorker 继续</td>
+<td>默认 15 分钟，可通过
+<code>COPILOTD_INTERACTION_TIMEOUT_SECONDS</code> 调整；超时 cancel；SDK
+callback/ReducerWorker 继续</td>
 </tr>
 <tr>
 <td>Runtime start</td>
@@ -5485,6 +5510,41 @@ model、<code>/mode</code>、<code>/goal</code>、<code>/bare</code>、<code>/to
 <code>/limits</code>、<code>/pr</code>、<code>/delegate</code>
 不进入命令面；<code>/unbound-fallback</code> 不存在，因为
 <code>$HOME</code> 行为固定启用。</li>
+<li>Token lookup 固定遵循 SDK precedence：
+<code>COPILOTD_GITHUB_TOKEN</code> &gt;
+<code>COPILOT_GITHUB_TOKEN</code> &gt; <code>GH_TOKEN</code> &gt;
+<code>GITHUB_TOKEN</code>； 任一命中都视为显式 token 并启用
+managed-settings options。</li>
+<li>implementation transport/queue bounds：owner lease/renew/headroom 为
+<code>60s/15s/40s</code> （renewal 在 create/resume RPC
+前启动）；ReducerInbox <code>4096</code>、reducer batch
+<code>64</code>、 CommandMailbox <code>1024</code>；generic SDK
+operation <code>30s</code>，compact <code>360s</code>，abort evidence
+<code>15s</code>，SDK graceful/force stop 各 <code>10s</code>，SQLite
+busy wait <code>5s</code>。</li>
+<li>输入附件默认单文件 <code>25 MiB</code>、单消息
+<code>100 MiB</code>、inline/frame <code>7 MiB</code>，同一 manifest
+串行处理；extension config file 上限 <code>1 MiB</code>；event-log 每页
+<code>500</code>。</li>
+<li>app scheduler 每 <code>1s</code> poll、每 tick 最多处理
+<code>100</code> 个 due run，pre-dispatch retry 为
+<code>5s/30s/2m/10m/30m</code>。当前 claimed run 全局串行
+dispatch；这是保守实现边界，慢 target 可能延迟其他 due
+run，后续并发化必须同时证明 claim lease renewal、adapter reentrancy 与
+crash recovery，不能仅用无界 <code>gather()</code>。</li>
+<li>eager resume 遇到旧 owner lease 时按
+<code>1s/2s/5s/10s/15s/15s/15s</code> 有界重试覆盖 60 秒 lease
+window；shutdown 显式取消 retry task。</li>
+<li>runtime command manifest 只请求 builtin，固定
+<code>include_client_commands=false/include_skills=false</code>；skills
+供 Agent 使用，不镜像为 Discord commands。model options 只接受当前可确认
+vocabulary：context tier <code>default|long_context</code>、reasoning
+summary <code>none|concise|detailed</code>。</li>
+<li>production <code>run_discord_bot</code> 全生命周期持有
+OS-account-fixed cache 的 per-user gateway lock； foreground 与 managed
+service 互斥，任意 HOME/XDG/LOCALAPPDATA 或 data/cache/log override
+都不能绕过。doctor、 sdk-probe、native acceptance 不获取该锁；直接构造
+bot 的 Discord E2E harness 也不受影响。</li>
 </ul>
 <h3 id="当前实现快照2026-08-07">当前实现快照（2026-08-07）</h3>
 <p>repository implementation 已按本设计完成对齐，credentialed Bridge
@@ -5510,7 +5570,7 @@ model、<code>/mode</code>、<code>/goal</code>、<code>/bare</code>、<code>/to
 unknown</td>
 </tr>
 <tr>
-<td>44 个唯一版本 SQLite migration：Foundation
+<td>45 个唯一版本 SQLite migration：Foundation
 <code>0001</code>–<code>0009</code>、Native RPC
 <code>0010</code>–<code>0014</code>、Protocol
 <code>0015</code>–<code>0019</code>、Scheduler
@@ -5519,14 +5579,14 @@ unknown</td>
 <code>0030</code>–<code>0037</code>、保留
 <code>0038</code>–<code>0039</code>、Operations
 <code>0040</code>–<code>0044</code>、session deletion
-<code>0045</code>、attachment lifecycle <code>0046</code>；project
-<code>$HOME</code> fallback/cwd snapshot、owner fence、creation
-saga、strict-UUID event journal、reducer-owned
-operation/submission/native-command receipts、submission-task
-links、liveness leases、startup recovery inventory 与 eager
-resume；attach 时按 current state 结算 pending agent、强制 uncertain
-remote off；force restart 使用 producer/journal dual epoch、loss
-watermark admission fence 与 owner handoff</td>
+<code>0045</code>、attachment lifecycle <code>0046</code>、background
+liveness compatibility <code>0047</code>；project <code>$HOME</code>
+fallback/cwd snapshot、owner fence、creation saga、strict-UUID event
+journal、reducer-owned operation/submission/native-command
+receipts、submission-task links、liveness leases、startup recovery
+inventory 与 eager resume；attach 时按 current state 结算 pending
+agent、强制 uncertain remote off；force restart 使用 producer/journal
+dual epoch、loss watermark admission fence 与 owner handoff</td>
 <td>bundled runtime 进程死亡后的 in-flight execution 仍只能标 outcome
 unknown</td>
 </tr>
@@ -5648,7 +5708,7 @@ wheel/sdist 的 isolated build/install；全量 pytest 还把
 <code>PytestUnhandledThreadExceptionWarning</code> 升级为 error，已修复
 failure-path tests 遗留的 aiosqlite worker。<code>copilotd doctor</code>
 已真实启动 bundled runtime并确认 SDK 1.0.8 / runtime 1.0.73 / protocol
-3、authentication 与 migration 46。</p>
+3、authentication 与 migration 47。</p>
 <p>真实 Copilot phase-2 evidence 使用同一 pinned identity，均为
 disposable workspace/session 且 cleanup 已确认：</p>
 <table>

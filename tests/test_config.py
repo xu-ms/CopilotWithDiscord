@@ -123,6 +123,7 @@ def test_settings_resolve_paths_and_create_layout(tmp_path: Path) -> None:
         ("owner_lease_renew_seconds", 0),
         ("ingress_capacity", 0),
         ("reducer_batch_size", 0),
+        ("interaction_timeout_seconds", 0),
     ],
 )
 def test_settings_reject_invalid_runtime_limits(field: str, value: int) -> None:
@@ -141,6 +142,17 @@ def test_owner_lease_timing_preserves_headroom_under_renewal_jitter() -> None:
             owner_lease_ttl_seconds=60,
             owner_lease_renew_seconds=16,
         )
+
+
+def test_interaction_timeout_defaults_to_design_value_and_is_configurable() -> None:
+    assert Settings(_env_file=None).interaction_timeout_seconds == 15 * 60
+    assert (
+        Settings(
+            _env_file=None,
+            interaction_timeout_seconds=120,
+        ).interaction_timeout_seconds
+        == 120
+    )
 
 
 def test_github_token_uses_sdk_auth_precedence_without_exposing_value(

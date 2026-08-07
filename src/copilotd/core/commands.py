@@ -463,7 +463,13 @@ class CommandExecutor:
                 ephemeral=True,
                 followup=unknown_interaction,
             )
-            await self._deliver(responder, response, force_followup=unknown_interaction)
+            response_fallback = await self._deliver_with_fallback(
+                responder,
+                invocation,
+                response,
+                force_followup=unknown_interaction,
+            )
+            unknown_interaction = unknown_interaction or response_fallback
             followup_used = response.followup or unknown_interaction
             return CommandDispatchOutcome(
                 deferred=deferred,
@@ -481,7 +487,13 @@ class CommandExecutor:
                 ephemeral=True,
                 followup=unknown_interaction,
             )
-            await self._deliver(responder, response, force_followup=unknown_interaction)
+            response_fallback = await self._deliver_with_fallback(
+                responder,
+                invocation,
+                response,
+                force_followup=unknown_interaction,
+            )
+            unknown_interaction = unknown_interaction or response_fallback
             followup_used = response.followup or unknown_interaction
             return CommandDispatchOutcome(
                 deferred=deferred,
@@ -500,17 +512,14 @@ class CommandExecutor:
                 error=None,
                 unknown_interaction=unknown_interaction,
             )
-        try:
-            await self._deliver(responder, response, force_followup=unknown_interaction)
-            followup_used = response.followup or unknown_interaction
-        except UnknownInteractionError:
-            responder.warn(
-                "discord_unknown_interaction_during_response",
-                discord_code=10062,
-                command=invocation.name,
-            )
-            await responder.send_followup(response.content, ephemeral=response.ephemeral)
-            followup_used = True
+        response_fallback = await self._deliver_with_fallback(
+            responder,
+            invocation,
+            response,
+            force_followup=unknown_interaction,
+        )
+        unknown_interaction = unknown_interaction or response_fallback
+        followup_used = response.followup or unknown_interaction
         return CommandDispatchOutcome(
             deferred=deferred,
             followup_used=followup_used,
@@ -518,6 +527,26 @@ class CommandExecutor:
             error=None,
             unknown_interaction=unknown_interaction,
         )
+
+    async def _deliver_with_fallback(
+        self,
+        responder: CommandResponder,
+        invocation: CommandInvocation,
+        response: CommandResponse,
+        *,
+        force_followup: bool,
+    ) -> bool:
+        try:
+            await self._deliver(responder, response, force_followup=force_followup)
+        except UnknownInteractionError:
+            responder.warn(
+                "discord_unknown_interaction_during_response",
+                discord_code=10062,
+                command=invocation.name,
+            )
+            await responder.send_followup(response.content, ephemeral=response.ephemeral)
+            return True
+        return False
 
     async def _deliver(
         self,
@@ -538,6 +567,14 @@ class CommandExecutor:
             await responder.send_followup(response.content, ephemeral=response.ephemeral)
             return
         await responder.send_inline(response.content, ephemeral=response.ephemeral)
+
+
+def fenced_code_block(content: str, *, language: str = "") -> str:
+    fence_length = 3
+    while "`" * fence_length in content:
+        fence_length += 1
+    fence = "`" * fence_length
+    return f"{fence}{language}\n{content.rstrip()}\n{fence}"
 
 
 def command_error_from_code(code: str, message: str = "") -> CDCommandError:

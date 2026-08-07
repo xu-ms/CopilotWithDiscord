@@ -27,6 +27,7 @@ from copilotd.core.commands import (
     UnknownInteractionError,
     command_error_code,
     command_error_from_code,
+    fenced_code_block,
 )
 
 
@@ -175,6 +176,45 @@ async def test_command_executor_unknown_interaction_falls_back_to_followup() -> 
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "operation_error",
+    [
+        CDProjectError("project unavailable"),
+        RuntimeError("unexpected failure"),
+    ],
+)
+async def test_command_executor_error_response_expiry_falls_back_to_thread(
+    operation_error: BaseException,
+) -> None:
+    responder = FakeResponder(inline_error=UnknownInteractionError())
+    executor = CommandExecutor()
+
+    def fail(_invocation: CommandInvocation) -> None:
+        raise operation_error
+
+    outcome = await executor.execute(
+        responder,
+        CommandInvocation(name="/demo", source="discord"),
+        fail,
+    )
+
+    assert responder.calls[0] == ("defer", True)
+    assert responder.calls[1][0] == "inline"
+    assert responder.calls[2][0] == "followup"
+    assert responder.calls[2][1] == responder.calls[1][1]
+    assert responder.warnings == [
+        {
+            "message": "discord_unknown_interaction_during_response",
+            "discord_code": 10062,
+            "command": "/demo",
+        }
+    ]
+    assert outcome.followup_used is True
+    assert outcome.unknown_interaction is True
+    assert outcome.error is not None
+
+
+@pytest.mark.asyncio
 async def test_command_executor_defers_before_a_delayed_callback() -> None:
     responder = FakeResponder()
     executor = CommandExecutor()
@@ -226,3 +266,11 @@ def test_command_capability_helpers_are_explicit() -> None:
     unsupported = CommandCapability.unsupported("probe missing")
     assert unsupported.supported is False
     assert unsupported.reason == "probe missing"
+
+
+def test_fenced_code_block_preserves_nested_backticks() -> None:
+    rendered = fenced_code_block('{"snippet": "```python\\npass\\n```"}', language="json")
+
+    assert rendered.startswith("````json\n")
+    assert rendered.endswith("\n````")
+    assert "```python\\npass\\n```" in rendered

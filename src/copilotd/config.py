@@ -144,6 +144,7 @@ class Settings(BaseSettings):
     owner_lease_renew_seconds: int = int(OWNER_LEASE_RENEW_SECONDS)
     ingress_capacity: int = 4096
     reducer_batch_size: int = 64
+    interaction_timeout_seconds: float = 15 * 60
     attachment_file_max_bytes: int = 25 * 1024 * 1024
     attachment_message_max_bytes: int = 100 * 1024 * 1024
     attachment_blob_max_bytes: int = 7 * 1024 * 1024
@@ -202,6 +203,7 @@ class Settings(BaseSettings):
         "setup_verify_timeout_seconds",
         "restart_drain_timeout_seconds",
         "service_startup_grace_seconds",
+        "interaction_timeout_seconds",
     )
     @classmethod
     def validate_positive_seconds(cls, value: float) -> float:

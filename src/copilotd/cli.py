@@ -23,6 +23,7 @@ from copilotd.ops.contracts import (
     LATEST_MIGRATION_VERSION,
     SERVICE_STATUS_SCHEMA_VERSION,
 )
+from copilotd.ops.gateway_lock import GatewayAlreadyRunning
 from copilotd.ops.preflight import PreflightFailed, SetupPreflight
 from copilotd.ops.service import (
     RestartBlocked,
@@ -432,6 +433,9 @@ def main(argv: list[str] | None = None) -> None:
             exit_code=4,
             detail={"blockers": list(error.blockers)},
         )
+        exit_code = 4
+    except GatewayAlreadyRunning as error:
+        _print_error("gateway_already_running", str(error), exit_code=4)
         exit_code = 4
     except ServiceError as error:
         _print_error("service_error", str(error), exit_code=4)
