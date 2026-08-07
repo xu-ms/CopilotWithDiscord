@@ -772,7 +772,7 @@ class DiscordRealHarness:
                 discord_ids=[str(ordinary.id)],
             )
         )
-        await self._run_rich_embed_gallery(thread)
+        await self._run_render_gallery(thread)
 
         image_path = root / "local-image.png"
         Image.new("RGB", (8, 8), "purple").save(image_path)
@@ -1087,12 +1087,12 @@ class DiscordRealHarness:
             )
         )
 
-    async def _run_rich_embed_gallery(self, thread: discord.Thread) -> None:
+    async def _run_render_gallery(self, thread: discord.Thread) -> None:
         interaction_id = str(uuid.uuid5(uuid.NAMESPACE_URL, f"copilotd:{self._run_id}:input"))
         payloads = [
             {
                 "type": "assistant.message_delta",
-                "content": "Copilot is streaming a **live rich response**…",
+                "content": "Copilot is streaming a **plain text response**…",
                 "finalized": False,
             },
             {
@@ -1100,7 +1100,7 @@ class DiscordRealHarness:
                 "content": (
                     "Here is a richer Copilot answer with **emphasis**, `inline code`, "
                     "[a link](https://docs.github.com/copilot), and a concise checklist.\n\n"
-                    "- Typed embed presentation\n"
+                    "- Plain message presentation\n"
                     "- Markdown remains copyable\n"
                     "- Attachments stay durable"
                 ),
@@ -1131,21 +1131,6 @@ class DiscordRealHarness:
                     "title": "Copilot warning",
                     "detail": "Context usage is approaching the configured limit.",
                     "event_type": "session.warning",
-                },
-                "finalized": True,
-            },
-            {
-                "type": "session.usage_info",
-                "content": "**Copilot usage**",
-                "usage": {
-                    "inputTokens": 12400,
-                    "outputTokens": 2180,
-                    "cacheReadTokens": 8600,
-                    "totalTokens": 14580,
-                    "premiumRequests": 1,
-                    "aiCredits": 1.25,
-                    "currentTokens": 73600,
-                    "tokenLimit": 128000,
                 },
                 "finalized": True,
             },
@@ -1233,8 +1218,8 @@ class DiscordRealHarness:
                 "content": (
                     "**Code changes** · `structured`\n"
                     "```diff\n"
-                    "- plain Discord output\n"
-                    "+ typed embeds with bounded metadata\n"
+                    "- every surface uses a card\n"
+                    "+ structured surfaces use bounded embeds\n"
                     "```"
                 ),
                 "source": "structured",
@@ -1255,7 +1240,7 @@ class DiscordRealHarness:
                 "finalized": True,
             },
         ]
-        messages: list[Any] = []
+        rendered: list[tuple[str, Any]] = []
         for payload in payloads:
             plan = await _discord_render_plan(payload)
             for index, batch in enumerate(plan.batches):
@@ -1267,23 +1252,32 @@ class DiscordRealHarness:
                     silent=True,
                 )
                 self._created_messages.append(message)
-                messages.append(message)
-        fetched = [await thread.fetch_message(message.id) for message in messages]
-        if any(not message.embeds for message in fetched):
-            raise DiscordE2EError("typed rich embed gallery contains a plain fallback message")
-        if not any(message.components for message in fetched):
+                rendered.append((str(payload["type"]), message))
+        fetched = [
+            (payload_type, await thread.fetch_message(message.id))
+            for payload_type, message in rendered
+        ]
+        plain_types = {"assistant.message_delta", "assistant.message", "idle_footer"}
+        for payload_type, message in fetched:
+            if payload_type in plain_types and message.embeds:
+                raise DiscordE2EError(f"{payload_type} unexpectedly rendered as an embed")
+            if payload_type not in plain_types and not message.embeds:
+                raise DiscordE2EError(f"{payload_type} lost its structured embed")
+            if payload_type == "idle_footer" and not str(message.content).startswith("-# "):
+                raise DiscordE2EError("turn summary did not render as compact subtext")
+        if not any(message.components for _, message in fetched):
             raise DiscordE2EError("rich interaction card has no Discord components")
         self.evidence.features.append(
             FeatureEvidence(
-                feature="typed rich embed gallery",
+                feature="Discord text, footer, and structured render gallery",
                 status="passed",
-                transport="real Discord embed and component serialization",
+                transport="real Discord content, embed, and component serialization",
                 detail=(
-                    "stream/final answer, reasoning, warning, usage, pending/resolved/expired "
-                    "interaction, task completed/continue/blocked, turn summary, and normal/"
-                    "oversized diff cards"
+                    "plain stream/final answer, compact turn footer, reasoning, warning, "
+                    "pending/resolved/expired interaction, task completed/continue/blocked, "
+                    "and normal/oversized diff cards"
                 ),
-                discord_ids=[str(message.id) for message in fetched],
+                discord_ids=[str(message.id) for _, message in fetched],
             )
         )
 
@@ -1599,6 +1593,7 @@ class DiscordRealHarness:
         expected_contents: list[str] = []
         expected_filenames: list[str] = []
         expected_sha256: list[str] = []
+        expected_embed_count = 0
         for payload in known_payloads:
             plan = await _discord_render_plan(
                 payload,
@@ -1607,6 +1602,7 @@ class DiscordRealHarness:
             )
             for batch in plan.batches:
                 expected_contents.append(batch.content or "\u200b")
+                expected_embed_count += bool(batch.embeds)
                 for asset in batch.assets:
                     expected_filenames.append(str(asset.filename))
                     expected_sha256.append(_hash_bytes(_asset_bytes(asset)))
@@ -1652,9 +1648,9 @@ class DiscordRealHarness:
                     "production Discord history did not contain the known marker exactly once"
                 )
             rich_embed_count = sum(bool(message.embeds) for message in messages)
-            if rich_embed_count != expected_intent_count:
+            if rich_embed_count != expected_embed_count:
                 raise DiscordE2EError(
-                    "production Discord history did not serialize every typed intent as rich embeds"
+                    "production Discord history did not preserve the planned content/embed mix"
                 )
             actual_artifact_digests = [
                 _hash_bytes(await attachment.read(use_cached=False))

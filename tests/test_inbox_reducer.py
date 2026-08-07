@@ -571,7 +571,7 @@ async def test_reducer_materializes_full_stream_content_for_each_outbox_edit(
 
 
 @pytest.mark.asyncio
-async def test_reducer_materializes_nonempty_status_and_usage_payloads(
+async def test_reducer_materializes_status_and_keeps_usage_in_footer_projection(
     tmp_path: Path,
 ) -> None:
     adapter = EventAdapter()
@@ -628,8 +628,15 @@ async def test_reducer_materializes_nonempty_status_and_usage_payloads(
         rows = await database.fetchall(
             "SELECT lane, payload FROM render_outbox ORDER BY logical_seq"
         )
+        usage = await database.fetchone(
+            """
+            SELECT input_tokens, output_tokens, premium_requests
+            FROM usage_samples WHERE session_id = 'session-render-status'
+            """
+        )
 
     payloads = [(row["lane"], json.loads(row["payload"])) for row in rows]
+    assert len(payloads) == 5
     assert payloads[0][0] == "status"
     assert "Context is nearly full." in payloads[0][1]["content"]
     assert payloads[0][1]["status"] == {
@@ -637,24 +644,20 @@ async def test_reducer_materializes_nonempty_status_and_usage_payloads(
         "detail": "Context is nearly full.",
         "event_type": "session.warning",
     }
-    assert payloads[1][0] == "usage"
-    assert "Input tokens: `12`" in payloads[1][1]["content"]
-    assert "Total tokens: `19`" in payloads[1][1]["content"]
-    assert payloads[1][1]["usage"] == {
-        "inputTokens": 12,
-        "outputTokens": 7,
-        "totalTokens": 19,
-        "premiumRequests": 1,
+    assert dict(usage) == {
+        "input_tokens": 12,
+        "output_tokens": 7,
+        "premium_requests": 1.0,
     }
+    assert payloads[1][0] == "status"
+    assert "raw chain-of-thought is hidden" in payloads[1][1]["content"]
+    assert "private chain of thought" not in payloads[1][1]["content"]
     assert payloads[2][0] == "status"
-    assert "raw chain-of-thought is hidden" in payloads[2][1]["content"]
-    assert "private chain of thought" not in payloads[2][1]["content"]
+    assert "`modified` `src/copilotd/app.py`" in payloads[2][1]["content"]
     assert payloads[3][0] == "status"
-    assert "`modified` `src/copilotd/app.py`" in payloads[3][1]["content"]
+    assert payloads[3][1]["status"]["outcome"] == "blocked"
     assert payloads[4][0] == "status"
-    assert payloads[4][1]["status"]["outcome"] == "blocked"
-    assert payloads[5][0] == "status"
-    assert payloads[5][1]["status"]["outcome"] == "completed"
+    assert payloads[4][1]["status"]["outcome"] == "completed"
 
 
 @pytest.mark.asyncio
@@ -2379,6 +2382,135 @@ async def test_user_message_correlation_retains_facts_and_creates_runtime_observ
         observed.event_id,
         external.event_id,
     ]
+
+
+@pytest.mark.asyncio
+async def test_idle_quarantines_unmatched_acceptance_without_blocking_local_queue(
+    tmp_path: Path,
+) -> None:
+    session_id = "session-acceptance-mismatch-idle"
+    prompt = "first prompt"
+    accepted_id = str(uuid4())
+    async with Database(tmp_path / "acceptance-mismatch-idle.sqlite3") as database:
+        await CapabilityRegistry(Settings(_env_file=None, data_dir=tmp_path)).activate(
+            database,
+            {
+                "runtime_version": "1.0.73",
+                "protocol_version": 3,
+                "ping_protocol_version": 3,
+            },
+        )
+        await _insert_projection_binding(database, session_id)
+        events = [
+            _adapted(
+                "copilotd.submission.queued",
+                {
+                    "submission_id": "submission-first",
+                    "thread_id": "thread-projection",
+                    "origin": "app_message",
+                    "prompt": prompt,
+                    "prompt_hash": hashlib.sha256(prompt.encode()).hexdigest(),
+                    "requested_mode": "interactive",
+                    "requested_delivery": "enqueue",
+                    "attachment_count": 0,
+                    "created_at": 101,
+                },
+                1,
+                source="internal",
+                session_id=session_id,
+            ),
+            _adapted(
+                "copilotd.submission.accepted",
+                {
+                    "submission_id": "submission-first",
+                    "message_id": accepted_id,
+                },
+                2,
+                source="internal",
+                session_id=session_id,
+            ),
+            _adapted(
+                "user.message",
+                {"content": prompt, "agentMode": "interactive"},
+                3,
+                session_id=session_id,
+            ),
+            _adapted(
+                "copilotd.submission.queued",
+                {
+                    "submission_id": "submission-second",
+                    "thread_id": "thread-projection",
+                    "origin": "app_message",
+                    "prompt": "second prompt",
+                    "prompt_hash": hashlib.sha256(b"second prompt").hexdigest(),
+                    "requested_mode": "interactive",
+                    "requested_delivery": "enqueue",
+                    "attachment_count": 0,
+                    "created_at": 104,
+                },
+                4,
+                source="internal",
+                session_id=session_id,
+            ),
+            _adapted("session.idle", {"aborted": False}, 5, session_id=session_id),
+        ]
+        assert await JournalReducer(database).persist(events) == len(events)
+        submissions = await database.fetchall(
+            """
+            SELECT submission_id, origin, state, completion_basis
+            FROM submissions WHERE sdk_session_id = ?
+            ORDER BY submission_id
+            """,
+            (session_id,),
+        )
+        queue = await database.fetchall("SELECT id, state FROM message_queue ORDER BY id")
+        leases = await database.fetchall(
+            """
+            SELECT source_id, state FROM liveness_leases
+            WHERE sdk_session_id = ? AND kind = 'submission'
+            ORDER BY source_id
+            """,
+            (session_id,),
+        )
+        incident = await database.fetchone(
+            """
+            SELECT kind FROM runtime_incidents
+            WHERE session_id = ? AND kind = 'submission_unobserved_at_session_idle'
+            """,
+            (session_id,),
+        )
+
+    app_submissions = {
+        row["submission_id"]: dict(row) for row in submissions if row["origin"] == "app_message"
+    }
+    runtime_submissions = [dict(row) for row in submissions if row["origin"] == "runtime_observed"]
+    assert app_submissions == {
+        "submission-first": {
+            "submission_id": "submission-first",
+            "origin": "app_message",
+            "state": "outcome_unknown",
+            "completion_basis": "session_idle_without_user_correlation",
+        },
+        "submission-second": {
+            "submission_id": "submission-second",
+            "origin": "app_message",
+            "state": "local_queued",
+            "completion_basis": None,
+        },
+    }
+    assert len(runtime_submissions) == 1
+    assert runtime_submissions[0]["origin"] == "runtime_observed"
+    assert runtime_submissions[0]["state"] == "loop_idle"
+    assert runtime_submissions[0]["completion_basis"] is None
+    assert [dict(row) for row in queue] == [
+        {"id": "submission-first", "state": "outcome_unknown"},
+        {"id": "submission-second", "state": "local_queued"},
+    ]
+    assert [dict(row) for row in leases if row["source_id"].startswith("submission-")] == [
+        {"source_id": "submission-first", "state": "released"},
+        {"source_id": "submission-second", "state": "active"},
+    ]
+    assert incident["kind"] == "submission_unobserved_at_session_idle"
 
 
 @pytest.mark.asyncio

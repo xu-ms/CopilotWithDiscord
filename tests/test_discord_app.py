@@ -982,7 +982,7 @@ async def test_verified_relative_assistant_image_is_uploaded(
 
 
 @pytest.mark.asyncio
-async def test_assistant_stream_and_final_render_as_rich_embeds() -> None:
+async def test_assistant_stream_and_final_render_as_plain_message_content() -> None:
     stream = await _discord_render_plan(
         {
             "type": "assistant.message_delta",
@@ -998,14 +998,11 @@ async def test_assistant_stream_and_final_render_as_rich_embeds() -> None:
         }
     )
 
-    assert stream.batches[0].content == ""
-    assert stream.batches[0].embeds[0]["title"] == "✨ Copilot is responding"
-    assert stream.batches[0].embeds[0]["description"] == "Working on **three checks**…"
-    assert stream.batches[0].embeds[0]["footer"]["text"] == "Live response"
-    assert final.batches[0].content == ""
-    assert final.batches[0].embeds[0]["title"] == "✨ Copilot response"
-    assert "```text" in final.batches[0].embeds[0]["description"]
-    assert final.batches[0].embeds[0]["footer"]["text"] == "Copilot · response complete"
+    assert stream.batches[0].content == "Working on **three checks**…"
+    assert stream.batches[0].embeds == ()
+    assert "All checks passed." in final.batches[0].content
+    assert "```text" in final.batches[0].content
+    assert final.batches[0].embeds == ()
 
 
 @pytest.mark.asyncio
@@ -1026,21 +1023,6 @@ async def test_structured_events_render_as_distinct_rich_cards() -> None:
         ),
         (
             {
-                "type": "session.usage_info",
-                "content": "**Copilot usage**",
-                "usage": {
-                    "inputTokens": 12,
-                    "outputTokens": 7,
-                    "totalTokens": 19,
-                    "currentTokens": 50,
-                    "tokenLimit": 100,
-                },
-                "finalized": True,
-            },
-            "📈 Copilot usage",
-        ),
-        (
-            {
                 "type": "interaction",
                 "content": "**Copilot needs input**",
                 "interaction": {
@@ -1051,21 +1033,6 @@ async def test_structured_events_render_as_distinct_rich_cards() -> None:
                 "finalized": False,
             },
             "📝 Copilot needs input",
-        ),
-        (
-            {
-                "type": "idle_footer",
-                "content": "turn complete",
-                "model": "gpt-test",
-                "input_tokens": 1200,
-                "output_tokens": 340,
-                "credits": 1.5,
-                "context": "50/100",
-                "duration_seconds": 65,
-                "background_observed": False,
-                "finalized": True,
-            },
-            "✅ Turn complete",
         ),
         (
             {
@@ -1116,24 +1083,51 @@ async def test_structured_events_render_as_distinct_rich_cards() -> None:
         assert plan.batches[0].embeds[0]["title"] == title
         assert len(discord.Embed.from_dict(plan.batches[0].embeds[0])) <= 6000
 
-    usage = (await _discord_render_plan(cases[1][0])).batches[0].embeds[0]
-    assert "`[######------]` 50%" in usage["description"]
-    assert [field["name"] for field in usage["fields"]] == ["Input", "Output", "Total"]
-    context_only = await _discord_render_plan(
+    expired = (await _discord_render_plan(cases[2][0])).batches[0].embeds[0]
+    assert expired["footer"]["text"] == "No response was sent"
+    blocked = (await _discord_render_plan(cases[3][0])).batches[0].embeds[0]
+    assert blocked["color"] == 0xFEE75C
+    continuing = (await _discord_render_plan(cases[4][0])).batches[0].embeds[0]
+    assert continuing["color"] == 0x5865F2
+
+
+@pytest.mark.asyncio
+async def test_usage_and_turn_summary_render_as_compact_subtext() -> None:
+    usage = await _discord_render_plan(
         {
             "type": "session.usage_info",
             "content": "**Copilot usage**",
-            "usage": {"currentTokens": 25, "tokenLimit": 100},
+            "usage": {
+                "inputTokens": 12,
+                "outputTokens": 7,
+                "totalTokens": 19,
+                "currentTokens": 50,
+                "tokenLimit": 100,
+            },
             "finalized": True,
         }
     )
-    assert "`[###---------]` 25%" in context_only.batches[0].embeds[0]["description"]
-    expired = (await _discord_render_plan(cases[4][0])).batches[0].embeds[0]
-    assert expired["footer"]["text"] == "No response was sent"
-    blocked = (await _discord_render_plan(cases[5][0])).batches[0].embeds[0]
-    assert blocked["color"] == 0xFEE75C
-    continuing = (await _discord_render_plan(cases[6][0])).batches[0].embeds[0]
-    assert continuing["color"] == 0x5865F2
+    footer = await _discord_render_plan(
+        {
+            "type": "idle_footer",
+            "content": "turn complete",
+            "model": "gpt-test",
+            "input_tokens": 1200,
+            "output_tokens": 340,
+            "credits": 1.5,
+            "context": "50/100",
+            "duration_seconds": 65,
+            "background_observed": False,
+            "finalized": True,
+        }
+    )
+
+    assert usage.batches[0].content == "-# 📥 12 │ 📤 7 │ Σ 19 │ 🧩 50/100"
+    assert usage.batches[0].embeds == ()
+    assert footer.batches[0].content == (
+        "-# ✅ 🧠 gpt-test │ 📥 1,200 │ 📤 340 │ ⏱ 1m 5s │ 🧩 50/100 │ ✨ 1.5"
+    )
+    assert footer.batches[0].embeds == ()
 
 
 @pytest.mark.asyncio
@@ -1246,7 +1240,7 @@ async def test_oversized_diff_and_legacy_tool_artifact_do_not_claim_success() ->
 
 
 @pytest.mark.asyncio
-async def test_rich_embed_gallery_respects_discord_count_and_character_budgets() -> None:
+async def test_image_preview_gallery_respects_discord_count_and_character_budgets() -> None:
     plan = await _discord_render_plan(
         {
             "type": "assistant.message",
@@ -1265,7 +1259,7 @@ async def test_rich_embed_gallery_respects_discord_count_and_character_budgets()
 
     embeds = plan.batches[0].embeds
     assert len(embeds) == 10
-    assert embeds[0]["title"] == "🖼️ Image gallery"
+    assert embeds[0]["title"] == "🖼️ Image preview · 1/10"
     assert sum(len(discord.Embed.from_dict(item)) for item in embeds) <= 6000
 
 
@@ -1296,7 +1290,7 @@ async def test_image_preview_filenames_are_safe_and_unique_per_discord_message()
         "report-chart.png",
         "report-chart-2.png",
     ]
-    assert [embed["image"]["url"] for embed in batch.embeds[1:]] == [
+    assert [embed["image"]["url"] for embed in batch.embeds] == [
         "attachment://report-chart.png",
         "attachment://report-chart-2.png",
     ]

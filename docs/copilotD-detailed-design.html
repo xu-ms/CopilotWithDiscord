@@ -4015,10 +4015,16 @@ break。不得在 code fence、blockquote 或 table 内跨消息。</li>
 <code>.md</code>/<code>.txt</code> 附件，正文只放摘要和文件名。</li>
 <li>text lane 最快 1 秒一次 edit；TaskDeck lane 最快 4 秒一次
 edit。计时从 Discord edit 完成时开始，而不是 request 发起时。</li>
-<li>普通回答、streaming/final、reasoning/status/warning/error、usage/context、interaction、
-turn summary、diff 和 tool artifact 都生成 typed
-embed，不再把结构化状态压成同一种纯文本。 assistant 正文只在 embed
-description 出现一次；message content 使用零宽占位，避免重复展示。</li>
+<li>普通 assistant streaming/final 正文使用 Discord message
+content，保留原生 Markdown、复制和 引用体验，不放进
+embed。reasoning/status/warning/error、interaction、diff、tool artifact
+等结构化状态继续使用 typed embed。</li>
+<li><code>assistant.usage</code>、<code>session.usage_info</code> 和
+<code>session.usage_checkpoint</code> 只更新 durable usage
+projection，不单独发卡片；<code>session.idle</code> 把
+model、tokens、duration、context 和 credits 合并成 ClaudeD 风格的
+<code>-#</code> compact subtext footer（如
+<code>-# 📥 1234 │ 📤 56</code>）。</li>
 <li>每条 Discord message 最多 10 个 embed，所有 embed 合计最多 6000
 字符；decorator 在发送前 统一约束 title/description/field/footer
 预算。usage 使用结构化字段和 context progress bar； interaction 明确区分
@@ -5544,7 +5550,10 @@ submission</td>
 <tr>
 <td>durable app FIFO；fresh readiness snapshot、reducer
 caught-up、config/agent/remote/schedule/task known gate
-后只派发队首；attachment manifest READY + hash/size 复验，无
+后只派发队首；<code>session.idle</code> 会把没有对应
+<code>user.message</code> 的已接受提交保守结算为
+<code>outcome_unknown</code> 并释放队首，避免 accepted/event ID
+契约漂移永久堵塞 FIFO；attachment manifest READY + hash/size 复验，无
 attachment-free
 fallback；<code>/queue add/list/remove/clear</code>；project variables
 只解析到 typed MCP/environment reference，不作为任意 process environment
@@ -5579,11 +5588,11 @@ retry-after 仍需真实 gateway fixture；Discord cached-media
 代理在当前网络不可达，不影响主 CDN 原件</td>
 </tr>
 <tr>
-<td>assistant
-stream/final、reasoning、status/warning/error、usage/context、interaction、turn
-summary、diff、tool artifact 全部使用 typed rich embed；单消息最多 10
-embeds/6000 字符；usage metrics/context
-bar、pending/resolved/expired、task
+<td>assistant stream/final 使用普通 Discord message content；usage
+snapshot 不单独发送，turn summary 合并为 ClaudeD 风格 <code>-#</code>
+compact footer。reasoning、status/warning/error、interaction、diff、tool
+artifact 保留 typed rich embed；单消息最多 10 embeds/6000
+字符；pending/resolved/expired、task
 completed/continue/blocked、hunk-aware diff stats、oversized
 omitted/unknown、legacy artifact unknown/failed
 语义均有确定颜色和字段；图片/table 使用消息内唯一
@@ -5699,18 +5708,15 @@ fail closed</td>
 <td><code>497059e7472f8878b446c8edb631dad58e480328dbcc2df5e42722e83863f2bc</code></td>
 </tr>
 <tr>
-<td>Discord rich gallery v2</td>
+<td>Discord rich gallery v2（历史基线）</td>
 <td>passed；run <code>cd-e2e-1786071615-eb6388be</code>；94
 项自动证据通过；最终现场保留，旧现场已删除</td>
-<td>assistant
-stream/final、reasoning、warning、usage/context、pending/resolved/expired
-interaction、task completed/continue/blocked、turn
-summary、normal/oversized diff、tool artifact、table/image/file 和
-TaskDeck 均为 typed rich card；rich gallery 独立发送 14 张卡；三个
-outbox intent、附件上传、embed-folded CDN image 和主 CDN byte/SHA
-readback 均成功；81 项 slash/component 操作为
-<code>pending_human_driver</code>；Pin message 因 bot 缺少 Manage
-Messages 阻塞，429 未实际观察</td>
+<td>该证据验证 typed cards、三个 outbox intent、附件上传、embed-folded
+CDN image 和主 CDN byte/SHA readback；assistant 正文和 usage/turn
+summary 后续已回退为 text + compact
+footer，因此这三项显示形态不再由该历史 rich-card evidence 覆盖；81 项
+slash/component 操作为 <code>pending_human_driver</code>；Pin message 因
+bot 缺少 Manage Messages 阻塞，429 未实际观察</td>
 <td><code>0233943194ef2304a6c017bc80e5e3a9ed0331dccb3ce57b520d4703985ec43c</code></td>
 </tr>
 <tr>

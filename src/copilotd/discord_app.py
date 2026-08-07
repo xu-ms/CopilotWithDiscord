@@ -4236,6 +4236,15 @@ async def _discord_render_plan(
     max_bytes: int | None = None,
 ) -> DiscordRenderPlan:
     content = str(payload.get("content", ""))
+    payload_type = str(payload.get("type") or "")
+    if payload_type in {
+        "assistant.usage",
+        "session.usage_checkpoint",
+        "session.usage_info",
+    }:
+        content = _compact_usage_subtext(payload)
+    elif payload_type == "idle_footer":
+        content = _compact_turn_subtext(payload)
     taskdeck_embeds = _taskdeck_embed_payloads(payload)
     if not payload.get("finalized") and not taskdeck_embeds:
         batches = [DiscordRenderBatch(_safe_stream_content(content))]
@@ -4544,22 +4553,7 @@ def _rich_content_embed(
         fields.append(attachment_field)
 
     if payload_type in {"assistant.message", "assistant.message_delta"}:
-        streaming = not bool(payload.get("finalized"))
-        title = "✨ Copilot is responding" if streaming else "✨ Copilot response"
-        if total > 1:
-            title += f" · {index + 1}/{total}"
-        if _has_table_preview(batch):
-            title = f"📊 Data table · {index + 1}/{total}" if total > 1 else "📊 Data table"
-        elif _only_image_assets(batch):
-            title = f"🖼️ Image gallery · {index + 1}/{total}" if total > 1 else "🖼️ Image gallery"
-        return _embed_payload(
-            title=title,
-            description=content
-            or ("Preparing the response…" if streaming else "Response complete."),
-            color=_COLOR_BLURPLE,
-            fields=fields,
-            footer="Live response" if streaming else "Copilot · response complete",
-        )
+        return None
 
     if payload_type == "interaction":
         interaction = payload.get("interaction")
@@ -4612,64 +4606,10 @@ def _rich_content_embed(
         "session.usage_checkpoint",
         "session.usage_info",
     }:
-        usage = payload.get("usage")
-        metrics = usage if isinstance(usage, dict) else {}
-        usage_fields = _usage_embed_fields(metrics)
-        description = _usage_context_bar(metrics)
-        if not usage_fields and not description:
-            description = _content_without_heading(content) or (
-                "The runtime updated usage without exposing numeric fields."
-            )
-        return _embed_payload(
-            title="📈 Copilot usage",
-            description=description,
-            color=_COLOR_CYAN,
-            fields=usage_fields,
-            footer="Live usage snapshot" if not payload.get("finalized") else "Usage checkpoint",
-        )
+        return None
 
     if payload_type == "idle_footer":
-        input_tokens = int(payload.get("input_tokens") or 0)
-        output_tokens = int(payload.get("output_tokens") or 0)
-        fields = [
-            {
-                "name": "Model",
-                "value": f"`{_bounded_discord_text(str(payload.get('model') or 'unknown'), 100)}`",
-                "inline": True,
-            },
-            {
-                "name": "Tokens",
-                "value": f"`{input_tokens:,}` in · `{output_tokens:,}` out",
-                "inline": True,
-            },
-            {
-                "name": "Duration",
-                "value": f"`{_format_render_duration(payload.get('duration_seconds'))}`",
-                "inline": True,
-            },
-            {
-                "name": "Context",
-                "value": f"`{_bounded_discord_text(str(payload.get('context') or 'unknown'), 80)}`",
-                "inline": True,
-            },
-            {
-                "name": "AI credits",
-                "value": f"`{_format_metric(payload.get('credits') or 0)}`",
-                "inline": True,
-            },
-        ]
-        description = (
-            "Background work is still observed; this is a point-in-time summary."
-            if payload.get("background_observed")
-            else "The current Copilot turn is complete."
-        )
-        return _embed_payload(
-            title="✅ Turn complete",
-            description=description,
-            color=_COLOR_YELLOW if payload.get("background_observed") else _COLOR_GREEN,
-            fields=fields,
-            footer="copilotD session summary",
-        )
+        return None
 
     if payload_type == "diff":
         stats = payload.get("stats")
@@ -4871,45 +4811,52 @@ def _status_embed_style(
     return "🔹", _COLOR_CYAN
 
 
-def _usage_embed_fields(metrics: dict[str, Any]) -> list[dict[str, Any]]:
-    labels = (
-        ("inputTokens", "Input"),
-        ("outputTokens", "Output"),
-        ("totalTokens", "Total"),
-        ("cacheReadTokens", "Cache read"),
-        ("cacheWriteTokens", "Cache write"),
-        ("premiumRequests", "Premium requests"),
-        ("aiCredits", "AI credits"),
-        ("nanoAiu", "nano AIU"),
-    )
-    return [
-        {
-            "name": label,
-            "value": f"`{_format_metric(metrics[key])}`",
-            "inline": True,
-        }
-        for key, label in labels
-        if key in metrics
-    ]
-
-
-def _usage_context_bar(metrics: dict[str, Any]) -> str:
+def _compact_usage_subtext(payload: dict[str, Any]) -> str:
+    usage = payload.get("usage")
+    metrics = usage if isinstance(usage, dict) else {}
+    parts: list[str] = []
+    if metrics.get("inputTokens") is not None:
+        parts.append(f"📥 {_format_metric(metrics['inputTokens'])}")
+    if metrics.get("outputTokens") is not None:
+        parts.append(f"📤 {_format_metric(metrics['outputTokens'])}")
+    if metrics.get("totalTokens") is not None:
+        parts.append(f"Σ {_format_metric(metrics['totalTokens'])}")
     current = metrics.get("currentTokens")
     limit = metrics.get("tokenLimit")
-    try:
-        current_value = max(0, float(current))
-        limit_value = max(0, float(limit))
-    except (TypeError, ValueError):
-        return ""
-    if limit_value <= 0:
-        return ""
-    ratio = min(1.0, current_value / limit_value)
-    filled = round(ratio * 12)
-    bar = "#" * filled + "-" * (12 - filled)
-    return (
-        f"**Context window**\n`[{bar}]` {ratio:.0%} · "
-        f"`{_format_metric(current_value)}` / `{_format_metric(limit_value)}` tokens"
+    if current is not None or limit is not None:
+        parts.append(f"🧩 {_format_metric(current or 0)}/{_format_metric(limit or 0)}")
+    if not parts:
+        parts.append("📈 Usage updated")
+    return "-# " + " │ ".join(parts)
+
+
+def _compact_turn_subtext(payload: dict[str, Any]) -> str:
+    background = bool(payload.get("background_observed"))
+    parts: list[str] = []
+    model = _bounded_discord_text(str(payload.get("model") or "unknown"), 100)
+    if model != "unknown":
+        parts.append(f"🧠 {model}")
+    parts.extend(
+        (
+            f"📥 {_format_metric(payload.get('input_tokens') or 0)}",
+            f"📤 {_format_metric(payload.get('output_tokens') or 0)}",
+        )
     )
+    duration = _format_render_duration(payload.get("duration_seconds"))
+    if duration != "unknown":
+        parts.append(f"⏱ {duration}")
+    context = _bounded_discord_text(str(payload.get("context") or "unknown"), 80)
+    if context != "unknown":
+        parts.append(f"🧩 {context}")
+    credits = payload.get("credits")
+    try:
+        has_credits = float(credits or 0) != 0
+    except (TypeError, ValueError):
+        has_credits = credits is not None
+    if has_credits:
+        parts.append(f"✨ {_format_metric(credits)}")
+    prefix = "⏳ background │ " if background else "✅ "
+    return "-# " + prefix + " │ ".join(parts)
 
 
 def _attachment_embed_field(assets: tuple[TableAsset, ...]) -> dict[str, Any] | None:
@@ -4988,19 +4935,6 @@ def _discord_safe_image_filename(filename: str) -> str:
     stem = re.sub(r"[^A-Za-z0-9._-]+", "-", path.stem).strip(".-") or "image"
     suffix = re.sub(r"[^A-Za-z0-9.]+", "", path.suffix.lower())
     return f"{stem[:160]}{suffix[:20]}"
-
-
-def _has_table_preview(batch: DiscordRenderBatch) -> bool:
-    return any(
-        asset.media_type.startswith("image/") and "table" in asset.filename.lower()
-        for asset in batch.assets
-    )
-
-
-def _only_image_assets(batch: DiscordRenderBatch) -> bool:
-    return bool(batch.assets) and all(
-        asset.media_type.startswith("image/") for asset in batch.assets
-    )
 
 
 def _embed_character_count(embed: dict[str, Any]) -> int:

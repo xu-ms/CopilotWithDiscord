@@ -124,9 +124,10 @@ class RenderPlanner:
             finalized = event.raw_type.endswith(("completed", "failed", "complete"))
             coalesce_key = "taskdeck"
         elif event.raw_type in self._USAGE_TYPES:
-            lane = "usage"
-            finalized = event.raw_type != "assistant.usage"
-            coalesce_key = "usage"
+            # Usage samples still feed the durable projection and the turn footer.
+            # Rendering each sample separately duplicates the final summary and
+            # interrupts the response text with a transient status message.
+            return []
         elif event.raw_type in self._INTERACTION_TYPES:
             data = event.raw_payload.get("data", event.raw_payload)
             interaction_id = (
@@ -6063,6 +6064,7 @@ class JournalReducer:
                 observed_origin_hint = COALESCE(?, observed_origin_hint),
                 correlation_basis = ?,
                 continuation_count = continuation_count + ?,
+                completion_basis = NULL,
                 terminal_at = NULL
             WHERE submission_id = ? AND sdk_session_id = ?
             """,
@@ -6077,6 +6079,14 @@ class JournalReducer:
                 submission_id,
                 event.sdk_session_id,
             ),
+        )
+        await connection.execute(
+            """
+            UPDATE message_queue
+            SET state = 'submitted', updated_at = ?
+            WHERE id = ? AND state = 'outcome_unknown'
+            """,
+            (now, submission_id),
         )
         cursor = await connection.execute(
             """
@@ -6608,8 +6618,6 @@ class JournalReducer:
         )
         candidates = await cursor.fetchall()
         await cursor.close()
-        if not candidates:
-            return
         for candidate in candidates:
             submission_id = str(candidate["submission_id"])
             mode = candidate["requested_mode"]
@@ -6676,6 +6684,69 @@ class JournalReducer:
                     submission_id=submission_id,
                     now=now,
                 )
+
+        orphan_cursor = await connection.execute(
+            """
+            SELECT submissions.submission_id, message_queue.schedule_run_id
+            FROM submissions
+            JOIN message_queue
+              ON message_queue.id = submissions.submission_id
+            WHERE submissions.sdk_session_id = ?
+              AND submissions.observed_user_event_id IS NULL
+              AND submissions.created_at <= ?
+              AND submissions.state IN (
+                  'submitting', 'submitted', 'submitted_unknown'
+              )
+            ORDER BY submissions.created_at
+            """,
+            (event.sdk_session_id, event.received_at),
+        )
+        uncorrelated = await orphan_cursor.fetchall()
+        await orphan_cursor.close()
+        for submission in uncorrelated:
+            submission_id = str(submission["submission_id"])
+            await connection.execute(
+                """
+                UPDATE submissions
+                SET state = 'outcome_unknown',
+                    completion_basis = 'session_idle_without_user_correlation',
+                    terminal_at = COALESCE(terminal_at, ?)
+                WHERE submission_id = ?
+                  AND state IN ('submitting', 'submitted', 'submitted_unknown')
+                """,
+                (event.received_at, submission_id),
+            )
+            await connection.execute(
+                """
+                UPDATE message_queue
+                SET state = 'outcome_unknown', updated_at = ?
+                WHERE id = ?
+                  AND state IN ('submitting', 'submitted', 'submitted_unknown')
+                """,
+                (now, submission_id),
+            )
+            await self._release_submission_liveness(
+                connection,
+                event,
+                submission_id=submission_id,
+                now=now,
+            )
+            schedule_run_id = submission["schedule_run_id"]
+            if schedule_run_id is not None:
+                await _finalize_schedule_run_from_reducer(
+                    connection,
+                    run_id=str(schedule_run_id),
+                    status="outcome_unknown",
+                    completion_basis=None,
+                    error_code="session_idle_without_user_correlation",
+                    now=now,
+                )
+            await self._record_runtime_incident_once(
+                connection,
+                event,
+                kind="submission_unobserved_at_session_idle",
+                detail={"submission_id": submission_id},
+            )
 
     async def _release_submission_liveness(
         self,

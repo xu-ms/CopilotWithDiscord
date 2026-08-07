@@ -840,7 +840,13 @@ async def test_dry_run_traverses_snapshot_sync_channel_probe_cleanup_without_net
     async def fake_render_plan(*args, **kwargs):
         payload = args[0] if args and isinstance(args[0], dict) else {}
         payload_type = payload.get("type")
-        embeds = ({"title": str(payload_type)},) if payload_type else ()
+        plain_types = {"assistant.message_delta", "assistant.message", "idle_footer"}
+        embeds = (
+            ({"title": str(payload_type)},)
+            if payload_type and payload_type not in plain_types
+            else ()
+        )
+        content = "-# ✅ 🧠 test" if payload_type == "idle_footer" else "rendered content"
         attachments = payload.get("attachments")
         inline_assets = (
             [
@@ -857,7 +863,7 @@ async def test_dry_run_traverses_snapshot_sync_channel_probe_cleanup_without_net
         return SimpleNamespace(
             batches=[
                 SimpleNamespace(
-                    content="rendered content",
+                    content=content,
                     embeds=embeds,
                     assets=inline_assets
                     or [
