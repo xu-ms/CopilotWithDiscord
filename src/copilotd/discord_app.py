@@ -122,6 +122,12 @@ from copilotd.storage.leases import OwnerLeaseStore
 
 logger = structlog.get_logger(__name__)
 _TABLE_DELIMITER = re.compile(r"^\s*\|?\s*:?-{3,}:?\s*(?:\|\s*:?-{3,}:?\s*)+\|?\s*$")
+_COLOR_BLURPLE = 0x5865F2
+_COLOR_GREEN = 0x57F287
+_COLOR_YELLOW = 0xFEE75C
+_COLOR_RED = 0xED4245
+_COLOR_CYAN = 0x5BC0DE
+_COLOR_NEUTRAL = 0x747F8D
 
 
 class CopilotDiscordBot(commands.Bot):
@@ -1039,25 +1045,17 @@ class CopilotDiscordBot(commands.Bot):
         try:
             if session_id.startswith(("thread:", "channel:", "ops:")):
                 destination = await self._render_destination(session_id)
-                content, assets = await _discord_render(payload)
-                content, assets = _prepare_discord_assets(
-                    content,
-                    assets,
+                plan = await _discord_render_plan(
+                    payload,
                     max_bytes=self.settings.discord_upload_max_bytes,
                 )
-                message = await destination.send(
-                    content=content or "\u200b",
-                    files=_discord_files(assets[:10]),
-                    embeds=_discord_embeds(_taskdeck_embed_payloads(payload)),
-                    view=_render_view(payload),
-                    silent=True,
+                message_id = await self._deliver_render_plan(
+                    thread=destination,
+                    session_id=session_id,
+                    payload=payload,
+                    plan=plan,
+                    delivery_id=idempotency_key,
                 )
-                for index in range(10, len(assets), 10):
-                    await destination.send(
-                        files=_discord_files(assets[index : index + 10]),
-                        silent=True,
-                    )
-                message_id = str(message.id)
             else:
                 binding = await self._require_bindings().by_session(session_id)
                 if binding is None:
@@ -1101,23 +1099,18 @@ class CopilotDiscordBot(commands.Bot):
             if session_id.startswith(("thread:", "channel:", "ops:")):
                 destination = await self._render_destination(session_id)
                 message = await destination.fetch_message(int(message_id))
-                content, assets = await _discord_render(payload)
-                content, assets = _prepare_discord_assets(
-                    content,
-                    assets,
+                plan = await _discord_render_plan(
+                    payload,
                     max_bytes=self.settings.discord_upload_max_bytes,
                 )
-                await message.edit(
-                    content=content or "\u200b",
-                    attachments=_discord_files(assets[:10]),
-                    embeds=_discord_embeds(_taskdeck_embed_payloads(payload)),
-                    view=_render_view(payload),
+                await self._deliver_render_plan(
+                    thread=destination,
+                    session_id=session_id,
+                    payload=payload,
+                    plan=plan,
+                    delivery_id=idempotency_key,
+                    first_message=message,
                 )
-                for index in range(10, len(assets), 10):
-                    await destination.send(
-                        files=_discord_files(assets[index : index + 10]),
-                        silent=True,
-                    )
             else:
                 binding = await self._require_bindings().by_session(session_id)
                 if binding is None:
@@ -1196,9 +1189,85 @@ class CopilotDiscordBot(commands.Bot):
         delivered_ids = {
             int(row["batch_index"]): str(row["discord_message_id"]) for row in delivered
         }
+        persisted_intents = await self.database.fetchall(
+            """
+            SELECT batch_index FROM render_batch_intents
+            WHERE session_id = ? AND render_message_id = ? AND agent_id = ?
+            """,
+            (session_id, delivery_id, agent_id),
+        )
+        unexpected_indices = sorted(
+            {
+                *delivered_ids,
+                *(int(row["batch_index"]) for row in persisted_intents),
+            }
+            - set(range(len(plan.batches)))
+        )
+        if unexpected_indices:
+            raise RenderPermanentError(
+                f"render batch count changed for {delivery_id}:"
+                f" unexpected persisted indices {unexpected_indices}"
+            )
         now = time.time()
         for index, batch in enumerate(plan.batches):
             if index in delivered_ids:
+                nonce = _render_batch_nonce(
+                    session_id,
+                    delivery_id,
+                    agent_id,
+                    index,
+                )
+                payload_hash = _render_batch_hash(batch)
+                delivered_intent = await self.database.fetchone(
+                    """
+                    SELECT nonce, payload_hash, state, discord_message_id
+                    FROM render_batch_intents
+                    WHERE session_id = ? AND render_message_id = ?
+                      AND agent_id = ? AND batch_index = ?
+                    """,
+                    (session_id, delivery_id, agent_id, index),
+                )
+                if delivered_intent is None:
+                    await self.database.execute(
+                        """
+                        INSERT OR IGNORE INTO render_batch_intents(
+                            session_id, render_message_id, agent_id, batch_index,
+                            nonce, payload_hash, state, discord_message_id,
+                            delivery_family, created_at, updated_at
+                        ) VALUES (?, ?, ?, ?, ?, ?, 'sent', ?, ?, ?, ?)
+                        """,
+                        (
+                            session_id,
+                            delivery_id,
+                            agent_id,
+                            index,
+                            nonce,
+                            payload_hash,
+                            delivered_ids[index],
+                            delivery_family,
+                            now,
+                            now,
+                        ),
+                    )
+                    delivered_intent = await self.database.fetchone(
+                        """
+                        SELECT nonce, payload_hash, state, discord_message_id
+                        FROM render_batch_intents
+                        WHERE session_id = ? AND render_message_id = ?
+                          AND agent_id = ? AND batch_index = ?
+                        """,
+                        (session_id, delivery_id, agent_id, index),
+                    )
+                if (
+                    delivered_intent is None
+                    or str(delivered_intent["nonce"]) != nonce
+                    or str(delivered_intent["payload_hash"]) != payload_hash
+                    or str(delivered_intent["state"]) != "sent"
+                    or str(delivered_intent["discord_message_id"]) != delivered_ids[index]
+                ):
+                    raise RenderPermanentError(
+                        f"render batch intent changed for {delivery_id}:{index}"
+                    )
                 if first_message_id is None and index == 0:
                     first_message_id = delivered_ids[index]
                 continue
@@ -1255,8 +1324,30 @@ class CopilotDiscordBot(commands.Bot):
                         now,
                     ),
                 )
-            elif str(intent["nonce"]) != nonce or str(intent["payload_hash"]) != payload_hash:
+            elif str(intent["nonce"]) != nonce:
                 raise RenderPermanentError(f"render batch intent changed for {delivery_id}:{index}")
+            elif str(intent["payload_hash"]) != payload_hash:
+                if str(intent["state"]) != "prepared" or intent["discord_message_id"] is not None:
+                    raise RenderPermanentError(
+                        f"render batch intent changed for {delivery_id}:{index}"
+                    )
+                await self.database.execute(
+                    """
+                    UPDATE render_batch_intents
+                    SET payload_hash = ?, updated_at = ?
+                    WHERE session_id = ? AND render_message_id = ?
+                      AND agent_id = ? AND batch_index = ?
+                      AND state = 'prepared' AND discord_message_id IS NULL
+                    """,
+                    (
+                        payload_hash,
+                        now,
+                        session_id,
+                        delivery_id,
+                        agent_id,
+                        index,
+                    ),
+                )
 
             if intent is not None and intent["discord_message_id"] is not None:
                 reconciled_message_id = str(intent["discord_message_id"])
@@ -4147,7 +4238,8 @@ async def _discord_render_plan(
     content = str(payload.get("content", ""))
     taskdeck_embeds = _taskdeck_embed_payloads(payload)
     if not payload.get("finalized") and not taskdeck_embeds:
-        return DiscordRenderPlan((DiscordRenderBatch(_safe_stream_content(content)),))
+        batches = [DiscordRenderBatch(_safe_stream_content(content))]
+        return DiscordRenderPlan(tuple(_decorate_discord_batches(payload, batches)))
 
     explicit_assets: list[TableAsset] = []
     attachments = payload.get("attachments")
@@ -4386,14 +4478,602 @@ async def _discord_render_plan(
             )
             continue
         for index in range(0, len(prepared_assets), 10):
+            batch_assets = _unique_discord_assets(tuple(prepared_assets[index : index + 10]))
             prepared_batches.append(
                 DiscordRenderBatch(
                     content=prepared_content if index == 0 else "",
-                    assets=tuple(prepared_assets[index : index + 10]),
+                    assets=batch_assets,
                     embeds=batch.embeds if index == 0 else (),
                 )
             )
-    return DiscordRenderPlan(tuple(prepared_batches))
+    return DiscordRenderPlan(tuple(_decorate_discord_batches(payload, prepared_batches)))
+
+
+def _decorate_discord_batches(
+    payload: dict[str, Any],
+    batches: list[DiscordRenderBatch],
+) -> list[DiscordRenderBatch]:
+    decorated: list[DiscordRenderBatch] = []
+    total = len(batches)
+    for index, batch in enumerate(batches):
+        embeds = list(batch.embeds)
+        content = batch.content
+        primary = _rich_content_embed(
+            payload,
+            batch,
+            index=index,
+            total=total,
+        )
+        if primary is not None and not embeds:
+            embeds.append(primary)
+            content = ""
+        candidates = embeds + _image_attachment_embeds(
+            batch.assets,
+            payload_type=str(payload.get("type") or ""),
+        )
+        bounded: list[dict[str, Any]] = []
+        character_count = 0
+        for candidate in candidates:
+            candidate_size = _embed_character_count(candidate)
+            if len(bounded) >= 10 or character_count + candidate_size > 6000:
+                break
+            bounded.append(candidate)
+            character_count += candidate_size
+        decorated.append(
+            DiscordRenderBatch(
+                content=content,
+                assets=batch.assets,
+                embeds=tuple(bounded),
+            )
+        )
+    return decorated
+
+
+def _rich_content_embed(
+    payload: dict[str, Any],
+    batch: DiscordRenderBatch,
+    *,
+    index: int,
+    total: int,
+) -> dict[str, Any] | None:
+    payload_type = str(payload.get("type") or "")
+    content = batch.content.strip()
+    attachment_field = _attachment_embed_field(batch.assets)
+    fields: list[dict[str, Any]] = []
+    if attachment_field is not None:
+        fields.append(attachment_field)
+
+    if payload_type in {"assistant.message", "assistant.message_delta"}:
+        streaming = not bool(payload.get("finalized"))
+        title = "✨ Copilot is responding" if streaming else "✨ Copilot response"
+        if total > 1:
+            title += f" · {index + 1}/{total}"
+        if _has_table_preview(batch):
+            title = f"📊 Data table · {index + 1}/{total}" if total > 1 else "📊 Data table"
+        elif _only_image_assets(batch):
+            title = f"🖼️ Image gallery · {index + 1}/{total}" if total > 1 else "🖼️ Image gallery"
+        return _embed_payload(
+            title=title,
+            description=content
+            or ("Preparing the response…" if streaming else "Response complete."),
+            color=_COLOR_BLURPLE,
+            fields=fields,
+            footer="Live response" if streaming else "Copilot · response complete",
+        )
+
+    if payload_type == "interaction":
+        interaction = payload.get("interaction")
+        if not isinstance(interaction, dict):
+            interaction = {}
+        state = str(interaction.get("state") or "pending")
+        pending = state == "pending"
+        resolved = state == "resolved"
+        question = str(
+            interaction.get("question")
+            or interaction.get("summary")
+            or "Copilot is waiting for input."
+        )
+        response = str(interaction.get("display_response") or "").strip()
+        description = question
+        if response and resolved:
+            description += f"\n\n**Response**\n{response}"
+        elif not pending and not resolved:
+            description += "\n\nThis request expired before a response was recorded."
+        fields = [
+            {
+                "name": "Request type",
+                "value": f"`{_bounded_discord_text(str(interaction.get('kind') or 'input'), 80)}`",
+                "inline": True,
+            },
+            {"name": "State", "value": f"`{_bounded_discord_text(state, 40)}`", "inline": True},
+        ]
+        if pending:
+            title = "📝 Copilot needs input"
+            color = _COLOR_YELLOW
+            footer = "Choose an option below"
+        elif resolved:
+            title = "✅ Copilot input recorded"
+            color = _COLOR_GREEN
+            footer = "The response was sent to Copilot"
+        else:
+            title = "⏳ Copilot input expired"
+            color = _COLOR_NEUTRAL
+            footer = "No response was sent"
+        return _embed_payload(
+            title=title,
+            description=description,
+            color=color,
+            fields=fields,
+            footer=footer,
+        )
+
+    if payload_type in {
+        "assistant.usage",
+        "session.usage_checkpoint",
+        "session.usage_info",
+    }:
+        usage = payload.get("usage")
+        metrics = usage if isinstance(usage, dict) else {}
+        usage_fields = _usage_embed_fields(metrics)
+        description = _usage_context_bar(metrics)
+        if not usage_fields and not description:
+            description = _content_without_heading(content) or (
+                "The runtime updated usage without exposing numeric fields."
+            )
+        return _embed_payload(
+            title="📈 Copilot usage",
+            description=description,
+            color=_COLOR_CYAN,
+            fields=usage_fields,
+            footer="Live usage snapshot" if not payload.get("finalized") else "Usage checkpoint",
+        )
+
+    if payload_type == "idle_footer":
+        input_tokens = int(payload.get("input_tokens") or 0)
+        output_tokens = int(payload.get("output_tokens") or 0)
+        fields = [
+            {
+                "name": "Model",
+                "value": f"`{_bounded_discord_text(str(payload.get('model') or 'unknown'), 100)}`",
+                "inline": True,
+            },
+            {
+                "name": "Tokens",
+                "value": f"`{input_tokens:,}` in · `{output_tokens:,}` out",
+                "inline": True,
+            },
+            {
+                "name": "Duration",
+                "value": f"`{_format_render_duration(payload.get('duration_seconds'))}`",
+                "inline": True,
+            },
+            {
+                "name": "Context",
+                "value": f"`{_bounded_discord_text(str(payload.get('context') or 'unknown'), 80)}`",
+                "inline": True,
+            },
+            {
+                "name": "AI credits",
+                "value": f"`{_format_metric(payload.get('credits') or 0)}`",
+                "inline": True,
+            },
+        ]
+        description = (
+            "Background work is still observed; this is a point-in-time summary."
+            if payload.get("background_observed")
+            else "The current Copilot turn is complete."
+        )
+        return _embed_payload(
+            title="✅ Turn complete",
+            description=description,
+            color=_COLOR_YELLOW if payload.get("background_observed") else _COLOR_GREEN,
+            fields=fields,
+            footer="copilotD session summary",
+        )
+
+    if payload_type == "diff":
+        stats = payload.get("stats")
+        stats = stats if isinstance(stats, dict) else {}
+        oversized = bool(payload.get("oversized"))
+        files_value = (
+            f"`{int(stats['files']):,}`" if stats.get("files") is not None else "`unknown`"
+        )
+        changes_value = (
+            (
+                f"🟢 `+{int(stats.get('additions') or 0):,}` · "
+                f"🔴 `-{int(stats.get('deletions') or 0):,}`"
+            )
+            if stats.get("additions") is not None or stats.get("deletions") is not None
+            else "`unknown`"
+        )
+        if oversized:
+            delivery = "`omitted: render safety limit`"
+        elif batch.assets:
+            delivery = "`attachment`"
+        else:
+            delivery = "`inline preview`"
+        fields = [
+            {
+                "name": "Source",
+                "value": f"`{_bounded_discord_text(str(payload.get('source') or 'unknown'), 80)}`",
+                "inline": True,
+            },
+            {
+                "name": "Files",
+                "value": files_value,
+                "inline": True,
+            },
+            {
+                "name": "Changes",
+                "value": changes_value,
+                "inline": True,
+            },
+            {
+                "name": "Size",
+                "value": f"`{_format_asset_size(int(payload.get('byte_count') or 0))}`",
+                "inline": True,
+            },
+            {
+                "name": "Delivery",
+                "value": delivery,
+                "inline": True,
+            },
+        ]
+        if attachment_field is not None:
+            fields.append(attachment_field)
+        return _embed_payload(
+            title="🧩 Code changes",
+            description=_content_without_heading(content)
+            or "Structured code changes are available.",
+            color=_COLOR_YELLOW if oversized else _COLOR_GREEN,
+            fields=fields,
+            footer=(
+                "Patch omitted from Discord; exact source remains in the durable event journal"
+                if oversized
+                else "Exact patch is preserved when attached"
+            ),
+        )
+
+    if payload_type == "tool_output_artifact":
+        status_value = payload.get("status")
+        if status_value is None:
+            heading = content.splitlines()[0].lower() if content else ""
+            status_value = (
+                "failed" if "tool failed" in heading or "tool error" in heading else "unknown"
+            )
+        status_text = str(status_value).lower()
+        fields = [
+            {
+                "name": "Status",
+                "value": f"`{_bounded_discord_text(status_text, 40)}`",
+                "inline": True,
+            },
+            {
+                "name": "Source",
+                "value": (
+                    "`"
+                    + _bounded_discord_text(
+                        str(payload.get("tool_source") or "unknown"),
+                        80,
+                    )
+                    + "`"
+                ),
+                "inline": True,
+            },
+            {
+                "name": "Fidelity",
+                "value": "`verbatim`" if payload.get("verbatim") else "`runtime fallback`",
+                "inline": True,
+            },
+            {
+                "name": "Output",
+                "value": _tool_output_size_text(payload),
+                "inline": False,
+            },
+        ]
+        if attachment_field is not None:
+            fields.append(attachment_field)
+        failed = status_text == "failed"
+        unknown = status_text == "unknown"
+        if failed:
+            title = "❌ Tool output"
+            color = _COLOR_RED
+        elif unknown:
+            title = "⚠️ Tool output"
+            color = _COLOR_NEUTRAL
+        else:
+            title = "📎 Tool output"
+            color = _COLOR_CYAN
+        return _embed_payload(
+            title=title,
+            description=_content_without_heading(content) or "Detailed tool output is attached.",
+            color=color,
+            fields=fields,
+            footer="Durable output artifact",
+        )
+
+    status = payload.get("status")
+    if isinstance(status, dict):
+        event_type = str(status.get("event_type") or payload_type)
+        icon, color = _status_embed_style(event_type, status=status)
+        title = str(status.get("title") or "Copilot status")
+        if event_type == "session.task_complete":
+            outcome = str(status.get("outcome") or "unknown")
+            title = {
+                "completed": "Task complete",
+                "continue": "Task continuing",
+                "blocked": "Task blocked",
+            }.get(outcome, title)
+        detail = str(status.get("detail") or _content_without_heading(content))
+        return _embed_payload(
+            title=f"{icon} {title}",
+            description=detail,
+            color=color,
+            footer=(f"{event_type} · updating" if not payload.get("finalized") else event_type),
+        )
+    return None
+
+
+def _embed_payload(
+    *,
+    title: str,
+    description: str,
+    color: int,
+    fields: list[dict[str, Any]] | None = None,
+    footer: str | None = None,
+) -> dict[str, Any]:
+    embed: dict[str, Any] = {
+        "title": _bounded_embed_markdown(title, 256),
+        "description": _bounded_embed_markdown(description, 3900),
+        "color": color,
+    }
+    if fields:
+        embed["fields"] = fields[:25]
+    if footer:
+        embed["footer"] = {"text": _bounded_embed_markdown(footer, 2048)}
+    return embed
+
+
+def _status_embed_style(
+    event_type: str,
+    *,
+    status: dict[str, Any] | None = None,
+) -> tuple[str, int]:
+    if event_type == "session.task_complete":
+        outcome = str((status or {}).get("outcome") or "unknown")
+        return {
+            "completed": ("✅", _COLOR_GREEN),
+            "continue": ("▶️", _COLOR_BLURPLE),
+            "blocked": ("⚠️", _COLOR_YELLOW),
+        }.get(outcome, ("🔹", _COLOR_CYAN))
+    if event_type in {"session.error", "model.call_failure"}:
+        return "❌", _COLOR_RED
+    if event_type in {
+        "session.warning",
+        "session.truncation",
+        "assistant.turn_retry",
+        "session.snapshot_rewind",
+    }:
+        return "⚠️", _COLOR_YELLOW
+    if event_type in {"abort", "session.shutdown"}:
+        return "⏹️", _COLOR_NEUTRAL
+    if event_type in {
+        "session.compaction_complete",
+        "session.context_cleared",
+    }:
+        return "✅", _COLOR_GREEN
+    if event_type == "session.workspace_file_changed":
+        return "📝", _COLOR_CYAN
+    if event_type in {"assistant.intent", "assistant.reasoning_delta", "session.compaction_start"}:
+        return "⏳", _COLOR_BLURPLE
+    if event_type == "assistant.reasoning":
+        return "💡", _COLOR_BLURPLE
+    return "🔹", _COLOR_CYAN
+
+
+def _usage_embed_fields(metrics: dict[str, Any]) -> list[dict[str, Any]]:
+    labels = (
+        ("inputTokens", "Input"),
+        ("outputTokens", "Output"),
+        ("totalTokens", "Total"),
+        ("cacheReadTokens", "Cache read"),
+        ("cacheWriteTokens", "Cache write"),
+        ("premiumRequests", "Premium requests"),
+        ("aiCredits", "AI credits"),
+        ("nanoAiu", "nano AIU"),
+    )
+    return [
+        {
+            "name": label,
+            "value": f"`{_format_metric(metrics[key])}`",
+            "inline": True,
+        }
+        for key, label in labels
+        if key in metrics
+    ]
+
+
+def _usage_context_bar(metrics: dict[str, Any]) -> str:
+    current = metrics.get("currentTokens")
+    limit = metrics.get("tokenLimit")
+    try:
+        current_value = max(0, float(current))
+        limit_value = max(0, float(limit))
+    except (TypeError, ValueError):
+        return ""
+    if limit_value <= 0:
+        return ""
+    ratio = min(1.0, current_value / limit_value)
+    filled = round(ratio * 12)
+    bar = "#" * filled + "-" * (12 - filled)
+    return (
+        f"**Context window**\n`[{bar}]` {ratio:.0%} · "
+        f"`{_format_metric(current_value)}` / `{_format_metric(limit_value)}` tokens"
+    )
+
+
+def _attachment_embed_field(assets: tuple[TableAsset, ...]) -> dict[str, Any] | None:
+    if not assets:
+        return None
+    lines = []
+    for asset in assets[:8]:
+        filename = _bounded_discord_text(asset.filename, 120)
+        lines.append(f"📎 `{filename}` · {_format_asset_size(len(asset.content))}")
+    if len(assets) > 8:
+        lines.append(f"… and {len(assets) - 8} more")
+    return {
+        "name": "Attachments",
+        "value": _bounded_embed_markdown("\n".join(lines), 1024),
+        "inline": False,
+    }
+
+
+def _image_attachment_embeds(
+    assets: tuple[TableAsset, ...],
+    *,
+    payload_type: str,
+) -> list[dict[str, Any]]:
+    images = [asset for asset in assets if asset.media_type.startswith("image/")]
+    embeds: list[dict[str, Any]] = []
+    for index, asset in enumerate(images):
+        is_table = "table" in asset.filename.lower() or payload_type == "table"
+        title = "📊 Table preview" if is_table else "🖼️ Image preview"
+        if len(images) > 1:
+            title += f" · {index + 1}/{len(images)}"
+        embeds.append(
+            {
+                "title": title,
+                "description": (
+                    f"`{_bounded_discord_text(asset.filename, 140)}` · "
+                    f"{_format_asset_size(len(asset.content))}"
+                ),
+                "color": _COLOR_CYAN,
+                "image": {"url": f"attachment://{asset.filename}"},
+            }
+        )
+    return embeds
+
+
+def _unique_discord_assets(assets: tuple[TableAsset, ...]) -> tuple[TableAsset, ...]:
+    used: set[str] = set()
+    normalized: list[TableAsset] = []
+    for asset in assets:
+        original = Path(asset.filename).name or "artifact"
+        filename = (
+            _discord_safe_image_filename(original)
+            if asset.media_type.startswith("image/")
+            else original
+        )
+        candidate = filename
+        suffix_index = 2
+        while candidate.casefold() in used:
+            path = Path(filename)
+            stem = path.stem[:160] or "artifact"
+            suffix = path.suffix[:20]
+            candidate = f"{stem}-{suffix_index}{suffix}"
+            suffix_index += 1
+        used.add(candidate.casefold())
+        normalized.append(
+            TableAsset(
+                filename=candidate,
+                media_type=asset.media_type,
+                content=asset.content,
+            )
+        )
+    return tuple(normalized)
+
+
+def _discord_safe_image_filename(filename: str) -> str:
+    path = Path(filename)
+    stem = re.sub(r"[^A-Za-z0-9._-]+", "-", path.stem).strip(".-") or "image"
+    suffix = re.sub(r"[^A-Za-z0-9.]+", "", path.suffix.lower())
+    return f"{stem[:160]}{suffix[:20]}"
+
+
+def _has_table_preview(batch: DiscordRenderBatch) -> bool:
+    return any(
+        asset.media_type.startswith("image/") and "table" in asset.filename.lower()
+        for asset in batch.assets
+    )
+
+
+def _only_image_assets(batch: DiscordRenderBatch) -> bool:
+    return bool(batch.assets) and all(
+        asset.media_type.startswith("image/") for asset in batch.assets
+    )
+
+
+def _embed_character_count(embed: dict[str, Any]) -> int:
+    count = len(str(embed.get("title") or "")) + len(str(embed.get("description") or ""))
+    footer = embed.get("footer")
+    if isinstance(footer, dict):
+        count += len(str(footer.get("text") or ""))
+    author = embed.get("author")
+    if isinstance(author, dict):
+        count += len(str(author.get("name") or ""))
+    fields = embed.get("fields")
+    if isinstance(fields, list):
+        for field in fields:
+            if isinstance(field, dict):
+                count += len(str(field.get("name") or "")) + len(str(field.get("value") or ""))
+    return count
+
+
+def _content_without_heading(content: str) -> str:
+    lines = content.strip().splitlines()
+    if not lines:
+        return ""
+    if lines[0].startswith("**") and "**" in lines[0][2:]:
+        return "\n".join(lines[1:]).strip() or lines[0].replace("**", "").strip()
+    return content.strip()
+
+
+def _bounded_embed_markdown(content: str, limit: int) -> str:
+    value = content.strip()
+    return value if len(value) <= limit else value[: limit - 1].rstrip() + "…"
+
+
+def _format_metric(value: Any) -> str:
+    if isinstance(value, bool):
+        return str(value).lower()
+    if isinstance(value, int):
+        return f"{value:,}"
+    if isinstance(value, float):
+        return f"{value:,.2f}".rstrip("0").rstrip(".")
+    return _bounded_discord_text(str(value), 80)
+
+
+def _tool_output_size_text(payload: dict[str, Any]) -> str:
+    character_count = payload.get("character_count")
+    line_count = payload.get("line_count")
+    if character_count is not None or line_count is not None:
+        return f"`{int(character_count or 0):,}` chars · `{int(line_count or 0):,}` lines"
+    if payload.get("byte_count") is not None:
+        return f"`{_format_asset_size(int(payload['byte_count']))}`"
+    return "`unknown`"
+
+
+def _format_asset_size(byte_count: int) -> str:
+    value = max(0, int(byte_count))
+    if value < 1024:
+        return f"{value} B"
+    if value < 1024 * 1024:
+        return f"{value / 1024:.1f} KiB"
+    return f"{value / (1024 * 1024):.1f} MiB"
+
+
+def _format_render_duration(value: Any) -> str:
+    try:
+        total = max(0, int(float(value)))
+    except (TypeError, ValueError):
+        return "unknown"
+    minutes, seconds = divmod(total, 60)
+    hours, minutes = divmod(minutes, 60)
+    if hours:
+        return f"{hours}h {minutes}m {seconds}s"
+    if minutes:
+        return f"{minutes}m {seconds}s"
+    return f"{seconds}s"
 
 
 def _safe_stream_content(content: str) -> str:

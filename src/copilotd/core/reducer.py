@@ -5,6 +5,7 @@ import hashlib
 import inspect
 import json
 import os
+import re
 import time
 import uuid
 from collections.abc import Awaitable, Callable
@@ -24,6 +25,7 @@ from copilotd.storage.database import Database
 
 FenceValidator = Callable[[int, int], Awaitable[bool]]
 _DIFF_OUTPUT_LIMIT = 8 * 1024 * 1024
+_DIFF_HUNK_PATTERN = re.compile(r"^@@ -\d+(?:,(\d+))? \+\d+(?:,(\d+))? @@")
 _TOOL_SPILL_RETENTION_SECONDS = 7 * 24 * 60 * 60
 _TRUSTED_LOCAL_IMAGE_SUFFIXES = {
     ".bmp",
@@ -574,10 +576,12 @@ class JournalReducer:
         if event.raw_type in RenderPlanner._USAGE_TYPES:
             data = event.raw_payload.get("data", event.raw_payload)
             values = data if isinstance(data, dict) else {}
-            lines = _usage_summary_lines(values)
+            metrics = _usage_summary_values(values)
+            lines = _usage_summary_lines(metrics)
             return {
                 "type": event.raw_type,
                 "content": "**Copilot usage**\n" + "\n".join(lines),
+                "usage": metrics,
                 "finalized": event.raw_type != "assistant.usage",
             }
         if event.raw_type in RenderPlanner._FOOTER_TYPES:
@@ -688,9 +692,21 @@ class JournalReducer:
             values = data if isinstance(data, dict) else {}
             title, fallback = _status_title(event.raw_type)
             detail = _status_detail(event.raw_type, values, fallback=fallback)
+            status = {
+                "title": title,
+                "detail": _bounded_text(detail, 1600),
+                "event_type": event.raw_type,
+            }
+            if event.raw_type == "session.task_complete":
+                outcome = values.get("outcome")
+                if outcome is None and values.get("success") is True:
+                    outcome = "completed"
+                if outcome is not None:
+                    status["outcome"] = str(outcome)
             return {
                 "type": event.raw_type,
                 "content": f"**{title}**\n{_bounded_text(detail, 1600)}",
+                "status": status,
                 "finalized": event.raw_type
                 not in {
                     "assistant.intent",
@@ -1279,6 +1295,12 @@ class JournalReducer:
             "stable_outbox_key": f"tool-spill:{tool_call_id}",
             "tool_source": source,
             "verbatim": verbatim,
+            "status": (
+                ("completed" if bool(data.get("success")) else "failed")
+                if finalized
+                else "partial spill"
+            ),
+            "byte_count": byte_size,
             "attachments": [
                 {
                     "filename": filename,
@@ -8046,6 +8068,22 @@ def _metric_summary(data: dict[str, Any]) -> str:
     return ", ".join(values)
 
 
+def _usage_summary_values(data: dict[str, Any]) -> dict[str, Any]:
+    keys = (
+        "inputTokens",
+        "outputTokens",
+        "cacheReadTokens",
+        "cacheWriteTokens",
+        "totalTokens",
+        "premiumRequests",
+        "aiCredits",
+        "nanoAiu",
+        "currentTokens",
+        "tokenLimit",
+    )
+    return {key: value for key in keys if (value := _find_nested_value(data, key)) is not None}
+
+
 def _usage_summary_lines(data: dict[str, Any]) -> list[str]:
     labels = {
         "inputTokens": "Input tokens",
@@ -8236,6 +8274,9 @@ def _tool_output_artifact(event: AdaptedEvent) -> dict[str, Any] | None:
         "finalized": True,
         "tool_source": source,
         "verbatim": verbatim,
+        "status": status,
+        "character_count": len(text),
+        "line_count": line_count,
         "attachments": [
             {
                 "filename": filename,
@@ -8336,10 +8377,12 @@ def _diff_render_payload(event: AdaptedEvent) -> dict[str, Any] | None:
             "source": source,
             "oversized": True,
             "byte_count": len(encoded_patch),
+            "stats": {},
             "finalized": True,
             "attachments": [],
         }
     patch = encoded_patch.decode("utf-8")
+    stats = _diff_stats(patch)
     tool_call_id = str(data.get("toolCallId", "diff"))
     if len(patch) <= 1600 and "```" not in patch:
         content = f"**Code changes** · `{source}`\n```diff\n{patch}\n```"
@@ -8358,9 +8401,73 @@ def _diff_render_payload(event: AdaptedEvent) -> dict[str, Any] | None:
         "type": "diff",
         "content": content,
         "source": source,
+        "byte_count": len(encoded_patch),
+        "stats": stats,
         "finalized": True,
         "attachments": attachments,
     }
+
+
+def _diff_stats(patch: str) -> dict[str, int]:
+    lines = patch.splitlines()
+    files = sum(line.startswith("diff --git ") for line in lines)
+    has_hunks = any(_DIFF_HUNK_PATTERN.match(line) for line in lines)
+    fallback_files = 0
+    in_hunk = False
+    old_remaining = 0
+    new_remaining = 0
+    additions = 0
+    deletions = 0
+    for index, line in enumerate(lines):
+        hunk = _DIFF_HUNK_PATTERN.match(line)
+        if hunk is not None:
+            in_hunk = True
+            old_remaining = int(hunk.group(1) or 1)
+            new_remaining = int(hunk.group(2) or 1)
+            continue
+        if in_hunk:
+            if line.startswith("\\"):
+                continue
+            if line.startswith("+"):
+                additions += 1
+                new_remaining = max(0, new_remaining - 1)
+            elif line.startswith("-"):
+                deletions += 1
+                old_remaining = max(0, old_remaining - 1)
+            else:
+                old_remaining = max(0, old_remaining - 1)
+                new_remaining = max(0, new_remaining - 1)
+            if old_remaining == 0 and new_remaining == 0:
+                in_hunk = False
+            continue
+        if (
+            files == 0
+            and has_hunks
+            and line.startswith("+++ ")
+            and index > 0
+            and lines[index - 1].startswith("--- ")
+            and index + 1 < len(lines)
+            and _DIFF_HUNK_PATTERN.match(lines[index + 1])
+        ):
+            fallback_files += 1
+        if has_hunks:
+            continue
+        if line.startswith("+++ "):
+            fallback_files += 1
+            continue
+        if line.startswith("--- "):
+            continue
+        additions += int(line.startswith("+"))
+        deletions += int(line.startswith("-"))
+    if files == 0:
+        files = fallback_files
+    stats = {
+        "additions": additions,
+        "deletions": deletions,
+    }
+    if files > 0:
+        stats["files"] = files
+    return stats
 
 
 def _structured_tool_text(value: Any) -> str:

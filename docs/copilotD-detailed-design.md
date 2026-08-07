@@ -1425,6 +1425,26 @@ InternalEvent
 - 单个 block 超过限制时不截断：code/text 输出 `.md`/`.txt` 附件，正文只放摘要和文件名。
 - text lane 最快 1 秒一次 edit；TaskDeck lane 最快 4 秒一次 edit。计时从 Discord edit
   完成时开始，而不是 request 发起时。
+- 普通回答、streaming/final、reasoning/status/warning/error、usage/context、interaction、
+  turn summary、diff 和 tool artifact 都生成 typed embed，不再把结构化状态压成同一种纯文本。
+  assistant 正文只在 embed description 出现一次；message content 使用零宽占位，避免重复展示。
+- 每条 Discord message 最多 10 个 embed，所有 embed 合计最多 6000 字符；decorator 在发送前
+  统一约束 title/description/field/footer 预算。usage 使用结构化字段和 context progress bar；
+  interaction 明确区分 pending/resolved/expired；`session.task_complete` 明确区分
+  completed/continue/blocked，不能把继续或阻塞显示成绿色成功。
+- diff card 显示 source、byte size 和 hunk-aware files/additions/deletions；超过 reducer 安全上限
+  时统计显示 unknown、delivery 显示 omitted，并明确原始事实仅保留在 durable event journal，
+  不能伪造 `0 changes` 或 inline preview。tool artifact 没有可信 status 时显示 unknown；只有
+  legacy 标题明确为 failed/error 才保守恢复失败语义。
+- PNG/table/image 使用 `attachment://<unique-safe-name>` 预览；同一 message 内 basename
+  规范化并去重。Discord 可能把仅由 embed 引用的图片折叠出普通 attachments 数组，因此真实
+  验收同时接受 attachment metadata 和 `cdn.discordapp.com/attachments/...` 原图，并按 SHA-256
+  校验字节，不依赖不可达的 cached-media proxy。
+- 所有 destination（包括 `thread:`、`channel:`、`ops:`）和所有 attachment batch 都走同一
+  durable nonce/checkpoint 恢复协议。renderer 升级只允许尚无 message ID 的 `prepared` intent
+  原子更新 payload hash，并按原 nonce 查找/编辑可能已发送的消息；sent 或已有 message ID 的
+  hash 不一致继续 fail closed。旧数据库只有 delivered checkpoint、没有 intent 时可一次性回填
+  sent intent，避免升级后永久阻塞。
 - task/subagent/background evidence 使用原 session thread 中的一张 rolling `TaskDeck`，默认
   collapsed；绝不为 subagent/task/Fleet worker 创建 child thread，也不为每个 ToolUse 单独
   发消息。主回答只接收已按 agent/message/parent ID 归属到 main submission 的文本；agent-scoped
@@ -2386,7 +2406,7 @@ claudeD issue 回归门禁：
   `/limits`、`/pr`、`/delegate` 不进入命令面；`/unbound-fallback` 不存在，因为 `$HOME`
   行为固定启用。
 
-### 当前实现快照（2026-08-06）
+### 当前实现快照（2026-08-07）
 
 repository implementation 已按本设计完成对齐，credentialed Bridge 全矩阵与真实 Discord
 gallery 均已完成；剩余工作是 macOS/Windows 实机与长时稳定性验收，不再以 mock/fixture
@@ -2399,8 +2419,8 @@ gallery 均已完成；剩余工作是 macOS/Windows 实机与长时稳定性验
 | eventLog `read/tail` durable backfill（固定过滤 ephemeral）、cursor epoch/rebase/predecessor-gap diagnostics、overflow freeze/backfill/generation replacement；activity/queue/task/remote/schedule snapshot requested/applied epoch 与 query watermark；crossing command/agent snapshot 禁止 merge 并强制 requery | ephemeral idle/delta 离开 live window 后不可恢复，不从 transcript 猜 terminal；compaction 无 completion evidence 时保持 unknown 并阻塞普通 submission |
 | durable app FIFO；fresh readiness snapshot、reducer caught-up、config/agent/remote/schedule/task known gate 后只派发队首；attachment manifest READY + hash/size 复验，无 attachment-free fallback；`/queue add/list/remove/clear`；project variables 只解析到 typed MCP/environment reference，不作为任意 process environment 注入 | native queue entry 没有 stable opaque ID 时只以 snapshot-local opaque key 诊断；transport ambiguity 不自动重放 |
 | Discord core 命令；strict dynamic builtin manifest；Native-Gated `/ask`、`/session compact`、`/fleet`、`/tasks`（含真实 promote）、`/agent list`、`/agent current`、`/after list`、`/after cancel`、`/every list`、`/every cancel`、`/remote status`、`/remote off`、`/review`、`/security-review`、`/research`、`/rubber-duck`；thread-first `/session delete session-id?`；JSON-Schema elicitation 与 MCP OAuth typed/exactly-once response plane；全部 action 由 exact capability 决定 | current-runtime fork 仍 capability-gated 且不注册；`/after create` 与 `/every create` 因 real invoke 返回 `text` 而非 required `completed` 不注册；agent select/deselect、remote on/export 的 real gate 未通过 |
-| durable input attachment manifest、hash/size 复验、图片 blob 压缩；中断的 `preparing` 可按 Discord channel/message locator 重启恢复，ready orphan 幂等重提，引用释放后默认保留 7 天再 GC；stream/final RenderOutbox；table hold 与 code/PNG/MD/CSV assets；Discord HTTP/rate-limit 错误分类，超上限 artifact 按序无损分片；真实 gallery 已验证三个 outbox intent、附件上传及主 CDN 逐字节回读 | Discord archived/locked thread、attachment edit、exact 429 retry-after 仍需真实 gateway fixture；Discord cached-media 代理在当前网络不可达，不影响主 CDN 原件 |
-| tool/subagent/agent-scoped output 归并为原 thread 的单条 embed-backed TaskDeck；每页最多 8 张 embed、总字符受 Discord 6000 限制，4 秒 cadence、pending coalescing、terminal flush、select/expand/collapse/prev/next，embed/asset hash 与 crash recovery 保持原位 edit；terminal-first tool event 会恢复既有标题或生成稳定默认标题，Discord select 对空 label/description 有合法回退；reasoning delta/coalesced thinking 与 configured final concise reasoning summary 已实现，`assistant.streaming_delta` 不进入 Discord UI；structured tool diff 与 local workspace diff artifact lane；typed task list/show/progress/message/promote/cancel-all/remove/wait 与 Fleet projection；>=8000 字符 tool result/error 逐字附件化；零 child-thread 路径 | Discord 上的 diff 附件/图片 delivery 仍受 upload limit 与 archived/locked thread 约束；81 项 slash/component 操作保留给人工 driver review |
+| durable input attachment manifest、hash/size 复验、图片 blob 压缩；中断的 `preparing` 可按 Discord channel/message locator 重启恢复，ready orphan 幂等重提，引用释放后默认保留 7 天再 GC；stream/final RenderOutbox；table hold 与 code/PNG/MD/CSV assets；Discord HTTP/rate-limit 错误分类，超上限 artifact 按序无损分片；全部 destination/multi-batch 共用 durable nonce/checkpoint；prepared intent 可安全跨 renderer 升级恢复，sent mismatch fail closed，旧 delivered-without-intent 可回填；真实 gallery 已验证三个 outbox intent、附件上传及主 CDN 逐字节回读 | Discord archived/locked thread、attachment edit、exact 429 retry-after 仍需真实 gateway fixture；Discord cached-media 代理在当前网络不可达，不影响主 CDN 原件 |
+| assistant stream/final、reasoning、status/warning/error、usage/context、interaction、turn summary、diff、tool artifact 全部使用 typed rich embed；单消息最多 10 embeds/6000 字符；usage metrics/context bar、pending/resolved/expired、task completed/continue/blocked、hunk-aware diff stats、oversized omitted/unknown、legacy artifact unknown/failed 语义均有确定颜色和字段；图片/table 使用消息内唯一 `attachment://` 名称。tool/subagent/agent-scoped output 仍归并为原 thread 的单条 embed-backed TaskDeck；每页最多 8 张 embed，4 秒 cadence、pending coalescing、terminal flush、select/expand/collapse/prev/next，embed/asset hash 与 crash recovery 保持原位 edit；terminal-first tool event 会恢复既有标题或生成稳定默认标题，Discord select 对空 label/description 有合法回退；structured tool diff 与 local workspace diff artifact lane；typed task list/show/progress/message/promote/cancel-all/remove/wait 与 Fleet projection；>=8000 字符 tool result/error 逐字附件化；零 child-thread 路径 | Discord 上的 diff 附件/图片 delivery 仍受 upload limit 与 archived/locked thread 约束；81 项 slash/component 操作保留给人工 driver review |
 | durable `DELETING → DELETE_UNKNOWN/DELETED` permanent-delete saga；stable SDK `delete_session(session_id)` + metadata not-found reconcile；non-deleted app schedule reference fail-closed；active target force teardown、15 秒 bounded native task/schedule/queue/remote cleanup、unprovable result unknown；confirmed delete 后才清 attachment/worktree metadata；abort 等 correlated abort + aborted-idle；unexpected `session.shutdown` terminalizes current handle and enters recovery | SDK response loss 仍需显式 retry，同一 mapping/session ID 保留；缺失 native capability 明确记录 unknown；只有 explicit close 可完成 CLOSED |
 | 共享 TaskRegistry、failure consumer、app scheduler fatal-loop supervision、10 分钟 active-execution SUSPECT + non-destructive ping、结构化 heartbeat、完整 setup preflight、fresh PID/generation/current-fence status、bounded restart saga、restart-storm alert、10 MiB × 7 JSON log、macOS LaunchAgent 与 Windows Scheduled Task 的 bundled 2-unit / sidecar 3-unit install/status/uninstall/effective-definition contract；owned Git 在 POSIX 使用 inherited `flock`，Windows 使用 `msvcrt` byte lock、独立进程组与 `taskkill /T /F` | 默认 bundled runtime 没有独立 runtime service；sidecar 三组件需要显式 runtime argv/URI/connection token；真实 credentialed install、sleep/wake、macOS soak 与 Windows 实机未在 deterministic suite 中验证 |
 
@@ -2409,7 +2429,7 @@ core send/abort/disconnect/history、transport、Native、protocol/extension 与
 调用全部走 typed wrapper。67 个 public operation 均在 `BRIDGE_ACCEPTANCE_LANES` 中分档，
 新增未分类 operation 会令 deterministic gate 失败。
 
-当前 deterministic 验证基线为 817 个 pytest case、`ruff check .`、`ruff format --check .`、
+当前 deterministic 验证基线为 831 个 pytest case、`ruff check .`、`ruff format --check .`、
 `compileall`、ops/design audit、CLI JSON/error contract、service definition/effective-state
 simulations，以及 wheel/sdist 的 isolated build/install；全量 pytest 还把
 `PytestUnhandledThreadExceptionWarning` 升级为 error，已修复 failure-path tests 遗留的
@@ -2425,7 +2445,7 @@ cleanup 已确认：
 | Native RPC | passed；45 exact gates = 33 supported / 12 unsupported | model/effort/context 改写、readback 与完整恢复通过；同一显式 model 的 optional fields 需经 `Auto` 中转清理；专用 synchronous-agent fixture 连续两次真实 promote 通过；after/every create 返回 `text`，agent select/deselect 与 remote on/export 保持 unsupported | `fca1b96b4f1e823f458fe3ec52983f62cf078dc59d7e98e24d1b048135002e07` |
 | Protocol/extensions | passed；11 features = 8 passed / 3 unprobed | permission、registered external tool、MCP/config reattach、isolated missing-auth fail-closed 等只走 Bridge；无双响应；session/workspace cleanup 完成 | `57f69511525274051d6d34c9bdbdb24fff129314978713d1febc707fb1eddac7` |
 | App scheduler/worktree | passed；6 product features passed / 1 history-fork gated；authentication 与 cleanup 通过 | scheduled message、closed-session resume、crash recovery、new session、blank worktree 全部通过；真正 history fork 继续按 capability fail closed | `497059e7472f8878b446c8edb631dad58e480328dbcc2df5e42722e83863f2bc` |
-| Discord gallery | passed；run `cd-e2e-1786056421-c7f7429a`；93 项自动证据通过；现场保留 | text/stream/reasoning/tool/diff/table/image/file/interaction/TaskDeck/error/usage、三个 outbox intent、附件上传和主 CDN byte readback 均成功；81 项 slash/component 操作为 `pending_human_driver`；Pin message 因 bot 缺少 Manage Messages 不可用，未强制触发 429 | `2d8191d9ebe8511891442cdc99530e3cbe320db487ddab2bd5b0d9fd7f3251d5` |
+| Discord rich gallery v2 | passed；run `cd-e2e-1786071615-eb6388be`；94 项自动证据通过；最终现场保留，旧现场已删除 | assistant stream/final、reasoning、warning、usage/context、pending/resolved/expired interaction、task completed/continue/blocked、turn summary、normal/oversized diff、tool artifact、table/image/file 和 TaskDeck 均为 typed rich card；rich gallery 独立发送 14 张卡；三个 outbox intent、附件上传、embed-folded CDN image 和主 CDN byte/SHA readback 均成功；81 项 slash/component 操作为 `pending_human_driver`；Pin message 因 bot 缺少 Manage Messages 阻塞，429 未实际观察 | `0233943194ef2304a6c017bc80e5e3a9ed0331dccb3ce57b520d4703985ec43c` |
 | Checked capability fixture | exact supported flags 与本次 45-gate Native evidence 零差异 | 固定 114-event inventory；`tasks_promote=true` | `3120c690ea9e8a1943d4ad17871b2d1c48db54eb87b50bb244d910090af7699a` |
 
 Broad event fixture SHA-256 为
@@ -2436,7 +2456,7 @@ Broad event fixture SHA-256 为
 unsupported/unprobed action 保存真实 discovery/gate，不由 deterministic fixture 冒充。
 这个快照用于区分“已验证实现”和后续设计，不降低以下章节对最终产品的契约要求。
 真实 Discord 人工 review 现场：
-<https://discord.com/channels/1499415073838600454/1535056664141504674>。
+<https://discord.com/channels/1499415073838600454/1535120391922516080>。
 
 ### HTML 交付要求
 
@@ -2532,7 +2552,7 @@ unsupported/unprobed action 保存真实 discovery/gate，不由 deterministic f
 2. [完成] 对真实 Copilot 逐项执行 Bridge broad/Native/protocol/scheduler-worktree 功能矩阵和
    负能力门禁，保存脱敏 evidence；未执行或未观测结果继续标 unsupported/unprobed。
 3. [完成] 向真实 Discord 发送 text/stream/reasoning/tool/diff/table/image/file/interaction/
-   TaskDeck/error/usage 等完整 gallery；93 项自动证据通过，消息现场与稳定 Discord ID 已保留供
+   TaskDeck/error/usage 等完整 gallery；94 项自动证据通过，消息现场与稳定 Discord ID 已保留供
    人工 review，81 项 slash/component 操作明确标为 `pending_human_driver`。
 4. 实机验证 macOS LaunchAgent 与 Windows Scheduled Task 的 install/login/sleep/wake/crash/
    restart-storm；完成 90 分钟 liveness soak 与平台字体/时区检查。

@@ -15,6 +15,7 @@ from collections.abc import Callable, Mapping
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
+from urllib.parse import unquote, urlparse
 
 import aiohttp
 import discord
@@ -29,6 +30,7 @@ from copilotd.discord_app import (
     _discord_embeds,
     _discord_files,
     _discord_render_plan,
+    _render_view,
     _taskdeck_view,
 )
 from copilotd.ops.surface import redact_sensitive_text
@@ -339,12 +341,32 @@ class DiscordRealHarness:
         actual_filenames: list[str] = []
         actual_sha256: list[str] = []
         for message in messages:
-            for attachment in getattr(message, "attachments", []):
+            delivered_assets: list[tuple[int, str, bytes]] = []
+            seen_attachment_ids: set[int] = set()
+            for position, attachment in enumerate(getattr(message, "attachments", [])):
                 filename = str(getattr(attachment, "filename", "attachment.bin"))
                 if hasattr(attachment, "read"):
-                    content = await attachment.read(use_cached=True)
+                    content = await attachment.read(use_cached=False)
                 else:
                     content = bytes(getattr(attachment, "content", b""))
+                attachment_id = int(getattr(attachment, "id", 0) or 0)
+                if attachment_id:
+                    seen_attachment_ids.add(attachment_id)
+                delivered_assets.append((attachment_id or position + 1, filename, content))
+            for image_url in _discord_embed_image_urls(message):
+                identity = _discord_cdn_attachment_identity(image_url)
+                if identity is None:
+                    continue
+                attachment_id, filename = identity
+                if attachment_id in seen_attachment_ids:
+                    continue
+                bot = self._require_bot()
+                get_from_cdn = getattr(bot.http, "get_from_cdn", None)
+                if not callable(get_from_cdn):
+                    raise DiscordE2EError("Discord HTTP client cannot read embedded CDN assets")
+                content = await get_from_cdn(image_url)
+                delivered_assets.append((attachment_id, filename, content))
+            for _asset_id, filename, content in sorted(delivered_assets):
                 actual_filenames.append(filename)
                 actual_sha256.append(_hash_bytes(content))
         if expected_contents is not None and list(expected_contents) != actual_contents:
@@ -750,6 +772,7 @@ class DiscordRealHarness:
                 discord_ids=[str(ordinary.id)],
             )
         )
+        await self._run_rich_embed_gallery(thread)
 
         image_path = root / "local-image.png"
         Image.new("RGB", (8, 8), "purple").save(image_path)
@@ -766,6 +789,7 @@ class DiscordRealHarness:
         )
         plan = await _discord_render_plan(
             {
+                "type": "assistant.message",
                 "content": markdown,
                 "finalized": True,
                 "trusted_local_images": True,
@@ -807,7 +831,14 @@ class DiscordRealHarness:
             for message in rendered_fetched
             for attachment in message.attachments
         ]
-        if "local-image.png" not in attachment_names:
+        embedded_image_names = [
+            identity[1]
+            for message in rendered_fetched
+            for url in _discord_embed_image_urls(message)
+            if (identity := _discord_cdn_attachment_identity(url)) is not None
+        ]
+        delivered_asset_names = attachment_names + embedded_image_names
+        if "local-image.png" not in delivered_asset_names:
             raise DiscordE2EError("local Markdown image was not uploaded")
         self.evidence.features.append(
             await self.record_ordered_delivery_probe(
@@ -823,7 +854,8 @@ class DiscordRealHarness:
                 status="passed",
                 transport="real Discord messages and files",
                 detail=(
-                    f"{len(plan.batches)} ordered batches; {len(attachment_names)} attachments"
+                    f"{len(plan.batches)} ordered batches; "
+                    f"{len(delivered_asset_names)} delivered assets"
                 ),
                 discord_ids=[str(message.id) for message in fetched],
             )
@@ -921,18 +953,39 @@ class DiscordRealHarness:
         )
 
         error_body = "E" * 8000
+        error_payload = {
+            "type": "tool_output_artifact",
+            "content": "**Tool failed**\nExact output is attached for diagnosis.",
+            "status": "failed",
+            "tool_source": "error",
+            "verbatim": True,
+            "character_count": len(error_body),
+            "line_count": 1,
+            "attachments": [
+                {
+                    "filename": "tool-error.txt",
+                    "media_type": "text/plain",
+                    "content": error_body,
+                }
+            ],
+            "finalized": True,
+        }
+        error_batch = (await _discord_render_plan(error_payload)).batches[0]
         error_message = await thread.send(
-            "**Tool failed** — exact output attached.",
-            file=discord.File(io.BytesIO(error_body.encode()), filename="tool-error.txt"),
+            content=error_batch.content or "\u200b",
+            files=_discord_files(list(error_batch.assets)),
+            embeds=_discord_embeds(error_batch.embeds),
             silent=True,
         )
         self._created_messages.append(error_message)
         if error_message.attachments[0].size != len(error_body):
             raise DiscordE2EError("exact tool error attachment size changed")
+        if not error_message.embeds:
+            raise DiscordE2EError("tool error rich embed was not serialized")
         self.evidence.features.append(
             await self.record_ordered_delivery_probe(
                 [error_message],
-                expected_contents=["**Tool failed** — exact output attached."],
+                expected_contents=[error_batch.content or "\u200b"],
                 expected_filenames=["tool-error.txt"],
                 expected_sha256=[_hash_bytes(error_body.encode())],
             )
@@ -1031,6 +1084,206 @@ class DiscordRealHarness:
                 transport="real Discord history",
                 detail=f"{len(ordered)} bot messages in one thread",
                 discord_ids=[str(thread.id)],
+            )
+        )
+
+    async def _run_rich_embed_gallery(self, thread: discord.Thread) -> None:
+        interaction_id = str(uuid.uuid5(uuid.NAMESPACE_URL, f"copilotd:{self._run_id}:input"))
+        payloads = [
+            {
+                "type": "assistant.message_delta",
+                "content": "Copilot is streaming a **live rich response**…",
+                "finalized": False,
+            },
+            {
+                "type": "assistant.message",
+                "content": (
+                    "Here is a richer Copilot answer with **emphasis**, `inline code`, "
+                    "[a link](https://docs.github.com/copilot), and a concise checklist.\n\n"
+                    "- Typed embed presentation\n"
+                    "- Markdown remains copyable\n"
+                    "- Attachments stay durable"
+                ),
+                "finalized": True,
+            },
+            {
+                "type": "assistant.reasoning",
+                "content": (
+                    "**Reasoning complete**\nCompared the renderer contract, Discord limits, "
+                    "and durable delivery state."
+                ),
+                "status": {
+                    "title": "Reasoning complete",
+                    "detail": (
+                        "Compared the renderer contract, Discord limits, "
+                        "and durable delivery state."
+                    ),
+                    "event_type": "assistant.reasoning",
+                },
+                "finalized": True,
+            },
+            {
+                "type": "session.warning",
+                "content": (
+                    "**Copilot warning**\nContext usage is approaching the configured limit."
+                ),
+                "status": {
+                    "title": "Copilot warning",
+                    "detail": "Context usage is approaching the configured limit.",
+                    "event_type": "session.warning",
+                },
+                "finalized": True,
+            },
+            {
+                "type": "session.usage_info",
+                "content": "**Copilot usage**",
+                "usage": {
+                    "inputTokens": 12400,
+                    "outputTokens": 2180,
+                    "cacheReadTokens": 8600,
+                    "totalTokens": 14580,
+                    "premiumRequests": 1,
+                    "aiCredits": 1.25,
+                    "currentTokens": 73600,
+                    "tokenLimit": 128000,
+                },
+                "finalized": True,
+            },
+            {
+                "type": "interaction",
+                "content": "**Copilot needs input**",
+                "interaction": {
+                    "interaction_id": interaction_id,
+                    "kind": "user_input",
+                    "state": "pending",
+                    "question": "Which deployment target should Copilot prepare?",
+                    "choices": ["Local package", "macOS service", "Windows task"],
+                    "allowFreeform": True,
+                },
+                "finalized": False,
+            },
+            {
+                "type": "interaction",
+                "content": "**Copilot input recorded**",
+                "interaction": {
+                    "kind": "user_input",
+                    "state": "resolved",
+                    "question": "Which deployment target should Copilot prepare?",
+                    "display_response": "macOS service",
+                },
+                "finalized": True,
+            },
+            {
+                "type": "interaction",
+                "content": "**Copilot input expired**",
+                "interaction": {
+                    "kind": "user_input",
+                    "state": "expired",
+                    "question": "Should Copilot continue waiting for approval?",
+                },
+                "finalized": True,
+            },
+            {
+                "type": "session.task_complete",
+                "content": "**Task evaluation**\nOutcome: `completed`",
+                "status": {
+                    "title": "Task evaluation",
+                    "detail": "Outcome: `completed`",
+                    "event_type": "session.task_complete",
+                    "outcome": "completed",
+                },
+                "finalized": True,
+            },
+            {
+                "type": "session.task_complete",
+                "content": "**Task evaluation**\nOutcome: `continue`",
+                "status": {
+                    "title": "Task evaluation",
+                    "detail": "Outcome: `continue`",
+                    "event_type": "session.task_complete",
+                    "outcome": "continue",
+                },
+                "finalized": True,
+            },
+            {
+                "type": "session.task_complete",
+                "content": "**Task evaluation**\nOutcome: `blocked`",
+                "status": {
+                    "title": "Task evaluation",
+                    "detail": "Outcome: `blocked`",
+                    "event_type": "session.task_complete",
+                    "outcome": "blocked",
+                },
+                "finalized": True,
+            },
+            {
+                "type": "idle_footer",
+                "content": "turn complete",
+                "model": "gpt-5.6-sol",
+                "input_tokens": 12400,
+                "output_tokens": 2180,
+                "credits": 1.25,
+                "context": "73600/128000",
+                "duration_seconds": 83,
+                "background_observed": True,
+                "finalized": True,
+            },
+            {
+                "type": "diff",
+                "content": (
+                    "**Code changes** · `structured`\n"
+                    "```diff\n"
+                    "- plain Discord output\n"
+                    "+ typed embeds with bounded metadata\n"
+                    "```"
+                ),
+                "source": "structured",
+                "byte_count": 82,
+                "stats": {"files": 1, "additions": 1, "deletions": 1},
+                "finalized": True,
+            },
+            {
+                "type": "diff",
+                "content": (
+                    "**Code changes**\nStructured diff exceeds the render safety limit; "
+                    "exact source remains in the durable event journal."
+                ),
+                "source": "structured",
+                "oversized": True,
+                "byte_count": 9 * 1024 * 1024,
+                "stats": {},
+                "finalized": True,
+            },
+        ]
+        messages: list[Any] = []
+        for payload in payloads:
+            plan = await _discord_render_plan(payload)
+            for index, batch in enumerate(plan.batches):
+                message = await thread.send(
+                    content=batch.content or "\u200b",
+                    files=_discord_files(list(batch.assets)),
+                    embeds=_discord_embeds(batch.embeds),
+                    view=_render_view(payload) if index == 0 else None,
+                    silent=True,
+                )
+                self._created_messages.append(message)
+                messages.append(message)
+        fetched = [await thread.fetch_message(message.id) for message in messages]
+        if any(not message.embeds for message in fetched):
+            raise DiscordE2EError("typed rich embed gallery contains a plain fallback message")
+        if not any(message.components for message in fetched):
+            raise DiscordE2EError("rich interaction card has no Discord components")
+        self.evidence.features.append(
+            FeatureEvidence(
+                feature="typed rich embed gallery",
+                status="passed",
+                transport="real Discord embed and component serialization",
+                detail=(
+                    "stream/final answer, reasoning, warning, usage, pending/resolved/expired "
+                    "interaction, task completed/continue/blocked, turn summary, and normal/"
+                    "oversized diff cards"
+                ),
+                discord_ids=[str(message.id) for message in fetched],
             )
         )
 
@@ -1393,13 +1646,18 @@ class DiscordRealHarness:
             )
         messages = [await thread.fetch_message(int(row["discord_message_id"])) for row in rows]
         if not self._dry_run:
-            actual_contents = [str(message.content) for message in messages]
-            if actual_contents.count(marker) != 1:
+            visible_text = [_discord_message_visible_text(message) for message in messages]
+            if sum(marker in text for text in visible_text) != 1:
                 raise DiscordE2EError(
                     "production Discord history did not contain the known marker exactly once"
                 )
+            rich_embed_count = sum(bool(message.embeds) for message in messages)
+            if rich_embed_count != expected_intent_count:
+                raise DiscordE2EError(
+                    "production Discord history did not serialize every typed intent as rich embeds"
+                )
             actual_artifact_digests = [
-                _hash_bytes(await attachment.read(use_cached=True))
+                _hash_bytes(await attachment.read(use_cached=False))
                 for message in messages
                 for attachment in message.attachments
             ]
@@ -1426,6 +1684,7 @@ class DiscordRealHarness:
                 "journal_event_count=2",
                 f"render_intent_count={expected_intent_count}",
                 f"render_message_count={len(rows)}",
+                f"rich_embed_message_count={sum(bool(message.embeds) for message in messages)}",
                 f"known_marker={marker}",
                 f"known_artifact_sha256={expected_artifact_sha256}",
                 "delivery_path=JournalReducer->RenderOutboxDispatcher",
@@ -1705,6 +1964,49 @@ def _asset_bytes(asset: Any) -> bytes:
         return bytes(file_pointer.read())
     finally:
         file_pointer.seek(position)
+
+
+def _discord_message_visible_text(message: Any) -> str:
+    parts = [str(getattr(message, "content", "") or "")]
+    for raw_embed in getattr(message, "embeds", ()):
+        embed = raw_embed.to_dict() if hasattr(raw_embed, "to_dict") else raw_embed
+        if not isinstance(embed, dict):
+            continue
+        parts.extend(str(embed.get(key) or "") for key in ("title", "description"))
+        fields = embed.get("fields")
+        if isinstance(fields, list):
+            for field in fields:
+                if isinstance(field, dict):
+                    parts.append(str(field.get("name") or ""))
+                    parts.append(str(field.get("value") or ""))
+    return "\n".join(part for part in parts if part)
+
+
+def _discord_embed_image_urls(message: Any) -> list[str]:
+    urls: list[str] = []
+    for raw_embed in getattr(message, "embeds", ()):
+        embed = raw_embed.to_dict() if hasattr(raw_embed, "to_dict") else raw_embed
+        if not isinstance(embed, dict):
+            continue
+        image = embed.get("image")
+        if isinstance(image, dict) and isinstance(image.get("url"), str):
+            urls.append(str(image["url"]))
+    return urls
+
+
+def _discord_cdn_attachment_identity(url: str) -> tuple[int, str] | None:
+    parsed = urlparse(url)
+    if parsed.scheme != "https" or parsed.hostname != "cdn.discordapp.com":
+        return None
+    parts = parsed.path.split("/")
+    if len(parts) < 5 or parts[1] != "attachments":
+        return None
+    try:
+        attachment_id = int(parts[3])
+    except ValueError:
+        return None
+    filename = unquote(parts[4])
+    return attachment_id, filename
 
 
 def _clone_json_value(value: Any) -> Any:

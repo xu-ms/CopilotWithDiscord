@@ -31,7 +31,7 @@ class FakeAttachment:
     filename: str = "attachment.bin"
 
     async def read(self, *, use_cached: bool = True) -> bytes:
-        assert use_cached
+        assert not use_cached
         return self.content
 
 
@@ -40,6 +40,7 @@ class FakeMessage:
     id: int
     content: str = ""
     attachments: list[FakeAttachment] = field(default_factory=list)
+    embeds: list[object] = field(default_factory=list)
     deleted: bool = False
 
     async def delete(self) -> None:
@@ -165,7 +166,7 @@ class DryRunAttachment:
         return len(self.content)
 
     async def read(self, *, use_cached: bool = True) -> bytes:
-        assert use_cached
+        assert not use_cached
         return self.content
 
 
@@ -718,6 +719,41 @@ async def test_ordered_content_and_attachment_sha256_probe(tmp_path: Path) -> No
 
 
 @pytest.mark.asyncio
+async def test_ordered_probe_reads_images_folded_into_discord_embed_cdn(tmp_path: Path) -> None:
+    harness = DiscordRealHarness(
+        token="not-used",
+        evidence_path=tmp_path / "evidence.json",
+        guild_id=20,
+        application_id=10,
+        channel_id=30,
+    )
+    image_url = (
+        "https://cdn.discordapp.com/attachments/30/200/chart.png?ex=example&is=example&hm=example"
+    )
+
+    class FakeCdnHttp:
+        async def get_from_cdn(self, url: str) -> bytes:
+            assert url == image_url
+            return b"chart-bytes"
+
+    harness._bot = SimpleNamespace(http=FakeCdnHttp(), user=SimpleNamespace(id=777))
+    message = FakeMessage(
+        id=1,
+        content="\u200b",
+        embeds=[{"image": {"url": image_url}}],
+    )
+
+    evidence = await harness.record_ordered_delivery_probe(
+        [message],
+        expected_contents=["\u200b"],
+        expected_filenames=["chart.png"],
+        expected_sha256=[hashlib.sha256(b"chart-bytes").hexdigest()],
+    )
+
+    assert evidence.status == "passed"
+
+
+@pytest.mark.asyncio
 async def test_ordered_delivery_probe_rejects_mismatched_expected_values(tmp_path: Path) -> None:
     harness = DiscordRealHarness(
         token="not-used",
@@ -802,17 +838,29 @@ async def test_dry_run_traverses_snapshot_sync_channel_probe_cleanup_without_net
     http = DryRunHttp()
 
     async def fake_render_plan(*args, **kwargs):
-        embeds = (
-            ({"title": "E2E task"},)
-            if args and isinstance(args[0], dict) and args[0].get("type") == "taskdeck"
-            else ()
+        payload = args[0] if args and isinstance(args[0], dict) else {}
+        payload_type = payload.get("type")
+        embeds = ({"title": str(payload_type)},) if payload_type else ()
+        attachments = payload.get("attachments")
+        inline_assets = (
+            [
+                SimpleNamespace(
+                    filename=str(attachment["filename"]),
+                    fp=io.BytesIO(str(attachment["content"]).encode()),
+                )
+                for attachment in attachments
+                if isinstance(attachment, dict) and isinstance(attachment.get("content"), str)
+            ]
+            if isinstance(attachments, list)
+            else []
         )
         return SimpleNamespace(
             batches=[
                 SimpleNamespace(
                     content="rendered content",
                     embeds=embeds,
-                    assets=[
+                    assets=inline_assets
+                    or [
                         SimpleNamespace(
                             filename="local-image.png",
                             fp=io.BytesIO(b"image-bytes"),

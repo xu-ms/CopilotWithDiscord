@@ -743,8 +743,8 @@ id="toc-会话存活保证与边界">会话存活保证与边界</a></li>
 <li><a href="#测试契约" id="toc-测试契约">测试契约</a></li>
 <li><a href="#已固定的关键默认"
 id="toc-已固定的关键默认">已固定的关键默认</a></li>
-<li><a href="#当前实现快照2026-08-06"
-id="toc-当前实现快照2026-08-06">当前实现快照（2026-08-06）</a></li>
+<li><a href="#当前实现快照2026-08-07"
+id="toc-当前实现快照2026-08-07">当前实现快照（2026-08-07）</a></li>
 <li><a href="#html-交付要求" id="toc-html-交付要求">HTML
 交付要求</a></li>
 </ul></li>
@@ -4015,6 +4015,35 @@ break。不得在 code fence、blockquote 或 table 内跨消息。</li>
 <code>.md</code>/<code>.txt</code> 附件，正文只放摘要和文件名。</li>
 <li>text lane 最快 1 秒一次 edit；TaskDeck lane 最快 4 秒一次
 edit。计时从 Discord edit 完成时开始，而不是 request 发起时。</li>
+<li>普通回答、streaming/final、reasoning/status/warning/error、usage/context、interaction、
+turn summary、diff 和 tool artifact 都生成 typed
+embed，不再把结构化状态压成同一种纯文本。 assistant 正文只在 embed
+description 出现一次；message content 使用零宽占位，避免重复展示。</li>
+<li>每条 Discord message 最多 10 个 embed，所有 embed 合计最多 6000
+字符；decorator 在发送前 统一约束 title/description/field/footer
+预算。usage 使用结构化字段和 context progress bar； interaction 明确区分
+pending/resolved/expired；<code>session.task_complete</code> 明确区分
+completed/continue/blocked，不能把继续或阻塞显示成绿色成功。</li>
+<li>diff card 显示 source、byte size 和 hunk-aware
+files/additions/deletions；超过 reducer 安全上限 时统计显示
+unknown、delivery 显示 omitted，并明确原始事实仅保留在 durable event
+journal， 不能伪造 <code>0 changes</code> 或 inline preview。tool
+artifact 没有可信 status 时显示 unknown；只有 legacy 标题明确为
+failed/error 才保守恢复失败语义。</li>
+<li>PNG/table/image 使用
+<code>attachment://&lt;unique-safe-name&gt;</code> 预览；同一 message 内
+basename 规范化并去重。Discord 可能把仅由 embed 引用的图片折叠出普通
+attachments 数组，因此真实 验收同时接受 attachment metadata 和
+<code>cdn.discordapp.com/attachments/...</code> 原图，并按 SHA-256
+校验字节，不依赖不可达的 cached-media proxy。</li>
+<li>所有 destination（包括
+<code>thread:</code>、<code>channel:</code>、<code>ops:</code>）和所有
+attachment batch 都走同一 durable nonce/checkpoint 恢复协议。renderer
+升级只允许尚无 message ID 的 <code>prepared</code> intent 原子更新
+payload hash，并按原 nonce 查找/编辑可能已发送的消息；sent 或已有
+message ID 的 hash 不一致继续 fail closed。旧数据库只有 delivered
+checkpoint、没有 intent 时可一次性回填 sent
+intent，避免升级后永久阻塞。</li>
 <li>task/subagent/background evidence 使用原 session thread 中的一张
 rolling <code>TaskDeck</code>，默认 collapsed；绝不为
 subagent/task/Fleet worker 创建 child thread，也不为每个 ToolUse 单独
@@ -5457,7 +5486,7 @@ model、<code>/mode</code>、<code>/goal</code>、<code>/bare</code>、<code>/to
 不进入命令面；<code>/unbound-fallback</code> 不存在，因为
 <code>$HOME</code> 行为固定启用。</li>
 </ul>
-<h3 id="当前实现快照2026-08-06">当前实现快照（2026-08-06）</h3>
+<h3 id="当前实现快照2026-08-07">当前实现快照（2026-08-07）</h3>
 <p>repository implementation 已按本设计完成对齐，credentialed Bridge
 全矩阵与真实 Discord gallery 均已完成；剩余工作是 macOS/Windows
 实机与长时稳定性验收，不再以 mock/fixture 结果替代真实 gate：</p>
@@ -5541,22 +5570,30 @@ real invoke 返回 <code>text</code> 而非 required <code>completed</code>
 重启恢复，ready orphan 幂等重提，引用释放后默认保留 7 天再
 GC；stream/final RenderOutbox；table hold 与 code/PNG/MD/CSV
 assets；Discord HTTP/rate-limit 错误分类，超上限 artifact
-按序无损分片；真实 gallery 已验证三个 outbox intent、附件上传及主 CDN
-逐字节回读</td>
+按序无损分片；全部 destination/multi-batch 共用 durable
+nonce/checkpoint；prepared intent 可安全跨 renderer 升级恢复，sent
+mismatch fail closed，旧 delivered-without-intent 可回填；真实 gallery
+已验证三个 outbox intent、附件上传及主 CDN 逐字节回读</td>
 <td>Discord archived/locked thread、attachment edit、exact 429
 retry-after 仍需真实 gateway fixture；Discord cached-media
 代理在当前网络不可达，不影响主 CDN 原件</td>
 </tr>
 <tr>
-<td>tool/subagent/agent-scoped output 归并为原 thread 的单条
-embed-backed TaskDeck；每页最多 8 张 embed、总字符受 Discord 6000
-限制，4 秒 cadence、pending coalescing、terminal
+<td>assistant
+stream/final、reasoning、status/warning/error、usage/context、interaction、turn
+summary、diff、tool artifact 全部使用 typed rich embed；单消息最多 10
+embeds/6000 字符；usage metrics/context
+bar、pending/resolved/expired、task
+completed/continue/blocked、hunk-aware diff stats、oversized
+omitted/unknown、legacy artifact unknown/failed
+语义均有确定颜色和字段；图片/table 使用消息内唯一
+<code>attachment://</code> 名称。tool/subagent/agent-scoped output
+仍归并为原 thread 的单条 embed-backed TaskDeck；每页最多 8 张 embed，4
+秒 cadence、pending coalescing、terminal
 flush、select/expand/collapse/prev/next，embed/asset hash 与 crash
 recovery 保持原位 edit；terminal-first tool event
 会恢复既有标题或生成稳定默认标题，Discord select 对空 label/description
-有合法回退；reasoning delta/coalesced thinking 与 configured final
-concise reasoning summary 已实现，<code>assistant.streaming_delta</code>
-不进入 Discord UI；structured tool diff 与 local workspace diff artifact
+有合法回退；structured tool diff 与 local workspace diff artifact
 lane；typed task
 list/show/progress/message/promote/cancel-all/remove/wait 与 Fleet
 projection；&gt;=8000 字符 tool result/error 逐字附件化；零 child-thread
@@ -5603,7 +5640,7 @@ send/abort/disconnect/history、transport、Native、protocol/extension 与
 scheduler/worktree 调用全部走 typed wrapper。67 个 public operation 均在
 <code>BRIDGE_ACCEPTANCE_LANES</code> 中分档， 新增未分类 operation 会令
 deterministic gate 失败。</p>
-<p>当前 deterministic 验证基线为 817 个 pytest
+<p>当前 deterministic 验证基线为 831 个 pytest
 case、<code>ruff check .</code>、<code>ruff format --check .</code>、
 <code>compileall</code>、ops/design audit、CLI JSON/error
 contract、service definition/effective-state simulations，以及
@@ -5662,14 +5699,19 @@ fail closed</td>
 <td><code>497059e7472f8878b446c8edb631dad58e480328dbcc2df5e42722e83863f2bc</code></td>
 </tr>
 <tr>
-<td>Discord gallery</td>
-<td>passed；run <code>cd-e2e-1786056421-c7f7429a</code>；93
-项自动证据通过；现场保留</td>
-<td>text/stream/reasoning/tool/diff/table/image/file/interaction/TaskDeck/error/usage、三个
-outbox intent、附件上传和主 CDN byte readback 均成功；81 项
-slash/component 操作为 <code>pending_human_driver</code>；Pin message 因
-bot 缺少 Manage Messages 不可用，未强制触发 429</td>
-<td><code>2d8191d9ebe8511891442cdc99530e3cbe320db487ddab2bd5b0d9fd7f3251d5</code></td>
+<td>Discord rich gallery v2</td>
+<td>passed；run <code>cd-e2e-1786071615-eb6388be</code>；94
+项自动证据通过；最终现场保留，旧现场已删除</td>
+<td>assistant
+stream/final、reasoning、warning、usage/context、pending/resolved/expired
+interaction、task completed/continue/blocked、turn
+summary、normal/oversized diff、tool artifact、table/image/file 和
+TaskDeck 均为 typed rich card；rich gallery 独立发送 14 张卡；三个
+outbox intent、附件上传、embed-folded CDN image 和主 CDN byte/SHA
+readback 均成功；81 项 slash/component 操作为
+<code>pending_human_driver</code>；Pin message 因 bot 缺少 Manage
+Messages 阻塞，429 未实际观察</td>
+<td><code>0233943194ef2304a6c017bc80e5e3a9ed0331dccb3ce57b520d4703985ec43c</code></td>
 </tr>
 <tr>
 <td>Checked capability fixture</td>
@@ -5687,7 +5729,7 @@ bot 缺少 Manage Messages 不可用，未强制触发 429</td>
 保存真实 discovery/gate，不由 deterministic fixture 冒充。
 这个快照用于区分“已验证实现”和后续设计，不降低以下章节对最终产品的契约要求。
 真实 Discord 人工 review 现场： <a
-href="https://discord.com/channels/1499415073838600454/1535056664141504674">https://discord.com/channels/1499415073838600454/1535056664141504674</a>。</p>
+href="https://discord.com/channels/1499415073838600454/1535120391922516080">https://discord.com/channels/1499415073838600454/1535120391922516080</a>。</p>
 <h3 id="html-交付要求">HTML 交付要求</h3>
 <ul>
 <li>以本文件“目标、调研结论、详细设计、实施阶段、风险和官方依据”为唯一内容源。</li>
@@ -5821,7 +5863,7 @@ broad/Native/protocol/scheduler-worktree 功能矩阵和 负能力门禁，保�
 evidence；未执行或未观测结果继续标 unsupported/unprobed。</li>
 <li>[完成] 向真实 Discord 发送
 text/stream/reasoning/tool/diff/table/image/file/interaction/
-TaskDeck/error/usage 等完整 gallery；93 项自动证据通过，消息现场与稳定
+TaskDeck/error/usage 等完整 gallery；94 项自动证据通过，消息现场与稳定
 Discord ID 已保留供 人工 review，81 项 slash/component 操作明确标为
 <code>pending_human_driver</code>。</li>
 <li>实机验证 macOS LaunchAgent 与 Windows Scheduled Task 的

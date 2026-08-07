@@ -981,6 +981,327 @@ async def test_verified_relative_assistant_image_is_uploaded(
     assert all("![chart]" not in batch.content for batch in plan.batches)
 
 
+@pytest.mark.asyncio
+async def test_assistant_stream_and_final_render_as_rich_embeds() -> None:
+    stream = await _discord_render_plan(
+        {
+            "type": "assistant.message_delta",
+            "content": "Working on **three checks**…",
+            "finalized": False,
+        }
+    )
+    final = await _discord_render_plan(
+        {
+            "type": "assistant.message",
+            "content": "All checks passed.\n\n```text\n3/3\n```",
+            "finalized": True,
+        }
+    )
+
+    assert stream.batches[0].content == ""
+    assert stream.batches[0].embeds[0]["title"] == "✨ Copilot is responding"
+    assert stream.batches[0].embeds[0]["description"] == "Working on **three checks**…"
+    assert stream.batches[0].embeds[0]["footer"]["text"] == "Live response"
+    assert final.batches[0].content == ""
+    assert final.batches[0].embeds[0]["title"] == "✨ Copilot response"
+    assert "```text" in final.batches[0].embeds[0]["description"]
+    assert final.batches[0].embeds[0]["footer"]["text"] == "Copilot · response complete"
+
+
+@pytest.mark.asyncio
+async def test_structured_events_render_as_distinct_rich_cards() -> None:
+    cases = [
+        (
+            {
+                "type": "session.warning",
+                "content": "**Copilot warning**\nContext is nearly full.",
+                "status": {
+                    "title": "Copilot warning",
+                    "detail": "Context is nearly full.",
+                    "event_type": "session.warning",
+                },
+                "finalized": True,
+            },
+            "⚠️ Copilot warning",
+        ),
+        (
+            {
+                "type": "session.usage_info",
+                "content": "**Copilot usage**",
+                "usage": {
+                    "inputTokens": 12,
+                    "outputTokens": 7,
+                    "totalTokens": 19,
+                    "currentTokens": 50,
+                    "tokenLimit": 100,
+                },
+                "finalized": True,
+            },
+            "📈 Copilot usage",
+        ),
+        (
+            {
+                "type": "interaction",
+                "content": "**Copilot needs input**",
+                "interaction": {
+                    "kind": "user_input",
+                    "state": "pending",
+                    "question": "Pick a deployment target.",
+                },
+                "finalized": False,
+            },
+            "📝 Copilot needs input",
+        ),
+        (
+            {
+                "type": "idle_footer",
+                "content": "turn complete",
+                "model": "gpt-test",
+                "input_tokens": 1200,
+                "output_tokens": 340,
+                "credits": 1.5,
+                "context": "50/100",
+                "duration_seconds": 65,
+                "background_observed": False,
+                "finalized": True,
+            },
+            "✅ Turn complete",
+        ),
+        (
+            {
+                "type": "interaction",
+                "content": "**Copilot input expired**",
+                "interaction": {
+                    "kind": "user_input",
+                    "state": "expired",
+                    "question": "Pick a deployment target.",
+                },
+                "finalized": True,
+            },
+            "⏳ Copilot input expired",
+        ),
+        (
+            {
+                "type": "session.task_complete",
+                "content": "**Task evaluation**\nOutcome: `blocked`",
+                "status": {
+                    "title": "Task evaluation",
+                    "detail": "Outcome: `blocked`",
+                    "event_type": "session.task_complete",
+                    "outcome": "blocked",
+                },
+                "finalized": True,
+            },
+            "⚠️ Task blocked",
+        ),
+        (
+            {
+                "type": "session.task_complete",
+                "content": "**Task evaluation**\nOutcome: `continue`",
+                "status": {
+                    "title": "Task evaluation",
+                    "detail": "Outcome: `continue`",
+                    "event_type": "session.task_complete",
+                    "outcome": "continue",
+                },
+                "finalized": True,
+            },
+            "▶️ Task continuing",
+        ),
+    ]
+
+    for payload, title in cases:
+        plan = await _discord_render_plan(payload)
+        assert plan.batches[0].content == ""
+        assert plan.batches[0].embeds[0]["title"] == title
+        assert len(discord.Embed.from_dict(plan.batches[0].embeds[0])) <= 6000
+
+    usage = (await _discord_render_plan(cases[1][0])).batches[0].embeds[0]
+    assert "`[######------]` 50%" in usage["description"]
+    assert [field["name"] for field in usage["fields"]] == ["Input", "Output", "Total"]
+    context_only = await _discord_render_plan(
+        {
+            "type": "session.usage_info",
+            "content": "**Copilot usage**",
+            "usage": {"currentTokens": 25, "tokenLimit": 100},
+            "finalized": True,
+        }
+    )
+    assert "`[###---------]` 25%" in context_only.batches[0].embeds[0]["description"]
+    expired = (await _discord_render_plan(cases[4][0])).batches[0].embeds[0]
+    assert expired["footer"]["text"] == "No response was sent"
+    blocked = (await _discord_render_plan(cases[5][0])).batches[0].embeds[0]
+    assert blocked["color"] == 0xFEE75C
+    continuing = (await _discord_render_plan(cases[6][0])).batches[0].embeds[0]
+    assert continuing["color"] == 0x5865F2
+
+
+@pytest.mark.asyncio
+async def test_diff_tool_artifact_and_images_use_metadata_and_attachment_previews() -> None:
+    image = TableAsset(
+        filename="table-preview.png",
+        media_type="image/png",
+        content=b"png",
+    )
+    diff = await _discord_render_plan(
+        {
+            "type": "diff",
+            "content": "**Code changes** · `structured`\n```diff\n+added\n-removed\n```",
+            "source": "structured",
+            "byte_count": 128,
+            "stats": {"files": 1, "additions": 4, "deletions": 2},
+            "attachments": [
+                {
+                    "filename": image.filename,
+                    "media_type": image.media_type,
+                    "content": image.content,
+                }
+            ],
+            "finalized": True,
+        }
+    )
+    artifact = await _discord_render_plan(
+        {
+            "type": "tool_output_artifact",
+            "content": "**Tool completed** — exact output attached.",
+            "status": "completed",
+            "tool_source": "detailedContent",
+            "verbatim": True,
+            "character_count": 9000,
+            "line_count": 120,
+            "attachments": [
+                {
+                    "filename": "tool-output.txt",
+                    "media_type": "text/plain",
+                    "content": "exact",
+                }
+            ],
+            "finalized": True,
+        }
+    )
+
+    assert diff.batches[0].content == ""
+    assert [embed["title"] for embed in diff.batches[0].embeds] == [
+        "🧩 Code changes",
+        "📊 Table preview",
+    ]
+    assert diff.batches[0].embeds[1]["image"]["url"] == "attachment://table-preview.png"
+    assert {field["name"] for field in diff.batches[0].embeds[0]["fields"]} >= {
+        "Files",
+        "Changes",
+        "Attachments",
+    }
+    assert artifact.batches[0].content == ""
+    assert artifact.batches[0].embeds[0]["title"] == "📎 Tool output"
+    assert any(
+        field["value"] == "`9,000` chars · `120` lines"
+        for field in artifact.batches[0].embeds[0]["fields"]
+    )
+
+
+@pytest.mark.asyncio
+async def test_oversized_diff_and_legacy_tool_artifact_do_not_claim_success() -> None:
+    oversized = await _discord_render_plan(
+        {
+            "type": "diff",
+            "content": (
+                "**Code changes**\nStructured diff exceeds the render safety limit; "
+                "exact source remains in the durable event journal."
+            ),
+            "source": "structured",
+            "oversized": True,
+            "byte_count": 9 * 1024 * 1024,
+            "stats": {},
+            "attachments": [],
+            "finalized": True,
+        }
+    )
+    legacy_failure = await _discord_render_plan(
+        {
+            "type": "tool_output_artifact",
+            "content": "**Tool failed** — exact output attached.",
+            "tool_source": "error",
+            "verbatim": True,
+            "attachments": [
+                {
+                    "filename": "legacy-error.txt",
+                    "media_type": "text/plain",
+                    "content": "failed",
+                }
+            ],
+            "finalized": True,
+        }
+    )
+
+    diff_embed = oversized.batches[0].embeds[0]
+    diff_fields = {field["name"]: field["value"] for field in diff_embed["fields"]}
+    assert diff_embed["color"] == 0xFEE75C
+    assert diff_fields["Files"] == "`unknown`"
+    assert diff_fields["Changes"] == "`unknown`"
+    assert diff_fields["Delivery"] == "`omitted: render safety limit`"
+    assert "durable event journal" in diff_embed["footer"]["text"]
+    legacy_embed = legacy_failure.batches[0].embeds[0]
+    assert legacy_embed["title"] == "❌ Tool output"
+    assert legacy_embed["color"] == 0xED4245
+
+
+@pytest.mark.asyncio
+async def test_rich_embed_gallery_respects_discord_count_and_character_budgets() -> None:
+    plan = await _discord_render_plan(
+        {
+            "type": "assistant.message",
+            "content": "Image results",
+            "attachments": [
+                {
+                    "filename": f"image-{index}.png",
+                    "media_type": "image/png",
+                    "content": b"image",
+                }
+                for index in range(10)
+            ],
+            "finalized": True,
+        }
+    )
+
+    embeds = plan.batches[0].embeds
+    assert len(embeds) == 10
+    assert embeds[0]["title"] == "🖼️ Image gallery"
+    assert sum(len(discord.Embed.from_dict(item)) for item in embeds) <= 6000
+
+
+@pytest.mark.asyncio
+async def test_image_preview_filenames_are_safe_and_unique_per_discord_message() -> None:
+    plan = await _discord_render_plan(
+        {
+            "type": "assistant.message",
+            "content": "Two generated charts",
+            "attachments": [
+                {
+                    "filename": "first/report chart.png",
+                    "media_type": "image/png",
+                    "content": b"first",
+                },
+                {
+                    "filename": "second/report chart.png",
+                    "media_type": "image/png",
+                    "content": b"second",
+                },
+            ],
+            "finalized": True,
+        }
+    )
+
+    batch = plan.batches[0]
+    assert [asset.filename for asset in batch.assets] == [
+        "report-chart.png",
+        "report-chart-2.png",
+    ]
+    assert [embed["image"]["url"] for embed in batch.embeds[1:]] == [
+        "attachment://report-chart.png",
+        "attachment://report-chart-2.png",
+    ]
+
+
 def test_large_discord_assets_are_split_losslessly_below_upload_limit() -> None:
     content, assets = _prepare_discord_assets(
         "Tool output attached.",

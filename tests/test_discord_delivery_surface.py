@@ -11,6 +11,7 @@ from copilotd.discord_app import (
     CopilotDiscordBot,
     DiscordRenderBatch,
     DiscordRenderPlan,
+    RenderPermanentError,
     _render_batch_hash,
 )
 from copilotd.render.tables import TableAsset
@@ -53,6 +54,67 @@ class FakeThread:
     async def history(self, **_kwargs: Any) -> Any:
         for message in reversed(self.messages.values()):
             yield message
+
+
+@pytest.mark.asyncio
+async def test_special_destination_multi_batch_retry_uses_durable_checkpoints(
+    tmp_path: Path,
+) -> None:
+    bot = CopilotDiscordBot(Settings(data_dir=tmp_path))
+    thread = FakeThread()
+
+    async def render_destination(_session_id: str) -> FakeThread:
+        return thread
+
+    bot._render_destination = render_destination  # type: ignore[method-assign]
+    payload = {
+        "type": "tool_output_artifact",
+        "content": "Durable attachment set",
+        "status": "completed",
+        "tool_source": "test",
+        "verbatim": True,
+        "character_count": 11,
+        "line_count": 1,
+        "attachments": [
+            {
+                "filename": f"artifact-{index}.txt",
+                "media_type": "text/plain",
+                "content": str(index),
+            }
+            for index in range(11)
+        ],
+        "finalized": True,
+    }
+
+    async with Database(tmp_path / "special-destination.sqlite3") as database:
+        bot.database = database
+        first = await bot.send(
+            session_id="ops:diagnostics",
+            lane="artifact",
+            payload=payload,
+            idempotency_key="ops:rich-artifacts",
+        )
+        retried = await bot.send(
+            session_id="ops:diagnostics",
+            lane="artifact",
+            payload=payload,
+            idempotency_key="ops:rich-artifacts",
+        )
+        rows = await database.fetchall(
+            """
+            SELECT batch_index, discord_message_id
+            FROM render_attachment_batches
+            WHERE session_id = 'ops:diagnostics'
+            ORDER BY batch_index
+            """
+        )
+
+    assert first == retried == "101"
+    assert thread.send_calls == 2
+    assert [dict(row) for row in rows] == [
+        {"batch_index": 0, "discord_message_id": "101"},
+        {"batch_index": 1, "discord_message_id": "102"},
+    ]
 
 
 @pytest.mark.asyncio
@@ -168,6 +230,158 @@ async def test_post_send_crash_reconciles_nonce_without_duplicate(
     assert dict(checkpoint) == {
         "state": "sent",
         "discord_message_id": "101",
+    }
+
+
+@pytest.mark.asyncio
+async def test_legacy_delivered_batch_backfills_missing_intent_without_duplicate(
+    tmp_path: Path,
+) -> None:
+    bot = CopilotDiscordBot(Settings(data_dir=tmp_path))
+    thread = FakeThread()
+    plan = DiscordRenderPlan((DiscordRenderBatch("legacy delivery"),))
+
+    async with Database(tmp_path / "legacy-delivery.sqlite3") as database:
+        bot.database = database
+        first = await bot._deliver_render_plan(
+            thread=thread,
+            session_id="session-legacy-delivery",
+            payload={"finalized": True},
+            plan=plan,
+            delivery_id="event:legacy-delivery",
+        )
+        await database.execute(
+            """
+            DELETE FROM render_batch_intents
+            WHERE session_id = 'session-legacy-delivery'
+            """
+        )
+        retried = await bot._deliver_render_plan(
+            thread=thread,
+            session_id="session-legacy-delivery",
+            payload={"finalized": True},
+            plan=plan,
+            delivery_id="event:legacy-delivery",
+        )
+        intent = await database.fetchone(
+            """
+            SELECT state, discord_message_id, payload_hash
+            FROM render_batch_intents
+            WHERE session_id = 'session-legacy-delivery'
+            """
+        )
+
+    assert first == retried == "101"
+    assert thread.send_calls == 1
+    assert dict(intent) == {
+        "state": "sent",
+        "discord_message_id": "101",
+        "payload_hash": _render_batch_hash(plan.batches[0]),
+    }
+
+
+@pytest.mark.asyncio
+async def test_delivered_plan_cannot_silently_drop_a_persisted_batch(
+    tmp_path: Path,
+) -> None:
+    bot = CopilotDiscordBot(Settings(data_dir=tmp_path))
+    thread = FakeThread()
+    original = DiscordRenderPlan(
+        (
+            DiscordRenderBatch("first"),
+            DiscordRenderBatch("second"),
+        )
+    )
+
+    async with Database(tmp_path / "delivery-count.sqlite3") as database:
+        bot.database = database
+        await bot._deliver_render_plan(
+            thread=thread,
+            session_id="session-delivery-count",
+            payload={"finalized": True},
+            plan=original,
+            delivery_id="event:delivery-count",
+        )
+        with pytest.raises(RenderPermanentError, match="render batch count changed"):
+            await bot._deliver_render_plan(
+                thread=thread,
+                session_id="session-delivery-count",
+                payload={"finalized": True},
+                plan=DiscordRenderPlan((DiscordRenderBatch("first"),)),
+                delivery_id="event:delivery-count",
+            )
+
+    assert thread.send_calls == 2
+
+
+@pytest.mark.asyncio
+async def test_prepared_intent_recovers_across_renderer_upgrade_without_duplicate(
+    tmp_path: Path,
+) -> None:
+    bot = CopilotDiscordBot(Settings(data_dir=tmp_path))
+    thread = FakeThread()
+    plain_plan = DiscordRenderPlan((DiscordRenderBatch("plain response"),))
+    rich_plan = DiscordRenderPlan(
+        (
+            DiscordRenderBatch(
+                "",
+                embeds=(
+                    {
+                        "title": "✨ Copilot response",
+                        "description": "rich response",
+                        "color": 0x5865F2,
+                    },
+                ),
+            ),
+        )
+    )
+
+    async def crash_after_send(_index: int, _message_id: str) -> None:
+        raise RuntimeError("simulated renderer-upgrade crash")
+
+    async with Database(tmp_path / "renderer-upgrade.sqlite3") as database:
+        bot.database = database
+        bot._after_render_send_hook = crash_after_send
+        with pytest.raises(RuntimeError, match="simulated renderer-upgrade crash"):
+            await bot._deliver_render_plan(
+                thread=thread,
+                session_id="session-renderer-upgrade",
+                payload={"finalized": True},
+                plan=plain_plan,
+                delivery_id="event:renderer-upgrade",
+            )
+
+        bot._after_render_send_hook = None
+        recovered = await bot._deliver_render_plan(
+            thread=thread,
+            session_id="session-renderer-upgrade",
+            payload={"finalized": True},
+            plan=rich_plan,
+            delivery_id="event:renderer-upgrade",
+        )
+        intent = await database.fetchone(
+            """
+            SELECT state, discord_message_id, payload_hash
+            FROM render_batch_intents
+            WHERE session_id = 'session-renderer-upgrade'
+            """
+        )
+        with pytest.raises(RenderPermanentError, match="render batch intent changed"):
+            await bot._deliver_render_plan(
+                thread=thread,
+                session_id="session-renderer-upgrade",
+                payload={"finalized": True},
+                plan=DiscordRenderPlan((DiscordRenderBatch("unexpected rewrite"),)),
+                delivery_id="event:renderer-upgrade",
+            )
+
+    assert recovered == "101"
+    assert thread.send_calls == 1
+    assert thread.messages[101].edits[-1]["embeds"][0].title == "✨ Copilot response"
+    assert dict(intent) == {
+        "state": "sent",
+        "discord_message_id": "101",
+        "payload_hash": _render_batch_hash(rich_plan.batches[0]),
     }
 
 

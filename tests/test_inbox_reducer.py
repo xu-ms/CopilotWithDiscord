@@ -35,6 +35,7 @@ from copilotd.core.reducer import (
     JournalReducer,
     RenderPlanner,
     _diff_render_payload,
+    _diff_stats,
 )
 from copilotd.discord_app import _discord_render_plan
 from copilotd.sdk.capabilities import CapabilityRegistry
@@ -598,6 +599,14 @@ async def test_reducer_materializes_nonempty_status_and_usage_payloads(
             "type": "session.workspace_file_changed",
             "data": {"operation": "modified", "path": "src/copilotd/app.py"},
         },
+        {
+            "type": "session.task_complete",
+            "data": {"outcome": "blocked"},
+        },
+        {
+            "type": "session.task_complete",
+            "data": {"success": True},
+        },
     ]
     adapted = [
         adapter.adapt(
@@ -615,7 +624,7 @@ async def test_reducer_materializes_nonempty_status_and_usage_payloads(
         for index, event in enumerate(source_events, start=1)
     ]
     async with Database(tmp_path / "status-render.sqlite3") as database:
-        assert await JournalReducer(database).persist(adapted) == 4
+        assert await JournalReducer(database).persist(adapted) == 6
         rows = await database.fetchall(
             "SELECT lane, payload FROM render_outbox ORDER BY logical_seq"
         )
@@ -623,14 +632,29 @@ async def test_reducer_materializes_nonempty_status_and_usage_payloads(
     payloads = [(row["lane"], json.loads(row["payload"])) for row in rows]
     assert payloads[0][0] == "status"
     assert "Context is nearly full." in payloads[0][1]["content"]
+    assert payloads[0][1]["status"] == {
+        "title": "Copilot warning",
+        "detail": "Context is nearly full.",
+        "event_type": "session.warning",
+    }
     assert payloads[1][0] == "usage"
     assert "Input tokens: `12`" in payloads[1][1]["content"]
     assert "Total tokens: `19`" in payloads[1][1]["content"]
+    assert payloads[1][1]["usage"] == {
+        "inputTokens": 12,
+        "outputTokens": 7,
+        "totalTokens": 19,
+        "premiumRequests": 1,
+    }
     assert payloads[2][0] == "status"
     assert "raw chain-of-thought is hidden" in payloads[2][1]["content"]
     assert "private chain of thought" not in payloads[2][1]["content"]
     assert payloads[3][0] == "status"
     assert "`modified` `src/copilotd/app.py`" in payloads[3][1]["content"]
+    assert payloads[4][0] == "status"
+    assert payloads[4][1]["status"]["outcome"] == "blocked"
+    assert payloads[5][0] == "status"
+    assert payloads[5][1]["status"]["outcome"] == "completed"
 
 
 @pytest.mark.asyncio
@@ -901,11 +925,15 @@ async def test_partial_tool_spill_and_fenced_diff_are_attached_losslessly(
         Path(spill_attachment["path"]),
     ) == "b" * (64 * 1024)
     assert artifact["verbatim"] is True
+    assert artifact["byte_count"] == 64 * 1024
+    assert artifact["status"] == "partial spill"
     assert spill["content"] == ""
     assert spill["spilled"] == 1
     diff = json.loads(diff_row["payload"])
     assert diff["content"].endswith("attached as `changes-diff-fence.diff`.")
     assert diff["attachments"][0]["content"] == "+```python\n+print('safe')\n+```"
+    assert diff["byte_count"] == len(b"+```python\n+print('safe')\n+```")
+    assert diff["stats"] == {"additions": 3, "deletions": 0}
 
 
 def test_structured_diff_enforces_render_byte_cap() -> None:
@@ -1121,6 +1149,84 @@ async def test_tool_spill_uses_durable_cumulative_stream(tmp_path: Path) -> None
     assert stream["spilled"] == 1
     assert stream["artifact_emitted"] == 1
     assert stream["finalized"] == 1
+
+
+@pytest.mark.asyncio
+async def test_failed_cumulative_tool_spill_keeps_failed_rich_status(tmp_path: Path) -> None:
+    events = [
+        _adapted(
+            "tool.execution_progress",
+            {"toolCallId": "failed-spill", "output": "x" * (64 * 1024)},
+            1,
+            session_id="session-failed-spill",
+        ),
+        _adapted(
+            "tool.execution_complete",
+            {
+                "toolCallId": "failed-spill",
+                "success": False,
+                "error": {"message": "tool failed"},
+            },
+            2,
+            session_id="session-failed-spill",
+        ),
+    ]
+
+    async with Database(tmp_path / "failed-spill.sqlite3") as database:
+        assert await JournalReducer(database).persist(events) == 2
+        row = await database.fetchone(
+            """
+            SELECT payload FROM render_outbox
+            WHERE session_id = 'session-failed-spill' AND lane = 'artifact'
+            """
+        )
+
+    payload = json.loads(row["payload"])
+    assert payload["finalized"] is True
+    assert payload["status"] == "failed"
+    plan = await _discord_render_plan(payload)
+    assert plan.batches[0].embeds[0]["title"] == "❌ Tool output"
+
+
+def test_diff_stats_parse_hunks_without_dropping_plus_or_minus_prefixed_content() -> None:
+    patch = "\n".join(
+        [
+            "--- /dev/null",
+            "+++ b/new-file.txt",
+            "@@ -1,3 +1,3 @@",
+            "+++counter",
+            "+normal",
+            "+++ new",
+            "---flag",
+            "-removed",
+            "--- old",
+        ]
+    )
+
+    assert _diff_stats(patch) == {"files": 1, "additions": 3, "deletions": 3}
+
+
+def test_diff_stats_distinguish_multiple_file_headers_from_hunk_content() -> None:
+    patch = "\n".join(
+        [
+            "--- a/one.txt",
+            "+++ b/one.txt",
+            "@@ -1 +1 @@",
+            "--- old",
+            "+++ new",
+            "--- a/two.txt",
+            "+++ b/two.txt",
+            "@@ -1 +1 @@",
+            "-old",
+            "+new",
+        ]
+    )
+
+    assert _diff_stats(patch) == {"files": 2, "additions": 2, "deletions": 2}
+    assert _diff_stats("@@ -1 +1 @@\n-old\n+new") == {
+        "additions": 1,
+        "deletions": 1,
+    }
 
 
 @pytest.mark.asyncio
