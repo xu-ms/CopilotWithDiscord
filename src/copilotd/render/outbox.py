@@ -362,6 +362,9 @@ class RenderOutboxDispatcher:
                 now=now,
                 live_clock=live_clock,
             )
+        if _is_internal_only_render(item):
+            await self._suppress_internal_claim(item, now=now)
+            return False, False
         logical_key = item.coalesce_key or item.id
         payload_hash = _payload_hash(item.payload)
         transport_idempotency_key = (
@@ -486,6 +489,39 @@ class RenderOutboxDispatcher:
                 session_id=item.session_id,
             )
         return True, False
+
+    async def _suppress_internal_claim(
+        self,
+        item: OutboxItem,
+        *,
+        now: float,
+    ) -> None:
+        async with self._database.transaction() as connection:
+            cursor = await connection.execute(
+                """
+                UPDATE render_outbox
+                SET state = 'superseded', updated_at = ?
+                WHERE id = ? AND state = 'sending' AND payload_revision = ?
+                """,
+                (now, item.id, item.payload_revision),
+            )
+            suppressed = cursor.rowcount == 1
+            await cursor.close()
+            if suppressed:
+                return
+            cursor = await connection.execute(
+                """
+                UPDATE render_outbox
+                SET state = 'pending', next_attempt_at = MIN(next_attempt_at, ?),
+                    updated_at = ?
+                WHERE id = ? AND state = 'sending' AND payload_revision > ?
+                """,
+                (now, now, item.id, item.payload_revision),
+            )
+            restored = cursor.rowcount == 1
+            await cursor.close()
+            if not restored:
+                raise RuntimeError(f"internal render outbox claim was lost: {item.id}")
 
     async def _deliver_reaction(
         self,
@@ -729,6 +765,14 @@ class RenderOutboxDispatcher:
 def _payload_hash(payload: dict[str, Any]) -> str:
     canonical = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(canonical.encode()).hexdigest()
+
+
+def _is_internal_only_render(item: OutboxItem) -> bool:
+    return item.lane in {"diff", "taskdeck"} or item.payload.get("type") in {
+        "diff",
+        "taskdeck",
+        "tool_output_artifact",
+    }
 
 
 async def recover_reaction_outbox(database: Database, *, now: float | None = None) -> int:

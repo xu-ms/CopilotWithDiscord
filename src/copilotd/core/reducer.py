@@ -45,6 +45,36 @@ _SUBMISSION_FAILURE_STATES = {
     "semantic_blocked",
     "submitted_unknown",
 }
+_TURN_PROGRESS_TYPES = {
+    "abort",
+    "assistant.intent",
+    "assistant.message_delta",
+    "assistant.reasoning",
+    "assistant.reasoning_delta",
+    "assistant.turn_end",
+    "assistant.turn_retry",
+    "assistant.turn_start",
+    "copilotd.interaction.expired",
+    "copilotd.interaction.resolved",
+    "copilotd.submission.accepted",
+    "copilotd.submission.queued",
+    "copilotd.tasks.snapshot",
+    "model.call_failure",
+    "session.error",
+    "session.idle",
+    "session.info",
+    "session.shutdown",
+    "session.task_complete",
+    "session.warning",
+    "session.workspace_file_changed",
+    "subagent.completed",
+    "subagent.failed",
+    "subagent.started",
+    "tool.execution_complete",
+    "tool.execution_progress",
+    "tool.execution_start",
+    "user.message",
+}
 _TRUSTED_LOCAL_IMAGE_SUFFIXES = {
     ".bmp",
     ".gif",
@@ -118,6 +148,39 @@ class RenderPlanner:
             return []
         if event.raw_type == "assistant.streaming_delta":
             return []
+        turn_key = (
+            None
+            if payload_override is None or payload_override.get("turn_render_key") is None
+            else str(payload_override["turn_render_key"])
+        )
+        if turn_key is not None:
+            turn_payload = {
+                **payload_override,
+                "stable_outbox_key": turn_key,
+            }
+            finalized = bool(turn_payload.get("finalized"))
+            lane = "assistant_final" if finalized else "assistant_stream"
+            idempotency_key = f"turn-render:{event.sdk_session_id}:{turn_key}"
+            return [
+                RenderIntent(
+                    id=str(uuid.uuid5(uuid.NAMESPACE_URL, idempotency_key)),
+                    session_id=event.sdk_session_id,
+                    logical_seq=event.inbox_seq,
+                    lane=lane,
+                    coalesce_key=turn_key,
+                    idempotency_key=idempotency_key,
+                    payload=turn_payload,
+                    finalized=finalized,
+                )
+            ]
+        if event.agent_id is not None and event.raw_type in (
+            self._STREAM_TYPES | {"assistant.message"}
+        ):
+            return []
+        if event.raw_type in self._TASK_TYPES or event.raw_type in self._TASK_VIEW_TYPES:
+            return []
+        if event.raw_type in self._FOOTER_TYPES:
+            return []
         agent_scoped_content = event.agent_id is not None and event.raw_type in (
             self._STREAM_TYPES | {"assistant.message"}
         )
@@ -137,10 +200,6 @@ class RenderPlanner:
                 if event.raw_type == "assistant.message"
                 else None
             )
-        elif event.raw_type in self._TASK_TYPES or event.raw_type in self._TASK_VIEW_TYPES:
-            lane = "taskdeck"
-            finalized = event.raw_type.endswith(("completed", "failed", "complete"))
-            coalesce_key = "taskdeck"
         elif event.raw_type in self._USAGE_TYPES:
             # Usage samples still feed the durable projection and the turn footer.
             # Rendering each sample separately duplicates the final summary and
@@ -156,10 +215,6 @@ class RenderPlanner:
             lane = "interaction"
             finalized = event.raw_type != "copilotd.interaction.requested"
             coalesce_key = f"interaction:{interaction_id}"
-        elif event.raw_type in self._FOOTER_TYPES:
-            lane = "footer"
-            finalized = True
-            coalesce_key = f"footer:{event.turn_id or event.event_id or event.inbox_seq}"
         elif event.raw_type in self._STATUS_TYPES:
             lane = "status"
             finalized = event.raw_type not in {
@@ -186,7 +241,7 @@ class RenderPlanner:
 
         event_key = event.event_id or event.internal_event_id or str(event.inbox_seq)
         idempotency_key = f"event:{event.sdk_session_id}:{event_key}:{lane}"
-        intents = [
+        return [
             RenderIntent(
                 id=str(uuid.uuid5(uuid.NAMESPACE_URL, idempotency_key)),
                 session_id=event.sdk_session_id,
@@ -203,57 +258,6 @@ class RenderPlanner:
                 finalized=finalized,
             )
         ]
-        diff = _diff_render_payload(event)
-        artifact = (
-            artifact_override
-            if artifact_override is not None or suppress_default_artifact
-            else _tool_output_artifact(event)
-        )
-        if (
-            diff is not None
-            and event.raw_type == "tool.execution_complete"
-            and artifact_override is None
-        ):
-            artifact = None
-        if artifact is not None:
-            stable_outbox_key = artifact.get("stable_outbox_key")
-            artifact_key = (
-                f"artifact:{event.sdk_session_id}:{stable_outbox_key}"
-                if stable_outbox_key is not None
-                else f"{idempotency_key}:artifact"
-            )
-            artifact_finalized = bool(artifact.get("finalized", True))
-            intents.append(
-                RenderIntent(
-                    id=str(uuid.uuid5(uuid.NAMESPACE_URL, artifact_key)),
-                    session_id=event.sdk_session_id,
-                    logical_seq=event.inbox_seq,
-                    lane="artifact",
-                    coalesce_key=(
-                        None
-                        if artifact.get("coalesce_key") is None
-                        else str(artifact["coalesce_key"])
-                    ),
-                    idempotency_key=artifact_key,
-                    payload=artifact,
-                    finalized=artifact_finalized,
-                )
-            )
-        if diff is not None:
-            diff_key = f"{idempotency_key}:diff"
-            intents.append(
-                RenderIntent(
-                    id=str(uuid.uuid5(uuid.NAMESPACE_URL, diff_key)),
-                    session_id=event.sdk_session_id,
-                    logical_seq=event.inbox_seq,
-                    lane="diff",
-                    coalesce_key=None,
-                    idempotency_key=diff_key,
-                    payload=diff,
-                    finalized=True,
-                )
-            )
-        return intents
 
 
 class JournalReducer:
@@ -423,6 +427,22 @@ class JournalReducer:
                         sort_keys=True,
                     )
                     if intent.payload.get("stable_outbox_key") is not None:
+                        cursor = await connection.execute(
+                            """
+                            SELECT payload FROM render_outbox
+                            WHERE idempotency_key = ?
+                            """,
+                            (intent.idempotency_key,),
+                        )
+                        existing_outbox = await cursor.fetchone()
+                        await cursor.close()
+                        if existing_outbox is not None:
+                            existing_payload = json.loads(str(existing_outbox["payload"]))
+                            if (
+                                bool(existing_payload.get("finalized"))
+                                and not bool(intent.payload.get("finalized"))
+                            ) or existing_payload == intent.payload:
+                                continue
                         await connection.execute(
                             """
                             INSERT INTO render_outbox(
@@ -432,6 +452,7 @@ class JournalReducer:
                             ) VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', 0, ?, ?, ?)
                             ON CONFLICT(idempotency_key) DO UPDATE SET
                                 logical_seq = excluded.logical_seq,
+                                lane = excluded.lane,
                                 coalesce_key = excluded.coalesce_key,
                                 payload = excluded.payload,
                                 payload_revision = render_outbox.payload_revision + 1,
@@ -837,6 +858,296 @@ class JournalReducer:
                 ),
             )
 
+    async def _turn_render_context(
+        self,
+        connection: Any,
+        event: AdaptedEvent,
+        *,
+        now: float,
+    ) -> dict[str, Any] | None:
+        data = event.raw_payload.get("data", event.raw_payload)
+        values = data if isinstance(data, dict) else {}
+        submission_id: str | None = None
+        segment_index: int | None = None
+
+        direct_submission = values.get("submission_id")
+        if direct_submission is not None:
+            row = await _fetchone_row(
+                connection,
+                """
+                SELECT submission_id FROM submissions
+                WHERE sdk_session_id = ? AND submission_id = ?
+                """,
+                (event.sdk_session_id, str(direct_submission)),
+            )
+            if row is not None:
+                submission_id = str(row["submission_id"])
+
+        if submission_id is None and event.raw_type == "user.message" and event.event_id:
+            row = await _fetchone_row(
+                connection,
+                """
+                SELECT s.submission_id, g.segment_index
+                FROM submissions s
+                LEFT JOIN submission_segments g
+                  ON g.submission_id = s.submission_id
+                 AND g.user_event_id = ?
+                WHERE s.sdk_session_id = ? AND s.observed_user_event_id = ?
+                """,
+                (event.event_id, event.sdk_session_id, event.event_id),
+            )
+            if row is not None:
+                submission_id = str(row["submission_id"])
+                segment_index = None if row["segment_index"] is None else int(row["segment_index"])
+
+        if submission_id is None and event.turn_id is not None:
+            row = await _fetchone_row(
+                connection,
+                """
+                SELECT submission_id, segment_index
+                FROM model_turns
+                WHERE sdk_session_id = ? AND sdk_turn_id = ?
+                  AND submission_id IS NOT NULL
+                """,
+                (event.sdk_session_id, event.turn_id),
+            )
+            if row is not None:
+                submission_id = str(row["submission_id"])
+                segment_index = None if row["segment_index"] is None else int(row["segment_index"])
+
+        if submission_id is None and event.task_id is not None:
+            row = await _fetchone_row(
+                connection,
+                """
+                SELECT submission_id FROM submission_task_links
+                WHERE sdk_session_id = ? AND task_id = ?
+                  AND submission_id IS NOT NULL
+                ORDER BY linked_at DESC LIMIT 1
+                """,
+                (event.sdk_session_id, event.task_id),
+            )
+            if row is not None:
+                submission_id = str(row["submission_id"])
+
+        if submission_id is None and event.interaction_id is not None:
+            row = await _fetchone_row(
+                connection,
+                """
+                SELECT submission_id, segment_index FROM model_turns
+                WHERE sdk_session_id = ? AND interaction_id = ?
+                  AND submission_id IS NOT NULL
+                ORDER BY started_at DESC LIMIT 1
+                """,
+                (event.sdk_session_id, event.interaction_id),
+            )
+            if row is not None:
+                submission_id = str(row["submission_id"])
+                segment_index = None if row["segment_index"] is None else int(row["segment_index"])
+
+        if submission_id is None:
+            rows = await _fetchall_rows(
+                connection,
+                """
+                SELECT s.submission_id
+                FROM submissions s
+                JOIN turn_render_state r
+                  ON r.sdk_session_id = s.sdk_session_id
+                 AND r.submission_id = s.submission_id
+                WHERE s.sdk_session_id = ?
+                  AND r.state IN ('running', 'answer_ready')
+                  AND s.state IN (
+                    'local_queued', 'submitting', 'submitted',
+                    'observed_active', 'loop_idle', 'continuation_expected',
+                    'semantic_complete', 'semantic_blocked', 'observed_aborted',
+                    'outcome_unknown', 'rejected', 'submitted_unknown', 'cancelled'
+                  )
+                ORDER BY
+                  CASE WHEN s.observed_at IS NULL THEN 1 ELSE 0 END,
+                  s.observed_at DESC, r.updated_at DESC, s.created_at
+                LIMIT 1
+                """,
+                (event.sdk_session_id,),
+            )
+            if rows:
+                submission_id = str(rows[0]["submission_id"])
+
+        if submission_id is None:
+            rows = await _fetchall_rows(
+                connection,
+                """
+                SELECT submission_id FROM submissions
+                WHERE sdk_session_id = ?
+                  AND state IN (
+                    'submitted', 'observed_active', 'loop_idle',
+                    'continuation_expected'
+                  )
+                ORDER BY
+                  CASE WHEN observed_at IS NULL THEN 1 ELSE 0 END,
+                  observed_at DESC, created_at
+                LIMIT 2
+                """,
+                (event.sdk_session_id,),
+            )
+            if len(rows) == 1:
+                submission_id = str(rows[0]["submission_id"])
+
+        if submission_id is None:
+            return None
+        if segment_index is None:
+            row = await _fetchone_row(
+                connection,
+                """
+                SELECT MAX(segment_index) AS segment_index
+                FROM submission_segments WHERE submission_id = ?
+                """,
+                (submission_id,),
+            )
+            if row is not None and row["segment_index"] is not None:
+                segment_index = int(row["segment_index"])
+        turn_key = (
+            f"turn:{submission_id}"
+            if segment_index in {None, 1}
+            else f"turn:{submission_id}:segment:{segment_index}"
+        )
+        submission = await _fetchone_row(
+            connection,
+            """
+            SELECT state FROM submissions
+            WHERE sdk_session_id = ? AND submission_id = ?
+            """,
+            (event.sdk_session_id, submission_id),
+        )
+        if submission is None:
+            return None
+        await connection.execute(
+            """
+            INSERT INTO turn_render_state(
+                sdk_session_id, turn_key, submission_id, segment_index,
+                state, runtime_generation, owner_fence_token,
+                created_at, updated_at
+            ) VALUES (?, ?, ?, ?, 'running', ?, ?, ?, ?)
+            ON CONFLICT(sdk_session_id, turn_key) DO UPDATE SET
+                submission_id = excluded.submission_id,
+                segment_index = COALESCE(
+                    excluded.segment_index,
+                    turn_render_state.segment_index
+                ),
+                runtime_generation = excluded.runtime_generation,
+                owner_fence_token = excluded.owner_fence_token,
+                updated_at = excluded.updated_at
+            """,
+            (
+                event.sdk_session_id,
+                turn_key,
+                submission_id,
+                segment_index,
+                event.generation,
+                event.fence_token,
+                now,
+                now,
+            ),
+        )
+        render = await _fetchone_row(
+            connection,
+            """
+            SELECT state, answer_payload
+            FROM turn_render_state
+            WHERE sdk_session_id = ? AND turn_key = ?
+            """,
+            (event.sdk_session_id, turn_key),
+        )
+        assert render is not None
+        return {
+            "turn_key": turn_key,
+            "submission_id": submission_id,
+            "segment_index": segment_index,
+            "submission_state": str(submission["state"]),
+            "render_state": str(render["state"]),
+            "answer_payload": render["answer_payload"],
+        }
+
+    async def _turn_progress_payload(
+        self,
+        connection: Any,
+        event: AdaptedEvent,
+        context: dict[str, Any],
+        *,
+        now: float,
+    ) -> dict[str, Any] | None:
+        turn_key = str(context["turn_key"])
+        submission_state = str(context["submission_state"])
+        if submission_state in _SUBMISSION_FAILURE_STATES or event.raw_type in {
+            "abort",
+            "session.error",
+            "session.shutdown",
+        }:
+            await connection.execute(
+                """
+                UPDATE turn_render_state
+                SET state = 'failed', updated_at = ?
+                WHERE sdk_session_id = ? AND turn_key = ?
+                """,
+                (now, event.sdk_session_id, turn_key),
+            )
+            return {
+                "type": "turn_error",
+                "content": (
+                    "**Copilot could not complete this request.**\n"
+                    "Please try again or refine the request."
+                ),
+                "status": {
+                    "title": "Copilot request failed",
+                    "detail": "The request did not complete successfully.",
+                    "event_type": "turn.failed",
+                },
+                "turn_render_key": turn_key,
+                "submission_id": context["submission_id"],
+                "finalized": True,
+            }
+        if event.raw_type == "assistant.message":
+            return None
+        if submission_state in _SUBMISSION_SUCCESS_STATES:
+            answer_payload = context.get("answer_payload")
+            if answer_payload is None:
+                payload: dict[str, Any] = {
+                    "type": "turn_complete",
+                    "content": "Copilot completed the request.",
+                }
+            else:
+                payload = json.loads(str(answer_payload))
+            payload.update(
+                turn_render_key=turn_key,
+                submission_id=context["submission_id"],
+                finalized=True,
+            )
+            await connection.execute(
+                """
+                UPDATE turn_render_state
+                SET state = 'final', updated_at = ?
+                WHERE sdk_session_id = ? AND turn_key = ?
+                """,
+                (now, event.sdk_session_id, turn_key),
+            )
+            return payload
+        if event.raw_type == "copilotd.interaction.requested":
+            return None
+        if event.raw_type not in _TURN_PROGRESS_TYPES:
+            return {"suppress": True}
+        if context["render_state"] in {"final", "failed"}:
+            return {"suppress": True}
+        return {
+            "type": "turn_progress",
+            "content": "Copilot is working…",
+            "status": {
+                "title": "Copilot is working",
+                "detail": "Processing your request.",
+                "event_type": "turn.running",
+            },
+            "turn_render_key": turn_key,
+            "submission_id": context["submission_id"],
+            "finalized": False,
+        }
+
     async def _materialize_render_payload(
         self,
         connection: Any,
@@ -844,6 +1155,25 @@ class JournalReducer:
         *,
         now: float,
     ) -> dict[str, Any] | None:
+        if event.agent_id is not None and event.raw_type in {
+            "assistant.message",
+            "assistant.message_delta",
+        }:
+            return {"suppress": True}
+        turn_context = await self._turn_render_context(
+            connection,
+            event,
+            now=now,
+        )
+        if turn_context is not None:
+            progress = await self._turn_progress_payload(
+                connection,
+                event,
+                turn_context,
+                now=now,
+            )
+            if progress is not None:
+                return progress
         if event.raw_type in RenderPlanner._INTERACTION_TYPES:
             data = event.raw_payload.get("data", event.raw_payload)
             if not isinstance(data, dict):
@@ -863,12 +1193,19 @@ class JournalReducer:
                     f"**Copilot input {state}** · `{kind}`\n"
                     f"{_bounded_text(str(interaction.get('display_response', '')), 1600)}"
                 ).rstrip()
-            return {
+            payload = {
                 "type": "interaction",
                 "content": content,
                 "finalized": state != "pending",
                 "interaction": interaction,
             }
+            if turn_context is not None:
+                payload.update(
+                    turn_render_key=turn_context["turn_key"],
+                    submission_id=turn_context["submission_id"],
+                    finalized=False,
+                )
+            return payload
         if event.raw_type in RenderPlanner._USAGE_TYPES:
             data = event.raw_payload.get("data", event.raw_payload)
             values = data if isinstance(data, dict) else {}
@@ -1202,6 +1539,28 @@ class JournalReducer:
                 }
                 for row in trusted_rows
             ]
+        if turn_context is not None:
+            answer_payload = {**payload, "finalized": True}
+            terminal = str(turn_context["submission_state"]) in _SUBMISSION_SUCCESS_STATES
+            await connection.execute(
+                """
+                UPDATE turn_render_state
+                SET state = ?, answer_payload = ?, updated_at = ?
+                WHERE sdk_session_id = ? AND turn_key = ?
+                """,
+                (
+                    "final" if terminal else "answer_ready",
+                    json.dumps(answer_payload, ensure_ascii=False, sort_keys=True),
+                    now,
+                    event.sdk_session_id,
+                    turn_context["turn_key"],
+                ),
+            )
+            payload.update(
+                turn_render_key=turn_context["turn_key"],
+                submission_id=turn_context["submission_id"],
+                finalized=terminal,
+            )
         return payload
 
     async def _accumulate_render_stream(
