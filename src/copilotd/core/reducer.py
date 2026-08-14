@@ -7792,7 +7792,7 @@ class JournalReducer:
             return
         cursor = await connection.execute(
             """
-            SELECT source_event_id, task_id FROM background_observations
+            SELECT source_event_id, task_id, task_type FROM background_observations
             WHERE sdk_session_id = ? AND runtime_generation = ?
               AND terminal_evidence IS NULL
               AND observed_state IN ('running', 'idle')
@@ -7806,6 +7806,75 @@ class JournalReducer:
             if task_id in seen:
                 continue
             card_key = str(observation["source_event_id"])
+            if str(observation["task_type"] or "").lower() == "shell":
+                await connection.execute(
+                    """
+                    UPDATE background_observations
+                    SET observed_state = 'completed',
+                        terminal_evidence = 'task_snapshot_absent',
+                        last_progress_at = ?
+                    WHERE sdk_session_id = ? AND runtime_generation = ?
+                      AND source_event_id = ? AND terminal_evidence IS NULL
+                    """,
+                    (
+                        evidence_time,
+                        event.sdk_session_id,
+                        event.generation,
+                        card_key,
+                    ),
+                )
+                await connection.execute(
+                    """
+                    UPDATE task_card_projections
+                    SET state = 'completed',
+                        progress_summary = 'Shell task exited.',
+                        terminal_at = ?,
+                        last_progress_at = ?,
+                        revision = revision + 1
+                    WHERE sdk_session_id = ? AND panel_id = ? AND card_key = ?
+                      AND terminal_at IS NULL
+                    """,
+                    (
+                        evidence_time,
+                        evidence_time,
+                        event.sdk_session_id,
+                        panel_id,
+                        card_key,
+                    ),
+                )
+                await connection.execute(
+                    """
+                    UPDATE submission_task_links
+                    SET state = 'completed',
+                        terminal_evidence = 'task_snapshot_absent',
+                        last_progress_at = ?, terminal_at = ?
+                    WHERE sdk_session_id = ? AND task_id = ? AND terminal_at IS NULL
+                    """,
+                    (
+                        evidence_time,
+                        evidence_time,
+                        event.sdk_session_id,
+                        task_id,
+                    ),
+                )
+                await connection.execute(
+                    """
+                    UPDATE liveness_leases
+                    SET state = 'released', refreshed_at = ?, released_at = ?
+                    WHERE sdk_session_id = ? AND lease_id = ?
+                      AND runtime_generation = ? AND owner_fence_token = ?
+                      AND state = 'active'
+                    """,
+                    (
+                        evidence_time,
+                        evidence_time,
+                        event.sdk_session_id,
+                        f"background:{card_key}",
+                        event.generation,
+                        event.fence_token,
+                    ),
+                )
+                continue
             await connection.execute(
                 """
                 UPDATE background_observations

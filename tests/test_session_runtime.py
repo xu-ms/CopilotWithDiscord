@@ -1924,7 +1924,67 @@ async def test_background_task_snapshot_marks_disappearance_unknown_then_termina
         }
         assert card is not None and card["state"] == "completed"
         assert lease is not None and lease["state"] == "released"
-        await runtime.close(idempotency_key="close-task-snapshot")
+
+        shell_task_id = "shell-1"
+        bridge.tasks = [
+            {
+                "id": shell_task_id,
+                "type": "shell",
+                "status": "running",
+                "command": "echo done",
+            }
+        ]
+        bridge.ingress(
+            _event(
+                SessionBackgroundTasksChangedData(),
+                SessionEventType.SESSION_BACKGROUND_TASKS_CHANGED,
+            )
+        )
+        for _ in range(50):
+            shell = await database.fetchone(
+                "SELECT observed_state FROM background_observations WHERE task_id = ?",
+                (shell_task_id,),
+            )
+            if shell is not None:
+                break
+            await asyncio.sleep(0.01)
+        assert shell is not None and shell["observed_state"] == "running"
+
+        bridge.tasks = []
+        bridge.ingress(
+            _event(
+                SessionBackgroundTasksChangedData(),
+                SessionEventType.SESSION_BACKGROUND_TASKS_CHANGED,
+            )
+        )
+        for _ in range(50):
+            shell = await database.fetchone(
+                """
+                SELECT observed_state, terminal_evidence
+                FROM background_observations WHERE task_id = ?
+                """,
+                (shell_task_id,),
+            )
+            if shell is not None and shell["terminal_evidence"]:
+                break
+            await asyncio.sleep(0.01)
+        shell_lease = await database.fetchone(
+            "SELECT state FROM liveness_leases WHERE source_id = ?",
+            (f"task:{shell_task_id}",),
+        )
+        assert shell is not None
+        assert dict(shell) == {
+            "observed_state": "completed",
+            "terminal_evidence": "task_snapshot_absent",
+        }
+        assert shell_lease is not None and shell_lease["state"] == "released"
+
+        message_id = await runtime.send(
+            "next message",
+            idempotency_key="after-shell-task-disappeared",
+        )
+        assert message_id == bridge.handle.message_id
+        await runtime.shutdown()
 
 
 @pytest.mark.asyncio
