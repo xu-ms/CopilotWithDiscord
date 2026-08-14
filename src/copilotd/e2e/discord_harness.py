@@ -959,51 +959,44 @@ class DiscordRealHarness:
             )
         )
 
-        error_body = "E" * 8000
-        error_payload = {
-            "type": "tool_output_artifact",
-            "content": "**Tool failed**\nExact output is attached for diagnosis.",
-            "status": "failed",
-            "tool_source": "error",
-            "verbatim": True,
-            "character_count": len(error_body),
-            "line_count": 1,
+        requested_file = "requested final report\n"
+        requested_file_payload = {
+            "type": "assistant.message",
+            "content": "The requested final report is attached.",
             "attachments": [
                 {
-                    "filename": "tool-error.txt",
+                    "filename": "requested-report.txt",
                     "media_type": "text/plain",
-                    "content": error_body,
+                    "content": requested_file,
                 }
             ],
             "finalized": True,
         }
-        error_batch = (await _discord_render_plan(error_payload)).batches[0]
-        error_message = await thread.send(
-            content=error_batch.content or "\u200b",
-            files=_discord_files(list(error_batch.assets)),
-            embeds=_discord_embeds(error_batch.embeds),
+        requested_file_batch = (await _discord_render_plan(requested_file_payload)).batches[0]
+        requested_file_message = await thread.send(
+            content=requested_file_batch.content or "\u200b",
+            files=_discord_files(list(requested_file_batch.assets)),
+            embeds=_discord_embeds(requested_file_batch.embeds),
             silent=True,
         )
-        self._created_messages.append(error_message)
-        if error_message.attachments[0].size != len(error_body):
-            raise DiscordE2EError("exact tool error attachment size changed")
-        if not error_message.embeds:
-            raise DiscordE2EError("tool error rich embed was not serialized")
+        self._created_messages.append(requested_file_message)
+        if requested_file_message.attachments[0].size != len(requested_file):
+            raise DiscordE2EError("requested final file attachment size changed")
         self.evidence.features.append(
             await self.record_ordered_delivery_probe(
-                [error_message],
-                expected_contents=[error_batch.content or "\u200b"],
-                expected_filenames=["tool-error.txt"],
-                expected_sha256=[_hash_bytes(error_body.encode())],
+                [requested_file_message],
+                expected_contents=[requested_file_batch.content or "\u200b"],
+                expected_filenames=["requested-report.txt"],
+                expected_sha256=[_hash_bytes(requested_file.encode())],
             )
         )
         self.evidence.features.append(
             FeatureEvidence(
-                feature="error/verbatim artifact boundary",
+                feature="explicit final user artifact delivery",
                 status="passed",
                 transport="real Discord file",
-                detail="8000-character exact artifact preserved",
-                discord_ids=[str(error_message.id)],
+                detail="requested final file remained attached to the final answer",
+                discord_ids=[str(requested_file_message.id)],
             )
         )
 
@@ -1593,7 +1586,7 @@ class DiscordRealHarness:
         )
         marker_prefix = "DRY-RUN-PIPELINE" if self._dry_run else "PRODUCTION-PIPELINE"
         marker = f"{marker_prefix}::{self._run_id}"
-        exact_artifact = ("artifact-" + self._run_id).encode() * 600
+        exact_artifact = ("artifact-" + self._run_id).encode() * 4000
         exact_text = exact_artifact.decode()
         events = [
             AdaptedEvent(
@@ -1601,20 +1594,19 @@ class DiscordRealHarness:
                 generation=0,
                 fence_token=0,
                 inbox_seq=1,
-                source="internal",
-                raw_type="assistant.message",
+                source="sdk",
+                raw_type="user.message",
                 raw_payload={
-                    "type": "assistant.message",
+                    "type": "user.message",
                     "data": {
-                        "messageId": "e2e-production-message",
-                        "content": marker,
+                        "content": "Run the single-card production probe.",
+                        "agentMode": "interactive",
                     },
                 },
-                reducer_hash="e2e-production-message",
-                persistence_class="internal",
+                reducer_hash="e2e-production-user",
+                persistence_class="durable",
                 received_at=time.time(),
-                internal_event_id=f"{self._run_id}:assistant",
-                message_id="e2e-production-message",
+                event_id=f"{self._run_id}:user",
             ),
             AdaptedEvent(
                 sdk_session_id=session_id,
@@ -1637,13 +1629,56 @@ class DiscordRealHarness:
                 received_at=time.time(),
                 internal_event_id=f"{self._run_id}:tool",
             ),
+            AdaptedEvent(
+                sdk_session_id=session_id,
+                generation=0,
+                fence_token=0,
+                inbox_seq=3,
+                source="internal",
+                raw_type="assistant.message",
+                raw_payload={
+                    "type": "assistant.message",
+                    "data": {
+                        "messageId": "e2e-production-message",
+                        "content": marker,
+                    },
+                },
+                reducer_hash="e2e-production-message",
+                persistence_class="internal",
+                received_at=time.time(),
+                internal_event_id=f"{self._run_id}:assistant",
+                message_id="e2e-production-message",
+            ),
         ]
         reducer = JournalReducer(
             bot.database,
             artifact_root=root / "artifacts",
         )
-        if await reducer.persist(events) != 2:
-            raise DiscordE2EError("production reducer did not persist both probe events")
+        if await reducer.persist(events) != 3:
+            raise DiscordE2EError("production reducer did not persist all probe events")
+        await bot.database.execute(
+            """
+            UPDATE submissions
+            SET state = 'semantic_complete', terminal_at = ?
+            WHERE sdk_session_id = ?
+            """,
+            (time.time(), session_id),
+        )
+        terminal = AdaptedEvent(
+            sdk_session_id=session_id,
+            generation=0,
+            fence_token=0,
+            inbox_seq=4,
+            source="internal",
+            raw_type="copilotd.snapshot.requested",
+            raw_payload={"type": "copilotd.snapshot.requested", "data": {"topic": "activity"}},
+            reducer_hash="e2e-production-terminal",
+            persistence_class="internal",
+            received_at=time.time(),
+            internal_event_id=f"{self._run_id}:terminal",
+        )
+        if await reducer.persist([terminal]) != 1:
+            raise DiscordE2EError("production reducer did not finalize the probe turn")
         journal_count = await bot.database.fetchone(
             """
             SELECT COUNT(*) AS count FROM event_journal
@@ -1651,9 +1686,9 @@ class DiscordRealHarness:
             """,
             (session_id,),
         )
-        if journal_count is None or int(journal_count["count"]) != 2:
+        if journal_count is None or int(journal_count["count"]) != 4:
             raise DiscordE2EError(
-                "production reducer probe did not journal exactly two known events"
+                "production reducer probe did not journal exactly four known events"
             )
         expected_rows = await bot.database.fetchall(
             """
@@ -1663,13 +1698,13 @@ class DiscordRealHarness:
             """,
             (session_id,),
         )
-        expected_intent_count = 3
+        expected_intent_count = 1
         if len(expected_rows) != expected_intent_count:
             raise DiscordE2EError(
-                "production reducer probe did not create exactly three known render intents"
+                "production reducer probe did not create exactly one turn render intent"
             )
         lanes = {str(row["lane"]) for row in expected_rows}
-        if lanes != {"assistant_final", "artifact", "taskdeck"}:
+        if lanes != {"assistant_final"}:
             raise DiscordE2EError(
                 f"production reducer probe emitted unexpected lanes: {sorted(lanes)}"
             )
@@ -1679,22 +1714,16 @@ class DiscordRealHarness:
                 "production reducer probe did not preserve the known marker intent"
             )
         expected_artifact_sha256 = _hash_bytes(exact_artifact)
-        intent_artifact_digests: list[str] = []
-        for payload in known_payloads:
-            attachments = payload.get("attachments")
-            if not isinstance(attachments, list):
-                continue
-            for attachment in attachments:
-                if not isinstance(attachment, dict):
-                    continue
-                body = attachment.get("content")
-                if isinstance(body, str):
-                    intent_artifact_digests.append(_hash_bytes(body.encode()))
-                elif isinstance(attachment.get("sha256"), str):
-                    intent_artifact_digests.append(str(attachment["sha256"]))
-        if intent_artifact_digests.count(expected_artifact_sha256) != 1:
+        spill = await bot.database.fetchone(
+            """
+            SELECT sha256 FROM tool_spill_artifacts
+            WHERE session_id = ? AND tool_call_id = 'e2e-production-tool'
+            """,
+            (session_id,),
+        )
+        if spill is None or str(spill["sha256"]) != expected_artifact_sha256:
             raise DiscordE2EError(
-                "production reducer probe did not create the known exact artifact intent"
+                "production reducer probe did not retain the exact durable tool spill"
             )
         expected_contents: list[str] = []
         expected_filenames: list[str] = []
@@ -1718,9 +1747,7 @@ class DiscordRealHarness:
         dispatcher = RenderOutboxDispatcher(bot.database, transport)
         delivered_count = await dispatcher.drain(deadline_seconds=30)
         if delivered_count != expected_intent_count:
-            raise DiscordE2EError(
-                "production outbox probe did not deliver exactly three known intents"
-            )
+            raise DiscordE2EError("production outbox probe did not deliver exactly one turn intent")
         pending = await bot.database.fetchone(
             """
             SELECT COUNT(*) AS count FROM render_outbox
@@ -1743,9 +1770,7 @@ class DiscordRealHarness:
             (session_id,),
         )
         if len(rows) != expected_intent_count:
-            raise DiscordE2EError(
-                "production outbox probe did not map exactly three Discord messages"
-            )
+            raise DiscordE2EError("production outbox probe did not map exactly one Discord message")
         messages = [await thread.fetch_message(int(row["discord_message_id"])) for row in rows]
         if not self._dry_run:
             visible_text = [_discord_message_visible_text(message) for message in messages]
@@ -1758,14 +1783,9 @@ class DiscordRealHarness:
                 raise DiscordE2EError(
                     "production Discord history did not preserve the planned content/embed mix"
                 )
-            actual_artifact_digests = [
-                _hash_bytes(await attachment.read(use_cached=False))
-                for message in messages
-                for attachment in message.attachments
-            ]
-            if actual_artifact_digests.count(expected_artifact_sha256) != 1:
+            if any(message.attachments for message in messages):
                 raise DiscordE2EError(
-                    "production Discord history did not contain the known artifact digest"
+                    "production Discord history exposed an internal tool artifact"
                 )
         evidence = await self.record_ordered_delivery_probe(
             messages,
@@ -1783,12 +1803,13 @@ class DiscordRealHarness:
             evidence.transport = "JournalReducer -> RenderOutboxDispatcher -> real Discord"
         evidence.assertions.extend(
             [
-                "journal_event_count=2",
+                "journal_event_count=4",
                 f"render_intent_count={expected_intent_count}",
                 f"render_message_count={len(rows)}",
                 f"rich_embed_message_count={sum(bool(message.embeds) for message in messages)}",
                 f"known_marker={marker}",
-                f"known_artifact_sha256={expected_artifact_sha256}",
+                f"durable_internal_artifact_sha256={expected_artifact_sha256}",
+                "discord_internal_artifact_count=0",
                 "delivery_path=JournalReducer->RenderOutboxDispatcher",
             ]
         )

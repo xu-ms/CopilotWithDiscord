@@ -803,7 +803,7 @@ async def test_sdk_workspace_event_authorizes_matching_local_image_path(
 
 
 @pytest.mark.asyncio
-async def test_long_tool_results_are_preserved_as_artifacts_at_8000_boundary(
+async def test_long_tool_results_stay_in_journal_without_discord_artifacts(
     tmp_path: Path,
 ) -> None:
     outputs = [
@@ -847,20 +847,18 @@ async def test_long_tool_results_are_preserved_as_artifacts_at_8000_boundary(
         assert await JournalReducer(database).persist(adapted) == 4
         rows = await database.fetchall(
             """
-            SELECT payload FROM render_outbox
-            WHERE lane = 'artifact' ORDER BY logical_seq
+            SELECT raw_payload FROM event_journal
+            WHERE raw_type = 'tool.execution_complete' ORDER BY inbox_seq
             """
         )
+        outbox = await database.fetchone("SELECT COUNT(*) FROM render_outbox")
 
-    payloads = [json.loads(row["payload"]) for row in rows]
-    assert len(payloads) == 3
-    assert "Runtime fallback content may be truncated." in payloads[0]["content"]
-    assert payloads[0]["attachments"][0]["content"] == "y" * 8000
-    assert "12,000" in payloads[1]["content"]
-    assert "truncated" not in payloads[1]["content"]
-    assert payloads[1]["attachments"][0]["content"] == "z" * 12000
-    assert "**Tool failed**" in payloads[2]["content"]
-    assert payloads[2]["attachments"][0]["content"] == "e" * 8000
+    payloads = [json.loads(row["raw_payload"]) for row in rows]
+    assert len(payloads) == 4
+    assert payloads[1]["data"]["result"]["content"] == "y" * 8000
+    assert payloads[2]["data"]["result"]["detailedContent"] == "z" * 12000
+    assert payloads[3]["data"]["error"]["message"] == "e" * 8000
+    assert outbox[0] == 0
 
 
 @pytest.mark.asyncio
@@ -915,29 +913,25 @@ async def test_partial_tool_spill_and_fenced_diff_are_attached_losslessly(
         diff_row = await database.fetchone("SELECT payload FROM render_outbox WHERE lane = 'diff'")
         spill = await database.fetchone(
             """
-            SELECT content, spilled FROM tool_output_streams
-            WHERE tool_call_id = 'partial-spill'
+            SELECT streams.content, streams.spilled, artifacts.local_path,
+                   artifacts.byte_size
+            FROM tool_output_streams AS streams
+            JOIN tool_spill_artifacts AS artifacts
+              ON artifacts.session_id = streams.session_id
+             AND artifacts.tool_call_id = streams.tool_call_id
+            WHERE streams.tool_call_id = 'partial-spill'
             """
         )
 
-    assert len(artifact_rows) == 1
-    artifact = json.loads(artifact_rows[0]["payload"])
-    spill_attachment = artifact["attachments"][0]
-    assert "content" not in spill_attachment
+    assert artifact_rows == []
+    assert diff_row is None
     assert await asyncio.to_thread(
         _read_text_file,
-        Path(spill_attachment["path"]),
+        Path(spill["local_path"]),
     ) == "b" * (64 * 1024)
-    assert artifact["verbatim"] is True
-    assert artifact["byte_count"] == 64 * 1024
-    assert artifact["status"] == "partial spill"
+    assert spill["byte_size"] == 64 * 1024
     assert spill["content"] == ""
     assert spill["spilled"] == 1
-    diff = json.loads(diff_row["payload"])
-    assert diff["content"].endswith("attached as `changes-diff-fence.diff`.")
-    assert diff["attachments"][0]["content"] == "+```python\n+print('safe')\n+```"
-    assert diff["byte_count"] == len(b"+```python\n+print('safe')\n+```")
-    assert diff["stats"] == {"additions": 3, "deletions": 0}
 
 
 def test_structured_diff_enforces_render_byte_cap() -> None:
@@ -1028,7 +1022,7 @@ async def test_structured_diff_suppresses_duplicate_generic_tool_artifact(
         assert await JournalReducer(database).persist([event]) == 1
         lanes = await database.fetchall("SELECT lane FROM render_outbox ORDER BY lane")
 
-    assert [row["lane"] for row in lanes] == ["diff", "taskdeck"]
+    assert [row["lane"] for row in lanes] == []
 
 
 @pytest.mark.asyncio
@@ -1132,22 +1126,22 @@ async def test_tool_spill_uses_durable_cumulative_stream(tmp_path: Path) -> None
               AND tool_call_id = 'cumulative-tool'
             """
         )
+        artifact = await database.fetchone(
+            """
+            SELECT local_path FROM tool_spill_artifacts
+            WHERE session_id = 'session-cumulative-tool'
+              AND tool_call_id = 'cumulative-tool'
+            """
+        )
 
-    assert len(rows) == 1
-    payloads = [json.loads(row["payload"]) for row in rows]
-    assert {row["coalesce_key"] for row in rows} == {"tool-spill:cumulative-tool"}
-    attachments = [payload["attachments"][0] for payload in payloads]
-    assert all("content" not in attachment for attachment in attachments)
-    assert len({attachment["path"] for attachment in attachments}) == 1
+    assert rows == []
     final_content = await asyncio.to_thread(
         _read_text_file,
-        Path(attachments[-1]["path"]),
+        Path(artifact["local_path"]),
     )
     assert final_content.startswith("".join(chunks))
     assert final_content.endswith("FINAL-RESULT")
     assert "LATE-PROGRESS" not in final_content
-    assert [payload["finalized"] for payload in payloads] == [True]
-    assert payloads[0]["tool_source"] == "durable-stream+detailedContent"
     assert stream["content"] == ""
     assert "human status only" not in final_content
     assert stream["spilled"] == 1
@@ -1156,7 +1150,7 @@ async def test_tool_spill_uses_durable_cumulative_stream(tmp_path: Path) -> None
 
 
 @pytest.mark.asyncio
-async def test_failed_cumulative_tool_spill_keeps_failed_rich_status(tmp_path: Path) -> None:
+async def test_failed_cumulative_tool_spill_stays_durable_and_hidden(tmp_path: Path) -> None:
     events = [
         _adapted(
             "tool.execution_progress",
@@ -1180,16 +1174,18 @@ async def test_failed_cumulative_tool_spill_keeps_failed_rich_status(tmp_path: P
         assert await JournalReducer(database).persist(events) == 2
         row = await database.fetchone(
             """
-            SELECT payload FROM render_outbox
-            WHERE session_id = 'session-failed-spill' AND lane = 'artifact'
+            SELECT local_path, finalized FROM tool_spill_artifacts
+            WHERE session_id = 'session-failed-spill'
+              AND tool_call_id = 'failed-spill'
             """
         )
+        outbox = await database.fetchone("SELECT COUNT(*) FROM render_outbox")
 
-    payload = json.loads(row["payload"])
-    assert payload["finalized"] is True
-    assert payload["status"] == "failed"
-    plan = await _discord_render_plan(payload)
-    assert plan.batches[0].embeds[0]["title"] == "❌ Tool output"
+    content = await asyncio.to_thread(Path(row["local_path"]).read_text, encoding="utf-8")
+    assert row["finalized"] == 1
+    assert content.startswith("x" * 100)
+    assert content.endswith("tool failed")
+    assert outbox[0] == 0
 
 
 def test_diff_stats_parse_hunks_without_dropping_plus_or_minus_prefixed_content() -> None:
@@ -1234,7 +1230,7 @@ def test_diff_stats_distinguish_multiple_file_headers_from_hunk_content() -> Non
 
 
 @pytest.mark.asyncio
-async def test_stable_spill_revision_preserves_pending_retry_window(
+async def test_spill_progress_grows_durable_file_without_outbox_delivery(
     tmp_path: Path,
 ) -> None:
     def progress(index: int, chunk: str) -> AdaptedEvent:
@@ -1260,26 +1256,23 @@ async def test_stable_spill_revision_preserves_pending_retry_window(
     async with Database(tmp_path / "spill-retry.sqlite3") as database:
         reducer = JournalReducer(database)
         assert await reducer.persist([progress(1, "a" * (70 * 1024))]) == 1
-        await database.execute(
-            """
-            UPDATE render_outbox
-            SET next_attempt_at = 9999999999, attempts = 1
-            WHERE coalesce_key = 'tool-spill:spill-retry'
-            """
-        )
         assert await reducer.persist([progress(2, "b")]) == 1
         row = await database.fetchone(
             """
-            SELECT next_attempt_at, attempts, payload_revision FROM render_outbox
-            WHERE coalesce_key = 'tool-spill:spill-retry'
+            SELECT local_path, byte_size FROM tool_spill_artifacts
+            WHERE session_id = 'session-spill-retry'
+              AND tool_call_id = 'spill-retry'
             """
         )
+        outbox = await database.fetchone("SELECT COUNT(*) FROM render_outbox")
 
-    assert dict(row) == {
-        "next_attempt_at": 9999999999,
-        "attempts": 1,
-        "payload_revision": 2,
-    }
+    assert row["byte_size"] == 70 * 1024 + 1
+    spill_content = await asyncio.to_thread(
+        Path(row["local_path"]).read_text,
+        encoding="utf-8",
+    )
+    assert spill_content.endswith("b")
+    assert outbox[0] == 0
 
 
 @pytest.mark.asyncio
@@ -1373,12 +1366,7 @@ async def test_completion_only_100mib_spills_without_large_outbox_payload(
               AND tool_call_id = 'completion-only'
             """
         )
-        outbox = await database.fetchone(
-            """
-            SELECT LENGTH(payload) AS payload_bytes
-            FROM render_outbox WHERE lane = 'artifact'
-            """
-        )
+        outbox = await database.fetchone("SELECT COUNT(*) FROM render_outbox")
         stream = await database.fetchone(
             """
             SELECT content, spilled, finalized FROM tool_output_streams
@@ -1393,7 +1381,7 @@ async def test_completion_only_100mib_spills_without_large_outbox_payload(
     assert artifact["byte_size"] == len(completion)
     assert artifact["sha256"] == artifact_digest
     assert artifact["finalized"] == 1
-    assert outbox["payload_bytes"] < 200_000
+    assert outbox[0] == 0
     assert dict(stream) == {"content": "", "spilled": 1, "finalized": 1}
     assert database_path.stat().st_size < 160 * 1024 * 1024
 
@@ -1440,22 +1428,24 @@ async def test_tool_spill_preserves_full_structured_completion_error(
     ]
     async with Database(tmp_path / "error-spill.sqlite3") as database:
         assert await JournalReducer(database).persist(adapted) == 2
-        rows = await database.fetchall(
+        artifact = await database.fetchone(
             """
-            SELECT payload FROM render_outbox
-            WHERE lane = 'artifact' ORDER BY logical_seq
+            SELECT local_path FROM tool_spill_artifacts
+            WHERE session_id = 'session-error-spill'
+              AND tool_call_id = 'error-spill'
             """
         )
+        outbox = await database.fetchone("SELECT COUNT(*) FROM render_outbox")
 
-    attachment = json.loads(rows[-1]["payload"])["attachments"][0]
     final_content = await asyncio.to_thread(
         _read_text_file,
-        Path(attachment["path"]),
+        Path(artifact["local_path"]),
     )
     assert final_content.startswith("x" * 100)
     assert '"message": "ENOENT"' in final_content
     assert '"path": "/tmp/missing"' in final_content
     assert '"errno": 2' in final_content
+    assert outbox[0] == 0
 
 
 @pytest.mark.timeout(60)
@@ -1517,14 +1507,7 @@ async def test_tool_spill_100x1mib_has_linear_database_growth(
               AND tool_call_id = 'stress-spill'
             """
         )
-        outbox = await database.fetchone(
-            """
-            SELECT COUNT(*) AS count,
-                   COUNT(DISTINCT coalesce_key) AS coalesce_count,
-                   SUM(LENGTH(payload)) AS payload_bytes
-            FROM render_outbox WHERE lane = 'artifact'
-            """
-        )
+        outbox = await database.fetchone("SELECT COUNT(*) AS count FROM render_outbox")
         stream = await database.fetchone(
             """
             SELECT content, finalized FROM tool_output_streams
@@ -1537,16 +1520,14 @@ async def test_tool_spill_100x1mib_has_linear_database_growth(
     assert artifact["finalized"] == 1
     assert artifact["sha256"] == artifact_digest
     assert artifact["byte_size"] >= 100 * 1024 * 1024
-    assert outbox["count"] == 1
-    assert outbox["coalesce_count"] == 1
-    assert outbox["payload_bytes"] < 200_000
+    assert outbox["count"] == 0
     assert stream["content"] == ""
     assert stream["finalized"] == 1
     assert database_path.stat().st_size < 300 * 1024 * 1024
 
 
 @pytest.mark.asyncio
-async def test_correlated_idle_emits_model_token_context_duration_footer(
+async def test_correlated_idle_keeps_metrics_durable_without_footer_message(
     tmp_path: Path,
 ) -> None:
     session_id = "session-footer"
@@ -1607,17 +1588,15 @@ async def test_correlated_idle_emits_model_token_context_duration_footer(
         )
         assert await JournalReducer(database).persist([event]) == 1
         row = await database.fetchone(
-            "SELECT lane, payload FROM render_outbox WHERE lane = 'footer'"
+            "SELECT lane, payload FROM render_outbox WHERE session_id = ?",
+            (session_id,),
         )
 
-    assert row["lane"] == "footer"
+    assert row["lane"] == "assistant_stream"
     payload = json.loads(row["payload"])
-    assert payload["model"] == "gpt-footer"
-    assert payload["input_tokens"] == 12
-    assert payload["output_tokens"] == 7
-    assert payload["credits"] == 1.5
-    assert payload["context"] == "19/100"
-    assert payload["duration_seconds"] == 20
+    assert payload["content"] == "Copilot is working…"
+    assert payload["turn_render_key"] == "turn:submission-footer"
+    assert "gpt-footer" not in payload["content"]
 
 
 @pytest.mark.asyncio
@@ -2048,7 +2027,7 @@ async def test_session_idle_is_the_supported_agent_loop_observation(
 
 
 @pytest.mark.asyncio
-async def test_subagent_output_stays_in_one_collapsed_taskdeck(tmp_path: Path) -> None:
+async def test_subagent_output_stays_durable_without_discord_taskdeck(tmp_path: Path) -> None:
     started = SessionEvent(
         data=SubagentStartedData(
             agent_description="Investigate the parser",
@@ -2121,20 +2100,14 @@ async def test_subagent_output_stays_in_one_collapsed_taskdeck(tmp_path: Path) -
             "progress_summary": "42 tokens, 2 tool calls",
         }
     ]
-    assert {row["lane"] for row in outbox} == {"taskdeck"}
-    assert {row["coalesce_key"] for row in outbox} == {"taskdeck"}
-    final_payload = json.loads(outbox[-1]["payload"])
-    assert final_payload["content"] == "**TaskDeck** — 1 item(s)"
-    assert final_payload["cards"][0]["title"] == "Parser investigator"
-    assert final_payload["cards"][0]["elapsed"].endswith("s")
-    assert final_payload["finalized"] is True
-    assert final_payload["taskdeck"]["expanded"] is False
-    assert final_payload["taskdeck"]["options"][0]["label"] == "Parser investigator"
+    assert outbox == []
     assert lease["state"] == "released"
 
 
 @pytest.mark.asyncio
-async def test_terminal_tool_event_creates_a_named_taskdeck_card(tmp_path: Path) -> None:
+async def test_terminal_tool_event_keeps_projection_without_taskdeck_delivery(
+    tmp_path: Path,
+) -> None:
     event = _adapted(
         "tool.execution_complete",
         {
@@ -2163,9 +2136,8 @@ async def test_terminal_tool_event_creates_a_named_taskdeck_card(tmp_path: Path)
             """
         )
 
-    payload = json.loads(outbox["payload"])
     assert dict(card) == {"title": "Copilot tool", "state": "completed"}
-    assert payload["taskdeck"]["options"][0]["label"] == "Copilot tool"
+    assert outbox is None
 
 
 @pytest.mark.asyncio
@@ -2234,7 +2206,7 @@ async def test_agent_deltas_assemble_before_taskdeck_projection(tmp_path: Path) 
 
 
 @pytest.mark.asyncio
-async def test_taskdeck_view_change_expands_the_selected_card_in_place(
+async def test_taskdeck_view_change_updates_projection_without_discord_delivery(
     tmp_path: Path,
 ) -> None:
     started = SessionEvent(
@@ -2266,11 +2238,13 @@ async def test_taskdeck_view_change_expands_the_selected_card_in_place(
     async with Database(tmp_path / "taskdeck-view.sqlite3") as database:
         reducer = JournalReducer(database)
         assert await reducer.persist([adapted_started]) == 1
-        initial_row = await database.fetchone(
-            "SELECT payload FROM render_outbox ORDER BY logical_seq DESC LIMIT 1"
+        initial = await database.fetchone(
+            """
+            SELECT panel_id, selected_card_token
+            FROM taskdeck_panel_state
+            WHERE sdk_session_id = 'session-taskdeck-view'
+            """
         )
-        initial = json.loads(initial_row["payload"])
-        metadata = initial["taskdeck"]
         changed = adapter.adapt(
             InboxEnvelope(
                 sdk_session_id="session-taskdeck-view",
@@ -2281,8 +2255,8 @@ async def test_taskdeck_view_change_expands_the_selected_card_in_place(
                 payload={
                     "type": "copilotd.taskdeck.view_changed",
                     "data": {
-                        "panel_id": metadata["panel_id"],
-                        "selected_card_token": metadata["selected_card_token"],
+                        "panel_id": initial["panel_id"],
+                        "selected_card_token": initial["selected_card_token"],
                         "page": 0,
                         "expanded": True,
                     },
@@ -2292,14 +2266,16 @@ async def test_taskdeck_view_change_expands_the_selected_card_in_place(
             )
         )
         assert await reducer.persist([changed]) == 1
-        expanded_row = await database.fetchone(
-            "SELECT payload FROM render_outbox ORDER BY logical_seq DESC LIMIT 1"
+        expanded = await database.fetchone(
+            """
+            SELECT expanded FROM taskdeck_panel_state
+            WHERE sdk_session_id = 'session-taskdeck-view'
+            """
         )
+        outbox = await database.fetchone("SELECT COUNT(*) FROM render_outbox")
 
-    expanded = json.loads(expanded_row["payload"])
-    assert expanded["taskdeck"]["expanded"] is True
-    assert expanded["content"] == "**TaskDeck** — 1 item(s)"
-    assert expanded["cards"][0]["progress_summary"] == "Investigate the parser"
+    assert expanded["expanded"] == 1
+    assert outbox[0] == 0
 
 
 @pytest.mark.asyncio

@@ -57,7 +57,7 @@ class FakeThread:
 
 
 @pytest.mark.asyncio
-async def test_special_destination_multi_batch_retry_uses_durable_checkpoints(
+async def test_special_destination_rejects_internal_tool_artifact_delivery(
     tmp_path: Path,
 ) -> None:
     bot = CopilotDiscordBot(Settings(data_dir=tmp_path))
@@ -88,18 +88,13 @@ async def test_special_destination_multi_batch_retry_uses_durable_checkpoints(
 
     async with Database(tmp_path / "special-destination.sqlite3") as database:
         bot.database = database
-        first = await bot.send(
-            session_id="ops:diagnostics",
-            lane="artifact",
-            payload=payload,
-            idempotency_key="ops:rich-artifacts",
-        )
-        retried = await bot.send(
-            session_id="ops:diagnostics",
-            lane="artifact",
-            payload=payload,
-            idempotency_key="ops:rich-artifacts",
-        )
+        with pytest.raises(RenderPermanentError, match="internal tool diagnostics"):
+            await bot.send(
+                session_id="ops:diagnostics",
+                lane="artifact",
+                payload=payload,
+                idempotency_key="ops:rich-artifacts",
+            )
         rows = await database.fetchall(
             """
             SELECT batch_index, discord_message_id
@@ -109,12 +104,8 @@ async def test_special_destination_multi_batch_retry_uses_durable_checkpoints(
             """
         )
 
-    assert first == retried == "101"
-    assert thread.send_calls == 2
-    assert [dict(row) for row in rows] == [
-        {"batch_index": 0, "discord_message_id": "101"},
-        {"batch_index": 1, "discord_message_id": "102"},
-    ]
+    assert thread.send_calls == 0
+    assert rows == []
 
 
 @pytest.mark.asyncio

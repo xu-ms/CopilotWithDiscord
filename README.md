@@ -21,20 +21,21 @@ The implementation follows [`docs/copilotD-detailed-design.md`](docs/copilotD-de
 - Durable SQLite event journal with strict UUID SDK IDs, app FIFO, reducer-owned
   operation receipts, liveness leases, epoch/watermark snapshots, render outbox,
   and attachment manifests.
-- Forty-four applied migrations use unique reserved namespaces: Foundation
+- Forty-seven applied migrations use unique reserved namespaces: Foundation
   `0001`-`0009`, Native `0010`-`0014`, Protocol `0015`-`0019`, Scheduler
   `0020`-`0028`, Protocol compatibility `0029`, and Discord `0030`-`0037`;
   `0038`-`0039` are reserved, Operations uses forward-only `0040`-`0044`,
-  session deletion and attachment lifecycle recovery are `0045`-`0046`, and
-  background-liveness compatibility is `0047`.
+  session deletion and attachment lifecycle recovery are `0045`-`0046`,
+  background-liveness compatibility is `0047`, reaction delivery is `0048`, and
+  single-turn Discord rendering is `0049`.
 - Durable event-log backfill with cursor rebase/gap diagnostics and ingress-overflow
   freeze/backfill/generation replacement; unrecoverable ephemeral gaps remain
   explicitly outcome-unknown.
 - Restart-recoverable input attachment preparation, ready-orphan resubmission,
   reference-aware release, and seven-day retained-file garbage collection.
-- Streaming replies, file/image attachments, table-aware Markdown rendering, and one
-  in-thread, embed-backed TaskDeck for tool/subagent activity with select,
-  expand/collapse, and pagination controls.
+- One durable Discord card per user turn: stable running status, final-answer in-place
+  editing, restart-safe replay, and requested final file/image delivery. Tool/subagent
+  output remains in the journal and spill store rather than becoming channel messages.
 - Durable Copilot input requests: ask-user choices/freeform, Plan exit actions, and
   auto-mode-switch prompts render in-place and settle exactly once without blocking
   event reduction.
@@ -48,8 +49,8 @@ The implementation follows [`docs/copilotD-detailed-design.md`](docs/copilotD-de
 - Durable mode/model per-field reconciliation (including gated reasoning-summary
   readback), MCP/extension health, and stale-aware usage/context projections.
 - Background task `refresh/list` reconciliation, disappearance-to-unknown handling,
-  usage/status rendering, and lossless attachment delivery for tool output at or above
-  8000 characters; oversized Discord uploads are split into ordered lossless parts.
+  durable internal tool-output spills, and main-turn progress merging without exposing
+  tool names, parameters, raw output, or diagnostic attachments in Discord.
 - Capability-backed registration for core commands plus exact native `/ask`,
   `/session compact`, `/fleet`, `/tasks`, `/agent`, `/after`, `/every`, `/remote`,
   `/review`, `/security-review`, `/research`, and `/rubber-duck` surfaces. Each native

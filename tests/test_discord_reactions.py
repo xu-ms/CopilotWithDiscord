@@ -424,7 +424,7 @@ async def test_reaction_delivery_is_durable_idempotent_and_fenced(tmp_path: Path
         await _binding(database)
         await JournalReducer(database).persist([_queued()])
         dispatcher = RenderOutboxDispatcher(database, transport)
-        assert await dispatcher.dispatch_once() == 1
+        assert await dispatcher.dispatch_once() == 2
         delivered = await _state(database)
         assert delivered["delivered_state"] == "accepted"
         assert delivered["delivered_revision"] == 1
@@ -477,7 +477,7 @@ async def test_reaction_permission_failure_is_diagnostic_not_submission_failure(
             database,
             _ReactionTransport(RenderPermanentError("missing Add Reactions")),
         )
-        assert await dispatcher.dispatch_once() == 0
+        assert await dispatcher.dispatch_once() == 1
         reaction = await _state(database)
         submission = await database.fetchone(
             "SELECT state FROM submissions WHERE submission_id = 'submission-1'"

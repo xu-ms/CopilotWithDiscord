@@ -1305,112 +1305,55 @@ async def test_usage_and_turn_summary_render_as_compact_subtext() -> None:
 
 
 @pytest.mark.asyncio
-async def test_diff_tool_artifact_and_images_use_metadata_and_attachment_previews() -> None:
+async def test_internal_diff_and_tool_artifacts_are_not_discord_renderable() -> None:
     image = TableAsset(
         filename="table-preview.png",
         media_type="image/png",
         content=b"png",
     )
-    diff = await _discord_render_plan(
-        {
-            "type": "diff",
-            "content": "**Code changes** · `structured`\n```diff\n+added\n-removed\n```",
-            "source": "structured",
-            "byte_count": 128,
-            "stats": {"files": 1, "additions": 4, "deletions": 2},
-            "attachments": [
-                {
-                    "filename": image.filename,
-                    "media_type": image.media_type,
-                    "content": image.content,
-                }
-            ],
-            "finalized": True,
-        }
-    )
-    artifact = await _discord_render_plan(
-        {
-            "type": "tool_output_artifact",
-            "content": "**Tool completed** — exact output attached.",
-            "status": "completed",
-            "tool_source": "detailedContent",
-            "verbatim": True,
-            "character_count": 9000,
-            "line_count": 120,
-            "attachments": [
-                {
-                    "filename": "tool-output.txt",
-                    "media_type": "text/plain",
-                    "content": "exact",
-                }
-            ],
-            "finalized": True,
-        }
-    )
-
-    assert diff.batches[0].content == ""
-    assert [embed["title"] for embed in diff.batches[0].embeds] == [
-        "🧩 Code changes",
-        "📊 Table preview",
-    ]
-    assert diff.batches[0].embeds[1]["image"]["url"] == "attachment://table-preview.png"
-    assert {field["name"] for field in diff.batches[0].embeds[0]["fields"]} >= {
-        "Files",
-        "Changes",
-        "Attachments",
-    }
-    assert artifact.batches[0].content == ""
-    assert artifact.batches[0].embeds[0]["title"] == "📎 Tool output"
-    assert any(
-        field["value"] == "`9,000` chars · `120` lines"
-        for field in artifact.batches[0].embeds[0]["fields"]
-    )
+    with pytest.raises(RenderPermanentError, match="internal tool diagnostics"):
+        await _discord_render_plan(
+            {
+                "type": "diff",
+                "content": "raw patch",
+                "attachments": [
+                    {
+                        "filename": image.filename,
+                        "media_type": image.media_type,
+                        "content": image.content,
+                    }
+                ],
+                "finalized": True,
+            }
+        )
+    with pytest.raises(RenderPermanentError, match="internal tool diagnostics"):
+        await _discord_render_plan(
+            {
+                "type": "tool_output_artifact",
+                "content": "raw detailedContent",
+                "attachments": [
+                    {
+                        "filename": "tool-output.txt",
+                        "media_type": "text/plain",
+                        "content": "exact",
+                    }
+                ],
+                "finalized": True,
+            }
+        )
 
 
 @pytest.mark.asyncio
-async def test_oversized_diff_and_legacy_tool_artifact_do_not_claim_success() -> None:
-    oversized = await _discord_render_plan(
-        {
-            "type": "diff",
-            "content": (
-                "**Code changes**\nStructured diff exceeds the render safety limit; "
-                "exact source remains in the durable event journal."
-            ),
-            "source": "structured",
-            "oversized": True,
-            "byte_count": 9 * 1024 * 1024,
-            "stats": {},
-            "attachments": [],
-            "finalized": True,
-        }
-    )
-    legacy_failure = await _discord_render_plan(
-        {
-            "type": "tool_output_artifact",
-            "content": "**Tool failed** — exact output attached.",
-            "tool_source": "error",
-            "verbatim": True,
-            "attachments": [
+async def test_legacy_tool_diagnostics_remain_blocked_from_discord() -> None:
+    for payload_type in ("diff", "tool_output_artifact"):
+        with pytest.raises(RenderPermanentError):
+            await _discord_render_plan(
                 {
-                    "filename": "legacy-error.txt",
-                    "media_type": "text/plain",
-                    "content": "failed",
+                    "type": payload_type,
+                    "content": "Traceback and raw tool logs",
+                    "finalized": True,
                 }
-            ],
-            "finalized": True,
-        }
-    )
-
-    diff_embed = oversized.batches[0].embeds[0]
-    diff_fields = {field["name"]: field["value"] for field in diff_embed["fields"]}
-    assert diff_embed["color"] == 0xFEE75C
-    assert diff_fields["Files"] == "`unknown`"
-    assert diff_fields["Changes"] == "`unknown`"
-    assert diff_fields["Delivery"] == "`omitted: render safety limit`"
-    assert "durable event journal" in diff_embed["footer"]["text"]
-    legacy_embed = legacy_failure.batches[0].embeds[0]
-    assert legacy_embed["title"] == "❌ Tool output"
-    assert legacy_embed["color"] == 0xED4245
+            )
 
 
 @pytest.mark.asyncio

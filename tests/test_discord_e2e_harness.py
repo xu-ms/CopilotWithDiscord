@@ -960,9 +960,11 @@ async def test_production_probe_rejects_empty_reducer_outbox_path(
     class EmptyOutboxReducer:
         def __init__(self, database, artifact_root=None) -> None:
             self.database = database
+            self.sequence = 0
 
         async def persist(self, events) -> int:
-            for index in range(2):
+            for event in events:
+                self.sequence += 1
                 await self.database.execute(
                     """
                     INSERT INTO event_journal(
@@ -972,16 +974,16 @@ async def test_production_probe_rejects_empty_reducer_outbox_path(
                     ) VALUES (?, 0, ?, 'internal', 'internal', 'probe', ?, '{}', 0)
                     """,
                     (
-                        events[0].sdk_session_id,
-                        index + 1,
-                        f"empty-{index}",
+                        event.sdk_session_id,
+                        self.sequence,
+                        f"empty-{self.sequence}",
                     ),
                 )
-            return 2
+            return len(events)
 
     monkeypatch.setattr(harness_module, "JournalReducer", EmptyOutboxReducer)
     try:
-        with pytest.raises(DiscordE2EError, match="three known render intents"):
+        with pytest.raises(DiscordE2EError, match="one turn render intent"):
             await harness._run_production_pipeline_probe(tmp_path, thread)
     finally:
         await bot.close()

@@ -638,7 +638,7 @@ async def test_transient_failure_blocks_after_three_attempts(tmp_path: Path) -> 
 
 
 @pytest.mark.asyncio
-async def test_taskdeck_cadence_is_delegated_to_discord_request_coordinator(
+async def test_legacy_taskdeck_rows_are_suppressed_without_transport(
     tmp_path: Path,
 ) -> None:
     async with Database(tmp_path / "taskdeck-outbox.sqlite3") as database:
@@ -652,7 +652,7 @@ async def test_taskdeck_cadence_is_delegated_to_discord_request_coordinator(
         )
         transport = FakeTransport()
         dispatcher = RenderOutboxDispatcher(database, transport)
-        assert await dispatcher.dispatch_once(now=100) == 1
+        assert await dispatcher.dispatch_once(now=100) == 0
 
         await _insert_outbox(
             database,
@@ -662,7 +662,7 @@ async def test_taskdeck_cadence_is_delegated_to_discord_request_coordinator(
             coalesce_key="taskdeck",
             payload={"content": "intermediate", "finalized": False},
         )
-        assert await dispatcher.dispatch_once(now=101) == 1
+        assert await dispatcher.dispatch_once(now=101) == 0
 
         await _insert_outbox(
             database,
@@ -672,12 +672,54 @@ async def test_taskdeck_cadence_is_delegated_to_discord_request_coordinator(
             coalesce_key="taskdeck",
             payload={"content": "terminal", "finalized": True},
         )
-        assert await dispatcher.dispatch_once(now=102) == 1
+        assert await dispatcher.dispatch_once(now=102) == 0
         states = await database.fetchall("SELECT state FROM render_outbox ORDER BY logical_seq")
 
-    assert [row["state"] for row in states] == ["sent", "sent", "sent"]
-    assert transport.edited[-1] == (
-        "discord-1",
-        "taskdeck",
-        {"content": "terminal", "finalized": True},
-    )
+    assert [row["state"] for row in states] == [
+        "superseded",
+        "superseded",
+        "superseded",
+    ]
+    assert transport.sent == []
+    assert transport.edited == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("lane", "payload_type"),
+    [
+        ("artifact", "tool_output_artifact"),
+        ("diff", "diff"),
+        ("taskdeck", "taskdeck"),
+    ],
+)
+async def test_legacy_internal_tool_rows_never_reach_transport(
+    tmp_path: Path,
+    lane: str,
+    payload_type: str,
+) -> None:
+    async with Database(tmp_path / f"internal-{lane}.sqlite3") as database:
+        await _insert_outbox(
+            database,
+            item_id=f"internal-{lane}",
+            sequence=1,
+            lane=lane,
+            coalesce_key=f"internal-{lane}",
+            payload={
+                "type": payload_type,
+                "content": "raw detailedContent and tool logs",
+                "attachments": [{"filename": "tool-output.txt", "content": "secret"}],
+                "finalized": True,
+            },
+        )
+        transport = FakeTransport()
+        dispatcher = RenderOutboxDispatcher(database, transport)
+        assert await dispatcher.dispatch_once() == 0
+        row = await database.fetchone(
+            "SELECT state FROM render_outbox WHERE id = ?",
+            (f"internal-{lane}",),
+        )
+
+    assert row["state"] == "superseded"
+    assert transport.sent == []
+    assert transport.edited == []

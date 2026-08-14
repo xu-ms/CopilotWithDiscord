@@ -10,7 +10,7 @@ import pytest
 
 from copilotd.storage.database import Database
 
-EXPECTED_MIGRATION_VERSIONS = [*range(1, 38), *range(40, 49)]
+EXPECTED_MIGRATION_VERSIONS = [*range(1, 38), *range(40, 50)]
 
 
 def _create_migration_fixture(path: Path, *, through_version: int) -> None:
@@ -201,6 +201,7 @@ async def test_initial_migration_creates_full_schema(tmp_path: Path) -> None:
         "taskdeck_panel_state",
         "pinned_message_provenance",
         "tool_output_streams",
+        "turn_render_state",
         "tool_spill_artifacts",
         "trusted_local_artifacts",
         "trusted_local_artifact_snapshots",

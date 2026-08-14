@@ -4768,6 +4768,8 @@ async def _discord_render_plan(
     allowed_roots: tuple[Path, ...] = (),
     max_bytes: int | None = None,
 ) -> DiscordRenderPlan:
+    if payload.get("type") in {"diff", "tool_output_artifact"}:
+        raise RenderPermanentError("internal tool diagnostics are not Discord-renderable")
     content = str(payload.get("content", ""))
     payload_type = str(payload.get("type") or "")
     if payload_type in {
