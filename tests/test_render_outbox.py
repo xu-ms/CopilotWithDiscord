@@ -638,7 +638,7 @@ async def test_transient_failure_blocks_after_three_attempts(tmp_path: Path) -> 
 
 
 @pytest.mark.asyncio
-async def test_taskdeck_coalesces_pending_updates_and_final_bypasses_cadence(
+async def test_taskdeck_cadence_is_delegated_to_discord_request_coordinator(
     tmp_path: Path,
 ) -> None:
     async with Database(tmp_path / "taskdeck-outbox.sqlite3") as database:
@@ -662,7 +662,7 @@ async def test_taskdeck_coalesces_pending_updates_and_final_bypasses_cadence(
             coalesce_key="taskdeck",
             payload={"content": "intermediate", "finalized": False},
         )
-        assert await dispatcher.dispatch_once(now=101) == 0
+        assert await dispatcher.dispatch_once(now=101) == 1
 
         await _insert_outbox(
             database,
@@ -675,7 +675,7 @@ async def test_taskdeck_coalesces_pending_updates_and_final_bypasses_cadence(
         assert await dispatcher.dispatch_once(now=102) == 1
         states = await database.fetchall("SELECT state FROM render_outbox ORDER BY logical_seq")
 
-    assert [row["state"] for row in states] == ["sent", "superseded", "sent"]
+    assert [row["state"] for row in states] == ["sent", "sent", "sent"]
     assert transport.edited[-1] == (
         "discord-1",
         "taskdeck",

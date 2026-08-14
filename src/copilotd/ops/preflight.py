@@ -92,6 +92,28 @@ class SetupPreflight:
                 "present" if token else "COPILOTD_DISCORD_TOKEN is required",
             )
         )
+        checks.append(
+            PreflightCheck(
+                "discord_required_permissions",
+                True,
+                ("runtime channel checks require Add Reactions and Read Message History"),
+            )
+        )
+        checks.append(
+            PreflightCheck(
+                "discord_request_coordinator",
+                True,
+                (
+                    f"rate={self._settings.discord_requests_per_second:g}/s "
+                    f"burst={self._settings.discord_request_burst} "
+                    f"route={self._settings.discord_route_requests_per_second:g}/s "
+                    f"route_burst={self._settings.discord_route_burst} "
+                    f"queue_limit={self._settings.discord_request_queue_limit} "
+                    f"interaction_deadline="
+                    f"{self._settings.discord_interaction_deadline_seconds:g}s"
+                ),
+            )
+        )
 
         try:
             self._settings.ensure_directories()

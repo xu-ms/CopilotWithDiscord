@@ -166,6 +166,7 @@ class QueueMetrics:
     render_pending: int = 0
     last_callback_at: str | None = None
     last_reducer_progress_at: str | None = None
+    discord_requests: dict[str, Any] | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -2550,6 +2551,7 @@ if ($remaining.Count -ne 0 -or $remainingTracked.Count -ne 0) {
                 render_pending=queues.render_pending,
                 last_callback_at=heartbeat.last_callback_at,
                 last_reducer_progress_at=heartbeat.last_reducer_progress_at,
+                discord_requests=heartbeat.discord_requests,
             )
 
         definition_drift = tuple(

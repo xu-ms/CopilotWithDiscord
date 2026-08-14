@@ -10,7 +10,7 @@ import pytest
 
 from copilotd.storage.database import Database
 
-EXPECTED_MIGRATION_VERSIONS = [*range(1, 38), *range(40, 48)]
+EXPECTED_MIGRATION_VERSIONS = [*range(1, 38), *range(40, 49)]
 
 
 def _create_migration_fixture(path: Path, *, through_version: int) -> None:
@@ -192,6 +192,7 @@ async def test_initial_migration_creates_full_schema(tmp_path: Path) -> None:
         "snapshot_observations",
         "submissions",
         "submission_segments",
+        "submission_reactions",
         "submission_task_links",
         "compaction_runs",
         "ephemeral_queries",

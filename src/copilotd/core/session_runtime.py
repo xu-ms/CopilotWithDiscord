@@ -545,6 +545,8 @@ class SessionRuntime:
         idempotency_key: str,
         attachments: list[Any] | None = None,
         attachment_manifest_id: str | None = None,
+        discord_source_channel_id: str | None = None,
+        discord_source_message_id: str | None = None,
         mode: DeliveryMode = "enqueue",
         agent_mode: AgentMode | None = None,
         origin: str = "app_message",
@@ -570,7 +572,8 @@ class SessionRuntime:
                        q.requested_session_config_version,
                        q.dispatch_attempt,
                        s.prompt_hash, s.requested_delivery, s.origin,
-                       s.attachment_count
+                       s.attachment_count, s.discord_source_channel_id,
+                       s.discord_source_message_id
                 FROM message_queue q
                 JOIN submissions s ON s.submission_id = q.id
                 WHERE q.id = ? AND q.thread_id = ?
@@ -612,6 +615,8 @@ class SessionRuntime:
                             "correlation_id": idempotency_key,
                             "attachment_manifest_id": attachment_manifest_id,
                             "attachment_count": len(attachments or []),
+                            "discord_source_channel_id": discord_source_channel_id,
+                            "discord_source_message_id": discord_source_message_id,
                             "requested_mode": effective_agent_mode,
                             "requested_model_config": json.loads(model_row["desired_model_config"]),
                             "requested_agent": model_row["desired_agent"],
@@ -633,7 +638,8 @@ class SessionRuntime:
                            q.requested_session_config_version,
                            q.dispatch_attempt,
                            s.prompt_hash, s.requested_delivery, s.origin,
-                           s.attachment_count
+                           s.attachment_count, s.discord_source_channel_id,
+                           s.discord_source_message_id
                     FROM message_queue q
                     JOIN submissions s ON s.submission_id = q.id
                     WHERE q.id = ? AND q.thread_id = ?
@@ -651,6 +657,8 @@ class SessionRuntime:
                 )
                 or str(snapshot["requested_delivery"]) != mode
                 or str(snapshot["origin"]) != origin
+                or snapshot["discord_source_channel_id"] != discord_source_channel_id
+                or snapshot["discord_source_message_id"] != discord_source_message_id
                 or (
                     attachments is not None
                     and len(attachments) != int(snapshot["attachment_count"])

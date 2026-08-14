@@ -816,6 +816,99 @@ async def test_real_prompt_types_submit_once_without_thread_starter_duplicate(
         idempotency_key="discord-message:71",
         attachments=None,
         attachment_manifest_id=None,
+        discord_source_channel_id="10",
+        discord_source_message_id="71",
+    )
+
+
+@pytest.mark.asyncio
+async def test_attachment_only_thread_message_persists_explicit_reaction_source(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FakeThread:
+        def __init__(self, thread_id: int) -> None:
+            self.id = thread_id
+
+    binding = SimpleNamespace(binding_intent=BindingIntent.ACTIVE, sdk_session_id="session-1")
+    runtime = SimpleNamespace(binding=binding, send=AsyncMock())
+    prepared = SimpleNamespace(manifest_id="manifest-1")
+    sdk_attachment = object()
+    bot = CopilotDiscordBot(Settings(_env_file=None, data_dir=tmp_path))
+    bot.bindings = SimpleNamespace(by_thread=AsyncMock(return_value=binding))
+    bot.sessions = SimpleNamespace(ensure_attached=AsyncMock(return_value=runtime))
+    bot.attachment_service.prepare = AsyncMock(return_value=prepared)
+    bot.attachment_service.sdk_attachments = AsyncMock(return_value=[sdk_attachment])
+    monkeypatch.setattr(discord, "Thread", FakeThread)
+    monkeypatch.setattr(bot, "_is_restart_draining", AsyncMock(return_value=False))
+    message = SimpleNamespace(
+        id=72,
+        type=discord.MessageType.default,
+        author=SimpleNamespace(bot=False),
+        guild=object(),
+        channel=FakeThread(10),
+        content="",
+        attachments=[_DiscordAttachmentFixture()],
+        mentions=[],
+        reply=AsyncMock(),
+    )
+
+    await bot.on_message(message)
+
+    runtime.send.assert_awaited_once_with(
+        "Please inspect the attached files.",
+        idempotency_key="discord-message:72",
+        attachments=[sdk_attachment],
+        attachment_manifest_id="manifest-1",
+        discord_source_channel_id="10",
+        discord_source_message_id="72",
+    )
+
+
+@pytest.mark.asyncio
+async def test_first_channel_message_persists_original_message_reaction_source(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FakeThread:
+        id = 999
+
+    class FakeChannel:
+        id = 20
+
+    binding = SimpleNamespace(
+        sdk_session_id="session-created",
+        thread_id="999",
+    )
+    runtime = SimpleNamespace(binding=binding, send=AsyncMock())
+    bot = CopilotDiscordBot(Settings(_env_file=None, data_dir=tmp_path))
+    bot.projects = SimpleNamespace(channel_settings=AsyncMock(return_value=("text", False, 1)))
+    bot.creation = SimpleNamespace(create_from_source=AsyncMock(return_value=runtime))
+    bot.attachment_service.prepare = AsyncMock(return_value=None)
+    monkeypatch.setattr(discord, "Thread", FakeThread)
+    monkeypatch.setattr(bot, "_record_session_ui", AsyncMock())
+    monkeypatch.setattr(bot, "_is_restart_draining", AsyncMock(return_value=False))
+    message = SimpleNamespace(
+        id=73,
+        type=discord.MessageType.default,
+        author=SimpleNamespace(bot=False),
+        guild=object(),
+        channel=FakeChannel(),
+        content="create a session",
+        attachments=[],
+        mentions=[],
+        reply=AsyncMock(),
+    )
+
+    await bot.on_message(message)
+
+    runtime.send.assert_awaited_once_with(
+        "create a session",
+        idempotency_key="message:73",
+        attachments=None,
+        attachment_manifest_id=None,
+        discord_source_channel_id="20",
+        discord_source_message_id="73",
     )
 
 
@@ -1527,6 +1620,53 @@ def test_discord_http_errors_map_to_outbox_delivery_classes() -> None:
     assert rate_limit.retry_after == 2.5
     assert isinstance(transient, RenderTransientError)
     assert isinstance(permanent, RenderPermanentError)
+
+
+@pytest.mark.asyncio
+async def test_reaction_transport_adds_new_state_before_removing_only_bot_states(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[tuple[Any, ...]] = []
+    bot_user = SimpleNamespace(id=999)
+
+    class Message:
+        async def add_reaction(self, emoji: str) -> None:
+            calls.append(("add", emoji))
+
+        async def remove_reaction(self, emoji: str, user: Any) -> None:
+            calls.append(("remove", emoji, user))
+
+    class Channel:
+        id = 100
+
+        async def fetch_message(self, message_id: int) -> Message:
+            assert message_id == 200
+            calls.append(("fetch", message_id))
+            return Message()
+
+    bot = CopilotDiscordBot(Settings(_env_file=None, data_dir=tmp_path))
+    monkeypatch.setattr(bot, "get_channel", lambda _channel_id: Channel())
+    monkeypatch.setattr(type(bot), "user", property(lambda _self: bot_user))
+
+    await bot.reaction(
+        session_id="session-1",
+        payload={
+            "source_channel_id": "100",
+            "source_message_id": "200",
+            "state": "action",
+            "emoji": "🛠️",
+            "finalized": False,
+        },
+        idempotency_key="reaction:submission-1:3",
+    )
+    await bot.discord_requests.close()
+
+    assert calls[0] == ("fetch", 200)
+    assert calls[1] == ("add", "🛠️")
+    removals = calls[2:]
+    assert {call[1] for call in removals} == {"👀", "🧠", "❓", "✅", "❌"}
+    assert all(call[2] is bot_user for call in removals)
 
 
 def test_taskdeck_view_uses_short_in_place_controls() -> None:

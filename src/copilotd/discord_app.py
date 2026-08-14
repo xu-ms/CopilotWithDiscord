@@ -12,7 +12,7 @@ from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, TypeVar, cast
 
 import aiohttp
 import discord
@@ -96,6 +96,15 @@ from copilotd.core.supervisor import ExecutionStallMonitor
 from copilotd.core.task_registry import TaskRegistry
 from copilotd.core.worktrees import SessionCreationWorktreeAdapter, WorktreeManager
 from copilotd.discord_native import NativeDiscordRegistrar
+from copilotd.discord_requests import (
+    DiscordCoordinatorConfig,
+    DiscordDeadlineExceeded,
+    DiscordOperation,
+    DiscordPriority,
+    DiscordRequest,
+    DiscordRequestCoordinator,
+    DiscordRequestError,
+)
 from copilotd.ops.control import ServiceControlWorker
 from copilotd.ops.gateway_lock import GatewayInstanceLock
 from copilotd.ops.heartbeat import HeartbeatWriter
@@ -115,6 +124,7 @@ from copilotd.render.outbox import (
     RenderPermanentError,
     RenderRateLimited,
     RenderTransientError,
+    recover_reaction_outbox,
 )
 from copilotd.render.tables import TableAsset, render_table
 from copilotd.sdk.bridge import CopilotBridge
@@ -123,6 +133,7 @@ from copilotd.storage.database import Database
 from copilotd.storage.leases import OwnerLeaseStore
 
 logger = structlog.get_logger(__name__)
+T = TypeVar("T")
 _TABLE_DELIMITER = re.compile(r"^\s*\|?\s*:?-{3,}:?\s*(?:\|\s*:?-{3,}:?\s*)+\|?\s*$")
 _COLOR_BLURPLE = 0x5865F2
 _COLOR_GREEN = 0x57F287
@@ -156,6 +167,20 @@ class CopilotDiscordBot(commands.Bot):
             http_trace=discord_http_trace,
         )
         self.settings = settings
+        self.discord_requests = DiscordRequestCoordinator(
+            DiscordCoordinatorConfig(
+                requests_per_second=settings.discord_requests_per_second,
+                burst=settings.discord_request_burst,
+                route_requests_per_second=settings.discord_route_requests_per_second,
+                route_burst=settings.discord_route_burst,
+                queue_limit=settings.discord_request_queue_limit,
+                interaction_deadline_seconds=settings.discord_interaction_deadline_seconds,
+                stream_edit_interval_seconds=settings.discord_stream_edit_interval_seconds,
+                taskdeck_edit_interval_seconds=settings.discord_taskdeck_edit_interval_seconds,
+                reaction_interval_seconds=settings.discord_reaction_interval_seconds,
+                transient_attempts=settings.discord_request_transient_attempts,
+            )
+        )
         self.database = Database(settings.database_path)
         self.bridge = CopilotBridge(settings)
         self.capability_registry = CapabilityRegistry(settings)
@@ -182,6 +207,7 @@ class CopilotDiscordBot(commands.Bot):
             gateway_down_seconds=settings.gateway_down_restart_seconds,
             resume_suppression_seconds=settings.resume_suppression_seconds,
             metrics_provider=self._heartbeat_metrics,
+            discord_metrics_provider=self.discord_requests.snapshot,
         )
         self.ops_service = ops_service or LocalOpsSurface(self.database, settings)
         self.session_naming_adapter = session_naming_adapter
@@ -226,6 +252,36 @@ class CopilotDiscordBot(commands.Bot):
         if self.sessions is None:
             return 0, 0, None
         return self.sessions.heartbeat_metrics()
+
+    async def _discord_request(
+        self,
+        operation: DiscordOperation,
+        callback: Callable[[], Awaitable[T]],
+        *,
+        route_key: str,
+        target_key: str,
+        priority: DiscordPriority = DiscordPriority.FOREGROUND,
+        coalesce_key: str | None = None,
+        terminal: bool = False,
+        deadline: float | None = None,
+        min_interval_seconds: float = 0.0,
+    ) -> T:
+        return cast(
+            T,
+            await self.discord_requests.execute(
+                DiscordRequest(
+                    operation=operation,
+                    callback=callback,
+                    route_key=route_key,
+                    target_key=target_key,
+                    priority=priority,
+                    coalesce_key=coalesce_key,
+                    terminal=terminal,
+                    deadline=deadline,
+                    min_interval_seconds=min_interval_seconds,
+                )
+            ),
+        )
 
     async def setup_hook(self) -> None:
         await self.database.open()
@@ -358,6 +414,7 @@ class CopilotDiscordBot(commands.Bot):
                 thread_id=thread_id,
                 error=error,
             )
+        await recover_reaction_outbox(self.database)
         self.scheduler_worker = SchedulerWorker(
             self.scheduler_repository,
             ApplicationSchedulerAdapter(
@@ -411,9 +468,21 @@ class CopilotDiscordBot(commands.Bot):
         if self.settings.discord_guild_id is not None:
             guild = discord.Object(id=self.settings.discord_guild_id)
             self.tree.copy_global_to(guild=guild)
-            await self.tree.sync(guild=guild)
+            await self._discord_request(
+                DiscordOperation.COMMAND_SYNC,
+                lambda: self.tree.sync(guild=guild),
+                route_key="applications.commands.sync.guild",
+                target_key=f"guild:{guild.id}:commands",
+                priority=DiscordPriority.MAINTENANCE,
+            )
         else:
-            await self.tree.sync()
+            await self._discord_request(
+                DiscordOperation.COMMAND_SYNC,
+                self.tree.sync,
+                route_key="applications.commands.sync.global",
+                target_key="application:commands",
+                priority=DiscordPriority.MAINTENANCE,
+            )
 
     async def close(self) -> None:
         async with self._close_lock:
@@ -464,6 +533,10 @@ class CopilotDiscordBot(commands.Bot):
                 await self.dispatcher.drain()
             except Exception as error:
                 errors.append(error)
+        try:
+            await self.discord_requests.close()
+        except Exception as error:
+            errors.append(error)
         try:
             excluded = (
                 frozenset()
@@ -555,6 +628,36 @@ class CopilotDiscordBot(commands.Bot):
 
     async def on_ready(self) -> None:
         self.heartbeat.set_gateway("ready")
+        missing_permissions: dict[str, list[str]] = {}
+        for guild in self.guilds:
+            member = guild.me
+            if member is None:
+                continue
+            required = {
+                "Add Reactions": member.guild_permissions.add_reactions,
+                "Read Message History": member.guild_permissions.read_message_history,
+            }
+            missing = [name for name, allowed in required.items() if not allowed]
+            if missing:
+                missing_permissions[str(guild.id)] = missing
+        await self.database.execute(
+            """
+            INSERT INTO global_config(key, value, updated_at)
+            VALUES ('discord_permission_diagnostics', ?, ?)
+            ON CONFLICT(key) DO UPDATE SET
+                value = excluded.value, updated_at = excluded.updated_at
+            """,
+            (
+                json.dumps(missing_permissions, sort_keys=True),
+                time.time(),
+            ),
+        )
+        if missing_permissions:
+            await logger.awarning(
+                "discord_required_permissions_missing",
+                guilds=missing_permissions,
+                required=["Add Reactions", "Read Message History"],
+            )
         if self._accepting_handlers and (
             self._attachment_recovery_task is None or self._attachment_recovery_task.done()
         ):
@@ -594,13 +697,27 @@ class CopilotDiscordBot(commands.Bot):
                     message_id = int(recovery.source_message_id or "")
                     channel = self.get_channel(channel_id)
                     if channel is None:
-                        channel = await self.fetch_channel(channel_id)
+                        channel = await self._discord_request(
+                            DiscordOperation.FETCH,
+                            lambda channel_id=channel_id: self.fetch_channel(channel_id),
+                            route_key="channels.fetch",
+                            target_key=f"channel:{channel_id}",
+                            priority=DiscordPriority.MAINTENANCE,
+                        )
                     fetch_message = getattr(channel, "fetch_message", None)
                     if fetch_message is None:
                         raise AttachmentError(
                             "the durable Discord attachment source is not message-addressable"
                         )
-                    message = await fetch_message(message_id)
+                    message = await self._discord_request(
+                        DiscordOperation.FETCH,
+                        lambda fetch_message=fetch_message, message_id=message_id: fetch_message(
+                            message_id
+                        ),
+                        route_key="channels.messages.fetch",
+                        target_key=f"channel:{channel_id}:message:{message_id}",
+                        priority=DiscordPriority.MAINTENANCE,
+                    )
                     prepared = await self.attachment_service.prepare(
                         source_kind=recovery.source_kind,
                         source_id=recovery.source_id,
@@ -631,6 +748,8 @@ class CopilotDiscordBot(commands.Bot):
                     idempotency_key=recovery.idempotency_key,
                     attachments=sdk_attachments,
                     attachment_manifest_id=recovery.manifest_id,
+                    discord_source_channel_id=recovery.source_channel_id,
+                    discord_source_message_id=recovery.source_message_id,
                     origin=recovery.origin or "discord_message",
                 )
             except (discord.NotFound, discord.Forbidden, AttachmentError) as error:
@@ -861,9 +980,10 @@ class CopilotDiscordBot(commands.Bot):
                 (interaction_id,),
             )
             if row is None or row["form_schema"] is None:
-                await interaction.response.send_message(
+                await self._send_component_text(
+                    interaction,
+                    "Copilot form",
                     "This Copilot form has expired.",
-                    ephemeral=True,
                 )
                 return
             form = ElicitationForm.from_dict(json.loads(str(row["form_schema"])))
@@ -923,7 +1043,10 @@ class CopilotDiscordBot(commands.Bot):
         if message.author.bot or message.guild is None:
             return
         if await self._is_restart_draining():
-            await message.reply("copilotD is draining for restart; no new work was accepted.")
+            await self._reply_message(
+                message,
+                "copilotD is draining for restart; no new work was accepted.",
+            )
             return
         prompt = self._clean_prompt(message)
         if isinstance(message.channel, discord.Thread):
@@ -932,9 +1055,10 @@ class CopilotDiscordBot(commands.Bot):
                 return
             if binding.binding_intent != BindingIntent.ACTIVE:
                 if binding.binding_intent == BindingIntent.CLOSED:
-                    await message.reply(
+                    await self._reply_message(
+                        message,
                         "[CD-SESSION-002] This session is closed; use `/session resume` "
-                        "in this original thread."
+                        "in this original thread.",
                     )
                 return
             sessions = self._require_sessions()
@@ -961,11 +1085,19 @@ class CopilotDiscordBot(commands.Bot):
                     idempotency_key=f"discord-message:{message.id}",
                     attachments=sdk_attachments,
                     attachment_manifest_id=(None if prepared is None else prepared.manifest_id),
+                    discord_source_channel_id=str(message.channel.id),
+                    discord_source_message_id=str(message.id),
                 )
             except AttachmentError as error:
-                await message.reply(f"copilotD could not prepare the attachments: `{error}`")
+                await self._reply_message(
+                    message,
+                    f"copilotD could not prepare the attachments: `{error}`",
+                )
             except Exception as error:
-                await message.reply(f"copilotD could not submit this message: `{error}`")
+                await self._reply_message(
+                    message,
+                    f"copilotD could not submit this message: `{error}`",
+                )
             return
 
         settings = await self._require_projects().channel_settings(str(message.channel.id))
@@ -1011,6 +1143,8 @@ class CopilotDiscordBot(commands.Bot):
                 idempotency_key=f"message:{message.id}",
                 attachments=sdk_attachments,
                 attachment_manifest_id=None if prepared is None else prepared.manifest_id,
+                discord_source_channel_id=str(message.channel.id),
+                discord_source_message_id=str(message.id),
             )
             await logger.ainfo(
                 "discord_session_created",
@@ -1018,9 +1152,24 @@ class CopilotDiscordBot(commands.Bot):
                 sdk_session_id=runtime.binding.sdk_session_id,
             )
         except AttachmentError as error:
-            await message.reply(f"copilotD could not prepare the attachments: `{error}`")
+            await self._reply_message(
+                message,
+                f"copilotD could not prepare the attachments: `{error}`",
+            )
         except Exception as error:
-            await message.reply(f"copilotD could not create the session: `{error}`")
+            await self._reply_message(
+                message,
+                f"copilotD could not create the session: `{error}`",
+            )
+
+    async def _reply_message(self, message: discord.Message, content: str) -> None:
+        await self._discord_request(
+            DiscordOperation.SEND,
+            lambda: message.reply(content),
+            route_key="channels.messages.send",
+            target_key=f"channel:{message.channel.id}",
+            priority=DiscordPriority.FOREGROUND,
+        )
 
     async def send(
         self,
@@ -1043,6 +1192,7 @@ class CopilotDiscordBot(commands.Bot):
                     payload=payload,
                     plan=plan,
                     delivery_id=idempotency_key,
+                    lane=lane,
                 )
             else:
                 binding = await self._require_bindings().by_session(session_id)
@@ -1060,9 +1210,12 @@ class CopilotDiscordBot(commands.Bot):
                     payload=payload,
                     plan=plan,
                     delivery_id=idempotency_key,
+                    lane=lane,
                 )
         except RenderDeliveryError:
             raise
+        except DiscordRequestError as error:
+            raise RenderTransientError(str(error)) from error
         except (discord.HTTPException, OSError, TimeoutError) as error:
             raise _render_delivery_error(error) from error
         await logger.adebug(
@@ -1086,7 +1239,13 @@ class CopilotDiscordBot(commands.Bot):
         try:
             if session_id.startswith(("thread:", "channel:", "ops:")):
                 destination = await self._render_destination(session_id)
-                message = await destination.fetch_message(int(message_id))
+                message = await self._discord_request(
+                    DiscordOperation.FETCH,
+                    lambda: destination.fetch_message(int(message_id)),
+                    route_key="channels.messages.fetch",
+                    target_key=f"{_channel_target_key(destination)}:message:{message_id}",
+                    priority=DiscordPriority.MAINTENANCE,
+                )
                 plan = await _discord_render_plan(
                     payload,
                     max_bytes=self.settings.discord_upload_max_bytes,
@@ -1098,13 +1257,20 @@ class CopilotDiscordBot(commands.Bot):
                     plan=plan,
                     delivery_id=idempotency_key,
                     first_message=message,
+                    lane=lane,
                 )
             else:
                 binding = await self._require_bindings().by_session(session_id)
                 if binding is None:
                     raise RenderPermanentError(f"no Discord binding for SDK session {session_id}")
                 thread = await self._thread_for_session(session_id)
-                message = await thread.fetch_message(int(message_id))
+                message = await self._discord_request(
+                    DiscordOperation.FETCH,
+                    lambda: thread.fetch_message(int(message_id)),
+                    route_key="channels.messages.fetch",
+                    target_key=f"{_channel_target_key(thread)}:message:{message_id}",
+                    priority=DiscordPriority.MAINTENANCE,
+                )
                 plan = await _discord_render_plan(
                     payload,
                     allowed_roots=(binding.cwd_snapshot,),
@@ -1117,12 +1283,102 @@ class CopilotDiscordBot(commands.Bot):
                     plan=plan,
                     delivery_id=idempotency_key,
                     first_message=message,
+                    lane=lane,
                 )
         except RenderDeliveryError:
             raise
+        except DiscordRequestError as error:
+            raise RenderTransientError(str(error)) from error
         except (discord.HTTPException, OSError, TimeoutError) as error:
             raise _render_delivery_error(error) from error
         await logger.adebug("render_edited", lane=lane, discord_message_id=message_id)
+
+    async def reaction(
+        self,
+        *,
+        session_id: str,
+        payload: dict[str, Any],
+        idempotency_key: str,
+    ) -> None:
+        channel_id = int(str(payload["source_channel_id"]))
+        message_id = int(str(payload["source_message_id"]))
+        state = str(payload["state"])
+        emoji = str(payload["emoji"])
+        terminal = bool(payload.get("finalized"))
+        priority = DiscordPriority.FOREGROUND if terminal else DiscordPriority.BACKGROUND
+        logical_target = f"channel:{channel_id}:message:{message_id}:reaction-state"
+        try:
+            channel = self.get_channel(channel_id)
+            if channel is None:
+                channel = await self._discord_request(
+                    DiscordOperation.FETCH,
+                    lambda: self.fetch_channel(channel_id),
+                    route_key="channels.fetch",
+                    target_key=f"channel:{channel_id}",
+                    priority=DiscordPriority.MAINTENANCE,
+                )
+            fetch_message = getattr(channel, "fetch_message", None)
+            if fetch_message is None:
+                raise RenderPermanentError("reaction source channel is not message-addressable")
+            message = await self._discord_request(
+                DiscordOperation.FETCH,
+                lambda: fetch_message(message_id),
+                route_key="channels.messages.fetch",
+                target_key=f"channel:{channel_id}:message:{message_id}",
+                priority=DiscordPriority.MAINTENANCE,
+            )
+            await self._discord_request(
+                DiscordOperation.ADD_REACTION,
+                lambda: message.add_reaction(emoji),
+                route_key="channels.messages.reactions.add",
+                target_key=logical_target,
+                priority=priority,
+                coalesce_key=logical_target,
+                terminal=terminal,
+                min_interval_seconds=self.settings.discord_reaction_interval_seconds,
+            )
+            bot_user = self.user
+            if bot_user is None:
+                raise RenderTransientError(
+                    "Discord bot identity is unavailable for reaction cleanup"
+                )
+            for old_emoji in ("👀", "🧠", "🛠️", "❓", "✅", "❌"):
+                if old_emoji == emoji:
+                    continue
+
+                await self._discord_request(
+                    DiscordOperation.REMOVE_REACTION,
+                    lambda value=old_emoji: message.remove_reaction(value, bot_user),
+                    route_key="channels.messages.reactions.remove-own",
+                    target_key=logical_target,
+                    priority=priority,
+                    terminal=terminal,
+                )
+        except RenderDeliveryError:
+            raise
+        except DiscordRequestError as error:
+            raise RenderTransientError(str(error)) from error
+        except (discord.HTTPException, OSError, TimeoutError) as error:
+            mapped = _render_delivery_error(error)
+            if isinstance(mapped, RenderPermanentError):
+                await logger.awarning(
+                    "discord_reaction_delivery_diagnostic",
+                    session_id=session_id,
+                    source_channel_id=str(channel_id),
+                    source_message_id=str(message_id),
+                    state=state,
+                    error_type=type(error).__name__,
+                    status=getattr(error, "status", None),
+                )
+            raise mapped from error
+        await logger.adebug(
+            "discord_reaction_delivered",
+            session_id=session_id,
+            source_channel_id=str(channel_id),
+            source_message_id=str(message_id),
+            state=state,
+            idempotency_key=idempotency_key,
+        )
 
     async def _deliver_render_plan(
         self,
@@ -1133,6 +1389,7 @@ class CopilotDiscordBot(commands.Bot):
         plan: DiscordRenderPlan,
         delivery_id: str,
         first_message: discord.Message | None = None,
+        lane: str = "status",
     ) -> str:
         agent_id = str(payload.get("agent_id") or "")
         delivery_family = _render_delivery_family(delivery_id)
@@ -1159,8 +1416,15 @@ class CopilotDiscordBot(commands.Bot):
             )
             if family_checkpoint is not None:
                 try:
-                    first_message = await thread.fetch_message(
-                        int(family_checkpoint["discord_message_id"])
+                    checkpoint_message_id = int(family_checkpoint["discord_message_id"])
+                    first_message = await self._discord_request(
+                        DiscordOperation.FETCH,
+                        lambda: thread.fetch_message(checkpoint_message_id),
+                        route_key="channels.messages.fetch",
+                        target_key=(
+                            f"{_channel_target_key(thread)}:message:{checkpoint_message_id}"
+                        ),
+                        priority=DiscordPriority.MAINTENANCE,
                     )
                 except (discord.NotFound, KeyError):
                     first_message = None
@@ -1365,8 +1629,17 @@ class CopilotDiscordBot(commands.Bot):
             if recovery_message is None and previous_intent is not None:
                 if previous_intent["discord_message_id"] is not None:
                     try:
-                        recovery_message = await thread.fetch_message(
-                            int(previous_intent["discord_message_id"])
+                        recovery_message_id = int(previous_intent["discord_message_id"])
+                        recovery_message = await self._discord_request(
+                            DiscordOperation.FETCH,
+                            lambda recovery_message_id=recovery_message_id: thread.fetch_message(
+                                recovery_message_id
+                            ),
+                            route_key="channels.messages.fetch",
+                            target_key=(
+                                f"{_channel_target_key(thread)}:message:{recovery_message_id}"
+                            ),
+                            priority=DiscordPriority.MAINTENANCE,
                         )
                     except (discord.NotFound, KeyError):
                         recovery_message = None
@@ -1378,37 +1651,63 @@ class CopilotDiscordBot(commands.Bot):
                     )
 
             if recovery_message is not None:
-                await recovery_message.edit(
-                    content=batch.content or "\u200b",
-                    attachments=_discord_files(list(batch.assets)),
-                    embeds=_discord_embeds(batch.embeds),
-                    view=(
-                        _render_view(
-                            payload,
-                            enable_task_actions=self.task_action_adapter is not None,
+                edit_target = f"{_channel_target_key(thread)}:message:{recovery_message.id}:render"
+                await self._discord_request(
+                    DiscordOperation.EDIT,
+                    lambda recovery_message=recovery_message, batch=batch, index=index: (
+                        recovery_message.edit(
+                            content=batch.content or "\u200b",
+                            attachments=_discord_files(list(batch.assets)),
+                            embeds=_discord_embeds(batch.embeds),
+                            view=(
+                                _render_view(
+                                    payload,
+                                    enable_task_actions=self.task_action_adapter is not None,
+                                )
+                                if index == 0
+                                else None
+                            ),
                         )
-                        if index == 0
-                        else None
                     ),
+                    route_key="channels.messages.edit",
+                    target_key=edit_target,
+                    priority=(
+                        DiscordPriority.FOREGROUND
+                        if payload.get("finalized")
+                        else DiscordPriority.BACKGROUND
+                    ),
+                    coalesce_key=edit_target,
+                    terminal=bool(payload.get("finalized")),
+                    min_interval_seconds=_render_min_interval(self, lane),
                 )
                 discord_message_id = str(recovery_message.id)
                 if index == 0:
                     first_message = recovery_message
             else:
-                sent = await thread.send(
-                    content=batch.content or "\u200b",
-                    files=_discord_files(list(batch.assets)),
-                    embeds=_discord_embeds(batch.embeds),
-                    view=(
-                        _render_view(
-                            payload,
-                            enable_task_actions=self.task_action_adapter is not None,
-                        )
-                        if index == 0
-                        else None
+                sent = await self._discord_request(
+                    DiscordOperation.SEND,
+                    lambda batch=batch, index=index, nonce=nonce: thread.send(
+                        content=batch.content or "\u200b",
+                        files=_discord_files(list(batch.assets)),
+                        embeds=_discord_embeds(batch.embeds),
+                        view=(
+                            _render_view(
+                                payload,
+                                enable_task_actions=self.task_action_adapter is not None,
+                            )
+                            if index == 0
+                            else None
+                        ),
+                        silent=True,
+                        nonce=nonce,
                     ),
-                    silent=True,
-                    nonce=nonce,
+                    route_key="channels.messages.send",
+                    target_key=_channel_target_key(thread),
+                    priority=(
+                        DiscordPriority.FOREGROUND
+                        if payload.get("finalized")
+                        else DiscordPriority.BACKGROUND
+                    ),
                 )
                 discord_message_id = str(sent.id)
             if first_message_id is None:
@@ -1542,12 +1841,26 @@ class CopilotDiscordBot(commands.Bot):
         history = getattr(thread, "history", None)
         if not callable(history):
             return None
+
+        async def read_history() -> list[discord.Message]:
+            return [
+                message
+                async for message in history(
+                    limit=None,
+                    after=datetime.fromtimestamp(max(0, created_at - 1), UTC),
+                    oldest_first=False,
+                )
+            ]
+
         try:
-            async for message in history(
-                limit=None,
-                after=datetime.fromtimestamp(max(0, created_at - 1), UTC),
-                oldest_first=False,
-            ):
+            messages = await self._discord_request(
+                DiscordOperation.HISTORY,
+                read_history,
+                route_key="channels.messages.history",
+                target_key=f"{_channel_target_key(thread)}:history",
+                priority=DiscordPriority.MAINTENANCE,
+            )
+            for message in messages:
                 if str(getattr(message, "nonce", "")) == nonce:
                     return message
         except discord.HTTPException as error:
@@ -1598,8 +1911,21 @@ class CopilotDiscordBot(commands.Bot):
                 if str(batch["discord_message_id"]) in current_message_ids:
                     continue
                 try:
-                    message = await thread.fetch_message(int(batch["discord_message_id"]))
-                    await message.delete()
+                    old_message_id = int(batch["discord_message_id"])
+                    message = await self._discord_request(
+                        DiscordOperation.FETCH,
+                        lambda old_message_id=old_message_id: thread.fetch_message(old_message_id),
+                        route_key="channels.messages.fetch",
+                        target_key=f"{_channel_target_key(thread)}:message:{old_message_id}",
+                        priority=DiscordPriority.MAINTENANCE,
+                    )
+                    await self._discord_request(
+                        DiscordOperation.DELETE,
+                        message.delete,
+                        route_key="channels.messages.delete",
+                        target_key=f"{_channel_target_key(thread)}:message:{old_message_id}",
+                        priority=DiscordPriority.MAINTENANCE,
+                    )
                 except discord.NotFound:
                     continue
         async with self.database.transaction() as connection:
@@ -1661,7 +1987,13 @@ class CopilotDiscordBot(commands.Bot):
         try:
             channel = self.get_channel(int(binding.thread_id))
             if channel is None:
-                channel = await self.fetch_channel(int(binding.thread_id))
+                channel = await self._discord_request(
+                    DiscordOperation.FETCH,
+                    lambda: self.fetch_channel(int(binding.thread_id)),
+                    route_key="channels.fetch",
+                    target_key=f"channel:{binding.thread_id}",
+                    priority=DiscordPriority.MAINTENANCE,
+                )
         except discord.NotFound as error:
             await self._parent_diagnostic(binding, "bound thread was deleted")
             raise RenderPermanentError(
@@ -1680,7 +2012,13 @@ class CopilotDiscordBot(commands.Bot):
             raise RenderPermanentError(f"bound Discord thread is locked: {binding.thread_id}")
         if channel.archived:
             try:
-                await channel.edit(archived=False)
+                await self._discord_request(
+                    DiscordOperation.CHANNEL_MUTATION,
+                    lambda: channel.edit(archived=False),
+                    route_key="channels.threads.edit",
+                    target_key=_channel_target_key(channel),
+                    priority=DiscordPriority.FOREGROUND,
+                )
             except discord.HTTPException as error:
                 await self._parent_diagnostic(binding, "archived thread could not be reopened")
                 raise _render_delivery_error(error) from error
@@ -1694,17 +2032,35 @@ class CopilotDiscordBot(commands.Bot):
             channel_id = destination_id.removeprefix("thread:")
             channel = self.get_channel(int(channel_id))
             if channel is None:
-                channel = await self.fetch_channel(int(channel_id))
+                channel = await self._discord_request(
+                    DiscordOperation.FETCH,
+                    lambda: self.fetch_channel(int(channel_id)),
+                    route_key="channels.fetch",
+                    target_key=f"channel:{channel_id}",
+                    priority=DiscordPriority.MAINTENANCE,
+                )
             if not isinstance(channel, discord.Thread):
                 raise RenderPermanentError(f"schedule render thread is unavailable: {channel_id}")
             if channel.archived and not channel.locked:
-                await channel.edit(archived=False)
+                await self._discord_request(
+                    DiscordOperation.CHANNEL_MUTATION,
+                    lambda: channel.edit(archived=False),
+                    route_key="channels.threads.edit",
+                    target_key=_channel_target_key(channel),
+                    priority=DiscordPriority.FOREGROUND,
+                )
             return channel
         if destination_id.startswith("channel:"):
             channel_id = destination_id.removeprefix("channel:")
             channel = self.get_channel(int(channel_id))
             if channel is None:
-                channel = await self.fetch_channel(int(channel_id))
+                channel = await self._discord_request(
+                    DiscordOperation.FETCH,
+                    lambda: self.fetch_channel(int(channel_id)),
+                    route_key="channels.fetch",
+                    target_key=f"channel:{channel_id}",
+                    priority=DiscordPriority.MAINTENANCE,
+                )
             if isinstance(channel, discord.TextChannel):
                 return channel
             raise RenderPermanentError(
@@ -1829,19 +2185,32 @@ class CopilotDiscordBot(commands.Bot):
         try:
             channel = self.get_channel(int(parent_channel_id))
             if channel is None:
-                channel = await self.fetch_channel(int(parent_channel_id))
+                channel = await self._discord_request(
+                    DiscordOperation.FETCH,
+                    lambda: self.fetch_channel(int(parent_channel_id)),
+                    route_key="channels.fetch",
+                    target_key=f"channel:{parent_channel_id}",
+                    priority=DiscordPriority.MAINTENANCE,
+                )
             if not hasattr(channel, "send"):
                 raise TypeError("parent channel cannot receive messages")
-            message = await channel.send(
-                _bounded_discord_text(
-                    (
-                        f"copilotD preserved session `{binding.sdk_session_id}`, but rendering "
-                        f"to <#{binding.thread_id}> is blocked: {reason}. "
-                        "The SDK session remains durable; restore the original thread and resume."
+            message = await self._discord_request(
+                DiscordOperation.SEND,
+                lambda: channel.send(
+                    _bounded_discord_text(
+                        (
+                            f"copilotD preserved session `{binding.sdk_session_id}`, but rendering "
+                            f"to <#{binding.thread_id}> is blocked: {reason}. "
+                            "The SDK session remains durable; restore the original thread "
+                            "and resume."
+                        ),
+                        1800,
                     ),
-                    1800,
+                    silent=True,
                 ),
-                silent=True,
+                route_key="channels.messages.send",
+                target_key=f"channel:{parent_channel_id}",
+                priority=DiscordPriority.FOREGROUND,
             )
         except (discord.HTTPException, OSError, TypeError, ValueError) as error:
             await self.database.execute(
@@ -2038,6 +2407,23 @@ class CopilotDiscordBot(commands.Bot):
             "sdk_session_id",
             binding.sdk_session_id,
         )
+        reaction_diagnostics = await self.database.fetchone(
+            """
+            SELECT COUNT(*) AS tracked,
+                   SUM(CASE WHEN last_error IS NOT NULL THEN 1 ELSE 0 END) AS failed
+            FROM submission_reactions WHERE sdk_session_id = ?
+            """,
+            (binding.sdk_session_id,),
+        )
+        permission_diagnostics = await self.database.fetchone(
+            "SELECT value FROM global_config WHERE key = 'discord_permission_diagnostics'"
+        )
+        coordinator = self.discord_requests.snapshot()
+        permission_text = (
+            "ok"
+            if permission_diagnostics is None or permission_diagnostics["value"] == "{}"
+            else f"missing: {permission_diagnostics['value']}"
+        )
 
         desired_model = _json_object(row["desired_model_config"])
         pending_model = _json_object(row["pending_model_config"])
@@ -2124,6 +2510,14 @@ class CopilotDiscordBot(commands.Bot):
             f"tasks: `{task_states}`",
             f"schedules app/runtime: `{app_schedule_states}` / `{runtime_schedule_states}`",
             f"liveness: `{liveness_states}` · render outbox pending `{counts['outbox']}`",
+            f"reactions tracked/diagnostic failures: "
+            f"`{0 if reaction_diagnostics is None else int(reaction_diagnostics['tracked'])}` / "
+            f"`{0 if reaction_diagnostics is None else int(reaction_diagnostics['failed'] or 0)}`",
+            f"Discord REST queue current/peak: `{coordinator['queue_depth']}` / "
+            f"`{coordinator['queue_peak']}` · 429 `{coordinator['rate_limited_429']}` · "
+            f"coalesced/dropped `{coordinator['coalesced']}/{coordinator['dropped']}` · "
+            f"deadline misses `{coordinator['deadline_misses']}`",
+            f"Discord permissions Add Reactions / Read Message History: `{permission_text}`",
             f"context: {context_text}",
             f"usage: {usage_text}",
             f"reconciliation mode/model/config: `{row['mode_reconciliation_state']}` "
@@ -2355,7 +2749,13 @@ class CopilotDiscordBot(commands.Bot):
                     parent_channel_id=str(interaction.channel.parent_id),
                     display_name=normalized,
                 )
-                await interaction.channel.edit(name=normalized)
+                await self._discord_request(
+                    DiscordOperation.CHANNEL_MUTATION,
+                    lambda: interaction.channel.edit(name=normalized),
+                    route_key="channels.threads.edit",
+                    target_key=f"channel:{interaction.channel.id}",
+                    priority=DiscordPriority.FOREGROUND,
+                )
                 native_state = "unsupported"
                 adapter = self.session_naming_adapter
                 if adapter is not None:
@@ -3383,7 +3783,13 @@ class CopilotDiscordBot(commands.Bot):
             target: discord.Message,
         ) -> None:
             async def operation(_: CommandInvocation) -> str:
-                await target.pin(reason=f"copilotD pin by interaction {interaction.id}")
+                await self._discord_request(
+                    DiscordOperation.PIN,
+                    lambda: target.pin(reason=f"copilotD pin by interaction {interaction.id}"),
+                    route_key="channels.messages.pin",
+                    target_key=f"channel:{target.channel.id}:message:{target.id}",
+                    priority=DiscordPriority.FOREGROUND,
+                )
                 await self.database.execute(
                     """
                     INSERT INTO pinned_message_provenance(
@@ -3803,7 +4209,13 @@ class DiscordThreadGateway:
         token = creation_token[:8]
         if isinstance(channel, discord.TextChannel):
             try:
-                source = await channel.fetch_message(int(source_id))
+                source = await self._bot._discord_request(
+                    DiscordOperation.FETCH,
+                    lambda: channel.fetch_message(int(source_id)),
+                    route_key="channels.messages.fetch",
+                    target_key=f"channel:{channel_id}:message:{source_id}",
+                    priority=DiscordPriority.MAINTENANCE,
+                )
             except (discord.NotFound, ValueError):
                 source = None
             if source is not None and source.thread is not None:
@@ -3829,16 +4241,43 @@ class DiscordThreadGateway:
         thread_name = f"{name[:75]} [cd:{creation_token[:8]}]"
         if layout == "text" and isinstance(channel, discord.TextChannel):
             try:
-                source = await channel.fetch_message(int(source_id))
+                source = await self._bot._discord_request(
+                    DiscordOperation.FETCH,
+                    lambda: channel.fetch_message(int(source_id)),
+                    route_key="channels.messages.fetch",
+                    target_key=f"channel:{channel_id}:message:{source_id}",
+                    priority=DiscordPriority.MAINTENANCE,
+                )
             except (discord.NotFound, ValueError):
-                source = await channel.send(f"Starting copilotD session `{creation_token[:8]}`")
-            thread = await source.create_thread(name=thread_name, auto_archive_duration=1440)
+                source = await self._bot._discord_request(
+                    DiscordOperation.SEND,
+                    lambda: channel.send(f"Starting copilotD session `{creation_token[:8]}`"),
+                    route_key="channels.messages.send",
+                    target_key=f"channel:{channel_id}",
+                    priority=DiscordPriority.FOREGROUND,
+                )
+            thread = await self._bot._discord_request(
+                DiscordOperation.THREAD_CREATE,
+                lambda: source.create_thread(
+                    name=thread_name,
+                    auto_archive_duration=1440,
+                ),
+                route_key="channels.threads.create-from-message",
+                target_key=f"channel:{channel_id}:message:{source.id}",
+                priority=DiscordPriority.FOREGROUND,
+            )
             return ThreadReference(str(thread.id))
         if layout == "forum" and isinstance(channel, discord.ForumChannel):
-            created = await channel.create_thread(
-                name=thread_name,
-                content=f"Starting copilotD session `{creation_token[:8]}`",
-                auto_archive_duration=1440,
+            created = await self._bot._discord_request(
+                DiscordOperation.THREAD_CREATE,
+                lambda: channel.create_thread(
+                    name=thread_name,
+                    content=f"Starting copilotD session `{creation_token[:8]}`",
+                    auto_archive_duration=1440,
+                ),
+                route_key="channels.forum-posts.create",
+                target_key=f"channel:{channel_id}",
+                priority=DiscordPriority.FOREGROUND,
             )
             return ThreadReference(str(created.thread.id))
         raise ValueError(
@@ -3852,7 +4291,13 @@ class DiscordThreadGateway:
     ) -> discord.TextChannel | discord.ForumChannel:
         channel = self._bot.get_channel(int(channel_id))
         if channel is None:
-            channel = await self._bot.fetch_channel(int(channel_id))
+            channel = await self._bot._discord_request(
+                DiscordOperation.FETCH,
+                lambda: self._bot.fetch_channel(int(channel_id)),
+                route_key="channels.fetch",
+                target_key=f"channel:{channel_id}",
+                priority=DiscordPriority.MAINTENANCE,
+            )
         if not isinstance(channel, (discord.TextChannel, discord.ForumChannel)):
             raise ValueError("channel does not support session threads")
         return channel
@@ -3875,7 +4320,22 @@ class DiscordInteractionResponder(CommandResponder):
         if self._interaction.response.is_done():
             return
         try:
-            await self._interaction.response.defer(ephemeral=ephemeral)
+            await self._bot._discord_request(
+                DiscordOperation.INTERACTION_DEFER,
+                lambda: self._interaction.response.defer(ephemeral=ephemeral),
+                route_key="interactions.initial_response",
+                target_key=_interaction_target_key(self._interaction),
+                priority=DiscordPriority.DEADLINE_CRITICAL,
+                deadline=_interaction_deadline(self._bot, self._interaction),
+            )
+        except DiscordDeadlineExceeded as error:
+            self._unknown_interaction = True
+            self.warn(
+                "discord_interaction_deadline_missed",
+                command=self._name,
+                operation="defer",
+            )
+            raise UnknownInteractionError() from error
         except discord.HTTPException as error:
             if not _is_unknown_interaction(error):
                 raise
@@ -3891,16 +4351,33 @@ class DiscordInteractionResponder(CommandResponder):
             return
         try:
             if len(content) <= 1850:
-                await self._interaction.response.send_message(
-                    content,
-                    ephemeral=ephemeral,
+                await self._bot._discord_request(
+                    DiscordOperation.INTERACTION_RESPONSE,
+                    lambda: self._interaction.response.send_message(
+                        content,
+                        ephemeral=ephemeral,
+                    ),
+                    route_key="interactions.initial_response",
+                    target_key=_interaction_target_key(self._interaction),
+                    priority=DiscordPriority.DEADLINE_CRITICAL,
+                    deadline=_interaction_deadline(self._bot, self._interaction),
                 )
             else:
-                await self._interaction.response.send_message(
-                    "The command result is attached.",
-                    file=_text_file(content, self._name),
-                    ephemeral=ephemeral,
+                await self._bot._discord_request(
+                    DiscordOperation.INTERACTION_RESPONSE,
+                    lambda: self._interaction.response.send_message(
+                        "The command result is attached.",
+                        file=_text_file(content, self._name),
+                        ephemeral=ephemeral,
+                    ),
+                    route_key="interactions.initial_response",
+                    target_key=_interaction_target_key(self._interaction),
+                    priority=DiscordPriority.DEADLINE_CRITICAL,
+                    deadline=_interaction_deadline(self._bot, self._interaction),
                 )
+        except DiscordDeadlineExceeded as error:
+            self._unknown_interaction = True
+            raise UnknownInteractionError() from error
         except discord.HTTPException as error:
             if not _is_unknown_interaction(error):
                 raise
@@ -3921,7 +4398,24 @@ class DiscordInteractionResponder(CommandResponder):
 
     async def send_modal(self, modal: discord.ui.Modal) -> None:
         try:
-            await self._interaction.response.send_modal(modal)
+            await self._bot._discord_request(
+                DiscordOperation.INTERACTION_MODAL,
+                lambda: self._interaction.response.send_modal(modal),
+                route_key="interactions.initial_response",
+                target_key=_interaction_target_key(self._interaction),
+                priority=DiscordPriority.DEADLINE_CRITICAL,
+                deadline=_interaction_deadline(self._bot, self._interaction),
+            )
+        except DiscordDeadlineExceeded:
+            self._unknown_interaction = True
+            self.warn(
+                "discord_interaction_deadline_missed",
+                command=self._name,
+                operation="modal",
+            )
+            await self._send_thread_fallback(
+                "The interaction deadline elapsed before the form opened; use the latest control."
+            )
         except discord.HTTPException as error:
             if not _is_unknown_interaction(error):
                 raise
@@ -3950,17 +4444,29 @@ class DiscordInteractionResponder(CommandResponder):
                 raise CDDiscordError(
                     "interaction expired and its Discord thread cannot receive the file"
                 )
-            await channel.send(
-                "⚠️ Discord expired this interaction (`10062`); result attached.",
-                file=file,
-                silent=True,
+            await self._bot._discord_request(
+                DiscordOperation.SEND,
+                lambda: channel.send(
+                    "⚠️ Discord expired this interaction (`10062`); result attached.",
+                    file=file,
+                    silent=True,
+                ),
+                route_key="channels.messages.send",
+                target_key=_channel_target_key(channel),
+                priority=DiscordPriority.FOREGROUND,
             )
             return
         try:
-            await self._interaction.followup.send(
-                message,
-                file=file,
-                ephemeral=ephemeral,
+            await self._bot._discord_request(
+                DiscordOperation.INTERACTION_FOLLOWUP,
+                lambda: self._interaction.followup.send(
+                    message,
+                    file=file,
+                    ephemeral=ephemeral,
+                ),
+                route_key="interactions.followup",
+                target_key=f"{_interaction_target_key(self._interaction)}:followup",
+                priority=DiscordPriority.FOREGROUND,
             )
         except discord.HTTPException as error:
             if not _is_unknown_interaction(error):
@@ -3971,10 +4477,16 @@ class DiscordInteractionResponder(CommandResponder):
                 raise CDDiscordError(
                     "interaction expired and its Discord thread cannot receive the file"
                 ) from error
-            await channel.send(
-                "⚠️ Discord expired this interaction (`10062`); result attached.",
-                file=discord.File(io.BytesIO(content), filename=filename),
-                silent=True,
+            await self._bot._discord_request(
+                DiscordOperation.SEND,
+                lambda: channel.send(
+                    "⚠️ Discord expired this interaction (`10062`); result attached.",
+                    file=discord.File(io.BytesIO(content), filename=filename),
+                    silent=True,
+                ),
+                route_key="channels.messages.send",
+                target_key=_channel_target_key(channel),
+                priority=DiscordPriority.FOREGROUND,
             )
 
     def warn(self, message: str, **fields: Any) -> None:
@@ -3982,12 +4494,24 @@ class DiscordInteractionResponder(CommandResponder):
 
     async def _send_followup_payload(self, content: str, *, ephemeral: bool) -> None:
         if len(content) <= 1850:
-            await self._interaction.followup.send(content, ephemeral=ephemeral)
+            await self._bot._discord_request(
+                DiscordOperation.INTERACTION_FOLLOWUP,
+                lambda: self._interaction.followup.send(content, ephemeral=ephemeral),
+                route_key="interactions.followup",
+                target_key=f"{_interaction_target_key(self._interaction)}:followup",
+                priority=DiscordPriority.FOREGROUND,
+            )
             return
-        await self._interaction.followup.send(
-            "The command result is attached.",
-            file=_text_file(content, self._name),
-            ephemeral=ephemeral,
+        await self._bot._discord_request(
+            DiscordOperation.INTERACTION_FOLLOWUP,
+            lambda: self._interaction.followup.send(
+                "The command result is attached.",
+                file=_text_file(content, self._name),
+                ephemeral=ephemeral,
+            ),
+            route_key="interactions.followup",
+            target_key=f"{_interaction_target_key(self._interaction)}:followup",
+            priority=DiscordPriority.FOREGROUND,
         )
 
     async def _send_thread_fallback(self, content: str) -> None:
@@ -4001,12 +4525,24 @@ class DiscordInteractionResponder(CommandResponder):
             "operation and is posting the durable result in-thread."
         )
         if len(content) + len(warning) + 2 <= 1850:
-            await channel.send(f"{warning}\n\n{content}", silent=True)
+            await self._bot._discord_request(
+                DiscordOperation.SEND,
+                lambda: channel.send(f"{warning}\n\n{content}", silent=True),
+                route_key="channels.messages.send",
+                target_key=_channel_target_key(channel),
+                priority=DiscordPriority.FOREGROUND,
+            )
             return
-        await channel.send(
-            warning,
-            file=_text_file(content, self._name),
-            silent=True,
+        await self._bot._discord_request(
+            DiscordOperation.SEND,
+            lambda: channel.send(
+                warning,
+                file=_text_file(content, self._name),
+                silent=True,
+            ),
+            route_key="channels.messages.send",
+            target_key=_channel_target_key(channel),
+            priority=DiscordPriority.FOREGROUND,
         )
 
 
@@ -4152,6 +4688,11 @@ class ElicitationResponseModal(discord.ui.Modal):
             self.add_item(text_input)
 
     async def on_submit(self, interaction: discord.Interaction) -> None:
+        responder = DiscordInteractionResponder(
+            self._bot,
+            interaction,
+            name="Copilot form",
+        )
         try:
             if self._json_input is not None:
                 decoded = json.loads(str(self._json_input.value))
@@ -4165,17 +4706,21 @@ class ElicitationResponseModal(discord.ui.Modal):
                     if str(item.value) or field.required
                 }
         except (ValueError, json.JSONDecodeError) as error:
-            await interaction.response.send_message(
-                f"Invalid form response: {error}",
-                ephemeral=True,
-            )
+            try:
+                await responder.send_inline(f"Invalid form response: {error}")
+            except UnknownInteractionError:
+                await responder.send_followup(f"Invalid form response: {error}")
             return
+        try:
+            await responder.defer(ephemeral=True)
+        except UnknownInteractionError:
+            pass
         runtime = await self._bot._interaction_runtime(interaction)
         result = await runtime.respond_interaction(
             self._interaction_id,
             form_content=content,
         )
-        await interaction.response.send_message(
+        await responder.send_followup(
             _interaction_result_text(result),
             ephemeral=True,
         )
@@ -5725,6 +6270,37 @@ def _discord_parent_type(interaction: discord.Interaction) -> DiscordParentType:
     if isinstance(parent, discord.TextChannel):
         return DiscordParentType.TEXT
     raise ValueError("project layout requires a text or forum Discord parent")
+
+
+def _render_min_interval(bot: CopilotDiscordBot, lane: str) -> float:
+    if lane == "assistant_stream":
+        return bot.settings.discord_stream_edit_interval_seconds
+    if lane == "taskdeck":
+        return bot.settings.discord_taskdeck_edit_interval_seconds
+    return 0.0
+
+
+def _interaction_deadline(
+    bot: CopilotDiscordBot,
+    interaction: discord.Interaction,
+) -> float:
+    created_at = getattr(interaction, "created_at", None)
+    age = 0.0
+    if isinstance(created_at, datetime):
+        age = max(0.0, time.time() - created_at.timestamp())
+    remaining = max(
+        0.0,
+        bot.settings.discord_interaction_deadline_seconds - age,
+    )
+    return time.monotonic() + remaining
+
+
+def _interaction_target_key(interaction: discord.Interaction) -> str:
+    return f"interaction:{getattr(interaction, 'id', 'unknown')}"
+
+
+def _channel_target_key(channel: Any) -> str:
+    return f"channel:{getattr(channel, 'id', 'unknown')}"
 
 
 def _csv_options(value: str | None) -> tuple[str, ...]:

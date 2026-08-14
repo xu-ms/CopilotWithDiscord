@@ -11,7 +11,7 @@ from typing import Any
 
 import aiosqlite
 
-_CORE_MIGRATION_VERSION = 47
+_CORE_MIGRATION_VERSION = 48
 _LEGACY_MIGRATION_REMAPPINGS = (
     (
         8,

@@ -27,6 +27,24 @@ FenceValidator = Callable[[int, int], Awaitable[bool]]
 _DIFF_OUTPUT_LIMIT = 8 * 1024 * 1024
 _DIFF_HUNK_PATTERN = re.compile(r"^@@ -\d+(?:,(\d+))? \+\d+(?:,(\d+))? @@")
 _TOOL_SPILL_RETENTION_SECONDS = 7 * 24 * 60 * 60
+REACTION_EMOJI = {
+    "accepted": "👀",
+    "reasoning": "🧠",
+    "action": "🛠️",
+    "unresolved": "❓",
+    "succeeded": "✅",
+    "failed": "❌",
+}
+_REACTION_TERMINAL_STATES = {"succeeded", "failed"}
+_SUBMISSION_SUCCESS_STATES = {"semantic_complete"}
+_SUBMISSION_FAILURE_STATES = {
+    "cancelled",
+    "observed_aborted",
+    "outcome_unknown",
+    "rejected",
+    "semantic_blocked",
+    "submitted_unknown",
+}
 _TRUSTED_LOCAL_IMAGE_SUFFIXES = {
     ".bmp",
     ".gif",
@@ -352,6 +370,7 @@ class JournalReducer:
                     continue
                 inserted += 1
                 await self._apply_domain_state(connection, event, now=now)
+                await self._apply_reaction_state(connection, event, now=now)
                 render_payload = await self._materialize_render_payload(
                     connection,
                     event,
@@ -468,6 +487,282 @@ class JournalReducer:
                         ),
                     )
         return inserted
+
+    async def _apply_reaction_state(
+        self,
+        connection: Any,
+        event: AdaptedEvent,
+        *,
+        now: float,
+    ) -> None:
+        data = event.raw_payload.get("data", event.raw_payload)
+        values = data if isinstance(data, dict) else {}
+        if event.raw_type == "copilotd.submission.queued":
+            await self._set_submission_reaction(
+                connection,
+                event,
+                str(values["submission_id"]),
+                "accepted",
+                now=now,
+            )
+
+        cursor = await connection.execute(
+            """
+            SELECT r.submission_id, s.state
+            FROM submission_reactions r
+            JOIN submissions s ON s.submission_id = r.submission_id
+            WHERE r.sdk_session_id = ? AND r.terminal = 0
+              AND s.state IN (
+                'cancelled', 'observed_aborted', 'outcome_unknown', 'rejected',
+                'semantic_blocked', 'semantic_complete', 'submitted_unknown'
+              )
+            """,
+            (event.sdk_session_id,),
+        )
+        terminal_rows = await cursor.fetchall()
+        await cursor.close()
+        for row in terminal_rows:
+            await self._set_submission_reaction(
+                connection,
+                event,
+                str(row["submission_id"]),
+                ("succeeded" if str(row["state"]) in _SUBMISSION_SUCCESS_STATES else "failed"),
+                now=now,
+            )
+
+        if event.raw_type == "abort":
+            state = "failed"
+        elif event.raw_type == "copilotd.interaction.requested":
+            state = "unresolved"
+        elif event.raw_type in {
+            "copilotd.interaction.resolved",
+            "copilotd.interaction.expired",
+        }:
+            state = "resume"
+        elif event.raw_type in {
+            "subagent.started",
+            "subagent.completed",
+            "subagent.failed",
+            "tool.execution_start",
+            "tool.execution_progress",
+            "tool.execution_complete",
+        }:
+            state = "action"
+        elif event.raw_type in {
+            "assistant.intent",
+            "assistant.message_delta",
+            "assistant.reasoning",
+            "assistant.reasoning_delta",
+            "assistant.turn_retry",
+            "assistant.turn_start",
+            "user.message",
+        }:
+            state = "reasoning"
+        else:
+            return
+
+        submission_id: str | None = None
+        if event.raw_type == "user.message" and event.event_id is not None:
+            row = await _fetchone_row(
+                connection,
+                """
+                SELECT submission_id FROM submissions
+                WHERE sdk_session_id = ? AND observed_user_event_id = ?
+                """,
+                (event.sdk_session_id, event.event_id),
+            )
+            if row is not None:
+                submission_id = str(row["submission_id"])
+        if submission_id is None and event.turn_id is not None:
+            row = await _fetchone_row(
+                connection,
+                """
+                SELECT submission_id FROM model_turns
+                WHERE sdk_session_id = ? AND sdk_turn_id = ?
+                """,
+                (event.sdk_session_id, event.turn_id),
+            )
+            if row is not None and row["submission_id"] is not None:
+                submission_id = str(row["submission_id"])
+        if submission_id is None:
+            row = await _fetchone_row(
+                connection,
+                """
+                SELECT s.submission_id
+                FROM submissions s
+                JOIN submission_reactions r
+                  ON r.submission_id = s.submission_id
+                WHERE s.sdk_session_id = ?
+                  AND s.state IN (
+                    'observed_active', 'loop_idle', 'continuation_expected',
+                    'submitted'
+                  )
+                  AND r.terminal = 0
+                ORDER BY
+                  CASE WHEN s.observed_at IS NULL THEN 1 ELSE 0 END,
+                  s.observed_at DESC, s.created_at
+                LIMIT 1
+                """,
+                (event.sdk_session_id,),
+            )
+            if row is not None:
+                submission_id = str(row["submission_id"])
+        if submission_id is None:
+            return
+        if state == "resume":
+            row = await _fetchone_row(
+                connection,
+                "SELECT resume_state FROM submission_reactions WHERE submission_id = ?",
+                (submission_id,),
+            )
+            state = (
+                "reasoning"
+                if row is None or row["resume_state"] not in {"reasoning", "action"}
+                else str(row["resume_state"])
+            )
+        await self._set_submission_reaction(
+            connection,
+            event,
+            submission_id,
+            state,
+            now=now,
+        )
+
+    async def _set_submission_reaction(
+        self,
+        connection: Any,
+        event: AdaptedEvent,
+        submission_id: str,
+        state: str,
+        *,
+        now: float,
+    ) -> None:
+        if state not in REACTION_EMOJI:
+            raise ValueError(f"unknown submission reaction state: {state}")
+        submission = await _fetchone_row(
+            connection,
+            """
+            SELECT sdk_session_id, discord_source_channel_id,
+                   discord_source_message_id
+            FROM submissions
+            WHERE submission_id = ? AND sdk_session_id = ?
+            """,
+            (submission_id, event.sdk_session_id),
+        )
+        if (
+            submission is None
+            or submission["discord_source_channel_id"] is None
+            or submission["discord_source_message_id"] is None
+        ):
+            return
+        existing = await _fetchone_row(
+            connection,
+            """
+            SELECT desired_state, resume_state, revision, terminal
+            FROM submission_reactions WHERE submission_id = ?
+            """,
+            (submission_id,),
+        )
+        if existing is not None:
+            existing_state = str(existing["desired_state"])
+            if bool(existing["terminal"]):
+                return
+            if existing_state == state:
+                return
+            revision = int(existing["revision"]) + 1
+            resume_state = (
+                existing_state
+                if state == "unresolved" and existing_state in {"reasoning", "action"}
+                else existing["resume_state"]
+            )
+        else:
+            revision = 1
+            resume_state = None
+        terminal = state in _REACTION_TERMINAL_STATES
+        source_channel_id = str(submission["discord_source_channel_id"])
+        source_message_id = str(submission["discord_source_message_id"])
+        await connection.execute(
+            """
+            INSERT INTO submission_reactions(
+                submission_id, sdk_session_id, source_channel_id,
+                source_message_id, desired_state, resume_state, revision,
+                runtime_generation, owner_fence_token, terminal,
+                created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(submission_id) DO UPDATE SET
+                desired_state = excluded.desired_state,
+                resume_state = excluded.resume_state,
+                revision = excluded.revision,
+                runtime_generation = excluded.runtime_generation,
+                owner_fence_token = excluded.owner_fence_token,
+                terminal = MAX(submission_reactions.terminal, excluded.terminal),
+                last_error = NULL,
+                updated_at = excluded.updated_at
+            """,
+            (
+                submission_id,
+                event.sdk_session_id,
+                source_channel_id,
+                source_message_id,
+                state,
+                resume_state,
+                revision,
+                event.generation,
+                event.fence_token,
+                int(terminal),
+                now,
+                now,
+            ),
+        )
+        payload = json.dumps(
+            {
+                "type": "reaction_state",
+                "submission_id": submission_id,
+                "source_channel_id": source_channel_id,
+                "source_message_id": source_message_id,
+                "state": state,
+                "emoji": REACTION_EMOJI[state],
+                "reaction_revision": revision,
+                "generation": event.generation,
+                "fence_token": event.fence_token,
+                "finalized": terminal,
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+        )
+        outbox_key = f"reaction:{submission_id}"
+        outbox_id = str(uuid.uuid5(uuid.NAMESPACE_URL, outbox_key))
+        await connection.execute(
+            """
+            INSERT INTO render_outbox(
+                id, session_id, logical_seq, lane, coalesce_key,
+                idempotency_key, payload, state, attempts,
+                next_attempt_at, created_at, updated_at
+            ) VALUES (?, ?, ?, 'reaction', ?, ?, ?, 'pending', 0, ?, ?, ?)
+            ON CONFLICT(idempotency_key) DO UPDATE SET
+                logical_seq = excluded.logical_seq,
+                payload = excluded.payload,
+                payload_revision = render_outbox.payload_revision + 1,
+                state = CASE
+                    WHEN render_outbox.state = 'sending' THEN 'sending'
+                    ELSE 'pending'
+                END,
+                next_attempt_at = MIN(render_outbox.next_attempt_at,
+                                      excluded.next_attempt_at),
+                updated_at = excluded.updated_at
+            """,
+            (
+                outbox_id,
+                event.sdk_session_id,
+                event.inbox_seq,
+                outbox_key,
+                outbox_key,
+                payload,
+                now,
+                now,
+                now,
+            ),
+        )
 
     async def persist_incident(
         self,
@@ -2121,8 +2416,9 @@ class JournalReducer:
                 INSERT INTO submissions(
                     submission_id, sdk_session_id, origin, attachment_manifest_id, prompt_hash,
                     requested_mode, requested_delivery, correlation_id, attachment_count,
+                    discord_source_channel_id, discord_source_message_id,
                     state, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'local_queued', ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'local_queued', ?)
                 ON CONFLICT(submission_id) DO NOTHING
                 """,
                 (
@@ -2135,6 +2431,8 @@ class JournalReducer:
                     data.get("requested_delivery", "enqueue"),
                     data.get("correlation_id"),
                     int(data.get("attachment_count", 0)),
+                    data.get("discord_source_channel_id"),
+                    data.get("discord_source_message_id"),
                     float(data.get("created_at", event.received_at)),
                 ),
             )
@@ -2386,7 +2684,8 @@ class JournalReducer:
                 connection,
                 f"""
                 SELECT q.*, s.sdk_session_id, s.origin, s.attachment_count,
-                       s.requested_delivery
+                       s.requested_delivery, s.discord_source_channel_id,
+                       s.discord_source_message_id
                 FROM message_queue q
                 JOIN submissions s ON s.submission_id = q.id
                 WHERE q.id = ? AND q.state IN ({placeholders})
@@ -2444,8 +2743,9 @@ class JournalReducer:
                     schedule_run_id, attachment_manifest_id, prompt_hash, requested_mode,
                     requested_model_config, requested_agent,
                     requested_session_config_version, requested_delivery,
-                    correlation_id, attachment_count, state, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                    correlation_id, attachment_count, discord_source_channel_id,
+                    discord_source_message_id, state, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
                           'local_queued', ?)
                 ON CONFLICT(submission_id) DO NOTHING
                 """,
@@ -2464,6 +2764,8 @@ class JournalReducer:
                     old["requested_delivery"],
                     f"queue-replacement:{old_id}",
                     int(old["attachment_count"]),
+                    old["discord_source_channel_id"],
+                    old["discord_source_message_id"],
                     float(data.get("created_at", now)),
                 ),
             )
