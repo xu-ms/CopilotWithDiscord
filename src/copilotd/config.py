@@ -150,6 +150,16 @@ class Settings(BaseSettings):
     attachment_blob_max_bytes: int = 7 * 1024 * 1024
     attachment_runtime_frame_max_bytes: int = 7 * 1024 * 1024
     discord_upload_max_bytes: int = 7 * 1024 * 1024
+    discord_requests_per_second: float = 20.0
+    discord_request_burst: int = 10
+    discord_route_requests_per_second: float = 5.0
+    discord_route_burst: int = 5
+    discord_request_queue_limit: int = 512
+    discord_interaction_deadline_seconds: float = 2.5
+    discord_stream_edit_interval_seconds: float = 1.0
+    discord_taskdeck_edit_interval_seconds: float = 4.0
+    discord_reaction_interval_seconds: float = 0.25
+    discord_request_transient_attempts: int = 3
     heartbeat_interval_seconds: float = 30
     heartbeat_stale_seconds: float = 120
     gateway_down_restart_seconds: float = 600
@@ -204,6 +214,12 @@ class Settings(BaseSettings):
         "restart_drain_timeout_seconds",
         "service_startup_grace_seconds",
         "interaction_timeout_seconds",
+        "discord_requests_per_second",
+        "discord_route_requests_per_second",
+        "discord_interaction_deadline_seconds",
+        "discord_stream_edit_interval_seconds",
+        "discord_taskdeck_edit_interval_seconds",
+        "discord_reaction_interval_seconds",
     )
     @classmethod
     def validate_positive_seconds(cls, value: float) -> float:
@@ -219,6 +235,10 @@ class Settings(BaseSettings):
         "attachment_blob_max_bytes",
         "attachment_runtime_frame_max_bytes",
         "discord_upload_max_bytes",
+        "discord_request_burst",
+        "discord_route_burst",
+        "discord_request_queue_limit",
+        "discord_request_transient_attempts",
     )
     @classmethod
     def validate_positive(cls, value: int) -> int:

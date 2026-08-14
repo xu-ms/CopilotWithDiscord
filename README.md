@@ -252,6 +252,15 @@ session lifetime:
 | Durable event-log read page | 500 events |
 | SQLite busy wait | 5 s |
 | App scheduler | 1 s poll, at most 100 due runs per tick; pre-dispatch retries at 5 s, 30 s, 2 m, 10 m, and 30 m |
+| Discord REST coordinator | 20 requests/s, burst 10; 5 requests/s and burst 5 per route; 512 queued |
+| Discord interaction / stream / TaskDeck / reaction cadence | 2.5 s deadline / 1 s / 4 s / 0.25 s |
+
+These Discord defaults use the `COPILOTD_DISCORD_*` settings matching the field names
+(`REQUESTS_PER_SECOND`, `REQUEST_BURST`, `ROUTE_REQUESTS_PER_SECOND`, `ROUTE_BURST`,
+`REQUEST_QUEUE_LIMIT`, `INTERACTION_DEADLINE_SECONDS`, and the three
+`*_INTERVAL_SECONDS` settings). All production REST operations share this coordinator.
+The bot requires **Add Reactions** and **Read Message History** in session channels;
+`doctor` reports these requirements and runtime readiness logs missing guild permissions.
 
 Input attachment preparation and eager session resume are intentionally conservative.
 Attachment files within one manifest are processed serially to bound memory. Eager resume

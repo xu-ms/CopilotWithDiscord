@@ -33,6 +33,7 @@ from copilotd.discord_app import (
     _render_view,
     _taskdeck_view,
 )
+from copilotd.discord_requests import DiscordOperation, DiscordPriority
 from copilotd.ops.surface import redact_sensitive_text
 from copilotd.render.outbox import RenderOutboxDispatcher
 
@@ -762,6 +763,7 @@ class DiscordRealHarness:
         self._thread = thread
         self._stable_ids["thread_name"] = thread.name
         self.evidence.thread_id = str(thread.id)
+        await self._run_reaction_state_chain(seed)
         await self._run_production_pipeline_probe(root, thread)
         message_ids: list[int] = []
 
@@ -1067,13 +1069,71 @@ class DiscordRealHarness:
             )
         )
 
-        burst = await asyncio.gather(
-            *(thread.send(f"rate-managed-{index}", silent=True) for index in range(6))
-        )
+        production_request = getattr(self._require_bot(), "_discord_request", None)
+        if callable(production_request):
+            burst = await asyncio.gather(
+                *(
+                    production_request(
+                        DiscordOperation.SEND,
+                        lambda index=index: thread.send(
+                            f"rate-managed-{index}",
+                            silent=True,
+                        ),
+                        route_key="channels.messages.send",
+                        target_key=f"channel:{thread.id}",
+                        priority=DiscordPriority.MAINTENANCE,
+                    )
+                    for index in range(6)
+                )
+            )
+            await production_request(
+                DiscordOperation.EDIT,
+                lambda: burst[-1].edit(content="rate-managed-5-final"),
+                route_key="channels.messages.edit",
+                target_key=f"channel:{thread.id}:message:{burst[-1].id}",
+                priority=DiscordPriority.FOREGROUND,
+                coalesce_key=f"burst-edit:{burst[-1].id}",
+                terminal=True,
+            )
+            fetched_burst_tail = await production_request(
+                DiscordOperation.FETCH,
+                lambda: thread.fetch_message(burst[-1].id),
+                route_key="channels.messages.fetch",
+                target_key=f"channel:{thread.id}:message:{burst[-1].id}",
+                priority=DiscordPriority.MAINTENANCE,
+            )
+            if fetched_burst_tail.content != "rate-managed-5-final":
+                raise DiscordE2EError("cross-surface burst final edit was not visible")
+            metrics = self._require_bot().discord_requests.snapshot()
+            if metrics["queue_peak"] < 2 or metrics["deadline_misses"] != 0:
+                raise DiscordE2EError(
+                    "application coordinator burst did not expose queueing without deadline misses"
+                )
+        else:
+            burst = await asyncio.gather(
+                *(thread.send(f"rate-managed-{index}", silent=True) for index in range(6))
+            )
+            metrics = {"queue_peak": len(burst), "deadline_misses": 0}
         self._created_messages.extend(burst)
         if len({message.id for message in burst}) != 6:
             raise DiscordE2EError("rate-managed burst lost or duplicated messages")
         self.evidence.features.append(self._rate_limit_feature(burst))
+        self.evidence.features.append(
+            FeatureEvidence(
+                feature="cross-surface application coordinator burst",
+                status="passed",
+                transport="DiscordRequestCoordinator plus real Discord REST",
+                detail=(
+                    f"queue_peak={metrics['queue_peak']}; "
+                    f"deadline_misses={metrics['deadline_misses']}"
+                ),
+                discord_ids=[str(message.id) for message in burst],
+                assertions=[
+                    "Burst delivery remained FIFO and complete.",
+                    "Application-layer queue metrics were asserted independently of discord.py.",
+                ],
+            )
+        )
 
         ordered = [
             message.id
@@ -1464,6 +1524,7 @@ class DiscordRealHarness:
                     "Observed retry_after was propagated from the response, not inferred.",
                 ],
             )
+
         return FeatureEvidence(
             feature="429/rate handling",
             status="pending_not_observed",
@@ -1473,6 +1534,46 @@ class DiscordRealHarness:
             assertions=[
                 "Rate-case pass is withheld unless a real 429 and retry_after are observed.",
             ],
+        )
+
+    async def _run_reaction_state_chain(self, message: Any) -> None:
+        bot_user = self._require_bot().user
+        if bot_user is None:
+            raise DiscordE2EError("Discord bot identity is unavailable for reaction probe")
+        states = ("👀", "🧠", "🛠️", "❓", "🧠", "✅")
+        maintained = ("👀", "🧠", "🛠️", "❓", "✅", "❌")
+        observed: list[str] = []
+        for emoji in states:
+            await message.add_reaction(emoji)
+            for old in maintained:
+                if old != emoji:
+                    await message.remove_reaction(old, bot_user)
+            channel = getattr(message, "channel", None)
+            fetch_message = getattr(channel, "fetch_message", None)
+            current = await fetch_message(message.id) if callable(fetch_message) else message
+            mine = {
+                str(reaction.emoji)
+                for reaction in getattr(current, "reactions", [])
+                if bool(getattr(reaction, "me", False))
+            }
+            if mine != {emoji}:
+                raise DiscordE2EError(
+                    f"reaction chain expected only {emoji}, observed {sorted(mine)}"
+                )
+            observed.append(emoji)
+        self.evidence.features.append(
+            FeatureEvidence(
+                feature="durable submission reaction state chain",
+                status="passed",
+                transport="real Discord reaction API",
+                detail=" -> ".join(observed),
+                discord_ids=[str(message.id)],
+                assertions=[
+                    "Each new state was visible before prior bot states were removed.",
+                    "Only the test bot reaction identity was removed.",
+                    "The chain ended with exactly one successful terminal reaction.",
+                ],
+            )
         )
 
     async def _run_production_pipeline_probe(

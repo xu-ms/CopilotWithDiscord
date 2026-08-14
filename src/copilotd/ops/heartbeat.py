@@ -10,7 +10,7 @@ from collections.abc import Callable
 from dataclasses import asdict, dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Literal
+from typing import Any, Literal
 
 from copilotd.ops.contracts import (
     GATEWAY_DOWN_RESTART_SECONDS,
@@ -58,6 +58,7 @@ class HeartbeatSnapshot:
     last_resume_at: str | None = None
     wake_suppression_until: str | None = None
     service_control_protocol: int = 1
+    discord_requests: dict[str, Any] | None = None
 
     @property
     def protected_work(self) -> bool:
@@ -87,6 +88,7 @@ class HeartbeatWriter:
         durable_replay_capable: bool = False,
         process_generation: str | None = None,
         metrics_provider: Callable[[], tuple[int, int, float | None]] | None = None,
+        discord_metrics_provider: Callable[[], dict[str, Any]] | None = None,
         resume_provider: ResumeTimestampProvider | None = None,
     ) -> None:
         self._database = database
@@ -98,6 +100,7 @@ class HeartbeatWriter:
         self._process_generation = process_generation or str(uuid.uuid4())
         self._process_started_at = time.time()
         self._metrics_provider = metrics_provider
+        self._discord_metrics_provider = discord_metrics_provider
         self._resume_provider = resume_provider or resume_timestamp_provider(sys.platform)
         self._freeze_announced = False
         self.gateway_state: GatewayState = "down"
@@ -272,6 +275,9 @@ class HeartbeatWriter:
             last_resume_at=_optional_rfc3339(last_resume_at),
             wake_suppression_until=_optional_rfc3339(wake_suppression_until),
             service_control_protocol=SERVICE_CONTROL_PROTOCOL_VERSION,
+            discord_requests=(
+                None if self._discord_metrics_provider is None else self._discord_metrics_provider()
+            ),
         )
 
 

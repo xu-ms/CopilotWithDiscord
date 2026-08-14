@@ -5,6 +5,7 @@ import hashlib
 import inspect
 import json
 import time
+import uuid
 from dataclasses import dataclass
 from typing import Any, Protocol
 
@@ -31,6 +32,14 @@ class RenderTransport(Protocol):
         session_id: str,
         message_id: str,
         lane: str,
+        payload: dict[str, Any],
+        idempotency_key: str,
+    ) -> None: ...
+
+    async def reaction(
+        self,
+        *,
+        session_id: str,
         payload: dict[str, Any],
         idempotency_key: str,
     ) -> None: ...
@@ -83,7 +92,6 @@ class RenderOutboxDispatcher:
         self._max_transient_attempts = max_transient_attempts
         self._spill_gc_interval_seconds = spill_gc_interval_seconds
         self._next_spill_gc = 0.0
-        self._last_delivery: dict[tuple[str, str], float] = {}
         self._dispatch_lock = asyncio.Lock()
         self._restore_tasks: set[asyncio.Task[None]] = set()
 
@@ -348,6 +356,12 @@ class RenderOutboxDispatcher:
         now: float,
         live_clock: bool,
     ) -> tuple[bool, bool]:
+        if item.lane == "reaction":
+            return await self._deliver_reaction(
+                item,
+                now=now,
+                live_clock=live_clock,
+            )
         logical_key = item.coalesce_key or item.id
         payload_hash = _payload_hash(item.payload)
         transport_idempotency_key = (
@@ -361,17 +375,6 @@ class RenderOutboxDispatcher:
             (item.session_id, logical_key),
         )
         finalized = bool(item.payload.get("finalized"))
-        cadence = 4.0 if item.lane == "taskdeck" else 1.0 if item.lane == "assistant_stream" else 0
-        delivery_key = (item.session_id, item.lane)
-        last_delivery = self._last_delivery.get(delivery_key)
-        elapsed = float("inf") if last_delivery is None else time.monotonic() - last_delivery
-        if cadence and not finalized and elapsed < cadence:
-            await self._retry(
-                item,
-                next_attempt_at=time.time() + cadence - elapsed,
-                now=now,
-            )
-            return False, True
         try:
             if mapping is not None and mapping["content_hash"] == payload_hash:
                 message_id = mapping["discord_message_id"]
@@ -426,7 +429,6 @@ class RenderOutboxDispatcher:
             )
             return False, not blocked
 
-        self._last_delivery[delivery_key] = time.monotonic()
         async with self._database.transaction() as connection:
             await connection.execute(
                 """
@@ -484,6 +486,166 @@ class RenderOutboxDispatcher:
                 session_id=item.session_id,
             )
         return True, False
+
+    async def _deliver_reaction(
+        self,
+        item: OutboxItem,
+        *,
+        now: float,
+        live_clock: bool,
+    ) -> tuple[bool, bool]:
+        payload = item.payload
+        current = await self._database.fetchone(
+            """
+            SELECT r.desired_state, r.revision, r.runtime_generation,
+                   r.owner_fence_token, b.runtime_generation AS binding_generation,
+                   b.owner_fence_token AS binding_fence,
+                   l.fence_token AS lease_fence, l.expires_at AS lease_expires_at
+            FROM submission_reactions r
+            JOIN session_bindings b ON b.sdk_session_id = r.sdk_session_id
+            LEFT JOIN session_owner_leases l
+              ON l.sdk_session_id = b.sdk_session_id
+             AND l.fence_token = b.owner_fence_token
+            WHERE r.submission_id = ? AND r.sdk_session_id = ?
+            """,
+            (payload.get("submission_id"), item.session_id),
+        )
+        desired_is_current = (
+            current is not None
+            and str(current["desired_state"]) == str(payload.get("state"))
+            and int(current["revision"]) == int(payload.get("reaction_revision", -1))
+        )
+        owner_is_current = (
+            current is not None
+            and current["lease_fence"] is not None
+            and current["lease_expires_at"] is not None
+            and float(current["lease_expires_at"]) > time.time()
+        )
+        is_current = (
+            desired_is_current
+            and owner_is_current
+            and int(current["runtime_generation"]) == int(payload.get("generation", -1))
+            and int(current["owner_fence_token"]) == int(payload.get("fence_token", -1))
+            and int(current["binding_generation"]) == int(payload.get("generation", -1))
+            and int(current["binding_fence"]) == int(payload.get("fence_token", -1))
+        )
+        if not is_current:
+            if desired_is_current and not owner_is_current:
+                retry_now = time.time() if live_clock else now
+                await self._retry(
+                    item,
+                    next_attempt_at=retry_now + 1,
+                    now=retry_now,
+                )
+                return False, True
+            await recover_reaction_outbox(self._database)
+            await self._finish_reaction_claim(item, now=now, delivered=False)
+            return False, False
+        transport_key = (
+            f"{item.idempotency_key}:payload:{item.payload_revision}:{_payload_hash(payload)[:16]}"
+        )
+        try:
+            await self._transport.reaction(
+                session_id=item.session_id,
+                payload=payload,
+                idempotency_key=transport_key,
+            )
+        except RenderRateLimited as error:
+            retry_now = time.time() if live_clock else now
+            await self._retry(
+                item,
+                next_attempt_at=retry_now + error.retry_after,
+                now=retry_now,
+            )
+            return False, True
+        except RenderTransientError:
+            retry_now = time.time() if live_clock else now
+            if item.attempts >= self._max_transient_attempts:
+                blocked = await self._block(item, now=retry_now)
+                return False, not blocked
+            await self._retry(
+                item,
+                next_attempt_at=retry_now + min(2 ** (item.attempts - 1), 30),
+                now=retry_now,
+            )
+            return False, True
+        except RenderPermanentError as error:
+            await self._database.execute(
+                """
+                UPDATE submission_reactions
+                SET last_error = ?, updated_at = ?
+                WHERE submission_id = ? AND revision = ?
+                """,
+                (
+                    f"{type(error).__name__}: {error}",
+                    time.time() if live_clock else now,
+                    payload.get("submission_id"),
+                    payload.get("reaction_revision"),
+                ),
+            )
+            blocked = await self._block(
+                item,
+                now=time.time() if live_clock else now,
+            )
+            return False, not blocked
+        await self._finish_reaction_claim(item, now=now, delivered=True)
+        return True, False
+
+    async def _finish_reaction_claim(
+        self,
+        item: OutboxItem,
+        *,
+        now: float,
+        delivered: bool,
+    ) -> None:
+        payload = item.payload
+        async with self._database.transaction() as connection:
+            if delivered:
+                await connection.execute(
+                    """
+                    UPDATE submission_reactions
+                    SET delivered_state = ?, delivered_revision = ?,
+                        last_error = NULL, updated_at = ?
+                    WHERE submission_id = ? AND desired_state = ?
+                      AND revision = ? AND runtime_generation = ?
+                      AND owner_fence_token = ?
+                    """,
+                    (
+                        payload["state"],
+                        int(payload["reaction_revision"]),
+                        now,
+                        payload["submission_id"],
+                        payload["state"],
+                        int(payload["reaction_revision"]),
+                        int(payload["generation"]),
+                        int(payload["fence_token"]),
+                    ),
+                )
+            cursor = await connection.execute(
+                """
+                UPDATE render_outbox
+                SET state = 'sent', updated_at = ?
+                WHERE id = ? AND state = 'sending' AND payload_revision = ?
+                """,
+                (now, item.id, item.payload_revision),
+            )
+            finished = cursor.rowcount == 1
+            await cursor.close()
+            if finished:
+                return
+            cursor = await connection.execute(
+                """
+                UPDATE render_outbox
+                SET state = 'pending', next_attempt_at = MIN(next_attempt_at, ?),
+                    updated_at = ?
+                WHERE id = ? AND state = 'sending' AND payload_revision > ?
+                """,
+                (now, now, item.id, item.payload_revision),
+            )
+            restored = cursor.rowcount == 1
+            await cursor.close()
+            if not restored:
+                raise RuntimeError(f"reaction outbox claim was lost: {item.id}")
 
     async def _retry(
         self,
@@ -567,3 +729,94 @@ class RenderOutboxDispatcher:
 def _payload_hash(payload: dict[str, Any]) -> str:
     canonical = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(canonical.encode()).hexdigest()
+
+
+async def recover_reaction_outbox(database: Database, *, now: float | None = None) -> int:
+    timestamp = time.time() if now is None else now
+    rows = await database.fetchall(
+        """
+        SELECT r.*, b.runtime_generation AS binding_generation,
+               b.owner_fence_token AS binding_fence
+        FROM submission_reactions r
+        JOIN session_bindings b ON b.sdk_session_id = r.sdk_session_id
+        JOIN session_owner_leases l
+          ON l.sdk_session_id = b.sdk_session_id
+         AND l.fence_token = b.owner_fence_token
+        WHERE b.owner_fence_token IS NOT NULL
+          AND l.expires_at > ?
+          AND (
+            r.delivered_state IS NULL
+            OR r.delivered_state != r.desired_state
+            OR r.delivered_revision != r.revision
+          )
+        """,
+        (timestamp,),
+    )
+    emojis = {
+        "accepted": "👀",
+        "reasoning": "🧠",
+        "action": "🛠️",
+        "unresolved": "❓",
+        "succeeded": "✅",
+        "failed": "❌",
+    }
+    async with database.transaction() as connection:
+        for row in rows:
+            generation = int(row["binding_generation"])
+            fence_token = int(row["binding_fence"])
+            submission_id = str(row["submission_id"])
+            state = str(row["desired_state"])
+            await connection.execute(
+                """
+                UPDATE submission_reactions
+                SET runtime_generation = ?, owner_fence_token = ?, updated_at = ?
+                WHERE submission_id = ?
+                """,
+                (generation, fence_token, timestamp, submission_id),
+            )
+            payload = json.dumps(
+                {
+                    "type": "reaction_state",
+                    "submission_id": submission_id,
+                    "source_channel_id": str(row["source_channel_id"]),
+                    "source_message_id": str(row["source_message_id"]),
+                    "state": state,
+                    "emoji": emojis[state],
+                    "reaction_revision": int(row["revision"]),
+                    "generation": generation,
+                    "fence_token": fence_token,
+                    "finalized": bool(row["terminal"]),
+                },
+                ensure_ascii=False,
+                sort_keys=True,
+            )
+            key = f"reaction:{submission_id}"
+            await connection.execute(
+                """
+                INSERT INTO render_outbox(
+                    id, session_id, logical_seq, lane, coalesce_key,
+                    idempotency_key, payload, state, attempts,
+                    next_attempt_at, created_at, updated_at
+                ) VALUES (?, ?, 0, 'reaction', ?, ?, ?, 'pending', 0, ?, ?, ?)
+                ON CONFLICT(idempotency_key) DO UPDATE SET
+                    payload = excluded.payload,
+                    payload_revision = render_outbox.payload_revision + 1,
+                    state = CASE
+                        WHEN render_outbox.state = 'sending' THEN 'sending'
+                        ELSE 'pending'
+                    END,
+                    next_attempt_at = excluded.next_attempt_at,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    str(uuid.uuid5(uuid.NAMESPACE_URL, key)),
+                    str(row["sdk_session_id"]),
+                    key,
+                    key,
+                    payload,
+                    timestamp,
+                    timestamp,
+                    timestamp,
+                ),
+            )
+    return len(rows)

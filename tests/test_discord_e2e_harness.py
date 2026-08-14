@@ -180,6 +180,7 @@ class DryRunMessage:
     channel: DryRunChannel | None = None  # type: ignore[name-defined]
     author: object = field(default_factory=lambda: SimpleNamespace(id=777))
     deleted: bool = False
+    reactions: list[SimpleNamespace] = field(default_factory=list)
 
     async def delete(self) -> None:
         self.deleted = True
@@ -187,6 +188,13 @@ class DryRunMessage:
     async def pin(self, *, reason: str | None = None) -> None:
         if self.channel is not None:
             self.channel.pinned = self
+
+    async def add_reaction(self, emoji: str) -> None:
+        if emoji not in {str(reaction.emoji) for reaction in self.reactions}:
+            self.reactions.append(SimpleNamespace(emoji=emoji, me=True))
+
+    async def remove_reaction(self, emoji: str, _user: object) -> None:
+        self.reactions = [reaction for reaction in self.reactions if str(reaction.emoji) != emoji]
 
     async def create_thread(self, *, name: str, auto_archive_duration: int):
         if self.channel is None:
