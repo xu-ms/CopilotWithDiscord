@@ -361,6 +361,9 @@ class CopilotDiscordBot(commands.Bot):
                 model_summary_adapter=self.model_summary_adapter,
                 task_action_adapter=self.task_action_adapter,
                 extension_configs=self.extension_configs,
+                managed_session_state_root=(
+                    self.settings.resolved_home / ".copilot" / "session-state"
+                ),
             )
 
         self.sessions = SessionRegistry(self.bindings, runtime_factory)
@@ -4866,6 +4869,11 @@ async def _discord_render_plan(
             lambda: extract_local_markdown_images(
                 content,
                 allowed_roots=allowed_roots,
+                trusted_paths=(
+                    payload.get("trusted_local_image_paths")
+                    if isinstance(payload.get("trusted_local_image_paths"), list)
+                    else ()
+                ),
                 trusted_artifacts=artifact_paths,
             )
         )
