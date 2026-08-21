@@ -9,6 +9,7 @@ import time
 import uuid
 from collections.abc import Awaitable, Callable, Mapping
 from enum import StrEnum
+from pathlib import Path
 from typing import Any, Literal, Protocol, TypeVar, cast
 
 from copilotd.core.attachments import (
@@ -430,6 +431,7 @@ class SessionRuntime:
         task_action_adapter: TaskActionAdapter | None = None,
         extension_configs: ExtensionConfigRepository | None = None,
         oauth_authorizer: OAuthAuthorizer | None = None,
+        managed_session_state_root: Path | None = None,
     ) -> None:
         self._database = database
         self._bridge = bridge
@@ -455,6 +457,7 @@ class SessionRuntime:
         self._remote_preflight = RemotePreflightController(bridge)
         self._extension_configs = extension_configs
         self._oauth_authorizer = oauth_authorizer
+        self._managed_session_state_root = managed_session_state_root
         self.state = RuntimeState.DETACHED
         self._lease: OwnerLease | None = None
         self._handle: SessionHandle | None = None
@@ -6404,6 +6407,7 @@ class SessionRuntime:
             inbox=self._inbox,
             reducer=JournalReducer(
                 self._database,
+                managed_session_state_root=self._managed_session_state_root,
                 require_binding_fence=True,
             ),
             batch_size=self._reducer_batch_size,

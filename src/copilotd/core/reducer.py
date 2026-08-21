@@ -6,11 +6,12 @@ import inspect
 import json
 import os
 import re
+import stat
 import time
 import uuid
 from collections.abc import Awaitable, Callable
 from pathlib import Path
-from typing import Any, ClassVar, cast
+from typing import Any, BinaryIO, ClassVar, cast
 
 from aiosqlite import Connection, Row
 
@@ -269,6 +270,7 @@ class JournalReducer:
         planner: RenderPlanner | None = None,
         *,
         artifact_root: Path | None = None,
+        managed_session_state_root: Path | None = None,
         require_binding_fence: bool = False,
     ) -> None:
         self._database = database
@@ -276,6 +278,7 @@ class JournalReducer:
         self._artifact_root = (
             database.path.parent / "sessions" if artifact_root is None else artifact_root
         )
+        self._managed_session_state_root = managed_session_state_root
         self._require_binding_fence = require_binding_fence
 
     async def persist(self, events: list[AdaptedEvent]) -> int:
@@ -1510,7 +1513,7 @@ class JournalReducer:
             SELECT trusted.path, snapshots.snapshot_path,
                    snapshots.byte_size, snapshots.sha256
             FROM trusted_local_artifacts AS trusted
-            JOIN trusted_local_artifact_snapshots AS snapshots
+            LEFT JOIN trusted_local_artifact_snapshots AS snapshots
               ON snapshots.session_id = trusted.session_id
              AND snapshots.source_path = trusted.path
             WHERE trusted.session_id = ?
@@ -1528,6 +1531,7 @@ class JournalReducer:
             "finalized": bool(stream["finalized"]),
         }
         if trusted_rows:
+            snapshot_rows = [row for row in trusted_rows if row["snapshot_path"] is not None]
             payload["trusted_local_images"] = True
             payload["trusted_local_image_paths"] = [str(row["path"]) for row in trusted_rows]
             payload["trusted_local_image_artifacts"] = [
@@ -1537,7 +1541,7 @@ class JournalReducer:
                     "byte_size": int(row["byte_size"]),
                     "sha256": str(row["sha256"]),
                 }
-                for row in trusted_rows
+                for row in snapshot_rows
             ]
         if turn_context is not None:
             answer_payload = {**payload, "finalized": True}
@@ -2024,6 +2028,7 @@ class JournalReducer:
                                 _snapshot_trusted_local_artifact,
                                 self._artifact_root,
                                 Path(str(binding["cwd_snapshot"])),
+                                self._managed_session_state_root,
                                 event.sdk_session_id,
                                 path,
                             )
@@ -9721,48 +9726,112 @@ def _tool_spill_path(root: Path, session_id: str, tool_call_id: str) -> Path:
 def _snapshot_trusted_local_artifact(
     root: Path,
     cwd: Path,
+    managed_session_state_root: Path | None,
     session_id: str,
     source_path: str,
 ) -> tuple[Path, int, str] | None:
     resolved_cwd = cwd.resolve(strict=False)
     candidate = Path(source_path)
-    source = (
-        candidate.resolve(strict=False)
-        if candidate.is_absolute()
-        else (resolved_cwd / candidate).resolve(strict=False)
+    source_candidate = candidate if candidate.is_absolute() else resolved_cwd / candidate
+    resolved_session_state_root = (
+        None
+        if managed_session_state_root is None
+        else managed_session_state_root.resolve(strict=False)
     )
-    try:
-        source.relative_to(resolved_cwd)
-    except ValueError:
+    managed_files = _managed_session_files_root(managed_session_state_root, session_id)
+    if source_candidate.suffix.lower() not in _TRUSTED_LOCAL_IMAGE_SUFFIXES:
         return None
-    if source.suffix.lower() not in _TRUSTED_LOCAL_IMAGE_SUFFIXES or not source.is_file():
+    try:
+        source_file = _open_trusted_local_artifact(
+            source_candidate,
+            cwd=resolved_cwd,
+            managed_session_state_root=resolved_session_state_root,
+            managed_files=managed_files,
+        )
+    except OSError:
         return None
 
     session_token = uuid.uuid5(uuid.NAMESPACE_URL, f"session:{session_id}").hex[:16]
     source_token = uuid.uuid5(uuid.NAMESPACE_URL, f"local-image:{source_path}").hex[:16]
     snapshot_root = root / session_token / "artifacts" / "local-images"
-    snapshot_root.mkdir(parents=True, exist_ok=True)
-    temporary = snapshot_root / f".{source_token}.{uuid.uuid4().hex}.tmp"
-    digest = hashlib.sha256()
-    byte_size = 0
-    try:
-        with source.open("rb") as input_file, temporary.open("xb") as output_file:
-            for chunk in iter(lambda: input_file.read(1024 * 1024), b""):
-                output_file.write(chunk)
-                digest.update(chunk)
-                byte_size += len(chunk)
-            output_file.flush()
-            os.fsync(output_file.fileno())
-        digest_text = digest.hexdigest()
-        suffix = source.suffix.lower()
-        snapshot_path = snapshot_root / f"{source_token}-{digest_text}{suffix}"
-        if snapshot_path.exists():
+    with source_file as input_file:
+        snapshot_root.mkdir(parents=True, exist_ok=True)
+        temporary = snapshot_root / f".{source_token}.{uuid.uuid4().hex}.tmp"
+        digest = hashlib.sha256()
+        byte_size = 0
+        try:
+            with temporary.open("xb") as output_file:
+                for chunk in iter(lambda: input_file.read(1024 * 1024), b""):
+                    output_file.write(chunk)
+                    digest.update(chunk)
+                    byte_size += len(chunk)
+                output_file.flush()
+                os.fsync(output_file.fileno())
+            digest_text = digest.hexdigest()
+            suffix = source_candidate.suffix.lower()
+            snapshot_path = snapshot_root / f"{source_token}-{digest_text}{suffix}"
+            if snapshot_path.exists():
+                temporary.unlink(missing_ok=True)
+            else:
+                os.replace(temporary, snapshot_path)
+            return snapshot_path, byte_size, digest_text
+        finally:
             temporary.unlink(missing_ok=True)
-        else:
-            os.replace(temporary, snapshot_path)
-        return snapshot_path, byte_size, digest_text
-    finally:
-        temporary.unlink(missing_ok=True)
+
+
+def _managed_session_files_root(root: Path | None, session_id: str) -> Path | None:
+    if root is None or Path(session_id).name != session_id or session_id in {".", ".."}:
+        return None
+    resolved_root = root.resolve(strict=False)
+    session_root = resolved_root / session_id
+    files_root = session_root / "files"
+    if session_root.is_symlink() or files_root.is_symlink():
+        return None
+    return files_root.resolve(strict=False)
+
+
+def _open_trusted_local_artifact(
+    source: Path,
+    *,
+    cwd: Path,
+    managed_session_state_root: Path | None,
+    managed_files: Path | None,
+) -> BinaryIO:
+    flags = (
+        os.O_RDONLY
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_NONBLOCK", 0)
+    )
+    descriptor = os.open(source, flags)
+    try:
+        opened = os.fstat(descriptor)
+        if not stat.S_ISREG(opened.st_mode):
+            raise OSError("trusted local image is not a regular file")
+        resolved = source.resolve(strict=True)
+        current = resolved.stat()
+        if (opened.st_dev, opened.st_ino) != (current.st_dev, current.st_ino):
+            raise OSError("trusted local image changed while opening")
+        if managed_session_state_root is not None and _path_is_within(
+            resolved,
+            managed_session_state_root,
+        ):
+            if managed_files is None or not _path_is_within(resolved, managed_files):
+                raise OSError("managed local image belongs to another session")
+        elif not _path_is_within(resolved, cwd):
+            raise OSError("trusted local image is outside approved roots")
+        return os.fdopen(descriptor, "rb")
+    except BaseException:
+        os.close(descriptor)
+        raise
+
+
+def _path_is_within(path: Path, root: Path) -> bool:
+    try:
+        path.relative_to(root)
+    except ValueError:
+        return False
+    return True
 
 
 def _write_spill_bytes(path: Path, content: bytes) -> None:

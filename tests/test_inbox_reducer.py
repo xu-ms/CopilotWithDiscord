@@ -1,6 +1,7 @@
 import asyncio
 import hashlib
 import json
+import os
 import threading
 from dataclasses import replace
 from datetime import UTC, datetime
@@ -800,6 +801,95 @@ async def test_sdk_workspace_event_authorizes_matching_local_image_path(
     assert [asset.content for batch in second_render.batches for asset in batch.assets] == [
         original_bytes
     ]
+
+
+@pytest.mark.asyncio
+async def test_current_copilot_session_image_is_snapshotted_without_cross_session_access(
+    tmp_path: Path,
+) -> None:
+    session_id = "session-managed-image"
+    session_state = tmp_path / ".copilot" / "session-state"
+    cwd = session_state
+    managed_files = session_state / session_id / "files"
+    managed_files.mkdir(parents=True)
+    image_path = managed_files / "report.png"
+    Image.new("RGB", (4, 4), "green").save(image_path)
+    original_bytes = image_path.read_bytes()
+
+    cross_session = session_state / "other-session" / "files" / "private.png"
+    cross_session.parent.mkdir(parents=True)
+    Image.new("RGB", (4, 4), "red").save(cross_session)
+    arbitrary = tmp_path / "arbitrary.png"
+    Image.new("RGB", (4, 4), "blue").save(arbitrary)
+    escaped = managed_files / "escaped.png"
+    escaped.symlink_to(arbitrary)
+    unsupported = managed_files / "notes.txt"
+    unsupported.write_text("not an image")
+    fifo = managed_files / "blocked.png"
+    os.mkfifo(fifo)
+
+    references = [image_path, cross_session, arbitrary, escaped, unsupported, fifo]
+    events = [
+        _adapted(
+            "session.workspace_file_changed",
+            {"operation": "created", "path": str(path)},
+            index,
+            session_id=session_id,
+        )
+        for index, path in enumerate(references, start=1)
+    ]
+    events.append(
+        replace(
+            _adapted(
+                "assistant.message",
+                {
+                    "messageId": "managed-image-message",
+                    "content": "\n".join(
+                        f"![image-{index}]({path})"
+                        for index, path in enumerate(references, start=1)
+                    ),
+                },
+                len(events) + 1,
+                session_id=session_id,
+            ),
+            message_id="managed-image-message",
+        )
+    )
+
+    async with Database(tmp_path / "managed-image.sqlite3") as database:
+        await SessionBindingRepository(database).create(
+            thread_id="thread-managed-image",
+            sdk_session_id=session_id,
+            cwd_snapshot=cwd,
+            project_source="explicit",
+        )
+        reducer = JournalReducer(
+            database,
+            managed_session_state_root=session_state,
+        )
+        assert await reducer.persist(events) == len(events)
+        row = await database.fetchone(
+            "SELECT payload FROM render_outbox WHERE lane = 'assistant_final'"
+        )
+
+    payload = json.loads(row["payload"])
+    assert payload["trusted_local_image_paths"] == [str(path) for path in references]
+    assert len(payload["trusted_local_image_artifacts"]) == 1
+    artifact = payload["trusted_local_image_artifacts"][0]
+    assert artifact["source_path"] == str(image_path)
+    assert artifact["byte_size"] == len(original_bytes)
+    assert artifact["sha256"] == hashlib.sha256(original_bytes).hexdigest()
+
+    Image.new("RGB", (4, 4), "yellow").save(image_path)
+    plan = await _discord_render_plan(payload, allowed_roots=(cwd,))
+    assets = [asset for batch in plan.batches for asset in batch.assets]
+    visible = "\n".join(batch.content for batch in plan.batches)
+
+    assert [(asset.filename, asset.content) for asset in assets] == [("report.png", original_bytes)]
+    assert all(str(path) not in visible for path in references)
+    assert "**Image:** image-1" in visible
+    assert "unsupported file type" in visible
+    assert "does not point to a file" in visible
 
 
 @pytest.mark.asyncio
