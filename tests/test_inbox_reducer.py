@@ -38,6 +38,7 @@ from copilotd.core.reducer import (
     _diff_render_payload,
     _diff_stats,
 )
+from copilotd.core.scheduler import SchedulerRepository, ScheduleRunState
 from copilotd.discord_app import _discord_render_plan
 from copilotd.ops.heartbeat import HeartbeatWriter
 from copilotd.sdk.capabilities import CapabilityRegistry
@@ -2415,6 +2416,14 @@ async def test_user_message_correlation_retains_facts_and_creates_runtime_observ
     session_id = "session-correlation"
     prompt = "same prompt"
     async with Database(tmp_path / "correlation.sqlite3") as database:
+        await CapabilityRegistry(Settings(_env_file=None, data_dir=tmp_path)).activate(
+            database,
+            {
+                "runtime_version": "1.0.73",
+                "protocol_version": 3,
+                "ping_protocol_version": 3,
+            },
+        )
         await _insert_projection_binding(database, session_id)
         queued = _adapted(
             "copilotd.submission.queued",
@@ -2426,7 +2435,9 @@ async def test_user_message_correlation_retains_facts_and_creates_runtime_observ
                 "prompt_hash": hashlib.sha256(prompt.encode()).hexdigest(),
                 "requested_mode": "interactive",
                 "requested_delivery": "enqueue",
-                "attachment_count": 0,
+                "attachment_count": 3,
+                "discord_source_channel_id": "channel-1",
+                "discord_source_message_id": "message-1",
             },
             1,
             source="internal",
@@ -2441,7 +2452,12 @@ async def test_user_message_correlation_retains_facts_and_creates_runtime_observ
         )
         observed = _adapted(
             "user.message",
-            {"content": prompt, "agentMode": "interactive", "delivery": "queued"},
+            {
+                "content": prompt,
+                "agentMode": "interactive",
+                "delivery": "queued",
+                "attachments": [{}, {}, {}],
+            },
             3,
             session_id=session_id,
         )
@@ -2469,13 +2485,26 @@ async def test_user_message_correlation_retains_facts_and_creates_runtime_observ
             FROM submission_segments ORDER BY observed_at
             """
         )
+        reaction = await database.fetchone(
+            """
+            SELECT desired_state, terminal FROM submission_reactions
+            WHERE submission_id = 'submission-app'
+            """
+        )
+        incident = await database.fetchone(
+            """
+            SELECT kind FROM runtime_incidents
+            WHERE session_id = ? AND kind = 'accepted_user_event_id_mapping_mismatch'
+            """,
+            (session_id,),
+        )
 
     assert [dict(row) for row in submissions] == [
         {
             "origin": "app_message",
             "state": "observed_active",
             "observed_user_event_id": observed.event_id,
-            "correlation_basis": "single_candidate_facts",
+            "correlation_basis": "single_candidate_facts_after_acceptance_id_mismatch",
         },
         {
             "origin": "runtime_observed",
@@ -2489,10 +2518,185 @@ async def test_user_message_correlation_retains_facts_and_creates_runtime_observ
         observed.event_id,
         external.event_id,
     ]
+    assert dict(reaction) == {"desired_state": "reasoning", "terminal": 0}
+    assert incident["kind"] == "accepted_user_event_id_mapping_mismatch"
 
 
 @pytest.mark.asyncio
-async def test_idle_quarantines_unmatched_acceptance_without_blocking_local_queue(
+async def test_late_user_correlation_recovers_submission_reaction_and_schedule(
+    tmp_path: Path,
+) -> None:
+    session_id = "session-late-correlation"
+    prompt = "scheduled prompt"
+    async with Database(tmp_path / "late-correlation.sqlite3") as database:
+        await _insert_projection_binding(database, session_id)
+        await database.execute(
+            """
+            INSERT INTO schedules(
+                id, thread_id, kind, expression, timezone, payload,
+                target_snapshot, misfire_policy, state, created_at, updated_at
+            ) VALUES (
+                'schedule-late', 'thread-projection', 'message', 'cron:0 9 * * *',
+                'UTC', '{}', '{}', 'latest', 'enabled', 1, 1
+            )
+            """
+        )
+        await database.execute(
+            """
+            INSERT INTO schedule_runs(
+                run_id, schedule_id, planned_key, planned_at_utc, status,
+                created_at, updated_at
+            ) VALUES ('run-late', 'schedule-late', 'manual:1', 1, 'accepted', 1, 1)
+            """
+        )
+        reducer = JournalReducer(database)
+        queued = _adapted(
+            "copilotd.submission.queued",
+            {
+                "submission_id": "submission-late",
+                "thread_id": "thread-projection",
+                "origin": "app_schedule",
+                "prompt": prompt,
+                "prompt_hash": hashlib.sha256(prompt.encode()).hexdigest(),
+                "requested_mode": "interactive",
+                "attachment_count": 0,
+                "discord_source_channel_id": "channel-late",
+                "discord_source_message_id": "message-late",
+            },
+            1,
+            source="internal",
+            session_id=session_id,
+        )
+        accepted = _adapted(
+            "copilotd.submission.accepted",
+            {"submission_id": "submission-late", "message_id": "accepted-late"},
+            2,
+            source="internal",
+            session_id=session_id,
+        )
+        assert await reducer.persist([queued, accepted]) == 2
+        await database.execute(
+            """
+            UPDATE message_queue SET schedule_run_id = 'run-late'
+            WHERE id = 'submission-late'
+            """
+        )
+        await database.execute(
+            """
+            UPDATE schedule_runs
+            SET result_submission_id = 'submission-late',
+                result_session_id = ?, accepted_message_id = 'accepted-late'
+            WHERE run_id = 'run-late'
+            """,
+            (session_id,),
+        )
+        assert (
+            await reducer.persist(
+                [_adapted("session.idle", {"aborted": False}, 3, session_id=session_id)]
+            )
+            == 1
+        )
+        await database.execute(
+            """
+            UPDATE render_outbox SET state = 'sending'
+            WHERE id = (
+                SELECT render_intent_id FROM schedule_runs WHERE run_id = 'run-late'
+            )
+            """
+        )
+        initial_render = await database.fetchone(
+            """
+            SELECT payload_revision FROM render_outbox
+            WHERE id = (
+                SELECT render_intent_id FROM schedule_runs WHERE run_id = 'run-late'
+            )
+            """
+        )
+        assert (
+            await reducer.persist(
+                [
+                    _adapted(
+                        "user.message",
+                        {"content": prompt, "agentMode": "interactive"},
+                        4,
+                        session_id=session_id,
+                    )
+                ]
+            )
+            == 1
+        )
+        submission = await database.fetchone(
+            "SELECT state FROM submissions WHERE submission_id = 'submission-late'"
+        )
+        reaction = await database.fetchone(
+            """
+            SELECT desired_state, terminal FROM submission_reactions
+            WHERE submission_id = 'submission-late'
+            """
+        )
+        lease = await database.fetchone(
+            """
+            SELECT state FROM liveness_leases
+            WHERE sdk_session_id = ? AND lease_id = 'submission:submission-late'
+            """,
+            (session_id,),
+        )
+        schedule = await database.fetchone(
+            """
+            SELECT status, completion_basis, error_code, terminal_at
+            FROM schedule_runs WHERE run_id = 'run-late'
+            """
+        )
+        schedule_render = await database.fetchone(
+            """
+            SELECT state, payload, payload_revision FROM render_outbox
+            WHERE id = (
+                SELECT render_intent_id FROM schedule_runs WHERE run_id = 'run-late'
+            )
+            """
+        )
+        await SchedulerRepository(database).finalize(
+            "run-late",
+            ScheduleRunState.SEMANTIC_COMPLETE,
+            completion_basis="loop_idle",
+            now=10,
+        )
+        terminal_schedule = await database.fetchone(
+            "SELECT status FROM schedule_runs WHERE run_id = 'run-late'"
+        )
+        terminal_render = await database.fetchone(
+            """
+            SELECT state, payload, payload_revision FROM render_outbox
+            WHERE id = (
+                SELECT render_intent_id FROM schedule_runs WHERE run_id = 'run-late'
+            )
+            """
+        )
+
+    assert submission["state"] == "observed_active"
+    assert dict(reaction) == {"desired_state": "reasoning", "terminal": 0}
+    assert lease["state"] == "active"
+    assert dict(schedule) == {
+        "status": "accepted",
+        "completion_basis": None,
+        "error_code": None,
+        "terminal_at": None,
+    }
+    assert schedule_render["state"] == "sending"
+    assert schedule_render["payload_revision"] == initial_render["payload_revision"] + 1
+    payload = json.loads(str(schedule_render["payload"]))
+    assert payload["finalized"] is False
+    assert payload["schedule_run"]["status"] == "accepted"
+    assert terminal_schedule["status"] == "semantic_complete"
+    assert terminal_render["state"] == "sending"
+    assert terminal_render["payload_revision"] == schedule_render["payload_revision"] + 1
+    terminal_payload = json.loads(str(terminal_render["payload"]))
+    assert terminal_payload["finalized"] is True
+    assert terminal_payload["schedule_run"]["status"] == "semantic_complete"
+
+
+@pytest.mark.asyncio
+async def test_idle_settles_uniquely_correlated_acceptance_without_blocking_local_queue(
     tmp_path: Path,
 ) -> None:
     session_id = "session-acceptance-mismatch-idle"
@@ -2582,7 +2786,7 @@ async def test_idle_quarantines_unmatched_acceptance_without_blocking_local_queu
         incident = await database.fetchone(
             """
             SELECT kind FROM runtime_incidents
-            WHERE session_id = ? AND kind = 'submission_unobserved_at_session_idle'
+            WHERE session_id = ? AND kind = 'accepted_user_event_id_mapping_mismatch'
             """,
             (session_id,),
         )
@@ -2595,8 +2799,8 @@ async def test_idle_quarantines_unmatched_acceptance_without_blocking_local_queu
         "submission-first": {
             "submission_id": "submission-first",
             "origin": "app_message",
-            "state": "outcome_unknown",
-            "completion_basis": "session_idle_without_user_correlation",
+            "state": "loop_idle",
+            "completion_basis": None,
         },
         "submission-second": {
             "submission_id": "submission-second",
@@ -2605,19 +2809,16 @@ async def test_idle_quarantines_unmatched_acceptance_without_blocking_local_queu
             "completion_basis": None,
         },
     }
-    assert len(runtime_submissions) == 1
-    assert runtime_submissions[0]["origin"] == "runtime_observed"
-    assert runtime_submissions[0]["state"] == "loop_idle"
-    assert runtime_submissions[0]["completion_basis"] is None
+    assert runtime_submissions == []
     assert [dict(row) for row in queue] == [
-        {"id": "submission-first", "state": "outcome_unknown"},
+        {"id": "submission-first", "state": "submitted"},
         {"id": "submission-second", "state": "local_queued"},
     ]
     assert [dict(row) for row in leases if row["source_id"].startswith("submission-")] == [
-        {"source_id": "submission-first", "state": "released"},
+        {"source_id": "submission-first", "state": "active"},
         {"source_id": "submission-second", "state": "active"},
     ]
-    assert incident["kind"] == "submission_unobserved_at_session_idle"
+    assert incident["kind"] == "accepted_user_event_id_mapping_mismatch"
 
 
 @pytest.mark.asyncio

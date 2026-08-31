@@ -5329,7 +5329,13 @@ def _status_embed_style(
             "continue": ("▶️", _COLOR_BLURPLE),
             "blocked": ("⚠️", _COLOR_YELLOW),
         }.get(outcome, ("🔹", _COLOR_CYAN))
-    if event_type in {"session.error", "model.call_failure"}:
+    if event_type in {
+        "session.error",
+        "model.call_failure",
+        "turn.failed",
+        "turn.tool_failed",
+        "turn.subagent_failed",
+    }:
         return "❌", _COLOR_RED
     if event_type in {
         "session.warning",
@@ -5347,8 +5353,16 @@ def _status_embed_style(
         return "✅", _COLOR_GREEN
     if event_type == "session.workspace_file_changed":
         return "📝", _COLOR_CYAN
-    if event_type in {"assistant.intent", "assistant.reasoning_delta", "session.compaction_start"}:
+    if event_type in {
+        "assistant.intent",
+        "assistant.reasoning_delta",
+        "session.compaction_start",
+        "turn.tool_running",
+        "turn.subagent_started",
+    }:
         return "⏳", _COLOR_BLURPLE
+    if event_type in {"turn.tool_complete", "turn.subagent_completed"}:
+        return "✅", _COLOR_GREEN
     if event_type == "assistant.reasoning":
         return "💡", _COLOR_BLURPLE
     return "🔹", _COLOR_CYAN

@@ -26,6 +26,7 @@ def _event(
     agent_id: str | None = None,
     task_id: str | None = None,
     tool_call_id: str | None = None,
+    interaction_id: str | None = None,
 ) -> AdaptedEvent:
     return AdaptedEvent(
         sdk_session_id="turn-session",
@@ -45,6 +46,7 @@ def _event(
         agent_id=agent_id,
         task_id=task_id,
         tool_call_id=tool_call_id,
+        interaction_id=interaction_id,
     )
 
 
@@ -121,6 +123,7 @@ class _Transport:
 @pytest.mark.asyncio
 async def test_multi_tool_stream_and_replay_use_one_durable_turn_card(tmp_path: Path) -> None:
     transport = _Transport()
+    interaction_id = "interaction-1"
     async with Database(tmp_path / "single-turn.sqlite3") as database:
         await _binding(database, tmp_path)
         reducer = JournalReducer(database)
@@ -149,36 +152,72 @@ async def test_multi_tool_stream_and_replay_use_one_durable_turn_card(tmp_path: 
             ),
             _event(
                 "user.message",
-                {"content": "build it", "agentMode": "interactive", "attachments": []},
+                {
+                    "content": "build it",
+                    "agentMode": "interactive",
+                    "attachments": [],
+                    "interactionId": interaction_id,
+                },
                 3,
                 source="sdk",
                 event_id="runtime-user",
+                interaction_id=interaction_id,
             ),
             _event(
                 "assistant.turn_start",
-                {"turnId": "turn-1"},
+                {"turnId": "turn-1", "interactionId": interaction_id},
                 4,
                 source="sdk",
                 event_id="turn-start",
                 turn_id="turn-1",
+                interaction_id=interaction_id,
+            ),
+            _event(
+                "assistant.intent",
+                {"intent": "Inspecting the repository."},
+                5,
+                source="sdk",
+                event_id="intent",
+                turn_id="turn-1",
+                interaction_id=interaction_id,
+            ),
+            _event(
+                "tool.execution_start",
+                {"toolCallId": "tool-1", "toolName": "private-shell"},
+                6,
+                source="sdk",
+                event_id="tool-start",
+                turn_id="turn-1",
+                tool_call_id="tool-1",
+                interaction_id=interaction_id,
             ),
             _event(
                 "tool.execution_progress",
-                {"toolCallId": "tool-1", "outputDelta": "secret-log-" * 7000},
-                5,
+                {
+                    "toolCallId": "tool-1",
+                    "progressMessage": "Running tests.",
+                    "outputDelta": "secret-log-" * 7000,
+                },
+                7,
                 source="sdk",
                 event_id="tool-progress",
                 turn_id="turn-1",
                 tool_call_id="tool-1",
+                interaction_id=interaction_id,
             ),
             _event(
-                "assistant.message_delta",
-                {"messageId": "answer-1", "deltaContent": "partial answer"},
-                6,
+                "assistant.message",
+                {
+                    "messageId": "answer-progress",
+                    "content": "I inspected the implementation.",
+                    "interactionId": interaction_id,
+                },
+                8,
                 source="sdk",
-                event_id="answer-delta",
-                message_id="answer-1",
+                event_id="answer-progress",
+                message_id="answer-progress",
                 turn_id="turn-1",
+                interaction_id=interaction_id,
             ),
             _event(
                 "tool.execution_complete",
@@ -188,11 +227,12 @@ async def test_multi_tool_stream_and_replay_use_one_durable_turn_card(tmp_path: 
                     "success": True,
                     "result": {"detailedContent": "raw-detail-" * 9000},
                 },
-                7,
+                9,
                 source="sdk",
                 event_id="tool-complete",
                 turn_id="turn-1",
                 tool_call_id="tool-1",
+                interaction_id=interaction_id,
             ),
         ]
         assert await reducer.persist(events) == len(events)
@@ -203,7 +243,14 @@ async def test_multi_tool_stream_and_replay_use_one_durable_turn_card(tmp_path: 
             """
         )
         assert len(rows) == 1
-        assert json.loads(str(rows[0]["payload"]))["content"] == "Copilot is working…"
+        progress_payload = json.loads(str(rows[0]["payload"]))
+        assert progress_payload["status"] == {
+            "title": "Tool completed",
+            "detail": "`private-shell`",
+            "event_type": "turn.tool_complete",
+        }
+        assert await dispatcher.dispatch_once() == 1
+        assert transport.edited[-1][1]["status"] == progress_payload["status"]
         spill = await database.fetchone(
             """
             SELECT local_path, finalized FROM tool_spill_artifacts
@@ -215,17 +262,24 @@ async def test_multi_tool_stream_and_replay_use_one_durable_turn_card(tmp_path: 
 
         final = _event(
             "assistant.message",
-            {"messageId": "answer-1", "content": "The complete final answer."},
-            8,
+            {
+                "messageId": "answer-1",
+                "content": "The complete final answer.",
+                "interactionId": interaction_id,
+            },
+            10,
             source="sdk",
             event_id="answer-final",
             message_id="answer-1",
             turn_id="turn-1",
+            interaction_id=interaction_id,
         )
         assert await reducer.persist([final]) == 1
         assert await dispatcher.dispatch_once() == 1
         assert transport.edited[-1][0] == "discord-turn-card"
-        assert transport.edited[-1][1]["content"] == "The complete final answer."
+        assert transport.edited[-1][1]["content"] == (
+            "I inspected the implementation.\n\nThe complete final answer."
+        )
 
         await database.execute(
             """
@@ -235,7 +289,9 @@ async def test_multi_tool_stream_and_replay_use_one_durable_turn_card(tmp_path: 
             """
         )
         assert (
-            await reducer.persist([_event("copilotd.snapshot.requested", {"topic": "activity"}, 9)])
+            await reducer.persist(
+                [_event("copilotd.snapshot.requested", {"topic": "activity"}, 11)]
+            )
             == 1
         )
         assert await RenderOutboxDispatcher(database, transport).dispatch_once() == 1
@@ -258,12 +314,116 @@ async def test_multi_tool_stream_and_replay_use_one_durable_turn_card(tmp_path: 
     assert len(transport.sent) == 1
     assert all(message_id == "discord-turn-card" for message_id, _ in transport.edited)
     assert transport.edited[-1][1]["finalized"] is True
-    assert "private-shell" not in encoded
+    assert "private-shell" in encoded
     assert "secret-log" not in encoded
     assert "raw-detail" not in encoded
     assert "tool_output_artifact" not in encoded
     assert dict(mapping) == {"discord_message_id": "discord-turn-card", "finalized": 1}
-    assert journal_tools[0] == 2
+    assert journal_tools[0] == 3
+
+
+@pytest.mark.asyncio
+async def test_autopilot_continuation_card_uses_current_interaction_transcript(
+    tmp_path: Path,
+) -> None:
+    async with Database(tmp_path / "continuation-turn.sqlite3") as database:
+        await _binding(database, tmp_path)
+        reducer = JournalReducer(database)
+        assert await reducer.persist([_queued()]) == 1
+        await database.execute(
+            """
+            UPDATE submissions SET requested_mode = 'autopilot'
+            WHERE submission_id = 'submission-1'
+            """
+        )
+        assert (
+            await reducer.persist(
+                [
+                    _event(
+                        "copilotd.submission.accepted",
+                        {"submission_id": "submission-1", "message_id": "runtime-root"},
+                        2,
+                    ),
+                    _event(
+                        "user.message",
+                        {
+                            "content": "build it",
+                            "agentMode": "autopilot",
+                            "interactionId": "interaction-root",
+                        },
+                        3,
+                        source="sdk",
+                        event_id="runtime-root",
+                        interaction_id="interaction-root",
+                    ),
+                    _event(
+                        "assistant.message",
+                        {
+                            "messageId": "root-answer",
+                            "content": "Root interaction answer.",
+                            "interactionId": "interaction-root",
+                        },
+                        4,
+                        source="sdk",
+                        event_id="root-answer",
+                        message_id="root-answer",
+                        interaction_id="interaction-root",
+                    ),
+                    _event(
+                        "session.task_complete",
+                        {"outcome": "continue"},
+                        5,
+                        source="sdk",
+                        event_id="continue",
+                    ),
+                    _event(
+                        "session.idle",
+                        {"aborted": False},
+                        6,
+                        source="sdk",
+                        event_id="root-idle",
+                    ),
+                    _event(
+                        "user.message",
+                        {
+                            "content": "continue",
+                            "agentMode": "autopilot",
+                            "isAutopilotContinuation": True,
+                            "interactionId": "interaction-continuation",
+                        },
+                        7,
+                        source="sdk",
+                        event_id="runtime-continuation",
+                        interaction_id="interaction-continuation",
+                    ),
+                    _event(
+                        "assistant.message",
+                        {
+                            "messageId": "continuation-answer",
+                            "content": "Continuation interaction answer.",
+                            "interactionId": "interaction-continuation",
+                        },
+                        8,
+                        source="sdk",
+                        event_id="continuation-answer",
+                        message_id="continuation-answer",
+                        interaction_id="interaction-continuation",
+                    ),
+                ]
+            )
+            == 7
+        )
+        continuation = await database.fetchone(
+            """
+            SELECT payload FROM render_outbox
+            WHERE session_id = 'turn-session'
+              AND coalesce_key = 'turn:submission-1:segment:2'
+            """
+        )
+
+    payload = json.loads(str(continuation["payload"]))
+    assert payload["content"] == "Continuation interaction answer."
+    assert "Root interaction answer." not in payload["content"]
 
 
 @pytest.mark.asyncio
@@ -368,7 +528,12 @@ async def test_subagent_background_progress_never_creates_taskdeck_message(
     payload = json.loads(str(rows[0]["payload"]))
     assert rows[0]["lane"] == "assistant_stream"
     assert payload["content"] == "Copilot is working…"
-    assert "Private investigator" not in json.dumps(payload)
+    assert payload["status"] == {
+        "title": "Subagent completed",
+        "detail": "`Private investigator`",
+        "event_type": "turn.subagent_completed",
+    }
+    assert "private subagent output" not in json.dumps(payload)
     assert cards
 
 
