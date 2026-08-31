@@ -386,7 +386,10 @@ class SdkEventIngress:
     ) -> None:
         self._inbox = inbox
         self._on_event_accepted = on_event_accepted
+        self._submission_lock = threading.Lock()
 
     def __call__(self, event: SessionEvent) -> None:
-        if self._inbox.submit_sdk(event) and self._on_event_accepted is not None:
-            self._on_event_accepted(event)
+        # Keep acceptance side effects in the same order as MPSC inbox reservations.
+        with self._submission_lock:
+            if self._inbox.submit_sdk(event) and self._on_event_accepted is not None:
+                self._on_event_accepted(event)
