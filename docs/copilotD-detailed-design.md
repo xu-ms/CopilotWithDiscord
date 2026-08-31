@@ -615,7 +615,9 @@ detach-safe 后恢复 `CLOSED + ABSENT`；run 未决/unknown 时继续 attached 
 intent 误杀工作。
 `session.shutdown` 使当前 handle terminal；只有 explicit close 已在进行时才提交
 `binding_intent=CLOSED`，其他 routine/error shutdown 均先进入 recovery/diagnostics，不能从
-`shutdownType` 猜用户意图。
+`shutdownType` 猜用户意图。resume callback 可能随后重放其 `session.resume.parentId` 指向的
+上一代 durable shutdown；该 shutdown 仅入 journal 供审计，不得终止新 handle、改变 attachment、
+finalize turn 或生成 “session ended” UI。
 
 owner lease TTL 固定 60 秒、每 15 秒续租，保留 40 秒 mutation headroom 与至少 5 秒调度抖动
 余量；每次 takeover 在 SQLite transaction 内分配严格

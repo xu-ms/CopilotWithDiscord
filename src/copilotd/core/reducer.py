@@ -376,18 +376,29 @@ class JournalReducer:
                     )
                     continue
                 inserted += 1
-                await self._apply_domain_state(connection, event, now=now)
-                await self._apply_reaction_state(connection, event, now=now)
-                render_payload = await self._materialize_render_payload(
+                superseded_shutdown = await self._is_superseded_shutdown(
                     connection,
                     event,
-                    now=now,
                 )
-                suppress_default_artifact, artifact_override = await self._cumulative_tool_artifact(
-                    connection,
-                    event,
-                    now=now,
-                )
+                render_payload: dict[str, Any] | None = None
+                suppress_default_artifact = False
+                artifact_override: dict[str, Any] | None = None
+                if not superseded_shutdown:
+                    await self._apply_domain_state(connection, event, now=now)
+                    await self._apply_reaction_state(connection, event, now=now)
+                    render_payload = await self._materialize_render_payload(
+                        connection,
+                        event,
+                        now=now,
+                    )
+                    (
+                        suppress_default_artifact,
+                        artifact_override,
+                    ) = await self._cumulative_tool_artifact(
+                        connection,
+                        event,
+                        now=now,
+                    )
                 await connection.execute(
                     """
                     UPDATE session_bindings
@@ -414,6 +425,8 @@ class JournalReducer:
                         event.fence_token,
                     ),
                 )
+                if superseded_shutdown:
+                    continue
                 planner_parameters = inspect.signature(self._planner.plan).parameters
                 planner_kwargs: dict[str, Any] = {
                     "payload_override": render_payload,
@@ -511,6 +524,31 @@ class JournalReducer:
                         ),
                     )
         return inserted
+
+    async def _is_superseded_shutdown(
+        self,
+        connection: Any,
+        event: AdaptedEvent,
+    ) -> bool:
+        if event.raw_type != "session.shutdown" or event.event_id is None:
+            return False
+        cursor = await connection.execute(
+            """
+            SELECT 1
+            FROM event_journal
+            WHERE sdk_session_id = ? AND generation = ?
+              AND raw_type = 'session.resume' AND parent_id = ?
+            LIMIT 1
+            """,
+            (
+                event.sdk_session_id,
+                event.generation,
+                event.event_id,
+            ),
+        )
+        resumed_after_shutdown = await cursor.fetchone()
+        await cursor.close()
+        return resumed_after_shutdown is not None
 
     async def _apply_reaction_state(
         self,
