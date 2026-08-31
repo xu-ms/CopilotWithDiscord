@@ -1249,7 +1249,18 @@ class SchedulerRepository:
                 idempotency_key, payload, state, attempts,
                 next_attempt_at, created_at, updated_at
             ) VALUES (?, ?, ?, 'schedule', ?, ?, ?, 'pending', 0, ?, ?, ?)
-            ON CONFLICT(idempotency_key) DO NOTHING
+            ON CONFLICT(idempotency_key) DO UPDATE SET
+                payload = excluded.payload,
+                payload_revision = render_outbox.payload_revision + 1,
+                state = CASE
+                    WHEN render_outbox.state = 'sending' THEN 'sending'
+                    ELSE 'pending'
+                END,
+                next_attempt_at = MIN(
+                    render_outbox.next_attempt_at,
+                    excluded.next_attempt_at
+                ),
+                updated_at = excluded.updated_at
             """,
             (
                 render_id,
@@ -1281,7 +1292,10 @@ class SchedulerRepository:
             INSERT INTO scheduler_render_intents(
                 run_id, render_outbox_id, terminal_status, completion_basis, created_at
             ) VALUES (?, ?, ?, ?, ?)
-            ON CONFLICT(run_id) DO NOTHING
+            ON CONFLICT(run_id) DO UPDATE SET
+                terminal_status = excluded.terminal_status,
+                completion_basis = excluded.completion_basis,
+                created_at = excluded.created_at
             """,
             (run_id, render_id, status.value, completion_basis, now),
         )

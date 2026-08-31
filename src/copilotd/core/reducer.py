@@ -705,7 +705,7 @@ class JournalReducer:
             connection,
             """
             SELECT sdk_session_id, discord_source_channel_id,
-                   discord_source_message_id
+                   discord_source_message_id, state
             FROM submissions
             WHERE submission_id = ? AND sdk_session_id = ?
             """,
@@ -728,7 +728,17 @@ class JournalReducer:
         if existing is not None:
             existing_state = str(existing["desired_state"])
             if bool(existing["terminal"]):
-                return
+                recoverable_failure = existing_state == "failed" and str(submission["state"]) in {
+                    "submitting",
+                    "submitted",
+                    "submitted_unknown",
+                    "observed_active",
+                    "loop_idle",
+                    "continuation_expected",
+                    "semantic_complete",
+                }
+                if not recoverable_failure:
+                    return
             if existing_state == state:
                 return
             revision = int(existing["revision"]) + 1
@@ -757,7 +767,7 @@ class JournalReducer:
                 revision = excluded.revision,
                 runtime_generation = excluded.runtime_generation,
                 owner_fence_token = excluded.owner_fence_token,
-                terminal = MAX(submission_reactions.terminal, excluded.terminal),
+                terminal = excluded.terminal,
                 last_error = NULL,
                 updated_at = excluded.updated_at
             """,
@@ -974,6 +984,19 @@ class JournalReducer:
             row = await _fetchone_row(
                 connection,
                 """
+                SELECT submission_id FROM submissions
+                WHERE sdk_session_id = ? AND observed_interaction_id = ?
+                ORDER BY observed_at DESC, created_at DESC
+                LIMIT 1
+                """,
+                (event.sdk_session_id, event.interaction_id),
+            )
+            if row is not None:
+                submission_id = str(row["submission_id"])
+        if submission_id is None and event.interaction_id is not None:
+            row = await _fetchone_row(
+                connection,
+                """
                 SELECT submission_id, segment_index FROM model_turns
                 WHERE sdk_session_id = ? AND interaction_id = ?
                   AND submission_id IS NOT NULL
@@ -1053,13 +1076,25 @@ class JournalReducer:
         submission = await _fetchone_row(
             connection,
             """
-            SELECT state FROM submissions
+            SELECT state, observed_interaction_id FROM submissions
             WHERE sdk_session_id = ? AND submission_id = ?
             """,
             (event.sdk_session_id, submission_id),
         )
         if submission is None:
             return None
+        segment_interaction_id = None
+        if segment_index is not None:
+            segment = await _fetchone_row(
+                connection,
+                """
+                SELECT interaction_id FROM submission_segments
+                WHERE submission_id = ? AND segment_index = ?
+                """,
+                (submission_id, segment_index),
+            )
+            if segment is not None:
+                segment_interaction_id = segment["interaction_id"]
         await connection.execute(
             """
             INSERT INTO turn_render_state(
@@ -1103,6 +1138,11 @@ class JournalReducer:
             "submission_id": submission_id,
             "segment_index": segment_index,
             "submission_state": str(submission["state"]),
+            "interaction_id": (
+                event.interaction_id
+                or segment_interaction_id
+                or submission["observed_interaction_id"]
+            ),
             "render_state": str(render["state"]),
             "answer_payload": render["answer_payload"],
         }
@@ -1176,17 +1216,89 @@ class JournalReducer:
             return {"suppress": True}
         if context["render_state"] in {"final", "failed"}:
             return {"suppress": True}
+        status = await self._turn_activity_status(connection, event)
         return {
             "type": "turn_progress",
             "content": "Copilot is working…",
-            "status": {
-                "title": "Copilot is working",
-                "detail": "Processing your request.",
-                "event_type": "turn.running",
-            },
+            "status": status,
             "turn_render_key": turn_key,
             "submission_id": context["submission_id"],
             "finalized": False,
+        }
+
+    async def _turn_activity_status(
+        self,
+        connection: Any,
+        event: AdaptedEvent,
+    ) -> dict[str, str]:
+        data = event.raw_payload.get("data", event.raw_payload)
+        values = data if isinstance(data, dict) else {}
+        if event.raw_type.startswith("tool.execution_"):
+            tool_name = _value(values, "toolName")
+            if tool_name is None and event.tool_call_id is not None:
+                row = await _fetchone_row(
+                    connection,
+                    """
+                    SELECT title FROM task_card_projections
+                    WHERE sdk_session_id = ? AND card_key = ?
+                    """,
+                    (event.sdk_session_id, f"tool:{event.tool_call_id}"),
+                )
+                if row is not None:
+                    tool_name = str(row["title"])
+            tool_name = _bounded_text(tool_name or "Copilot tool", 120)
+            if event.raw_type == "tool.execution_complete":
+                success = bool(values.get("success"))
+                return {
+                    "title": "Tool completed" if success else "Tool failed",
+                    "detail": f"`{tool_name}`",
+                    "event_type": "turn.tool_complete" if success else "turn.tool_failed",
+                }
+            progress = _value(values, "progressMessage")
+            return {
+                "title": "Running tool",
+                "detail": (
+                    f"`{tool_name}`"
+                    if progress is None
+                    else f"`{tool_name}` · {_bounded_text(progress, 500)}"
+                ),
+                "event_type": "turn.tool_running",
+            }
+        if event.raw_type.startswith("subagent."):
+            name = (
+                _value(values, "agentDisplayName")
+                or _value(values, "agentName")
+                or "Copilot subagent"
+            )
+            state = event.raw_type.removeprefix("subagent.")
+            return {
+                "title": {
+                    "started": "Subagent running",
+                    "completed": "Subagent completed",
+                    "failed": "Subagent failed",
+                }.get(state, "Subagent update"),
+                "detail": f"`{_bounded_text(name, 120)}`",
+                "event_type": f"turn.subagent_{state}",
+            }
+        if event.raw_type in {
+            "assistant.intent",
+            "assistant.reasoning",
+            "assistant.reasoning_delta",
+            "assistant.turn_retry",
+        }:
+            title, fallback = _status_title(event.raw_type)
+            return {
+                "title": title,
+                "detail": _bounded_text(
+                    _status_detail(event.raw_type, values, fallback=fallback),
+                    500,
+                ),
+                "event_type": event.raw_type,
+            }
+        return {
+            "title": "Copilot is working",
+            "detail": "Processing your request.",
+            "event_type": "turn.running",
         }
 
     async def _materialize_render_payload(
@@ -1582,6 +1694,12 @@ class JournalReducer:
                 for row in snapshot_rows
             ]
         if turn_context is not None:
+            payload["content"] = await self._turn_transcript_content(
+                connection,
+                event,
+                turn_context,
+                fallback=str(stream["content"]),
+            )
             answer_payload = {**payload, "finalized": True}
             terminal = str(turn_context["submission_state"]) in _SUBMISSION_SUCCESS_STATES
             await connection.execute(
@@ -1604,6 +1722,39 @@ class JournalReducer:
                 finalized=terminal,
             )
         return payload
+
+    async def _turn_transcript_content(
+        self,
+        connection: Any,
+        event: AdaptedEvent,
+        context: dict[str, Any],
+        *,
+        fallback: str,
+    ) -> str:
+        interaction_id = event.interaction_id or context.get("interaction_id")
+        if interaction_id is None:
+            return fallback
+        cursor = await connection.execute(
+            """
+            SELECT raw_payload
+            FROM event_journal
+            WHERE sdk_session_id = ? AND interaction_id = ?
+              AND raw_type = 'assistant.message'
+              AND (agent_id IS NULL OR agent_id = '')
+            ORDER BY journal_id
+            """,
+            (event.sdk_session_id, str(interaction_id)),
+        )
+        rows = await cursor.fetchall()
+        await cursor.close()
+        parts: list[str] = []
+        for row in rows:
+            raw_payload = json.loads(str(row["raw_payload"]))
+            data = raw_payload.get("data", raw_payload)
+            content = data.get("content") if isinstance(data, dict) else None
+            if isinstance(content, str) and content.strip():
+                parts.append(content.strip())
+        return "\n\n".join(parts) or fallback
 
     async def _accumulate_render_stream(
         self,
@@ -6693,11 +6844,6 @@ class JournalReducer:
                     content_hash is not None
                     and candidate["prompt_hash"] == content_hash
                     and (
-                        not exact_mapping
-                        or candidate["accepted_message_id"] is None
-                        or str(candidate["accepted_message_id"]) == event.event_id
-                    )
-                    and (
                         observed_mode is None
                         or candidate["requested_mode"] is None
                         or candidate["requested_mode"] == observed_mode
@@ -6711,10 +6857,30 @@ class JournalReducer:
             correlation_basis = "single_candidate_facts"
 
         if len(candidates) == 1:
+            candidate = candidates[0]
+            accepted_message_id = candidate["accepted_message_id"]
+            correlation_basis = (
+                "single_candidate_facts_after_acceptance_id_mismatch"
+                if exact_mapping
+                and accepted_message_id is not None
+                and str(accepted_message_id) != event.event_id
+                else correlation_basis
+            )
+            if correlation_basis == "single_candidate_facts_after_acceptance_id_mismatch":
+                await self._record_runtime_incident_once(
+                    connection,
+                    event,
+                    kind="accepted_user_event_id_mapping_mismatch",
+                    detail={
+                        "submission_id": str(candidate["submission_id"]),
+                        "accepted_message_id": str(accepted_message_id),
+                        "user_event_id": event.event_id,
+                    },
+                )
             await self._observe_submission(
                 connection,
                 event,
-                submission_id=str(candidates[0]["submission_id"]),
+                submission_id=str(candidate["submission_id"]),
                 correlation_basis=correlation_basis,
                 interaction_id=interaction_id,
                 delivery=delivery,
@@ -6758,6 +6924,15 @@ class JournalReducer:
         continuation: bool,
         now: float,
     ) -> None:
+        previous = await _fetchone_row(
+            connection,
+            """
+            SELECT state FROM submissions
+            WHERE submission_id = ? AND sdk_session_id = ?
+            """,
+            (submission_id, event.sdk_session_id),
+        )
+        recovering_unknown = previous is not None and previous["state"] == "outcome_unknown"
         await connection.execute(
             """
             UPDATE submissions
@@ -6841,6 +7016,78 @@ class JournalReducer:
                 event.fence_token,
                 now,
                 now,
+            ),
+        )
+        if recovering_unknown:
+            await self._recover_schedule_run_after_late_correlation(
+                connection,
+                submission_id=submission_id,
+                now=now,
+            )
+
+    async def _recover_schedule_run_after_late_correlation(
+        self,
+        connection: Any,
+        *,
+        submission_id: str,
+        now: float,
+    ) -> None:
+        schedule_run = await _fetchone_row(
+            connection,
+            """
+            SELECT run_id, render_intent_id
+            FROM schedule_runs
+            WHERE result_submission_id = ?
+              AND status = 'outcome_unknown'
+              AND error_code = 'session_idle_without_user_correlation'
+            """,
+            (submission_id,),
+        )
+        if schedule_run is None:
+            return
+        await connection.execute(
+            """
+            UPDATE schedule_runs
+            SET status = 'accepted', completion_basis = NULL, error_code = NULL,
+                terminal_at = NULL, last_progress_at = ?, updated_at = ?
+            WHERE run_id = ?
+            """,
+            (now, now, str(schedule_run["run_id"])),
+        )
+        render_intent_id = schedule_run["render_intent_id"]
+        if render_intent_id is None:
+            return
+        outbox = await _fetchone_row(
+            connection,
+            "SELECT payload FROM render_outbox WHERE id = ?",
+            (str(render_intent_id),),
+        )
+        if outbox is None:
+            return
+        payload = json.loads(str(outbox["payload"]))
+        payload["content"] = (
+            f"Scheduled run `{schedule_run['run_id']}` resumed after delayed runtime correlation."
+        )
+        payload["finalized"] = False
+        schedule_payload = payload.get("schedule_run")
+        if isinstance(schedule_payload, dict):
+            schedule_payload["status"] = "accepted"
+            schedule_payload["completion_basis"] = None
+            schedule_payload["error_code"] = None
+        await connection.execute(
+            """
+            UPDATE render_outbox
+            SET payload = ?,
+                payload_revision = payload_revision + 1,
+                state = CASE WHEN state = 'sending' THEN 'sending' ELSE 'pending' END,
+                next_attempt_at = ?, updated_at = ?
+            WHERE id = ?
+            """,
+            (
+                json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")),
+                now,
+                now,
+                str(render_intent_id),
             ),
         )
 
@@ -9466,7 +9713,9 @@ async def _finalize_schedule_run_from_reducer(
         """,
         (run_id,),
     )
-    if row is None or row["render_intent_id"] is not None:
+    if row is None:
+        return
+    if row["render_intent_id"] is not None and row["status"] != "accepted":
         return
     render_id = str(uuid.uuid5(uuid.NAMESPACE_URL, f"copilotd:schedule-run:{run_id}:final-render"))
     if row["result_session_id"] is not None and bool(row["result_session_bound"]):
@@ -9515,7 +9764,18 @@ async def _finalize_schedule_run_from_reducer(
             idempotency_key, payload, state, attempts,
             next_attempt_at, created_at, updated_at
         ) VALUES (?, ?, ?, 'schedule', ?, ?, ?, 'pending', 0, ?, ?, ?)
-        ON CONFLICT(idempotency_key) DO NOTHING
+        ON CONFLICT(idempotency_key) DO UPDATE SET
+            payload = excluded.payload,
+            payload_revision = render_outbox.payload_revision + 1,
+            state = CASE
+                WHEN render_outbox.state = 'sending' THEN 'sending'
+                ELSE 'pending'
+            END,
+            next_attempt_at = MIN(
+                render_outbox.next_attempt_at,
+                excluded.next_attempt_at
+            ),
+            updated_at = excluded.updated_at
         """,
         (
             render_id,
@@ -9534,7 +9794,10 @@ async def _finalize_schedule_run_from_reducer(
         INSERT INTO scheduler_render_intents(
             run_id, render_outbox_id, terminal_status, completion_basis, created_at
         ) VALUES (?, ?, ?, ?, ?)
-        ON CONFLICT(run_id) DO NOTHING
+        ON CONFLICT(run_id) DO UPDATE SET
+            terminal_status = excluded.terminal_status,
+            completion_basis = excluded.completion_basis,
+            created_at = excluded.created_at
         """,
         (run_id, render_id, status, completion_basis, now),
     )
