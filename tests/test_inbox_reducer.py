@@ -29,7 +29,7 @@ from copilotd.core.event_inventory import (
     MAIN_BRANCH_ONLY_DISPOSITIONS,
     disposition_for,
 )
-from copilotd.core.inbox import ReducerInbox
+from copilotd.core.inbox import ReducerInbox, SdkEventIngress
 from copilotd.core.models import AdaptedEvent, InboxEnvelope
 from copilotd.core.reducer import (
     EventReducerWorker,
@@ -179,6 +179,46 @@ async def test_inbox_reserves_capacity_before_cross_thread_scheduling() -> None:
     assert received == list(range(1, 21))
     assert inbox.size == 0
     assert inbox.overflow is None
+
+
+@pytest.mark.asyncio
+async def test_sdk_ingress_serializes_acceptance_callbacks_with_reservations() -> None:
+    inbox = ReducerInbox(
+        sdk_session_id="session-1",
+        generation=1,
+        fence_token=7,
+        capacity=4,
+    )
+    first = _message_delta(content="first")
+    second = _message_delta(content="second")
+    first_reserved = threading.Event()
+    release_first = threading.Event()
+    original_submit = inbox.submit_sdk
+
+    def delayed_submit(event: SessionEvent) -> bool:
+        accepted = original_submit(event)
+        if event is first:
+            first_reserved.set()
+            assert release_first.wait(timeout=1)
+        return accepted
+
+    inbox.submit_sdk = delayed_submit  # type: ignore[method-assign]
+    accepted: list[SessionEvent] = []
+    ingress = SdkEventIngress(inbox, on_event_accepted=accepted.append)
+    first_thread = threading.Thread(target=ingress, args=(first,))
+    second_thread = threading.Thread(target=ingress, args=(second,))
+
+    first_thread.start()
+    assert first_reserved.wait(timeout=1)
+    second_thread.start()
+    release_first.set()
+    first_thread.join()
+    second_thread.join()
+
+    assert accepted == [first, second]
+    for _ in range(2):
+        envelope = await inbox.get()
+        inbox.acknowledge(envelope)
 
 
 @pytest.mark.asyncio

@@ -27,6 +27,7 @@ from copilot.session_events import (
     SessionManagedSettingsResolvedData,
     SessionModeChangedData,
     SessionPermissionsChangedData,
+    SessionResumeData,
     SessionShutdownData,
     ShutdownCodeChanges,
     ShutdownType,
@@ -135,6 +136,7 @@ class FakeBridge:
         self.context_error: Exception | None = None
         self.usage_error: Exception | None = None
         self.managed_settings_enabled = True
+        self.resume_events: list[SessionEvent] = []
 
     def managed_settings_available(self) -> bool:
         return self.managed_settings_enabled
@@ -153,6 +155,8 @@ class FakeBridge:
         if self.fail_resume:
             raise ConnectionError("resume transport lost")
         assert session_id == self.handle.session_id
+        for event in self.resume_events:
+            self.ingress(event)
         return self.handle
 
     async def send(self, session: FakeHandle, prompt: str, **kwargs: Any) -> str:
@@ -2429,6 +2433,63 @@ async def test_unexpected_sdk_shutdown_terminalizes_handle_and_registry_runtime(
         assert runtime.state == RuntimeState.RECOVERY_UNKNOWN
         assert runtime.handle is None
         assert registry.for_thread(binding.thread_id) is None
+
+
+@pytest.mark.asyncio
+async def test_resume_ignores_shutdown_superseded_by_resume_event(
+    tmp_path: Path,
+) -> None:
+    session_id = str(uuid4())
+    shutdown = _shutdown_event()
+    resumed_at = datetime.now(UTC)
+    resume = SessionEvent(
+        data=SessionResumeData(event_count=1, resume_time=resumed_at),
+        id=uuid4(),
+        parent_id=shutdown.id,
+        timestamp=resumed_at,
+        type=SessionEventType.SESSION_RESUME,
+    )
+    async with Database(tmp_path / "sdk-shutdown-replay.sqlite3") as database:
+        bindings = SessionBindingRepository(database)
+        binding = await bindings.create(
+            thread_id="thread-sdk-shutdown-replay",
+            sdk_session_id=session_id,
+            cwd_snapshot=tmp_path,
+            project_source="implicit-home",
+        )
+        bridge = FakeBridge(session_id)
+        bridge.resume_events = [resume, shutdown]
+        runtime = SessionRuntime(
+            database=database,
+            bridge=bridge,
+            bindings=bindings,
+            owner_leases=OwnerLeaseStore(database),
+            owner_id="sdk-shutdown-replay-owner",
+            binding=binding,
+        )
+
+        await runtime.attach_resume()
+        await runtime.inbox.join()
+        current = await bindings.by_thread(binding.thread_id)
+        shutdown_journal = await database.fetchone(
+            "SELECT journal_id FROM event_journal WHERE event_id = ?",
+            (str(shutdown.id),),
+        )
+        shutdown_render = await database.fetchone(
+            """
+            SELECT id FROM render_outbox
+            WHERE session_id = ? AND payload LIKE '%session.shutdown%'
+            """,
+            (session_id,),
+        )
+
+        assert current is not None
+        assert current.attachment_state == AttachmentState.ATTACHED
+        assert runtime.state == RuntimeState.READY
+        assert runtime.handle is bridge.handle
+        assert shutdown_journal is not None
+        assert shutdown_render is None
+        await runtime.shutdown()
 
 
 @pytest.mark.asyncio

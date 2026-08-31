@@ -502,6 +502,7 @@ class SessionRuntime:
         self._service_quiesce_violation_callback: Callable[[str], None] | None = None
         self._service_producers_stopped = False
         self._handle_terminal = False
+        self._superseded_shutdown_event_ids: set[str] = set()
         self._shutdown_finalize_task: asyncio.Task[None] | None = None
 
     @property
@@ -2223,19 +2224,18 @@ class SessionRuntime:
 
     def _on_sdk_event_accepted(self, event: Any) -> None:
         try:
-            validate_sdk_event_identity(event)
+            event_id, parent_id = validate_sdk_event_identity(event)
         except (InvalidSdkEvent, TypeError):
             return
         event_type = getattr(event, "type", None)
         raw_type = getattr(event_type, "value", event_type)
         loop = self._loop
-        raw_event_id = getattr(event, "id", None)
-        event_id = (
-            str(raw_event_id)
-            if raw_event_id is not None
-            else f"missing-sdk-id:{self.binding.runtime_generation}:{time.time_ns()}"
-        )
-        if raw_type == "session.shutdown":
+        if raw_type == "session.resume" and parent_id is not None:
+            self._superseded_shutdown_event_ids.add(parent_id)
+        if (
+            raw_type == "session.shutdown"
+            and event_id not in self._superseded_shutdown_event_ids
+        ):
             self._handle_terminal = True
             self._accepting_sends = False
             if self.state != RuntimeState.CLOSING:
@@ -6348,6 +6348,7 @@ class SessionRuntime:
 
     def _start_components(self) -> None:
         self._loop = asyncio.get_running_loop()
+        self._superseded_shutdown_event_ids.clear()
         fence_token = self._require_fence_token()
         self._inbox = ReducerInbox(
             sdk_session_id=self.binding.sdk_session_id,
