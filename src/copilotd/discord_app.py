@@ -1323,13 +1323,17 @@ class CopilotDiscordBot(commands.Bot):
             fetch_message = getattr(channel, "fetch_message", None)
             if fetch_message is None:
                 raise RenderPermanentError("reaction source channel is not message-addressable")
-            message = await self._discord_request(
-                DiscordOperation.FETCH,
-                lambda: fetch_message(message_id),
-                route_key="channels.messages.fetch",
-                target_key=f"channel:{channel_id}:message:{message_id}",
-                priority=DiscordPriority.MAINTENANCE,
-            )
+            partial_message = getattr(channel, "get_partial_message", None)
+            if partial_message is not None:
+                message = partial_message(message_id)
+            else:
+                message = await self._discord_request(
+                    DiscordOperation.FETCH,
+                    lambda: fetch_message(message_id),
+                    route_key="channels.messages.fetch",
+                    target_key=f"channel:{channel_id}:message:{message_id}",
+                    priority=DiscordPriority.MAINTENANCE,
+                )
             await self._discord_request(
                 DiscordOperation.ADD_REACTION,
                 lambda: message.add_reaction(emoji),
@@ -1340,18 +1344,16 @@ class CopilotDiscordBot(commands.Bot):
                 terminal=terminal,
                 min_interval_seconds=self.settings.discord_reaction_interval_seconds,
             )
-            bot_user = self.user
-            if bot_user is None:
-                raise RenderTransientError(
-                    "Discord bot identity is unavailable for reaction cleanup"
-                )
-            for old_emoji in ("👀", "🧠", "🛠️", "❓", "✅", "❌"):
-                if old_emoji == emoji:
-                    continue
-
+            previous_emoji = payload.get("previous_emoji")
+            if isinstance(previous_emoji, str) and previous_emoji != emoji:
+                bot_user = self.user
+                if bot_user is None:
+                    raise RenderTransientError(
+                        "Discord bot identity is unavailable for reaction cleanup"
+                    )
                 await self._discord_request(
                     DiscordOperation.REMOVE_REACTION,
-                    lambda value=old_emoji: message.remove_reaction(value, bot_user),
+                    lambda: message.remove_reaction(previous_emoji, bot_user),
                     route_key="channels.messages.reactions.remove-own",
                     target_key=logical_target,
                     priority=priority,
