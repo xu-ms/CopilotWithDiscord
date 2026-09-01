@@ -2089,9 +2089,13 @@ class SessionRuntime:
                 unknown_tasks = await self._database.fetchone(
                     """
                     SELECT COUNT(*) FROM background_observations
-                    WHERE sdk_session_id = ? AND observed_state = 'unknown'
+                    WHERE sdk_session_id = ? AND runtime_generation = ?
+                      AND observed_state = 'unknown'
                     """,
-                    (self.binding.sdk_session_id,),
+                    (
+                        self.binding.sdk_session_id,
+                        int(binding["runtime_generation"]),
+                    ),
                 )
                 if unknown_tasks is not None and int(unknown_tasks[0]) > 0:
                     blockers.append(f"background_tasks_unknown:{int(unknown_tasks[0])}")
@@ -2129,10 +2133,13 @@ class SessionRuntime:
                 active_tasks = await self._database.fetchone(
                     """
                     SELECT COUNT(*) FROM background_observations
-                    WHERE sdk_session_id = ?
+                    WHERE sdk_session_id = ? AND runtime_generation = ?
                       AND observed_state IN ('running', 'idle', 'unknown')
                     """,
-                    (self.binding.sdk_session_id,),
+                    (
+                        self.binding.sdk_session_id,
+                        int(binding["runtime_generation"]),
+                    ),
                 )
                 if active_tasks is not None and int(active_tasks[0]) > 0:
                     blockers.append(f"background_tasks_active:{int(active_tasks[0])}")

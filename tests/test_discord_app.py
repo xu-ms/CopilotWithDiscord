@@ -1566,7 +1566,7 @@ def test_discord_http_errors_map_to_outbox_delivery_classes() -> None:
 
 
 @pytest.mark.asyncio
-async def test_reaction_transport_adds_new_state_before_removing_only_bot_states(
+async def test_reaction_transport_adds_new_state_before_removing_previous_bot_state(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1599,6 +1599,7 @@ async def test_reaction_transport_adds_new_state_before_removing_only_bot_states
             "source_message_id": "200",
             "state": "action",
             "emoji": "🛠️",
+            "previous_emoji": "🧠",
             "finalized": False,
         },
         idempotency_key="reaction:submission-1:3",
@@ -1607,9 +1608,7 @@ async def test_reaction_transport_adds_new_state_before_removing_only_bot_states
 
     assert calls[0] == ("fetch", 200)
     assert calls[1] == ("add", "🛠️")
-    removals = calls[2:]
-    assert {call[1] for call in removals} == {"👀", "🧠", "❓", "✅", "❌"}
-    assert all(call[2] is bot_user for call in removals)
+    assert calls[2:] == [("remove", "🧠", bot_user)]
 
 
 def test_taskdeck_view_uses_short_in_place_controls() -> None:

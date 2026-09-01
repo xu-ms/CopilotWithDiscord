@@ -397,8 +397,10 @@ class _ReactionTransport:
     def __init__(self, error: Exception | None = None) -> None:
         self.error = error
         self.reactions: list[tuple[str, dict[str, Any], str]] = []
+        self.deliveries: list[str] = []
 
     async def send(self, **_kwargs: Any) -> str:
+        self.deliveries.append("message")
         return "unused"
 
     async def edit(self, **_kwargs: Any) -> None:
@@ -413,6 +415,7 @@ class _ReactionTransport:
     ) -> None:
         if self.error is not None:
             raise self.error
+        self.deliveries.append("reaction")
         self.reactions.append((session_id, payload, idempotency_key))
 
 
@@ -428,6 +431,7 @@ async def test_reaction_delivery_is_durable_idempotent_and_fenced(tmp_path: Path
         delivered = await _state(database)
         assert delivered["delivered_state"] == "accepted"
         assert delivered["delivered_revision"] == 1
+        assert transport.deliveries == ["message", "reaction"]
         assert await dispatcher.dispatch_once() == 0
 
         await database.execute(
@@ -462,6 +466,8 @@ async def test_reaction_delivery_is_durable_idempotent_and_fenced(tmp_path: Path
         latest = await _state(database)
 
     assert [call[1]["state"] for call in transport.reactions] == ["accepted", "reasoning"]
+    assert "previous_emoji" not in transport.reactions[0][1]
+    assert transport.reactions[1][1]["previous_emoji"] == "👀"
     assert (latest["runtime_generation"], latest["owner_fence_token"]) == (2, 8)
     assert latest["delivered_state"] == "reasoning"
 

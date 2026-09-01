@@ -15,6 +15,15 @@ from copilotd.core.spill_artifacts import (
 )
 from copilotd.storage.database import Database
 
+_REACTION_EMOJIS = {
+    "accepted": "👀",
+    "reasoning": "🧠",
+    "action": "🛠️",
+    "unresolved": "❓",
+    "succeeded": "✅",
+    "failed": "❌",
+}
+
 
 class RenderTransport(Protocol):
     async def send(
@@ -303,6 +312,7 @@ class RenderOutboxDispatcher:
                     SELECT 1 FROM render_outbox AS earlier
                     WHERE earlier.session_id = candidate.session_id
                       AND earlier.state IN ('pending', 'sending')
+                      AND (earlier.lane = 'reaction') = (candidate.lane = 'reaction')
                       AND (
                         earlier.logical_seq < candidate.logical_seq
                         OR (
@@ -312,6 +322,7 @@ class RenderOutboxDispatcher:
                       )
                   )
                 ORDER BY candidate.session_id,
+                         CASE WHEN candidate.lane = 'reaction' THEN 1 ELSE 0 END,
                          candidate.logical_seq,
                          candidate.created_at
                 LIMIT ?
@@ -533,7 +544,8 @@ class RenderOutboxDispatcher:
         payload = item.payload
         current = await self._database.fetchone(
             """
-            SELECT r.desired_state, r.revision, r.runtime_generation,
+            SELECT r.desired_state, r.revision, r.delivered_state,
+                   r.runtime_generation,
                    r.owner_fence_token, b.runtime_generation AS binding_generation,
                    b.owner_fence_token AS binding_fence,
                    l.fence_token AS lease_fence, l.expires_at AS lease_expires_at
@@ -580,10 +592,17 @@ class RenderOutboxDispatcher:
         transport_key = (
             f"{item.idempotency_key}:payload:{item.payload_revision}:{_payload_hash(payload)[:16]}"
         )
+        transport_payload = dict(payload)
+        previous_state = current["delivered_state"]
+        previous_emoji = (
+            None if previous_state is None else _REACTION_EMOJIS.get(str(previous_state))
+        )
+        if previous_emoji is not None and previous_emoji != payload.get("emoji"):
+            transport_payload["previous_emoji"] = previous_emoji
         try:
             await self._transport.reaction(
                 session_id=item.session_id,
-                payload=payload,
+                payload=transport_payload,
                 idempotency_key=transport_key,
             )
         except RenderRateLimited as error:
@@ -796,14 +815,6 @@ async def recover_reaction_outbox(database: Database, *, now: float | None = Non
         """,
         (timestamp,),
     )
-    emojis = {
-        "accepted": "👀",
-        "reasoning": "🧠",
-        "action": "🛠️",
-        "unresolved": "❓",
-        "succeeded": "✅",
-        "failed": "❌",
-    }
     async with database.transaction() as connection:
         for row in rows:
             generation = int(row["binding_generation"])
@@ -825,7 +836,7 @@ async def recover_reaction_outbox(database: Database, *, now: float | None = Non
                     "source_channel_id": str(row["source_channel_id"]),
                     "source_message_id": str(row["source_message_id"]),
                     "state": state,
-                    "emoji": emojis[state],
+                    "emoji": _REACTION_EMOJIS[state],
                     "reaction_revision": int(row["revision"]),
                     "generation": generation,
                     "fence_token": fence_token,

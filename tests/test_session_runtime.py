@@ -3392,6 +3392,18 @@ async def test_capability_runtime_unknown_states_gate_dispatch(tmp_path: Path) -
             INSERT INTO background_observations(
                 sdk_session_id, runtime_generation, source_event_id,
                 task_id, observed_state, last_progress_at
+            ) VALUES (?, 0, 'task:stale-unknown', 'task-stale-unknown', 'unknown', 1)
+            """,
+            (session_id,),
+        )
+        stale_blockers = await runtime._readiness_blockers(require_quiet=True)
+        assert "background_tasks_unknown" not in stale_blockers
+        assert "background_tasks_active" not in stale_blockers
+        await database.execute(
+            """
+            INSERT INTO background_observations(
+                sdk_session_id, runtime_generation, source_event_id,
+                task_id, observed_state, last_progress_at
             ) VALUES (?, 1, 'task:unknown', 'task-unknown', 'unknown', 1)
             """,
             (session_id,),
