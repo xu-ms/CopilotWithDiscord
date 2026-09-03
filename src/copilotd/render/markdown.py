@@ -463,8 +463,14 @@ def _extract_images_from_line(
             pieces.append(character)
             index += 1
             continue
-        if text.startswith("![", index):
-            candidate = _scan_markdown_image_candidate(text, index)
+        is_image = text.startswith("![", index)
+        is_link = character == "[" and (index == 0 or text[index - 1] != "!")
+        if is_image or is_link:
+            candidate = (
+                _scan_markdown_image_candidate(text, index)
+                if is_image
+                else _scan_markdown_link_candidate(text, index)
+            )
             if candidate is None:
                 pieces.append(character)
                 index += 1
@@ -472,6 +478,10 @@ def _extract_images_from_line(
             end, source_text, alt_text, target = candidate
             path_text, title = _parse_markdown_image_target(target)
             if path_text is None:
+                if is_link:
+                    pieces.append(source_text)
+                    index = end
+                    continue
                 warnings.append(
                     MarkdownImageWarning(
                         kind="invalid-target",
@@ -519,6 +529,10 @@ def _extract_images_from_line(
                 index = end
                 continue
             if Path(path_text).suffix.lower() not in _SUPPORTED_IMAGE_SUFFIXES:
+                if is_link:
+                    pieces.append(source_text)
+                    index = end
+                    continue
                 warnings.append(
                     MarkdownImageWarning(
                         kind="unsupported-image",
@@ -1092,10 +1106,16 @@ def _parse_markdown_image_target(target: str) -> tuple[str | None, str | None]:
     title = None if len(parts) == 1 else " ".join(parts[1:])
     if re.match(r"^[a-zA-Z][a-zA-Z0-9+.-]*:", path):
         parsed = urlsplit(path)
-        if parsed.scheme.lower() != "file" or parsed.netloc not in {"", "localhost"}:
+        scheme = parsed.scheme.lower()
+        if scheme == "file" and parsed.netloc in {"", "localhost"}:
+            path = unquote(parsed.path)
+        elif scheme == "sandbox" and not parsed.netloc:
+            path = unquote(parsed.path)
+        elif scheme == "attachment" and parsed.netloc:
+            path = unquote(f"{parsed.netloc}{parsed.path}")
+        else:
             return None, None
-        path = unquote(parsed.path)
-        if not Path(path).is_absolute():
+        if scheme in {"file", "sandbox"} and not Path(path).is_absolute():
             return None, None
     return path, title
 
@@ -1104,6 +1124,25 @@ def _scan_markdown_image_candidate(text: str, index: int) -> tuple[int, str, str
     if not text.startswith("![", index):
         return None
     alt_start = index + 2
+    alt_end = _find_matching_markdown_bracket(text, alt_start)
+    if alt_end is None:
+        return None
+    target_start = alt_end + 1
+    if target_start >= len(text) or text[target_start] != "(":
+        return None
+    target_end = _find_matching_markdown_paren(text, target_start + 1)
+    if target_end is None:
+        return None
+    source = text[index : target_end + 1]
+    alt_text = text[alt_start:alt_end]
+    target = text[target_start + 1 : target_end]
+    return target_end + 1, source, alt_text, target
+
+
+def _scan_markdown_link_candidate(text: str, index: int) -> tuple[int, str, str, str] | None:
+    if index >= len(text) or text[index] != "[":
+        return None
+    alt_start = index + 1
     alt_end = _find_matching_markdown_bracket(text, alt_start)
     if alt_end is None:
         return None

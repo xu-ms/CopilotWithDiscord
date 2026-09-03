@@ -160,6 +160,45 @@ def test_local_markdown_image_extraction_accepts_file_uri_within_root(
     assert plan.warnings == ()
 
 
+@pytest.mark.parametrize(
+    "reference",
+    [
+        "![chart](sandbox:{absolute})",
+        "![chart](attachment://rendered-chart.png)",
+        "[download](file://{absolute})",
+    ],
+)
+def test_local_markdown_image_extraction_accepts_copilot_artifact_references(
+    tmp_path: Path,
+    reference: str,
+) -> None:
+    root = tmp_path / "allowed"
+    root.mkdir()
+    image = root / "rendered-chart.png"
+    _write_png(image)
+
+    plan = extract_local_markdown_images(
+        reference.format(absolute=image.as_posix()),
+        allowed_roots=[root],
+    )
+
+    assert plan.content == ""
+    assert [item.resolved_path for item in plan.attachments] == [str(image.resolve())]
+    assert plan.warnings == ()
+
+
+def test_local_markdown_image_extraction_preserves_remote_and_non_image_links(
+    tmp_path: Path,
+) -> None:
+    source = "[site](https://example.com) and [notes](notes.txt)"
+
+    plan = extract_local_markdown_images(source, allowed_roots=[tmp_path])
+
+    assert plan.content == source
+    assert plan.attachments == ()
+    assert plan.warnings == ()
+
+
 @pytest.mark.asyncio
 async def test_local_markdown_image_extraction_ends_container_scoped_fences_at_boundary(
     tmp_path: Path,
