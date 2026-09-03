@@ -14,6 +14,7 @@ from typing import Any
 
 from copilotd.core.inbox import ReducerInbox
 from copilotd.core.task_registry import TaskRegistry
+from copilotd.core.volatile_content import opaque_content_key
 from copilotd.storage.database import Database
 
 OperationCallable = Callable[[], Awaitable[Any]]
@@ -67,12 +68,14 @@ class _MailboxItem:
     result_persistence: ResultPersistence | None
     defer_on_fence_loss: bool
     on_fence_deferred: OperationCallable | None
+    retain_result_for_replay: bool
 
 
 class OperationStore:
     def __init__(self, database: Database, inbox: ReducerInbox) -> None:
         self._database = database
         self._inbox = inbox
+        self._content_store = database.content_store
 
     async def begin(
         self,
@@ -148,21 +151,42 @@ class OperationStore:
         }
         if state not in allowed.get(record.state, set()):
             raise ValueError(f"invalid operation transition {record.state} -> {state}")
-        result_ref = None if result is None else json.dumps(_jsonable(result), sort_keys=True)
-        await self._inbox.commit_internal(
-            {
-                "type": "copilotd.operation.transition",
-                "data": {
-                    "operation_id": record.operation_id,
-                    "from_state": record.state.value,
-                    "to_state": state.value,
-                    "result_ref": result_ref,
-                    "error_code": error_code,
-                    "transitioned_at": time.time(),
+        result_ref = None
+        if result is not None:
+            result_ref = opaque_content_key(
+                "operation-result",
+                record.sdk_session_id,
+                record.operation_id,
+            )
+            self._content_store.put(_jsonable(result), key=result_ref)
+        try:
+            await self._inbox.commit_internal(
+                {
+                    "type": "copilotd.operation.transition",
+                    "data": {
+                        "operation_id": record.operation_id,
+                        "from_state": record.state.value,
+                        "to_state": state.value,
+                        "result_ref": result_ref,
+                        "error_code": error_code,
+                        "transitioned_at": time.time(),
+                    },
                 },
-            },
-            internal_event_id=f"operation:{record.operation_id}:{state.value}",
-        )
+                internal_event_id=f"operation:{record.operation_id}:{state.value}",
+            )
+        except BaseException:
+            if result_ref is not None:
+                settled = await self._database.fetchone(
+                    "SELECT state, result_ref FROM session_operations WHERE operation_id = ?",
+                    (record.operation_id,),
+                )
+                if (
+                    settled is None
+                    or settled["state"] != state.value
+                    or settled["result_ref"] != result_ref
+                ):
+                    self._content_store.delete(result_ref)
+            raise
         row = await self._database.fetchone(
             "SELECT * FROM session_operations WHERE operation_id = ?",
             (record.operation_id,),
@@ -171,10 +195,52 @@ class OperationStore:
             raise RuntimeError(f"operation disappeared: {record.operation_id}")
         transitioned = _row_to_record(row)
         if transitioned.state != state:
+            if result_ref is not None and transitioned.result_ref != result_ref:
+                self._content_store.delete(result_ref)
             raise OperationAmbiguous(
                 f"operation {record.operation_id} did not durably reach {state}"
             )
         return transitioned
+
+    async def settled_result(
+        self,
+        record: OperationRecord,
+        *,
+        retain_result_for_replay: bool = False,
+    ) -> Any:
+        if record.state == OperationState.CONFIRMED:
+            if record.result_ref is None:
+                return None
+            result = self._content_store.get(record.result_ref)
+            if result is None:
+                raise OperationAmbiguous(
+                    f"operation {record.operation_id} result is content_unavailable"
+                )
+            if not retain_result_for_replay:
+                await self.discard_result(record)
+            return result
+        if record.state == OperationState.REJECTED:
+            raise OperationRejected(
+                f"operation {record.operation_id} was rejected: {record.error_code}"
+            )
+        raise OperationAmbiguous(
+            f"operation {record.operation_id} is {record.state}; automatic replay is forbidden"
+        )
+
+    async def discard_result(self, record: OperationRecord) -> None:
+        if record.result_ref is None:
+            return
+        with self._content_store.transaction():
+            async with self._database.transaction() as connection:
+                await connection.execute(
+                    """
+                    UPDATE session_operations
+                    SET result_ref = NULL
+                    WHERE operation_id = ? AND result_ref = ?
+                    """,
+                    (record.operation_id, record.result_ref),
+                )
+                self._content_store.delete(record.result_ref)
 
     async def mark_unsettled_unknown(
         self,
@@ -414,7 +480,13 @@ class CommandMailbox:
         allow_when_frozen: bool = False,
         defer_on_fence_loss: bool = False,
         on_fence_deferred: OperationCallable | None = None,
+        retain_result_for_replay: bool = False,
+        consume_result_on_delivery: bool | None = None,
     ) -> Any:
+        if consume_result_on_delivery is not None:
+            if retain_result_for_replay and consume_result_on_delivery:
+                raise ValueError("operation result cannot be both retained and consumed")
+            retain_result_for_replay = not consume_result_on_delivery
         if not self._accepting and not allow_when_frozen:
             raise MailboxNotAccepting("command mailbox is not accepting operations")
         input_hash = _input_hash(input_payload)
@@ -439,7 +511,10 @@ class CommandMailbox:
                         "operation admission could not be durably established"
                     ) from error
                 if not created:
-                    return _settled_result(record)
+                    return await self._store.settled_result(
+                        record,
+                        retain_result_for_replay=retain_result_for_replay,
+                    )
 
                 future = asyncio.get_running_loop().create_future()
                 self._futures[idempotency_key] = future
@@ -455,6 +530,7 @@ class CommandMailbox:
                         result_persistence,
                         defer_on_fence_loss,
                         on_fence_deferred,
+                        retain_result_for_replay,
                     )
                 )
             elif self._future_inputs.get(idempotency_key) != (kind, input_hash):
@@ -567,7 +643,7 @@ class CommandMailbox:
                 )
                 return
             try:
-                await self._store.transition(
+                transitioned = await self._store.transition(
                     record,
                     state=OperationState.CONFIRMED,
                     result=(
@@ -584,6 +660,8 @@ class CommandMailbox:
                     message=(f"operation {record.operation_id} result was not durably confirmed"),
                 )
             else:
+                if not item.retain_result_for_replay:
+                    await self._store.discard_result(transitioned)
                 item.future.set_result(result)
 
     async def _defer_for_fence_loss(
@@ -635,18 +713,6 @@ class CommandMailbox:
             pass
         if not item.future.done():
             item.future.set_exception(OperationAmbiguous(message))
-
-
-def _settled_result(record: OperationRecord) -> Any:
-    if record.state == OperationState.CONFIRMED:
-        return None if record.result_ref is None else json.loads(record.result_ref)
-    if record.state == OperationState.REJECTED:
-        raise OperationRejected(
-            f"operation {record.operation_id} was rejected: {record.error_code}"
-        )
-    raise OperationAmbiguous(
-        f"operation {record.operation_id} is {record.state}; automatic replay is forbidden"
-    )
 
 
 def _consume_task_result(task: asyncio.Task[Any]) -> None:

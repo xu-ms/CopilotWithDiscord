@@ -13,6 +13,7 @@ import discord
 import pytest
 
 import copilotd.e2e.discord_harness as harness_module
+from copilotd.discord_http_limiter import DiscordHttpRateLimiter
 from copilotd.e2e.discord_harness import (
     DiscordE2EConfigurationError,
     DiscordE2EError,
@@ -626,13 +627,21 @@ def test_manifest_merges_mutable_access_controls_from_attributes() -> None:
 @pytest.mark.asyncio
 async def test_http_trace_is_wired_to_discord_http_client_before_start() -> None:
     connector = aiohttp.TCPConnector()
-    trace = aiohttp.TraceConfig()
-    bot = SimpleNamespace(http=SimpleNamespace())
+    observer = aiohttp.TraceConfig()
+
+    async def observe(*_args) -> None:
+        return None
+
+    observer.on_request_end.append(observe)
+    mandatory = DiscordHttpRateLimiter().trace_config()
+    bot = SimpleNamespace(http=SimpleNamespace(http_trace=mandatory))
     try:
-        harness_module._wire_discord_http_trace(bot, connector, trace)
+        harness_module._wire_discord_http_trace(bot, connector, observer)
 
         assert bot.http.connector is connector
-        assert bot.http.http_trace is trace
+        assert bot.http.http_trace is mandatory
+        assert bot.http.http_trace._copilotd_discord_http_limiter is not None
+        assert len(bot.http.http_trace.on_request_end) == 2
     finally:
         await connector.close()
 
@@ -887,12 +896,8 @@ async def test_dry_run_traverses_snapshot_sync_channel_probe_cleanup_without_net
     def fake_files(assets):
         return list(assets)
 
-    def fake_taskdeck_view(payload):
-        return SimpleNamespace(payload=payload)
-
     monkeypatch.setattr(harness_module, "_discord_render_plan", fake_render_plan)
     monkeypatch.setattr(harness_module, "_discord_files", fake_files)
-    monkeypatch.setattr(harness_module, "_taskdeck_view", fake_taskdeck_view)
 
     def bot_factory(settings):
         return DryRunBot(
@@ -971,7 +976,10 @@ async def test_production_probe_rejects_empty_reducer_outbox_path(
                         sdk_session_id, generation, inbox_seq, source,
                         persistence_class, raw_type, reducer_hash,
                         raw_payload, received_at
-                    ) VALUES (?, 0, ?, 'internal', 'internal', 'probe', ?, '{}', 0)
+                    ) VALUES (
+                        ?, 0, ?, 'internal', 'internal', 'probe', ?,
+                        '{"payload_state":"discarded","schema":1}', 0
+                    )
                     """,
                     (
                         event.sdk_session_id,
@@ -983,7 +991,7 @@ async def test_production_probe_rejects_empty_reducer_outbox_path(
 
     monkeypatch.setattr(harness_module, "JournalReducer", EmptyOutboxReducer)
     try:
-        with pytest.raises(DiscordE2EError, match="one turn render intent"):
+        with pytest.raises(DiscordE2EError, match="distinct tool and assistant intents"):
             await harness._run_production_pipeline_probe(tmp_path, thread)
     finally:
         await bot.close()
@@ -1017,16 +1025,11 @@ async def test_run_aggregates_original_cleanup_restore_and_write_errors(
     http.bulk_upsert_guild_commands = failing_restore  # type: ignore[assignment]
 
     async def fake_render_plan(*args, **kwargs):
-        embeds = (
-            ({"title": "E2E task"},)
-            if args and isinstance(args[0], dict) and args[0].get("type") == "taskdeck"
-            else ()
-        )
         return SimpleNamespace(
             batches=[
                 SimpleNamespace(
                     content="rendered content",
-                    embeds=embeds,
+                    embeds=(),
                     assets=[
                         SimpleNamespace(
                             filename="local-image.png",
@@ -1040,12 +1043,8 @@ async def test_run_aggregates_original_cleanup_restore_and_write_errors(
     def fake_files(assets):
         return list(assets)
 
-    def fake_taskdeck_view(payload):
-        return SimpleNamespace(payload=payload)
-
     monkeypatch.setattr(harness_module, "_discord_render_plan", fake_render_plan)
     monkeypatch.setattr(harness_module, "_discord_files", fake_files)
-    monkeypatch.setattr(harness_module, "_taskdeck_view", fake_taskdeck_view)
 
     def bot_factory(settings):
         bot = DryRunBot(
@@ -1298,7 +1297,6 @@ def test_human_driver_plan_has_actions_assertions_and_stable_ids(tmp_path: Path)
     harness._stable_ids = {
         "thread_name": "e2e-thread",
         "seed_message_id": "seed",
-        "taskdeck_message_id": "taskdeck",
     }
 
     harness._record_interaction_coverage()

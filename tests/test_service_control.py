@@ -462,7 +462,8 @@ async def test_requested_pre_observer_journal_event_is_in_ack_epoch(
                 persistence_class, raw_type, reducer_hash,
                 raw_payload, received_at
             ) VALUES ('session-1', 1, 1, 'sdk',
-                      'durable', 'assistant.message', 'hash', '{}', ?)
+                      'durable', 'assistant.message', 'hash',
+                      '{"payload_state":"discarded","schema":1}', ?)
             """,
             (time.time(),),
         )

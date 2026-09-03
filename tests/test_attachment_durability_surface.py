@@ -2,10 +2,11 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import hashlib
 import io
 import json
 import os
-import re
+import sqlite3
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
@@ -18,6 +19,10 @@ from copilotd.core.attachments import (
     AttachmentError,
     AttachmentService,
     sdk_send_frame_size,
+)
+from copilotd.core.volatile_content import (
+    VolatileContentStore,
+    opaque_content_key,
 )
 from copilotd.storage.database import Database
 
@@ -95,10 +100,8 @@ def _file_payload(path: str, display_name: str) -> dict[str, str]:
     }
 
 
-def _safe_filename(filename: str) -> str:
-    name = Path(filename).name
-    name = re.sub(r"[^A-Za-z0-9._-]+", "_", name).strip("._")
-    return name[:160] or "attachment"
+def _opaque_filename(index: int, content: bytes) -> str:
+    return f"{index:03d}-{hashlib.sha256(content).hexdigest()}"
 
 
 def _inline_blob_cost(content: bytes, filename: str, mime_type: str) -> int:
@@ -251,7 +254,7 @@ async def test_runtime_serialized_frame_budget_is_cumulative_across_images_and_p
     ]
     files = [
         _file_payload(
-            str((directory / f"{index:03d}-{_safe_filename(attachment.filename)}").resolve()),
+            str((directory / _opaque_filename(index, attachment.content)).resolve()),
             attachment.filename,
         )
         for index, attachment in enumerate(attachments)
@@ -432,9 +435,9 @@ async def test_later_file_can_downgrade_an_earlier_blob_to_fit_frame(
     )
     directory = tmp_path / "sessions" / "session-greedy" / "attachments" / manifest_id
     all_files = [
-        _file_payload(str((directory / "000-image.jpg").resolve()), "image.jpg"),
+        _file_payload(str((directory / _opaque_filename(0, image)).resolve()), "image.jpg"),
         _file_payload(
-            str((directory / "001-document.txt").resolve()),
+            str((directory / _opaque_filename(1, b"document")).resolve()),
             "document.txt",
         ),
     ]
@@ -488,11 +491,11 @@ async def test_frame_fit_keeps_tiny_blob_when_file_descriptor_is_larger(
     tiny_blob = _blob_payload(tiny, "tiny.png", "image/png")
     large_blob = _blob_payload(large, "large.jpg", "image/jpeg")
     tiny_file = _file_payload(
-        str((directory / "000-tiny.png").resolve()),
+        str((directory / _opaque_filename(0, tiny)).resolve()),
         "tiny.png",
     )
     large_file = _file_payload(
-        str((directory / "001-large.jpg").resolve()),
+        str((directory / _opaque_filename(1, large)).resolve()),
         "large.jpg",
     )
     budget = _serialized_request_size([tiny_blob, large_file])
@@ -536,7 +539,12 @@ async def test_complete_send_frame_downgrades_blob_for_long_prompt(
         )
     )
     path = (
-        tmp_path / "sessions" / "session-full-frame" / "attachments" / manifest_id / "000-jpg"
+        tmp_path
+        / "sessions"
+        / "session-full-frame"
+        / "attachments"
+        / manifest_id
+        / _opaque_filename(0, content)
     ).resolve()
     file_payload = _file_payload(str(path), attachment.filename)
     blob_payload = _blob_payload(content, attachment.filename, "image/jpeg")
@@ -623,7 +631,7 @@ async def test_transcoded_inline_variant_keeps_original_file_fallback(
         / "session-transcode"
         / "attachments"
         / manifest_id
-        / "000-screenshot.png"
+        / _opaque_filename(0, original)
     ).resolve()
     file_payload = _file_payload(str(original_path), "screenshot.png")
     frame_budget = (
@@ -745,11 +753,11 @@ async def test_mixed_image_and_file_order_is_preserved_with_budgeted_fallback(
                 "image/png",
             ),
             _file_payload(
-                str((directory / "001-document.txt").resolve()),
+                str((directory / _opaque_filename(1, file_content)).resolve()),
                 "document.txt",
             ),
             _file_payload(
-                str((directory / "002-second.jpg").resolve()),
+                str((directory / _opaque_filename(2, second_image)).resolve()),
                 "second.jpg",
             ),
         ]
@@ -802,6 +810,11 @@ async def test_attachment_manifest_survives_restart_and_detects_tampering(
             source_id="message-restart",
             session_id="session-restart",
             attachments=[attachment],
+            source_channel_id="restart-channel",
+            source_message_id="restart-message",
+            recovery_prompt="inspect restart attachment",
+            recovery_idempotency_key="restart-attachment",
+            recovery_origin="discord_message",
         )
         assert prepared is not None
         manifest_id = prepared.manifest_id
@@ -813,6 +826,27 @@ async def test_attachment_manifest_survives_restart_and_detects_tampering(
 
     async with Database(database_path) as reopened:
         service = AttachmentService(reopened, tmp_path)
+        recoveries = await service.pending_recoveries()
+        assert len(recoveries) == 1
+        assert recoveries[0].state == "needs_refetch"
+        refetched = FakeAttachment(
+            id=3,
+            filename="report.txt",
+            content=b"durable input",
+            content_type="text/plain",
+        )
+        prepared = await service.prepare(
+            source_kind=recoveries[0].source_kind,
+            source_id=recoveries[0].source_id,
+            session_id=str(recoveries[0].session_id),
+            attachments=[refetched],
+            source_channel_id=recoveries[0].source_channel_id,
+            source_message_id=recoveries[0].source_message_id,
+            recovery_prompt="inspect restart attachment",
+            recovery_idempotency_key=recoveries[0].idempotency_key,
+            recovery_origin=recoveries[0].origin,
+        )
+        assert prepared is not None
         sdk_attachments = await service.sdk_attachments(manifest_id)
         assert sdk_attachments == [
             {
@@ -869,6 +903,7 @@ async def test_interrupted_preparation_resumes_from_durable_discord_source(
         manifest = await database.fetchone(
             """
             SELECT id, state, source_channel_id, source_message_id,
+                   recovery_prompt, recovery_prompt_hash,
                    recovery_idempotency_key
             FROM attachment_manifests
             """
@@ -885,6 +920,8 @@ async def test_interrupted_preparation_resumes_from_durable_discord_source(
         "state": "preparing",
         "source_channel_id": "123",
         "source_message_id": "456",
+        "recovery_prompt": None,
+        "recovery_prompt_hash": hashlib.sha256(b"resume this attachment").hexdigest(),
         "recovery_idempotency_key": "discord-message:456",
     }
 
@@ -895,6 +932,8 @@ async def test_interrupted_preparation_resumes_from_durable_discord_source(
         recovery = pending[0]
         assert recovery.state == "preparing"
         assert recovery.needs_submission
+        assert recovery.prompt is None
+        assert recovery.prompt_hash == hashlib.sha256(b"resume this attachment").hexdigest()
 
         prepared = await service.prepare(
             source_kind=recovery.source_kind,
@@ -910,7 +949,7 @@ async def test_interrupted_preparation_resumes_from_durable_discord_source(
             ],
             source_channel_id=recovery.source_channel_id,
             source_message_id=recovery.source_message_id,
-            recovery_prompt=recovery.prompt,
+            recovery_prompt="resume this attachment",
             recovery_idempotency_key=recovery.idempotency_key,
             recovery_origin=recovery.origin,
         )
@@ -1000,3 +1039,160 @@ async def test_attachment_retention_waits_for_terminal_reference_then_collects(
         "retention_until": None,
     }
     assert item_count[0] == 0
+
+
+@pytest.mark.asyncio
+async def test_repeated_prepare_release_reclaims_attachment_names_beyond_store_capacity(
+    tmp_path: Path,
+) -> None:
+    store = VolatileContentStore(max_items=1, max_bytes=1024)
+    async with Database(tmp_path / "attachment-name-capacity.sqlite3") as database:
+        service = AttachmentService(
+            database,
+            tmp_path,
+            retention_seconds=10,
+            content_store=store,
+        )
+        for index in range(8):
+            filename = f"name-{index}.txt"
+            prepared = await service.prepare(
+                source_kind="capacity",
+                source_id=f"message-{index}",
+                session_id="session-capacity",
+                attachments=[
+                    FakeAttachment(
+                        id=index,
+                        filename=filename,
+                        content=b"x",
+                        content_type="text/plain",
+                    )
+                ],
+            )
+            assert prepared is not None
+            name_key = opaque_content_key(
+                "attachment-name",
+                prepared.manifest_id,
+                0,
+            )
+            assert store.require(name_key) == filename
+            assert store.item_count == 1
+            assert await service.release_unreferenced(now=float(index)) == 1
+            assert store.get(name_key) is None
+            assert store.item_count == 0
+
+
+@pytest.mark.asyncio
+async def test_repeated_prepare_release_reclaims_recovery_prompt_keys(
+    tmp_path: Path,
+) -> None:
+    store = VolatileContentStore(max_items=2, max_bytes=1024)
+    async with Database(tmp_path / "attachment-prompt-capacity.sqlite3") as database:
+        service = AttachmentService(
+            database,
+            tmp_path,
+            retention_seconds=10,
+            content_store=store,
+        )
+        for index in range(16):
+            prepared = await service.prepare(
+                source_kind="prompt-capacity",
+                source_id=f"message-{index}",
+                session_id="session-capacity",
+                attachments=[
+                    FakeAttachment(
+                        id=index,
+                        filename=f"volatile-{index}.txt",
+                        content=str(index).encode(),
+                        content_type="text/plain",
+                    )
+                ],
+                recovery_prompt=f"volatile prompt {index}",
+            )
+            assert prepared is not None
+            prompt_key = opaque_content_key(
+                "attachment-recovery-prompt",
+                prepared.manifest_id,
+            )
+            assert store.get(prompt_key) == f"volatile prompt {index}"
+            assert store.item_count == 2
+            assert await service.release_unreferenced(now=float(index)) == 1
+            assert store.get(prompt_key) is None
+            assert store.item_count == 0
+
+
+@pytest.mark.asyncio
+async def test_original_attachment_filename_never_reaches_sqlite_or_wal(
+    tmp_path: Path,
+) -> None:
+    sentinel = "PRIVATE-FILENAME-7f3b9a.txt"
+    database_path = tmp_path / "opaque-attachment.sqlite3"
+    database = Database(database_path)
+    await database.open()
+    service = AttachmentService(database, tmp_path)
+    prepared = await service.prepare(
+        source_kind="discord-message",
+        source_id="opaque-source",
+        session_id="opaque-session",
+        attachments=[
+            FakeAttachment(
+                id=77,
+                filename=sentinel,
+                content=b"opaque attachment",
+                content_type="text/plain",
+            )
+        ],
+    )
+    assert prepared is not None
+    item = await database.fetchone(
+        "SELECT original_name, local_path FROM attachment_items WHERE manifest_id = ?",
+        (prepared.manifest_id,),
+    )
+    live = await service.sdk_attachments(prepared.manifest_id)
+    await database.close()
+
+    assert item["original_name"] == ""
+    assert sentinel not in str(item["local_path"])
+    assert live[0]["displayName"] == sentinel
+    wal_path = database_path.with_name(database_path.name + "-wal")
+    persisted = database_path.read_bytes()
+    wal = wal_path.read_bytes() if wal_path.exists() else b""
+    assert sentinel.encode() not in persisted
+    assert sentinel.encode() not in wal
+
+
+@pytest.mark.asyncio
+async def test_attachment_item_insert_failure_rolls_back_volatile_name(
+    tmp_path: Path,
+) -> None:
+    store = VolatileContentStore(max_items=1, max_bytes=1024)
+    async with Database(tmp_path / "attachment-name-rollback.sqlite3") as database:
+        await database.execute(
+            """
+            CREATE TRIGGER reject_attachment_item
+            BEFORE INSERT ON attachment_items
+            BEGIN
+                SELECT RAISE(ABORT, 'injected attachment insert failure');
+            END
+            """
+        )
+        service = AttachmentService(database, tmp_path, content_store=store)
+
+        with pytest.raises(
+            sqlite3.IntegrityError,
+            match="injected attachment insert failure",
+        ):
+            await service.prepare(
+                source_kind="rollback",
+                source_id="message",
+                session_id="session-rollback",
+                attachments=[
+                    FakeAttachment(
+                        id=1,
+                        filename="must-rollback.txt",
+                        content=b"x",
+                        content_type="text/plain",
+                    )
+                ],
+            )
+
+    assert store.item_count == 0

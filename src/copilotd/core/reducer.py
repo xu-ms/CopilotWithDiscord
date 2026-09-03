@@ -2,16 +2,11 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
-import inspect
 import json
-import os
-import re
-import stat
 import time
 import uuid
 from collections.abc import Awaitable, Callable
-from pathlib import Path
-from typing import Any, BinaryIO, ClassVar, cast
+from typing import Any, ClassVar, cast
 
 from aiosqlite import Connection, Row
 
@@ -22,12 +17,31 @@ from copilotd.core.models import AdaptedEvent, InboxEnvelope, RenderIntent
 from copilotd.core.native import stable_hash, timestamp_seconds
 from copilotd.core.protocol import apply_protocol_event
 from copilotd.core.task_registry import TaskRegistry
+from copilotd.core.volatile_content import (
+    CommittedCancellation,
+    VolatileContentStore,
+    opaque_content_key,
+    process_content_store,
+    tool_event_evidence_key,
+)
+from copilotd.render.outbox import supersede_admission_reaction
+from copilotd.render.sanitizer import (
+    discord_inline_code,
+    redact_sensitive_text,
+    sanitize_failure_summary,
+    sanitize_tool_command,
+    sanitize_tool_name,
+)
 from copilotd.storage.database import Database
+from copilotd.storage.state_only import (
+    event_payload_receipt,
+    payload_sha256,
+    render_payload_receipt,
+    state_only_json,
+)
 
 FenceValidator = Callable[[int, int], Awaitable[bool]]
-_DIFF_OUTPUT_LIMIT = 8 * 1024 * 1024
-_DIFF_HUNK_PATTERN = re.compile(r"^@@ -\d+(?:,(\d+))? \+\d+(?:,(\d+))? @@")
-_TOOL_SPILL_RETENTION_SECONDS = 7 * 24 * 60 * 60
+_SHUTDOWN_SETTLEMENT_SECONDS = 0.25
 REACTION_EMOJI = {
     "accepted": "👀",
     "reasoning": "🧠",
@@ -45,45 +59,6 @@ _SUBMISSION_FAILURE_STATES = {
     "rejected",
     "semantic_blocked",
     "submitted_unknown",
-}
-_TURN_PROGRESS_TYPES = {
-    "abort",
-    "assistant.intent",
-    "assistant.message_delta",
-    "assistant.reasoning",
-    "assistant.reasoning_delta",
-    "assistant.turn_end",
-    "assistant.turn_retry",
-    "assistant.turn_start",
-    "copilotd.interaction.expired",
-    "copilotd.interaction.resolved",
-    "copilotd.submission.accepted",
-    "copilotd.submission.queued",
-    "copilotd.tasks.snapshot",
-    "model.call_failure",
-    "session.error",
-    "session.idle",
-    "session.info",
-    "session.shutdown",
-    "session.task_complete",
-    "session.warning",
-    "session.workspace_file_changed",
-    "subagent.completed",
-    "subagent.failed",
-    "subagent.started",
-    "tool.execution_complete",
-    "tool.execution_progress",
-    "tool.execution_start",
-    "user.message",
-}
-_TRUSTED_LOCAL_IMAGE_SUFFIXES = {
-    ".bmp",
-    ".gif",
-    ".jpeg",
-    ".jpg",
-    ".png",
-    ".tiff",
-    ".webp",
 }
 
 
@@ -107,7 +82,6 @@ class RenderPlanner:
         "tool.execution_progress",
         "tool.execution_complete",
     }
-    _TASK_VIEW_TYPES: ClassVar[set[str]] = {"copilotd.taskdeck.view_changed"}
     _INTERACTION_TYPES: ClassVar[set[str]] = {
         "copilotd.interaction.requested",
         "copilotd.interaction.resolved",
@@ -142,35 +116,41 @@ class RenderPlanner:
         event: AdaptedEvent,
         *,
         payload_override: dict[str, Any] | None = None,
-        artifact_override: dict[str, Any] | None = None,
-        suppress_default_artifact: bool = False,
     ) -> list[RenderIntent]:
         if payload_override is not None and payload_override.get("suppress"):
             return []
-        if event.raw_type == "assistant.streaming_delta":
+        if event.raw_type in {
+            "assistant.intent",
+            "assistant.reasoning",
+            "assistant.reasoning_delta",
+            "assistant.streaming_delta",
+        }:
             return []
-        turn_key = (
+        render_key = (
             None
-            if payload_override is None or payload_override.get("turn_render_key") is None
-            else str(payload_override["turn_render_key"])
+            if payload_override is None or payload_override.get("stable_render_key") is None
+            else str(payload_override["stable_render_key"])
         )
-        if turn_key is not None:
-            turn_payload = {
+        if render_key is not None:
+            stable_payload = {
                 **payload_override,
-                "stable_outbox_key": turn_key,
+                "stable_outbox_key": render_key,
             }
-            finalized = bool(turn_payload.get("finalized"))
-            lane = "assistant_final" if finalized else "assistant_stream"
-            idempotency_key = f"turn-render:{event.sdk_session_id}:{turn_key}"
+            finalized = bool(stable_payload.get("finalized"))
+            lane = str(
+                stable_payload.get("render_lane")
+                or ("assistant_final" if finalized else "assistant_stream")
+            )
+            idempotency_key = f"render-family:{event.sdk_session_id}:{render_key}"
             return [
                 RenderIntent(
                     id=str(uuid.uuid5(uuid.NAMESPACE_URL, idempotency_key)),
                     session_id=event.sdk_session_id,
                     logical_seq=event.inbox_seq,
                     lane=lane,
-                    coalesce_key=turn_key,
+                    coalesce_key=render_key,
                     idempotency_key=idempotency_key,
-                    payload=turn_payload,
+                    payload=stable_payload,
                     finalized=finalized,
                 )
             ]
@@ -178,18 +158,11 @@ class RenderPlanner:
             self._STREAM_TYPES | {"assistant.message"}
         ):
             return []
-        if event.raw_type in self._TASK_TYPES or event.raw_type in self._TASK_VIEW_TYPES:
+        if event.raw_type in self._TASK_TYPES:
             return []
         if event.raw_type in self._FOOTER_TYPES:
             return []
-        agent_scoped_content = event.agent_id is not None and event.raw_type in (
-            self._STREAM_TYPES | {"assistant.message"}
-        )
-        if agent_scoped_content:
-            lane = "taskdeck"
-            finalized = False
-            coalesce_key = "taskdeck"
-        elif event.raw_type in self._STREAM_TYPES:
+        if event.raw_type in self._STREAM_TYPES:
             lane = "assistant_stream"
             finalized = False
             coalesce_key = f"assistant:{event.message_id or event.turn_id or 'main'}"
@@ -269,21 +242,50 @@ class JournalReducer:
         database: Database,
         planner: RenderPlanner | None = None,
         *,
-        artifact_root: Path | None = None,
-        managed_session_state_root: Path | None = None,
         require_binding_fence: bool = False,
+        content_store: VolatileContentStore | None = None,
+        capture_tool_acceptance_evidence: bool = False,
     ) -> None:
         self._database = database
         self._planner = planner or RenderPlanner()
-        self._artifact_root = (
-            database.path.parent / "sessions" if artifact_root is None else artifact_root
-        )
-        self._managed_session_state_root = managed_session_state_root
         self._require_binding_fence = require_binding_fence
+        self._content_store = content_store or database.content_store
+        self._capture_tool_acceptance_evidence = capture_tool_acceptance_evidence
 
     async def persist(self, events: list[AdaptedEvent]) -> int:
+        operation = asyncio.create_task(self._persist_coupled(events))
+        try:
+            return await asyncio.shield(operation)
+        except asyncio.CancelledError as cancellation:
+            while not operation.done():
+                try:
+                    await asyncio.shield(operation)
+                except asyncio.CancelledError:
+                    continue
+                except BaseException:
+                    break
+            if operation.cancelled():
+                raise
+            try:
+                operation.result()
+            except BaseException as error:
+                raise error from cancellation
+            raise CommittedCancellation(
+                "event batch committed after caller cancellation"
+            ) from cancellation
+
+    async def _persist_coupled(self, events: list[AdaptedEvent]) -> int:
+        with self._content_store.transaction():
+            return await self._persist_transaction(events)
+
+    async def _persist_transaction(self, events: list[AdaptedEvent]) -> int:
         inserted = 0
         now = time.time()
+        resumes_in_batch = {
+            (event.sdk_session_id, event.generation, event.parent_id)
+            for event in events
+            if event.raw_type == "session.resume" and event.parent_id is not None
+        }
         async with self._database.transaction() as connection:
             for event in events:
                 if self._require_binding_fence:
@@ -312,10 +314,10 @@ class JournalReducer:
                         persistence_class, raw_type, parent_id, agent_id,
                         message_id, turn_id, interaction_id, task_id, tool_call_id,
                         request_id, correlation_id,
-                        reducer_hash, raw_payload, received_at
+                        reducer_hash, raw_payload, payload_sha256, received_at
                     ) VALUES (
                         ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-                        ?, ?, ?, ?, ?
+                        ?, ?, ?, ?, ?, ?
                     )
                     ON CONFLICT DO NOTHING
                     """,
@@ -343,7 +345,8 @@ class JournalReducer:
                         event.request_id,
                         event.correlation_id,
                         event.reducer_hash,
-                        json.dumps(event.raw_payload, ensure_ascii=False, sort_keys=True),
+                        event_payload_receipt(event.raw_payload),
+                        event.reducer_hash,
                         event.received_at,
                     ),
                 )
@@ -374,27 +377,24 @@ class JournalReducer:
                             event.fence_token,
                         ),
                     )
-                    continue
-                inserted += 1
-                superseded_shutdown = await self._is_superseded_shutdown(
-                    connection,
-                    event,
-                )
-                render_payload: dict[str, Any] | None = None
-                suppress_default_artifact = False
-                artifact_override: dict[str, Any] | None = None
-                if not superseded_shutdown:
-                    await self._apply_domain_state(connection, event, now=now)
-                    await self._apply_reaction_state(connection, event, now=now)
-                    render_payload = await self._materialize_render_payload(
+                    await self._recover_volatile_event(
                         connection,
                         event,
                         now=now,
                     )
-                    (
-                        suppress_default_artifact,
-                        artifact_override,
-                    ) = await self._cumulative_tool_artifact(
+                    continue
+                self._capture_tool_event_evidence(event)
+                inserted += 1
+                superseded_shutdown = await self._is_superseded_shutdown(
+                    connection,
+                    event,
+                    resumes_in_batch=resumes_in_batch,
+                )
+                render_payload: dict[str, Any] | None = None
+                if not superseded_shutdown:
+                    await self._apply_domain_state(connection, event, now=now)
+                    await self._apply_reaction_state(connection, event, now=now)
+                    render_payload = await self._materialize_render_payload(
                         connection,
                         event,
                         now=now,
@@ -427,111 +427,543 @@ class JournalReducer:
                 )
                 if superseded_shutdown:
                     continue
-                planner_parameters = inspect.signature(self._planner.plan).parameters
-                planner_kwargs: dict[str, Any] = {
-                    "payload_override": render_payload,
-                }
-                if "artifact_override" in planner_parameters:
-                    planner_kwargs.update(
-                        artifact_override=artifact_override,
-                        suppress_default_artifact=suppress_default_artifact,
+                for intent in self._planner.plan(
+                    event,
+                    payload_override=render_payload,
+                ):
+                    next_attempt_at = (
+                        now + _SHUTDOWN_SETTLEMENT_SECONDS
+                        if event.raw_type == "session.shutdown"
+                        else now
                     )
-                for intent in self._planner.plan(event, **planner_kwargs):
-                    serialized_payload = json.dumps(
-                        intent.payload,
-                        ensure_ascii=False,
-                        sort_keys=True,
+                    await self._queue_render_intent(
+                        connection,
+                        event,
+                        intent,
+                        next_attempt_at=next_attempt_at,
+                        now=now,
                     )
-                    if intent.payload.get("stable_outbox_key") is not None:
-                        cursor = await connection.execute(
-                            """
-                            SELECT payload FROM render_outbox
-                            WHERE idempotency_key = ?
-                            """,
-                            (intent.idempotency_key,),
-                        )
-                        existing_outbox = await cursor.fetchone()
-                        await cursor.close()
-                        if existing_outbox is not None:
-                            existing_payload = json.loads(str(existing_outbox["payload"]))
-                            if (
-                                bool(existing_payload.get("finalized"))
-                                and not bool(intent.payload.get("finalized"))
-                            ) or existing_payload == intent.payload:
-                                continue
-                        await connection.execute(
-                            """
-                            INSERT INTO render_outbox(
-                                id, session_id, logical_seq, lane, coalesce_key,
-                                idempotency_key, payload, state, attempts,
-                                next_attempt_at, created_at, updated_at
-                            ) VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', 0, ?, ?, ?)
-                            ON CONFLICT(idempotency_key) DO UPDATE SET
-                                logical_seq = excluded.logical_seq,
-                                lane = excluded.lane,
-                                coalesce_key = excluded.coalesce_key,
-                                payload = excluded.payload,
-                                payload_revision = render_outbox.payload_revision + 1,
-                                state = CASE
-                                    WHEN render_outbox.state = 'sending'
-                                    THEN 'sending'
-                                    ELSE 'pending'
-                                END,
-                                next_attempt_at = CASE
-                                    WHEN render_outbox.state IN ('pending', 'sending')
-                                    THEN MAX(
-                                        render_outbox.next_attempt_at,
-                                        excluded.next_attempt_at
-                                    )
-                                    ELSE excluded.next_attempt_at
-                                END,
-                                updated_at = excluded.updated_at
-                            """,
-                            (
-                                intent.id,
-                                intent.session_id,
-                                intent.logical_seq,
-                                intent.lane,
-                                intent.coalesce_key,
-                                intent.idempotency_key,
-                                serialized_payload,
-                                now,
-                                now,
-                                now,
-                            ),
-                        )
-                        continue
-                    await connection.execute(
-                        """
-                        INSERT INTO render_outbox(
-                            id, session_id, logical_seq, lane, coalesce_key,
-                            idempotency_key, payload, state, attempts,
-                            next_attempt_at, created_at, updated_at
-                        ) VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', 0, ?, ?, ?)
-                        ON CONFLICT(idempotency_key) DO NOTHING
-                        """,
-                        (
-                            intent.id,
-                            intent.session_id,
-                            intent.logical_seq,
-                            intent.lane,
-                            intent.coalesce_key,
-                            intent.idempotency_key,
-                            serialized_payload,
-                            now,
-                            now,
-                            now,
-                        ),
-                    )
+            for session_id in {event.sdk_session_id for event in events}:
+                await self._reclaim_submission_prompts(connection, session_id)
         return inserted
+
+    async def _reclaim_submission_prompts(
+        self,
+        connection: Any,
+        session_id: str,
+    ) -> None:
+        cursor = await connection.execute(
+            """
+            SELECT q.prompt_content_key
+            FROM message_queue q
+            JOIN submissions s ON s.submission_id = q.id
+            WHERE s.sdk_session_id = ?
+              AND q.prompt_content_key IS NOT NULL
+              AND q.state IN (
+                  'cancelled', 'submitted', 'submitted_unknown',
+                  'rejected', 'failed', 'content_unavailable'
+              )
+            """,
+            (session_id,),
+        )
+        keys = [str(row["prompt_content_key"]) for row in await cursor.fetchall()]
+        await cursor.close()
+        for key in keys:
+            self._content_store.delete(key)
+
+    async def _queue_render_intent(
+        self,
+        connection: Any,
+        event: AdaptedEvent,
+        intent: RenderIntent,
+        *,
+        next_attempt_at: float,
+        now: float,
+    ) -> None:
+        cursor = await connection.execute(
+            """
+            SELECT id, state, content_hash, render_kind, finalized
+            FROM render_outbox WHERE idempotency_key = ?
+            """,
+            (intent.idempotency_key,),
+        )
+        existing = await cursor.fetchone()
+        await cursor.close()
+        stable = intent.payload.get("stable_outbox_key") is not None
+        incoming_hash = payload_sha256(intent.payload)
+        if existing is not None:
+            if not stable:
+                return
+            reopens_tool_card = (
+                str(existing["render_kind"]) == "tool_card"
+                and intent.payload.get("type") == "tool_card"
+            )
+            if (
+                bool(existing["finalized"])
+                and not bool(intent.payload.get("finalized"))
+                and not reopens_tool_card
+            ):
+                return
+            if str(existing["content_hash"]) == incoming_hash:
+                if str(existing["state"]) == "sent":
+                    return
+                if (
+                    self._content_store.get(
+                        opaque_content_key("render-outbox", intent.id),
+                        expected_hash=incoming_hash,
+                    )
+                    is not None
+                ):
+                    await self._compensate_content_unavailable_fallback(
+                        connection,
+                        event,
+                        source_outbox_id=str(existing["id"]),
+                        submission_id=intent.payload.get("submission_id"),
+                        now=now,
+                    )
+                    return
+
+        payload_ref = self._content_store.put(
+            intent.payload,
+            key=opaque_content_key("render-outbox", intent.id),
+        )
+        serialized_payload = render_payload_receipt(intent.payload, payload_ref)
+        conflict = (
+            """
+            ON CONFLICT(idempotency_key) DO UPDATE SET
+                logical_seq = excluded.logical_seq,
+                lane = excluded.lane,
+                coalesce_key = excluded.coalesce_key,
+                payload = excluded.payload,
+                content_key = excluded.content_key,
+                content_hash = excluded.content_hash,
+                render_kind = excluded.render_kind,
+                finalized = excluded.finalized,
+                source_submission_id = COALESCE(
+                    excluded.source_submission_id,
+                    render_outbox.source_submission_id
+                ),
+                source_channel_id = COALESCE(
+                    excluded.source_channel_id,
+                    render_outbox.source_channel_id
+                ),
+                source_message_id = COALESCE(
+                    excluded.source_message_id,
+                    render_outbox.source_message_id
+                ),
+                tool_call_id = excluded.tool_call_id,
+                payload_revision = render_outbox.payload_revision + 1,
+                state = CASE
+                    WHEN render_outbox.state = 'sending' THEN 'sending'
+                    ELSE 'pending'
+                END,
+                next_attempt_at = CASE
+                    WHEN render_outbox.state IN ('pending', 'sending')
+                    THEN MAX(render_outbox.next_attempt_at, excluded.next_attempt_at)
+                    ELSE excluded.next_attempt_at
+                END,
+                last_error = NULL,
+                error_code = NULL,
+                updated_at = excluded.updated_at
+            """
+            if stable
+            else "ON CONFLICT(idempotency_key) DO NOTHING"
+        )
+        await connection.execute(
+            f"""
+            INSERT INTO render_outbox(
+                id, session_id, logical_seq, lane, coalesce_key,
+                idempotency_key, payload, state, attempts,
+                next_attempt_at, created_at, updated_at,
+                content_key, content_hash, render_kind, finalized,
+                source_submission_id, source_channel_id,
+                source_message_id, tool_call_id
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', 0, ?, ?, ?,
+                     ?, ?, ?, ?, ?, ?, ?, ?)
+            {conflict}
+            """,
+            (
+                intent.id,
+                intent.session_id,
+                intent.logical_seq,
+                intent.lane,
+                intent.coalesce_key,
+                intent.idempotency_key,
+                serialized_payload,
+                next_attempt_at,
+                now,
+                now,
+                payload_ref.key,
+                payload_ref.sha256,
+                str(intent.payload.get("type", "render")),
+                int(bool(intent.payload.get("finalized"))),
+                intent.payload.get("submission_id"),
+                intent.payload.get("source_channel_id"),
+                intent.payload.get("source_message_id"),
+                intent.payload.get("tool_call_id"),
+            ),
+        )
+        await self._compensate_content_unavailable_fallback(
+            connection,
+            event,
+            source_outbox_id=(intent.id if existing is None else str(existing["id"])),
+            submission_id=intent.payload.get("submission_id"),
+            now=now,
+        )
+
+    def _capture_tool_event_evidence(self, event: AdaptedEvent) -> None:
+        if not self._capture_tool_acceptance_evidence or event.raw_type not in {
+            "tool.execution_start",
+            "tool.execution_complete",
+        }:
+            return
+        data = event.raw_payload.get("data", event.raw_payload)
+        if not isinstance(data, dict):
+            return
+        tool_call_id = str(
+            event.tool_call_id or data.get("toolCallId") or data.get("tool_call_id") or ""
+        )
+        if not tool_call_id:
+            return
+        observed_id = str(data.get("toolCallId") or data.get("tool_call_id") or "")
+        if observed_id and observed_id != tool_call_id:
+            return
+        if event.raw_type == "tool.execution_start":
+            evidence = {
+                "kind": event.raw_type,
+                "tool_call_id": tool_call_id,
+                "server_name": str(data.get("mcpServerName") or "")[:256],
+                "tool_name": str(data.get("mcpToolName") or "")[:256],
+                "arguments_hash": payload_sha256(data.get("arguments")),
+            }
+        else:
+            evidence = {
+                "kind": event.raw_type,
+                "tool_call_id": tool_call_id,
+                "success": data.get("success") is True,
+                "result_text_hashes": _text_leaf_hashes(data.get("result")),
+            }
+        key = tool_event_evidence_key(
+            event.sdk_session_id,
+            event.generation,
+            tool_call_id,
+            event.raw_type,
+        )
+        existing = self._content_store.get(key)
+        history = list(existing) if isinstance(existing, list) else []
+        if len(history) >= 2:
+            return
+        history.append(evidence)
+        self._content_store.put(history, key=key)
+
+    async def _recover_volatile_event(
+        self,
+        connection: Any,
+        event: AdaptedEvent,
+        *,
+        now: float,
+    ) -> None:
+        data = event.raw_payload.get("data", event.raw_payload)
+        if not isinstance(data, dict):
+            return
+        if (
+            event.raw_type in {"assistant.message_delta", "assistant.message"}
+            and event.message_id is not None
+            and event.agent_id is None
+        ):
+            stream_key = opaque_content_key(
+                "assistant-stream",
+                event.sdk_session_id,
+                event.message_id,
+                event.agent_id or "",
+            )
+            if event.raw_type == "assistant.message" or self._content_store.get(stream_key) is None:
+                await self._accumulate_render_stream(
+                    connection,
+                    event,
+                    data=data,
+                    now=now,
+                )
+        if event.raw_type.startswith("tool.execution_") and event.agent_id is None:
+            context = await self._turn_render_context(
+                connection,
+                event,
+                now=now,
+            )
+            if context is not None:
+                await self._tool_card_payload(
+                    connection,
+                    event,
+                    context,
+                    now=now,
+                )
+        await apply_protocol_event(
+            connection,
+            event,
+            data,
+            now=now,
+            content_store=self._content_store,
+        )
+        payload = await self._materialize_render_payload(
+            connection,
+            event,
+            now=now,
+        )
+        intents = self._planner.plan(event, payload_override=payload)
+        retained_render_content = False
+        for intent in intents:
+            content_key = opaque_content_key("render-outbox", intent.id)
+            incoming_hash = payload_sha256(intent.payload)
+            cursor = await connection.execute(
+                """
+                SELECT id, state, content_hash, finalized, render_kind
+                FROM render_outbox WHERE idempotency_key = ?
+                """,
+                (intent.idempotency_key,),
+            )
+            existing = await cursor.fetchone()
+            await cursor.close()
+            stable = intent.payload.get("stable_outbox_key") is not None
+            if existing is not None:
+                if str(existing["state"]) == "sent":
+                    self._content_store.delete(content_key)
+                    continue
+                reopens_tool_card = (
+                    str(existing["render_kind"]) == "tool_card"
+                    and intent.payload.get("type") == "tool_card"
+                )
+                if (
+                    bool(existing["finalized"])
+                    and not bool(intent.payload.get("finalized"))
+                    and not reopens_tool_card
+                ):
+                    continue
+                if str(existing["content_hash"]) == incoming_hash and (
+                    self._content_store.get(
+                        content_key,
+                        expected_hash=incoming_hash,
+                    )
+                    is not None
+                ):
+                    retained_render_content = True
+                    await self._compensate_content_unavailable_fallback(
+                        connection,
+                        event,
+                        source_outbox_id=str(existing["id"]),
+                        submission_id=intent.payload.get("submission_id"),
+                        now=now,
+                    )
+                    continue
+                if not stable and str(existing["content_hash"]) != incoming_hash:
+                    continue
+            ref = self._content_store.put(
+                intent.payload,
+                key=content_key,
+            )
+            receipt = render_payload_receipt(intent.payload, ref)
+            await connection.execute(
+                """
+                INSERT INTO render_outbox(
+                    id, session_id, logical_seq, lane, coalesce_key,
+                    idempotency_key, payload, state, attempts,
+                    next_attempt_at, created_at, updated_at,
+                    content_key, content_hash, render_kind, finalized,
+                    source_submission_id, source_channel_id,
+                    source_message_id, tool_call_id
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', 0, ?, ?, ?,
+                          ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(idempotency_key) DO UPDATE SET
+                    logical_seq = excluded.logical_seq,
+                    lane = excluded.lane,
+                    coalesce_key = excluded.coalesce_key,
+                    payload = excluded.payload,
+                    content_key = excluded.content_key,
+                    content_hash = excluded.content_hash,
+                    render_kind = excluded.render_kind,
+                    finalized = excluded.finalized,
+                    source_submission_id = COALESCE(
+                        excluded.source_submission_id,
+                        render_outbox.source_submission_id
+                    ),
+                    source_channel_id = COALESCE(
+                        excluded.source_channel_id,
+                        render_outbox.source_channel_id
+                    ),
+                    source_message_id = COALESCE(
+                        excluded.source_message_id,
+                        render_outbox.source_message_id
+                    ),
+                    tool_call_id = excluded.tool_call_id,
+                    payload_revision = render_outbox.payload_revision + 1,
+                    state = CASE
+                        WHEN render_outbox.state = 'sent' THEN 'sent'
+                        WHEN render_outbox.state = 'sending' THEN 'sending'
+                        ELSE 'pending'
+                    END,
+                    next_attempt_at = MIN(
+                        render_outbox.next_attempt_at,
+                        excluded.next_attempt_at
+                    ),
+                    last_error = NULL,
+                    error_code = NULL,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    intent.id,
+                    intent.session_id,
+                    intent.logical_seq,
+                    intent.lane,
+                    intent.coalesce_key,
+                    intent.idempotency_key,
+                    receipt,
+                    now,
+                    now,
+                    now,
+                    ref.key,
+                    ref.sha256,
+                    str(intent.payload.get("type", "render")),
+                    int(bool(intent.payload.get("finalized"))),
+                    intent.payload.get("submission_id"),
+                    intent.payload.get("source_channel_id"),
+                    intent.payload.get("source_message_id"),
+                    intent.payload.get("tool_call_id"),
+                ),
+            )
+            retained_render_content = True
+            await self._compensate_content_unavailable_fallback(
+                connection,
+                event,
+                source_outbox_id=(intent.id if existing is None else str(existing["id"])),
+                submission_id=intent.payload.get("submission_id"),
+                now=now,
+            )
+        if (
+            intents
+            and not retained_render_content
+            and event.raw_type in {"assistant.message_delta", "assistant.message"}
+            and event.message_id is not None
+        ):
+            self._content_store.delete(
+                opaque_content_key(
+                    "assistant-stream",
+                    event.sdk_session_id,
+                    event.message_id,
+                    event.agent_id or "",
+                )
+            )
+
+    async def _compensate_content_unavailable_fallback(
+        self,
+        connection: Any,
+        event: AdaptedEvent,
+        *,
+        source_outbox_id: str,
+        submission_id: Any,
+        now: float,
+    ) -> None:
+        cursor = await connection.execute(
+            """
+            SELECT content_key
+            FROM render_outbox
+            WHERE render_kind = 'content_unavailable'
+              AND state IN ('pending', 'sending', 'blocked', 'sent')
+              AND json_extract(payload, '$.source_outbox_id') = ?
+            """,
+            (source_outbox_id,),
+        )
+        fallback_rows = await cursor.fetchall()
+        fallback_keys = [
+            str(row["content_key"]) for row in fallback_rows if row["content_key"] is not None
+        ]
+        await cursor.close()
+        if not fallback_rows:
+            return
+        await connection.execute(
+            """
+            UPDATE render_outbox
+            SET state = 'superseded', content_key = NULL,
+                last_error = NULL, error_code = NULL, updated_at = ?
+            WHERE render_kind = 'content_unavailable'
+              AND state IN ('pending', 'sending', 'blocked', 'sent')
+              AND json_extract(payload, '$.source_outbox_id') = ?
+            """,
+            (now, source_outbox_id),
+        )
+        for key in fallback_keys:
+            self._content_store.delete(key)
+
+        requested_submission = None if submission_id is None else str(submission_id)
+        if requested_submission is None:
+            source = await _fetchone_row(
+                connection,
+                """
+                SELECT source_submission_id
+                FROM render_outbox
+                WHERE id = ?
+                """,
+                (source_outbox_id,),
+            )
+            if source is not None and source["source_submission_id"] is not None:
+                requested_submission = str(source["source_submission_id"])
+        if requested_submission is None:
+            return
+        reaction = await _fetchone_row(
+            connection,
+            """
+            SELECT r.source_channel_id, r.source_message_id, r.revision,
+                   s.state AS submission_state
+            FROM submission_reactions AS r
+            JOIN submissions AS s ON s.submission_id = r.submission_id
+            WHERE r.submission_id = ? AND r.sdk_session_id = ?
+              AND r.desired_state = 'failed' AND r.terminal = 1
+              AND r.resume_state = 'content_unavailable'
+            """,
+            (requested_submission, event.sdk_session_id),
+        )
+        if reaction is None:
+            return
+        submission_state = str(reaction["submission_state"])
+        if submission_state == "semantic_complete":
+            restored_state = "succeeded"
+        elif submission_state in _SUBMISSION_FAILURE_STATES:
+            restored_state = "failed"
+        else:
+            return
+        revision = int(reaction["revision"]) + 1
+        await connection.execute(
+            """
+            UPDATE submission_reactions
+            SET desired_state = ?, resume_state = NULL, revision = ?,
+                terminal = 1, last_error = NULL, updated_at = ?
+            WHERE submission_id = ? AND desired_state = 'failed'
+              AND terminal = 1 AND resume_state = 'content_unavailable'
+            """,
+            (restored_state, revision, now, requested_submission),
+        )
+        if restored_state == "succeeded":
+            await self._queue_submission_reaction(
+                connection,
+                event,
+                submission_id=requested_submission,
+                source_channel_id=str(reaction["source_channel_id"]),
+                source_message_id=str(reaction["source_message_id"]),
+                state=restored_state,
+                revision=revision,
+                terminal=True,
+                now=now,
+            )
 
     async def _is_superseded_shutdown(
         self,
         connection: Any,
         event: AdaptedEvent,
+        *,
+        resumes_in_batch: set[tuple[str, int, str | None]],
     ) -> bool:
         if event.raw_type != "session.shutdown" or event.event_id is None:
             return False
+        if (event.sdk_session_id, event.generation, event.event_id) in resumes_in_batch:
+            return True
         cursor = await connection.execute(
             """
             SELECT 1
@@ -567,6 +999,34 @@ class JournalReducer:
                 "accepted",
                 now=now,
             )
+            source_channel_id = values.get("discord_source_channel_id")
+            source_message_id = values.get("discord_source_message_id")
+            if source_channel_id is not None and source_message_id is not None:
+                persisted_submission = await _fetchone_row(
+                    connection,
+                    """
+                    SELECT 1 FROM submissions
+                    WHERE submission_id = ? AND sdk_session_id = ?
+                      AND discord_source_channel_id = ?
+                      AND discord_source_message_id = ?
+                    """,
+                    (
+                        str(values["submission_id"]),
+                        event.sdk_session_id,
+                        str(source_channel_id),
+                        str(source_message_id),
+                    ),
+                )
+                if persisted_submission is not None:
+                    await supersede_admission_reaction(
+                        connection,
+                        session_id=event.sdk_session_id,
+                        logical_seq=event.inbox_seq,
+                        source_channel_id=str(source_channel_id),
+                        source_message_id=str(source_message_id),
+                        now=now,
+                        content_store=self._content_store,
+                    )
 
         cursor = await connection.execute(
             """
@@ -592,7 +1052,12 @@ class JournalReducer:
                 now=now,
             )
 
-        if event.raw_type == "abort":
+        if event.raw_type in {
+            "abort",
+            "model.call_failure",
+            "session.error",
+            "session.shutdown",
+        }:
             state = "failed"
         elif event.raw_type == "copilotd.interaction.requested":
             state = "unresolved"
@@ -720,33 +1185,99 @@ class JournalReducer:
         existing = await _fetchone_row(
             connection,
             """
-            SELECT desired_state, resume_state, revision, terminal
+            SELECT desired_state, resume_state, revision, terminal, last_error
             FROM submission_reactions WHERE submission_id = ?
             """,
             (submission_id,),
         )
         if existing is not None:
             existing_state = str(existing["desired_state"])
-            if bool(existing["terminal"]):
-                recoverable_failure = existing_state == "failed" and str(submission["state"]) in {
-                    "submitting",
-                    "submitted",
-                    "submitted_unknown",
-                    "observed_active",
-                    "loop_idle",
-                    "continuation_expected",
-                    "semantic_complete",
-                }
-                if not recoverable_failure:
-                    return
+            shutdown_state = _shutdown_reaction_state(existing["resume_state"])
+            render_failure_state = _render_failure_reaction_state(existing["resume_state"])
             if existing_state == state:
+                if (
+                    state == "failed"
+                    and event.raw_type == "session.shutdown"
+                    and event.event_id is not None
+                ):
+                    await connection.execute(
+                        """
+                        UPDATE submission_reactions
+                        SET resume_state = ?, runtime_generation = ?,
+                            owner_fence_token = ?, updated_at = ?
+                        WHERE submission_id = ?
+                        """,
+                        (
+                            _encode_shutdown_reaction_state(
+                                event,
+                                previous_state=existing_state,
+                                previous_resume_state=existing["resume_state"],
+                                previous_terminal=bool(existing["terminal"]),
+                                previous_last_error=existing["last_error"],
+                            ),
+                            event.generation,
+                            event.fence_token,
+                            now,
+                            submission_id,
+                        ),
+                    )
+                elif state == "failed" and (
+                    shutdown_state is not None or render_failure_state is not None
+                ):
+                    failure_state = shutdown_state or render_failure_state
+                    assert failure_state is not None
+                    await connection.execute(
+                        """
+                        UPDATE submission_reactions
+                        SET resume_state = ?, updated_at = ?
+                        WHERE submission_id = ?
+                        """,
+                        (
+                            failure_state.get("previous_resume_state"),
+                            now,
+                            submission_id,
+                        ),
+                    )
                 return
+            if bool(existing["terminal"]):
+                recoverable_failure = (
+                    existing_state == "failed"
+                    and not _is_render_failure_reaction_state(existing["resume_state"])
+                    and str(submission["state"])
+                    in {
+                        "submitting",
+                        "submitted",
+                        "submitted_unknown",
+                        "observed_active",
+                        "loop_idle",
+                        "continuation_expected",
+                        "semantic_complete",
+                    }
+                )
+                failure_override = state == "failed" and existing_state == "succeeded"
+                if not recoverable_failure and not failure_override:
+                    return
             revision = int(existing["revision"]) + 1
-            resume_state = (
-                existing_state
-                if state == "unresolved" and existing_state in {"reasoning", "action"}
-                else existing["resume_state"]
-            )
+            if (
+                state == "failed"
+                and event.raw_type == "session.shutdown"
+                and event.event_id is not None
+            ):
+                resume_state = _encode_shutdown_reaction_state(
+                    event,
+                    previous_state=existing_state,
+                    previous_resume_state=existing["resume_state"],
+                    previous_terminal=bool(existing["terminal"]),
+                    previous_last_error=existing["last_error"],
+                )
+            elif shutdown_state is not None:
+                resume_state = shutdown_state.get("previous_resume_state")
+            else:
+                resume_state = (
+                    existing_state
+                    if state == "unresolved" and existing_state in {"reasoning", "action"}
+                    else existing["resume_state"]
+                )
         else:
             revision = 1
             resume_state = None
@@ -786,34 +1317,93 @@ class JournalReducer:
                 now,
             ),
         )
-        payload = json.dumps(
-            {
-                "type": "reaction_state",
-                "submission_id": submission_id,
-                "source_channel_id": source_channel_id,
-                "source_message_id": source_message_id,
-                "state": state,
-                "emoji": REACTION_EMOJI[state],
-                "reaction_revision": revision,
-                "generation": event.generation,
-                "fence_token": event.fence_token,
-                "finalized": terminal,
-            },
-            ensure_ascii=False,
-            sort_keys=True,
+        await self._queue_submission_reaction(
+            connection,
+            event,
+            submission_id=submission_id,
+            source_channel_id=source_channel_id,
+            source_message_id=source_message_id,
+            state=state,
+            revision=revision,
+            terminal=terminal,
+            now=now,
         )
+
+    async def _queue_submission_reaction(
+        self,
+        connection: Any,
+        event: AdaptedEvent,
+        *,
+        submission_id: str,
+        source_channel_id: str,
+        source_message_id: str,
+        state: str,
+        revision: int,
+        terminal: bool,
+        now: float,
+    ) -> None:
+        render_payload = {
+            "type": "reaction_state",
+            "submission_id": submission_id,
+            "source_channel_id": source_channel_id,
+            "source_message_id": source_message_id,
+            "state": state,
+            "emoji": REACTION_EMOJI[state],
+            "reaction_revision": revision,
+            "generation": event.generation,
+            "fence_token": event.fence_token,
+            "finalized": terminal,
+        }
         outbox_key = f"reaction:{submission_id}"
         outbox_id = str(uuid.uuid5(uuid.NAMESPACE_URL, outbox_key))
+        content_key = opaque_content_key("render-outbox", outbox_id)
+        incoming_hash = payload_sha256(render_payload)
+        cursor = await connection.execute(
+            """
+            SELECT content_hash FROM render_outbox
+            WHERE idempotency_key = ?
+            """,
+            (outbox_key,),
+        )
+        existing = await cursor.fetchone()
+        await cursor.close()
+        if existing is not None:
+            if (
+                str(existing["content_hash"]) == incoming_hash
+                and self._content_store.get(
+                    content_key,
+                    expected_hash=incoming_hash,
+                )
+                is not None
+            ):
+                return
+        ref = self._content_store.put(
+            render_payload,
+            key=content_key,
+        )
+        payload = render_payload_receipt(render_payload, ref)
         await connection.execute(
             """
             INSERT INTO render_outbox(
                 id, session_id, logical_seq, lane, coalesce_key,
                 idempotency_key, payload, state, attempts,
-                next_attempt_at, created_at, updated_at
-            ) VALUES (?, ?, ?, 'reaction', ?, ?, ?, 'pending', 0, ?, ?, ?)
+                next_attempt_at, created_at, updated_at,
+                content_key, content_hash, render_kind, finalized,
+                source_submission_id, source_channel_id, source_message_id,
+                reaction_state
+            ) VALUES (?, ?, ?, 'reaction', ?, ?, ?, 'pending', 0, ?, ?, ?,
+                     ?, ?, 'reaction_state', ?, ?, ?, ?, ?)
             ON CONFLICT(idempotency_key) DO UPDATE SET
                 logical_seq = excluded.logical_seq,
                 payload = excluded.payload,
+                content_key = excluded.content_key,
+                content_hash = excluded.content_hash,
+                render_kind = excluded.render_kind,
+                finalized = excluded.finalized,
+                source_submission_id = excluded.source_submission_id,
+                source_channel_id = excluded.source_channel_id,
+                source_message_id = excluded.source_message_id,
+                reaction_state = excluded.reaction_state,
                 payload_revision = render_outbox.payload_revision + 1,
                 state = CASE
                     WHEN render_outbox.state = 'sending' THEN 'sending'
@@ -833,8 +1423,88 @@ class JournalReducer:
                 now,
                 now,
                 now,
+                ref.key,
+                ref.sha256,
+                int(terminal),
+                submission_id,
+                source_channel_id,
+                source_message_id,
+                state,
             ),
         )
+
+    async def _restore_shutdown_reactions(
+        self,
+        connection: Any,
+        event: AdaptedEvent,
+        *,
+        now: float,
+    ) -> None:
+        if event.parent_id is None:
+            return
+        rows = await _fetchall_rows(
+            connection,
+            """
+            SELECT submission_id, source_channel_id, source_message_id,
+                   desired_state, resume_state, revision, terminal,
+                   runtime_generation, owner_fence_token
+            FROM submission_reactions
+            WHERE sdk_session_id = ? AND desired_state = 'failed'
+              AND terminal = 1 AND resume_state IS NOT NULL
+            """,
+            (event.sdk_session_id,),
+        )
+        for row in rows:
+            encoded_state = str(row["resume_state"])
+            shutdown_state = _shutdown_reaction_state(encoded_state)
+            if (
+                shutdown_state is None
+                or shutdown_state.get("event_id") != event.parent_id
+                or shutdown_state.get("generation") != event.generation
+            ):
+                continue
+            previous_state = shutdown_state.get("previous_state")
+            if previous_state not in REACTION_EMOJI:
+                continue
+            previous_terminal = bool(shutdown_state.get("previous_terminal"))
+            revision = int(row["revision"]) + 1
+            cursor = await connection.execute(
+                """
+                UPDATE submission_reactions
+                SET desired_state = ?, resume_state = ?, revision = ?,
+                    runtime_generation = ?, owner_fence_token = ?, terminal = ?,
+                    last_error = ?, updated_at = ?
+                WHERE submission_id = ? AND desired_state = 'failed'
+                  AND terminal = 1 AND resume_state = ?
+                """,
+                (
+                    previous_state,
+                    shutdown_state.get("previous_resume_state"),
+                    revision,
+                    event.generation,
+                    event.fence_token,
+                    int(previous_terminal),
+                    shutdown_state.get("previous_last_error"),
+                    now,
+                    row["submission_id"],
+                    encoded_state,
+                ),
+            )
+            restored = cursor.rowcount == 1
+            await cursor.close()
+            if not restored:
+                continue
+            await self._queue_submission_reaction(
+                connection,
+                event,
+                submission_id=str(row["submission_id"]),
+                source_channel_id=str(row["source_channel_id"]),
+                source_message_id=str(row["source_message_id"]),
+                state=str(previous_state),
+                revision=revision,
+                terminal=previous_terminal,
+                now=now,
+            )
 
     async def persist_incident(
         self,
@@ -881,7 +1551,7 @@ class JournalReducer:
                     error.kind,
                     envelope.inbox_seq,
                     envelope.sdk_receive_seq,
-                    json.dumps(detail, ensure_ascii=False, sort_keys=True),
+                    state_only_json(detail),
                 ),
             )
             await connection.execute(
@@ -1076,25 +1746,13 @@ class JournalReducer:
         submission = await _fetchone_row(
             connection,
             """
-            SELECT state, observed_interaction_id FROM submissions
+            SELECT state FROM submissions
             WHERE sdk_session_id = ? AND submission_id = ?
             """,
             (event.sdk_session_id, submission_id),
         )
         if submission is None:
             return None
-        segment_interaction_id = None
-        if segment_index is not None:
-            segment = await _fetchone_row(
-                connection,
-                """
-                SELECT interaction_id FROM submission_segments
-                WHERE submission_id = ? AND segment_index = ?
-                """,
-                (submission_id, segment_index),
-            )
-            if segment is not None:
-                segment_interaction_id = segment["interaction_id"]
         await connection.execute(
             """
             INSERT INTO turn_render_state(
@@ -1123,31 +1781,14 @@ class JournalReducer:
                 now,
             ),
         )
-        render = await _fetchone_row(
-            connection,
-            """
-            SELECT state, answer_payload
-            FROM turn_render_state
-            WHERE sdk_session_id = ? AND turn_key = ?
-            """,
-            (event.sdk_session_id, turn_key),
-        )
-        assert render is not None
         return {
             "turn_key": turn_key,
             "submission_id": submission_id,
             "segment_index": segment_index,
             "submission_state": str(submission["state"]),
-            "interaction_id": (
-                event.interaction_id
-                or segment_interaction_id
-                or submission["observed_interaction_id"]
-            ),
-            "render_state": str(render["state"]),
-            "answer_payload": render["answer_payload"],
         }
 
-    async def _turn_progress_payload(
+    async def _submission_render_payload(
         self,
         connection: Any,
         event: AdaptedEvent,
@@ -1155,13 +1796,21 @@ class JournalReducer:
         *,
         now: float,
     ) -> dict[str, Any] | None:
-        turn_key = str(context["turn_key"])
         submission_state = str(context["submission_state"])
+        if event.raw_type.startswith("tool.execution_") and event.agent_id is None:
+            return await self._tool_card_payload(
+                connection,
+                event,
+                context,
+                now=now,
+            )
         if submission_state in _SUBMISSION_FAILURE_STATES or event.raw_type in {
             "abort",
+            "model.call_failure",
             "session.error",
             "session.shutdown",
         }:
+            turn_key = str(context["turn_key"])
             await connection.execute(
                 """
                 UPDATE turn_render_state
@@ -1170,135 +1819,252 @@ class JournalReducer:
                 """,
                 (now, event.sdk_session_id, turn_key),
             )
-            return {
-                "type": "turn_error",
-                "content": (
-                    "**Copilot could not complete this request.**\n"
-                    "Please try again or refine the request."
-                ),
+            data = event.raw_payload.get("data", event.raw_payload)
+            values = data if isinstance(data, dict) else {}
+            title, fallback = _status_title(event.raw_type)
+            if event.raw_type not in {
+                "abort",
+                "model.call_failure",
+                "session.error",
+                "session.shutdown",
+            }:
+                title = "Copilot request failed"
+                fallback = "The request did not complete successfully."
+            detail = sanitize_failure_summary(
+                _status_detail(event.raw_type, values, fallback=fallback),
+                limit=800,
+            )
+            payload = {
+                "type": event.raw_type
+                if event.raw_type
+                in {
+                    "abort",
+                    "model.call_failure",
+                    "session.error",
+                    "session.shutdown",
+                }
+                else "turn_error",
+                "content": f"**{title}**\n{detail}",
                 "status": {
-                    "title": "Copilot request failed",
-                    "detail": "The request did not complete successfully.",
-                    "event_type": "turn.failed",
+                    "title": title,
+                    "detail": detail,
+                    "event_type": (
+                        event.raw_type
+                        if event.raw_type
+                        in {
+                            "abort",
+                            "model.call_failure",
+                            "session.error",
+                            "session.shutdown",
+                        }
+                        else "turn.failed"
+                    ),
                 },
+                "stable_render_key": f"failure:{turn_key}",
+                "render_lane": "status",
                 "turn_render_key": turn_key,
                 "submission_id": context["submission_id"],
                 "finalized": True,
             }
-        if event.raw_type == "assistant.message":
-            return None
+            if event.raw_type == "session.shutdown" and event.event_id is not None:
+                payload.update(
+                    shutdown_event_id=event.event_id,
+                    shutdown_generation=event.generation,
+                )
+            return payload
         if submission_state in _SUBMISSION_SUCCESS_STATES:
-            answer_payload = context.get("answer_payload")
-            if answer_payload is None:
-                payload: dict[str, Any] = {
-                    "type": "turn_complete",
-                    "content": "Copilot completed the request.",
-                }
-            else:
-                payload = json.loads(str(answer_payload))
-            payload.update(
-                turn_render_key=turn_key,
-                submission_id=context["submission_id"],
-                finalized=True,
-            )
             await connection.execute(
                 """
                 UPDATE turn_render_state
                 SET state = 'final', updated_at = ?
                 WHERE sdk_session_id = ? AND turn_key = ?
                 """,
-                (now, event.sdk_session_id, turn_key),
+                (now, event.sdk_session_id, context["turn_key"]),
             )
-            return payload
-        if event.raw_type == "copilotd.interaction.requested":
-            return None
-        if event.raw_type not in _TURN_PROGRESS_TYPES:
-            return {"suppress": True}
-        if context["render_state"] in {"final", "failed"}:
-            return {"suppress": True}
-        status = await self._turn_activity_status(connection, event)
-        return {
-            "type": "turn_progress",
-            "content": "Copilot is working…",
-            "status": status,
-            "turn_render_key": turn_key,
-            "submission_id": context["submission_id"],
-            "finalized": False,
-        }
+        return None
 
-    async def _turn_activity_status(
+    async def _tool_card_payload(
         self,
         connection: Any,
         event: AdaptedEvent,
-    ) -> dict[str, str]:
+        context: dict[str, Any],
+        *,
+        now: float,
+    ) -> dict[str, Any] | None:
         data = event.raw_payload.get("data", event.raw_payload)
-        values = data if isinstance(data, dict) else {}
-        if event.raw_type.startswith("tool.execution_"):
-            tool_name = _value(values, "toolName")
-            if tool_name is None and event.tool_call_id is not None:
-                row = await _fetchone_row(
-                    connection,
-                    """
-                    SELECT title FROM task_card_projections
-                    WHERE sdk_session_id = ? AND card_key = ?
-                    """,
-                    (event.sdk_session_id, f"tool:{event.tool_call_id}"),
-                )
-                if row is not None:
-                    tool_name = str(row["title"])
-            tool_name = _bounded_text(tool_name or "Copilot tool", 120)
-            if event.raw_type == "tool.execution_complete":
-                success = bool(values.get("success"))
-                return {
-                    "title": "Tool completed" if success else "Tool failed",
-                    "detail": f"`{tool_name}`",
-                    "event_type": "turn.tool_complete" if success else "turn.tool_failed",
-                }
-            progress = _value(values, "progressMessage")
-            return {
-                "title": "Running tool",
-                "detail": (
-                    f"`{tool_name}`"
-                    if progress is None
-                    else f"`{tool_name}` · {_bounded_text(progress, 500)}"
-                ),
-                "event_type": "turn.tool_running",
-            }
-        if event.raw_type.startswith("subagent."):
-            name = (
-                _value(values, "agentDisplayName")
-                or _value(values, "agentName")
-                or "Copilot subagent"
+        if not isinstance(data, dict):
+            return None
+        tool_call_id = _value(data, "toolCallId") or event.tool_call_id
+        if tool_call_id is None:
+            return None
+        turn_key = str(context["turn_key"])
+        display_key = opaque_content_key(
+            "tool-display",
+            event.sdk_session_id,
+            turn_key,
+            tool_call_id,
+        )
+        existing = self._content_store.get(display_key)
+        previous = existing if isinstance(existing, dict) else {}
+        tool_name = sanitize_tool_name(data.get("toolName") or previous.get("tool_name"))
+        command = sanitize_tool_command(data)
+        if command == "(command unavailable)" and previous.get("sanitized_command"):
+            command = str(previous["sanitized_command"])
+        if event.raw_type == "tool.execution_complete":
+            state = "succeeded" if bool(data.get("success")) else "failed"
+            progress_summary = "Completed successfully." if state == "succeeded" else "Failed."
+            failure_summary = (
+                None
+                if state == "succeeded"
+                else sanitize_failure_summary(data.get("error"), limit=300)
             )
-            state = event.raw_type.removeprefix("subagent.")
-            return {
-                "title": {
-                    "started": "Subagent running",
-                    "completed": "Subagent completed",
-                    "failed": "Subagent failed",
-                }.get(state, "Subagent update"),
-                "detail": f"`{_bounded_text(name, 120)}`",
-                "event_type": f"turn.subagent_{state}",
-            }
-        if event.raw_type in {
-            "assistant.intent",
-            "assistant.reasoning",
-            "assistant.reasoning_delta",
-            "assistant.turn_retry",
-        }:
-            title, fallback = _status_title(event.raw_type)
-            return {
-                "title": title,
-                "detail": _bounded_text(
-                    _status_detail(event.raw_type, values, fallback=fallback),
-                    500,
-                ),
-                "event_type": event.raw_type,
-            }
+        else:
+            state = "running"
+            progress_summary = redact_sensitive_text(data.get("progressMessage"), limit=300) or (
+                str(previous["progress_summary"])
+                if previous.get("progress_summary")
+                else "Started."
+            )
+            failure_summary = None
+        self._content_store.put(
+            {
+                "tool_name": tool_name,
+                "sanitized_command": command,
+                "progress_summary": progress_summary,
+                "failure_summary": failure_summary,
+            },
+            key=display_key,
+        )
+        await connection.execute(
+            """
+            INSERT INTO tool_render_state(
+                sdk_session_id, turn_key, submission_id, segment_index,
+                tool_call_id, state, started_seq, updated_seq, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(sdk_session_id, turn_key, tool_call_id) DO UPDATE SET
+                state = CASE
+                    WHEN tool_render_state.state IN ('succeeded', 'failed')
+                    THEN tool_render_state.state ELSE excluded.state
+                END,
+                updated_seq = MAX(tool_render_state.updated_seq, excluded.updated_seq),
+                updated_at = MAX(tool_render_state.updated_at, excluded.updated_at)
+            """,
+            (
+                event.sdk_session_id,
+                turn_key,
+                context["submission_id"],
+                context["segment_index"],
+                tool_call_id,
+                state,
+                event.inbox_seq,
+                event.inbox_seq,
+                now,
+                now,
+            ),
+        )
+        current = await _fetchone_row(
+            connection,
+            """
+            SELECT tool_call_id, state, updated_seq
+            FROM tool_render_state
+            WHERE sdk_session_id = ? AND turn_key = ?
+            ORDER BY CASE WHEN state = 'running' THEN 0 ELSE 1 END,
+                     updated_seq DESC, tool_call_id
+            LIMIT 1
+            """,
+            (event.sdk_session_id, turn_key),
+        )
+        latest = await _fetchone_row(
+            connection,
+            """
+            SELECT tool_call_id, state, updated_seq
+            FROM tool_render_state
+            WHERE sdk_session_id = ? AND turn_key = ?
+            ORDER BY updated_seq DESC, tool_call_id
+            LIMIT 1
+            """,
+            (event.sdk_session_id, turn_key),
+        )
+        if current is None or latest is None:
+            return None
+        active = await _fetchone_row(
+            connection,
+            """
+            SELECT COUNT(*) AS count FROM tool_render_state
+            WHERE sdk_session_id = ? AND turn_key = ? AND state = 'running'
+            """,
+            (event.sdk_session_id, turn_key),
+        )
+        active_count = 0 if active is None else int(active["count"])
+        current_display = self._content_store.get(
+            opaque_content_key(
+                "tool-display",
+                event.sdk_session_id,
+                turn_key,
+                current["tool_call_id"],
+            )
+        )
+        latest_display = self._content_store.get(
+            opaque_content_key(
+                "tool-display",
+                event.sdk_session_id,
+                turn_key,
+                latest["tool_call_id"],
+            )
+        )
+        current_values = current_display if isinstance(current_display, dict) else {}
+        latest_values = latest_display if isinstance(latest_display, dict) else {}
+        current_name = discord_inline_code(str(current_values.get("tool_name", "Copilot tool")))
+        current_command = discord_inline_code(
+            str(current_values.get("sanitized_command", "(command unavailable)"))
+        )
+        current_state = str(current["state"])
+        title = {
+            "running": "Running tool",
+            "succeeded": "Tool completed",
+            "failed": "Tool failed",
+        }[current_state]
+        event_type = {
+            "running": "turn.tool_running",
+            "succeeded": "turn.tool_complete",
+            "failed": "turn.tool_failed",
+        }[current_state]
+        details = [f"`{current_name}`", f"Command: `{current_command}`"]
+        if current_values.get("progress_summary"):
+            details.append(str(current_values["progress_summary"]))
+        if current_state == "failed" and current_values.get("failure_summary"):
+            details.append(str(current_values["failure_summary"]))
+        if str(latest["tool_call_id"]) != str(current["tool_call_id"]):
+            latest_name = discord_inline_code(str(latest_values.get("tool_name", "Copilot tool")))
+            details.append(f"Latest: `{latest_name}` · {latest['state']}")
+        if active_count > 1:
+            details.append(f"{active_count} tools currently active.")
+        detail = "\n".join(details)
+        finalized = active_count == 0
         return {
-            "title": "Copilot is working",
-            "detail": "Processing your request.",
-            "event_type": "turn.running",
+            "type": "tool_card",
+            "content": f"**{title}**\n{detail}",
+            "status": {
+                "title": title,
+                "detail": detail,
+                "event_type": event_type,
+            },
+            "tool": {
+                "tool_call_id": str(current["tool_call_id"]),
+                "name": str(current_values.get("tool_name", "Copilot tool")),
+                "command": str(current_values.get("sanitized_command", "(command unavailable)")),
+                "state": current_state,
+                "progress": current_values.get("progress_summary"),
+                "active_count": active_count,
+                "latest_tool_call_id": str(latest["tool_call_id"]),
+                "latest_state": str(latest["state"]),
+            },
+            "stable_render_key": f"tool-card:{turn_key}",
+            "render_lane": "tool",
+            "turn_render_key": turn_key,
+            "submission_id": context["submission_id"],
+            "segment_index": context["segment_index"],
+            "finalized": finalized,
         }
 
     async def _materialize_render_payload(
@@ -1313,20 +2079,26 @@ class JournalReducer:
             "assistant.message_delta",
         }:
             return {"suppress": True}
+        if event.raw_type in {
+            "assistant.intent",
+            "assistant.reasoning",
+            "assistant.reasoning_delta",
+        }:
+            return {"suppress": True}
         turn_context = await self._turn_render_context(
             connection,
             event,
             now=now,
         )
         if turn_context is not None:
-            progress = await self._turn_progress_payload(
+            submission_payload = await self._submission_render_payload(
                 connection,
                 event,
                 turn_context,
                 now=now,
             )
-            if progress is not None:
-                return progress
+            if submission_payload is not None:
+                return submission_payload
         if event.raw_type in RenderPlanner._INTERACTION_TYPES:
             data = event.raw_payload.get("data", event.raw_payload)
             if not isinstance(data, dict):
@@ -1352,12 +2124,6 @@ class JournalReducer:
                 "finalized": state != "pending",
                 "interaction": interaction,
             }
-            if turn_context is not None:
-                payload.update(
-                    turn_render_key=turn_context["turn_key"],
-                    submission_id=turn_context["submission_id"],
-                    finalized=False,
-                )
             return payload
         if event.raw_type in RenderPlanner._USAGE_TYPES:
             data = event.raw_payload.get("data", event.raw_payload)
@@ -1479,6 +2245,13 @@ class JournalReducer:
             values = data if isinstance(data, dict) else {}
             title, fallback = _status_title(event.raw_type)
             detail = _status_detail(event.raw_type, values, fallback=fallback)
+            if event.raw_type in {
+                "abort",
+                "model.call_failure",
+                "session.error",
+                "session.shutdown",
+            }:
+                detail = sanitize_failure_summary(detail, limit=1600)
             status = {
                 "title": title,
                 "detail": _bounded_text(detail, 1600),
@@ -1490,7 +2263,7 @@ class JournalReducer:
                     outcome = "completed"
                 if outcome is not None:
                     status["outcome"] = str(outcome)
-            return {
+            payload = {
                 "type": event.raw_type,
                 "content": f"**{title}**\n{_bounded_text(detail, 1600)}",
                 "status": status,
@@ -1501,178 +2274,26 @@ class JournalReducer:
                     "session.compaction_start",
                 },
             }
-        if _is_task_projection_event(event) or event.raw_type in RenderPlanner._TASK_VIEW_TYPES:
-            rows = await connection.execute(
-                """
-                SELECT panel_id, card_token, card_key, task_id, agent_id,
-                       kind, title, state, progress_summary, detail_artifact,
-                       first_seen_at, terminal_at, dependencies_json,
-                       artifact_links_json, can_promote, last_progress_at,
-                       revision
-                FROM task_card_projections
-                WHERE sdk_session_id = ?
-                ORDER BY
-                  CASE WHEN terminal_at IS NULL THEN 0 ELSE 1 END,
-                  first_seen_at, card_key
-                """,
-                (event.sdk_session_id,),
-            )
-            cards = [dict(row) for row in await rows.fetchall()]
-            await rows.close()
-            for card in cards:
-                card["dependencies"] = json.loads(str(card["dependencies_json"]))
-                card["artifact_links"] = json.loads(str(card["artifact_links_json"]))
-                card["can_promote"] = bool(card["can_promote"])
-                ended_at = card["terminal_at"] or now
-                card["elapsed"] = _format_elapsed(
-                    max(0.0, float(ended_at) - float(card["first_seen_at"]))
+            if event.raw_type == "session.shutdown" and event.event_id is not None:
+                payload.update(
+                    shutdown_event_id=event.event_id,
+                    shutdown_generation=event.generation,
                 )
-            if not cards:
-                if event.raw_type == "copilotd.tasks.snapshot":
-                    return {"suppress": True}
-                return {
-                    "type": "taskdeck",
-                    "content": "**TaskDeck**\nNo observed tasks.",
-                    "cards": [],
-                    "finalized": True,
-                    "taskdeck": None,
-                }
-            panel_id = str(cards[0]["panel_id"])
-            deck_revision = sum(int(card["revision"]) for card in cards)
-            state_cursor = await connection.execute(
-                """
-                SELECT selected_card_token, page, expanded
-                FROM taskdeck_panel_state WHERE sdk_session_id = ?
-                """,
-                (event.sdk_session_id,),
-            )
-            state_row = await state_cursor.fetchone()
-            await state_cursor.close()
-            page_count = max(1, (len(cards) + 7) // 8)
-            page = 0 if state_row is None else min(max(int(state_row["page"]), 0), page_count - 1)
-            visible = cards[page * 8 : (page + 1) * 8]
-            selected = None if state_row is None else state_row["selected_card_token"]
-            if selected not in {card["card_token"] for card in cards}:
-                selected = visible[0]["card_token"]
-            selected_card = next(
-                (card for card in cards if card["card_token"] == selected),
-                visible[0],
-            )
-            expanded = bool(state_row is not None and state_row["expanded"])
-            terminal_states = {"completed", "failed", "cancelled"}
-            finalized = all(str(card["state"]) in terminal_states for card in cards)
-            if (
-                finalized
-                and event.raw_type != "copilotd.taskdeck.view_changed"
-                and str(selected_card["state"]) in terminal_states
-            ):
-                expanded = False
-            await connection.execute(
-                """
-                INSERT INTO taskdeck_panel_state(
-                    sdk_session_id, panel_id, selected_card_token,
-                    page, expanded, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?)
-                ON CONFLICT(sdk_session_id) DO UPDATE SET
-                    panel_id = excluded.panel_id,
-                    selected_card_token = excluded.selected_card_token,
-                    page = excluded.page,
-                    expanded = excluded.expanded,
-                    updated_at = excluded.updated_at
-                """,
-                (
-                    event.sdk_session_id,
-                    panel_id,
-                    selected,
-                    page,
-                    int(expanded),
-                    now,
-                ),
-            )
-            lines = [f"**TaskDeck** — {len(cards)} item(s)"]
-            attachments: list[dict[str, Any]] = []
-            if expanded:
-                artifact = selected_card["detail_artifact"]
-                if artifact:
-                    filename = f"task-{selected_card['card_token']}-detail.md"
-                    attachments.append(
-                        {
-                            "filename": filename,
-                            "media_type": "text/markdown",
-                            "content": str(artifact),
-                        }
-                    )
-            if page_count > 1:
-                lines.append(f"Page {page + 1}/{page_count}")
-            selected_state = str(selected_card["state"])
-            actions: list[str] = []
-            if selected_card["task_id"] is not None and selected_state in {"running", "idle"}:
-                actions.append("cancel")
-                if selected_card["can_promote"]:
-                    actions.append("promote")
-                if str(selected_card["kind"]) == "agent":
-                    actions.append("message")
-            if selected_card["task_id"] is not None and selected_state in {
-                "completed",
-                "failed",
-                "cancelled",
-            }:
-                actions.append("remove")
-            if selected_card["detail_artifact"]:
-                actions.append("download")
-            return {
-                "type": "taskdeck",
-                "content": "\n".join(lines),
-                "cards": cards,
-                "attachments": attachments,
-                "finalized": finalized,
-                "taskdeck": {
-                    "panel_id": panel_id,
-                    "revision": deck_revision,
-                    "page": page,
-                    "page_count": page_count,
-                    "selected_card_token": selected,
-                    "expanded": expanded,
-                    "actions": actions,
-                    "options": [
-                        {
-                            "label": _bounded_text(str(card["title"]), 90),
-                            "value": str(card["card_token"]),
-                            "state": str(card["state"]),
-                        }
-                        for card in visible
-                    ],
-                },
-            }
-
+            return payload
         if event.raw_type not in {"assistant.message_delta", "assistant.message"}:
             return None
         if event.message_id is None:
             return None
-        cursor = await connection.execute(
-            """
-            SELECT content, finalized FROM render_streams
-            WHERE session_id = ? AND message_id = ? AND agent_id = ?
-            """,
-            (event.sdk_session_id, event.message_id, event.agent_id or ""),
+        stream = self._content_store.get(
+            opaque_content_key(
+                "assistant-stream",
+                event.sdk_session_id,
+                event.message_id,
+                event.agent_id or "",
+            )
         )
-        stream = await cursor.fetchone()
-        await cursor.close()
-        trusted_cursor = await connection.execute(
-            """
-            SELECT trusted.path, snapshots.snapshot_path,
-                   snapshots.byte_size, snapshots.sha256
-            FROM trusted_local_artifacts AS trusted
-            LEFT JOIN trusted_local_artifact_snapshots AS snapshots
-              ON snapshots.session_id = trusted.session_id
-             AND snapshots.source_path = trusted.path
-            WHERE trusted.session_id = ?
-            ORDER BY trusted.observed_at, trusted.path
-            """,
-            (event.sdk_session_id,),
-        )
-        trusted_rows = await trusted_cursor.fetchall()
-        await trusted_cursor.close()
+        if not isinstance(stream, dict):
+            return {"suppress": True}
         payload = {
             "type": event.raw_type,
             "content": stream["content"],
@@ -1680,81 +2301,27 @@ class JournalReducer:
             "agent_id": event.agent_id,
             "finalized": bool(stream["finalized"]),
         }
-        if trusted_rows:
-            snapshot_rows = [row for row in trusted_rows if row["snapshot_path"] is not None]
-            payload["trusted_local_images"] = True
-            payload["trusted_local_image_paths"] = [str(row["path"]) for row in trusted_rows]
-            payload["trusted_local_image_artifacts"] = [
-                {
-                    "source_path": str(row["path"]),
-                    "snapshot_path": str(row["snapshot_path"]),
-                    "byte_size": int(row["byte_size"]),
-                    "sha256": str(row["sha256"]),
-                }
-                for row in snapshot_rows
-            ]
-        if turn_context is not None:
-            payload["content"] = await self._turn_transcript_content(
-                connection,
-                event,
-                turn_context,
-                fallback=str(stream["content"]),
-            )
-            answer_payload = {**payload, "finalized": True}
-            terminal = str(turn_context["submission_state"]) in _SUBMISSION_SUCCESS_STATES
-            await connection.execute(
-                """
-                UPDATE turn_render_state
-                SET state = ?, answer_payload = ?, updated_at = ?
-                WHERE sdk_session_id = ? AND turn_key = ?
-                """,
-                (
-                    "final" if terminal else "answer_ready",
-                    json.dumps(answer_payload, ensure_ascii=False, sort_keys=True),
-                    now,
+        if bool(stream["finalized"]) and not str(stream["content"]):
+            self._content_store.delete(
+                opaque_content_key(
+                    "assistant-stream",
                     event.sdk_session_id,
-                    turn_context["turn_key"],
-                ),
+                    event.message_id,
+                    event.agent_id or "",
+                )
             )
+            return {"suppress": True}
+        payload["stable_render_key"] = f"assistant:{event.message_id}"
+        payload["render_lane"] = (
+            "assistant_final" if bool(stream["finalized"]) else "assistant_stream"
+        )
+        if turn_context is not None:
             payload.update(
                 turn_render_key=turn_context["turn_key"],
                 submission_id=turn_context["submission_id"],
-                finalized=terminal,
+                segment_index=turn_context["segment_index"],
             )
         return payload
-
-    async def _turn_transcript_content(
-        self,
-        connection: Any,
-        event: AdaptedEvent,
-        context: dict[str, Any],
-        *,
-        fallback: str,
-    ) -> str:
-        interaction_id = event.interaction_id or context.get("interaction_id")
-        if interaction_id is None:
-            return fallback
-        cursor = await connection.execute(
-            """
-            SELECT raw_payload
-            FROM event_journal
-            WHERE sdk_session_id = ? AND interaction_id = ?
-              AND raw_type = 'assistant.message'
-              AND (agent_id IS NULL OR agent_id = '')
-            ORDER BY journal_id
-            """,
-            (event.sdk_session_id, str(interaction_id)),
-        )
-        rows = await cursor.fetchall()
-        await cursor.close()
-        parts: list[str] = []
-        for row in rows:
-            raw_payload = json.loads(str(row["raw_payload"]))
-            data = raw_payload.get("data", raw_payload)
-            content = data.get("content") if isinstance(data, dict) else None
-            if isinstance(content, str) and content.strip():
-                parts.append(content.strip())
-        return "\n\n".join(parts) or fallback
 
     async def _accumulate_render_stream(
         self,
@@ -1764,402 +2331,31 @@ class JournalReducer:
         data: dict[str, Any],
         now: float,
     ) -> str:
+        del connection, now
         agent_id = event.agent_id or ""
+        key = opaque_content_key(
+            "assistant-stream",
+            event.sdk_session_id,
+            event.message_id,
+            agent_id,
+        )
+        existing = self._content_store.get(key)
+        previous = existing if isinstance(existing, dict) else {"content": "", "finalized": False}
         if event.raw_type == "assistant.message_delta":
             delta = str(data.get("deltaContent", ""))
-            await connection.execute(
-                """
-                INSERT INTO render_streams(
-                    session_id, message_id, agent_id, content, finalized, updated_at
-                ) VALUES (?, ?, ?, ?, 0, ?)
-                ON CONFLICT(session_id, message_id, agent_id) DO UPDATE SET
-                    content = CASE
-                        WHEN render_streams.finalized = 1 THEN render_streams.content
-                        ELSE render_streams.content || excluded.content
-                    END,
-                    updated_at = excluded.updated_at
-                """,
-                (event.sdk_session_id, event.message_id, agent_id, delta, now),
-            )
+            content = str(previous["content"])
+            finalized = bool(previous["finalized"])
+            if not finalized:
+                content += delta
         else:
             content = str(data.get("content", ""))
-            await connection.execute(
-                """
-                INSERT INTO render_streams(
-                    session_id, message_id, agent_id, content, finalized, updated_at
-                ) VALUES (?, ?, ?, ?, 1, ?)
-                ON CONFLICT(session_id, message_id, agent_id) DO UPDATE SET
-                    content = excluded.content,
-                    finalized = 1,
-                    updated_at = excluded.updated_at
-                """,
-                (event.sdk_session_id, event.message_id, agent_id, content, now),
-            )
-        cursor = await connection.execute(
-            """
-            SELECT content FROM render_streams
-            WHERE session_id = ? AND message_id = ? AND agent_id = ?
-            """,
-            (event.sdk_session_id, event.message_id, agent_id),
+            content = _merge_final_stream_content(str(previous["content"]), content)
+            finalized = True
+        self._content_store.put(
+            {"content": content, "finalized": finalized},
+            key=key,
         )
-        row = await cursor.fetchone()
-        await cursor.close()
-        return "" if row is None else str(row["content"])
-
-    async def _append_tool_output(
-        self,
-        connection: Any,
-        event: AdaptedEvent,
-        *,
-        data: dict[str, Any],
-        now: float,
-    ) -> None:
-        tool_call_id = _value(data, "toolCallId")
-        partial = _tool_partial_text(data)
-        if tool_call_id is None or partial is None:
-            return
-        cursor = await connection.execute(
-            """
-            SELECT content, finalized FROM tool_output_streams
-            WHERE session_id = ? AND tool_call_id = ?
-            """,
-            (event.sdk_session_id, tool_call_id),
-        )
-        stream = await cursor.fetchone()
-        await cursor.close()
-        if stream is not None and bool(stream["finalized"]):
-            return
-        cursor = await connection.execute(
-            """
-            SELECT local_path, byte_size FROM tool_spill_artifacts
-            WHERE session_id = ? AND tool_call_id = ?
-            """,
-            (event.sdk_session_id, tool_call_id),
-        )
-        artifact = await cursor.fetchone()
-        await cursor.close()
-        encoded = partial.encode("utf-8")
-        if artifact is not None:
-            path = Path(str(artifact["local_path"]))
-            byte_size = await asyncio.to_thread(
-                _append_spill_bytes,
-                path,
-                int(artifact["byte_size"]),
-                encoded,
-            )
-            await connection.execute(
-                """
-                UPDATE tool_spill_artifacts
-                SET byte_size = ?, sha256 = NULL,
-                    retention_until = MAX(retention_until, ?),
-                    updated_at = ?
-                WHERE session_id = ? AND tool_call_id = ? AND finalized = 0
-                """,
-                (
-                    byte_size,
-                    now + _TOOL_SPILL_RETENTION_SECONDS,
-                    now,
-                    event.sdk_session_id,
-                    tool_call_id,
-                ),
-            )
-            await connection.execute(
-                """
-                UPDATE tool_output_streams
-                SET content = '', spilled = 1, updated_at = ?
-                WHERE session_id = ? AND tool_call_id = ? AND finalized = 0
-                """,
-                (now, event.sdk_session_id, tool_call_id),
-            )
-            return
-        existing = "" if stream is None else str(stream["content"])
-        combined = existing.encode("utf-8") + encoded
-        if len(combined) < 64 * 1024:
-            await connection.execute(
-                """
-                INSERT INTO tool_output_streams(
-                    session_id, tool_call_id, content, spilled, updated_at
-                ) VALUES (?, ?, ?, 0, ?)
-                ON CONFLICT(session_id, tool_call_id) DO UPDATE SET
-                    content = excluded.content,
-                    updated_at = excluded.updated_at
-                WHERE tool_output_streams.finalized = 0
-                """,
-                (event.sdk_session_id, tool_call_id, combined.decode(), now),
-            )
-            return
-        path = _tool_spill_path(
-            self._artifact_root,
-            event.sdk_session_id,
-            tool_call_id,
-        )
-        await asyncio.to_thread(_write_spill_bytes, path, combined)
-        await connection.execute(
-            """
-            INSERT INTO tool_spill_artifacts(
-                session_id, tool_call_id, local_path, byte_size,
-                sha256, finalized, retention_until, updated_at
-            ) VALUES (?, ?, ?, ?, NULL, 0, ?, ?)
-            ON CONFLICT(session_id, tool_call_id) DO UPDATE SET
-                local_path = excluded.local_path,
-                byte_size = excluded.byte_size,
-                sha256 = NULL,
-                finalized = 0,
-                retention_until = MAX(
-                    tool_spill_artifacts.retention_until,
-                    excluded.retention_until
-                ),
-                updated_at = excluded.updated_at
-            """,
-            (
-                event.sdk_session_id,
-                tool_call_id,
-                str(path),
-                len(combined),
-                now + _TOOL_SPILL_RETENTION_SECONDS,
-                now,
-            ),
-        )
-        await connection.execute(
-            """
-            INSERT INTO tool_output_streams(
-                session_id, tool_call_id, content, spilled,
-                artifact_emitted, finalized, updated_at
-            ) VALUES (?, ?, '', 1, 0, 0, ?)
-            ON CONFLICT(session_id, tool_call_id) DO UPDATE SET
-                content = '',
-                spilled = 1,
-                updated_at = excluded.updated_at
-            WHERE tool_output_streams.finalized = 0
-            """,
-            (event.sdk_session_id, tool_call_id, now),
-        )
-
-    async def _cumulative_tool_artifact(
-        self,
-        connection: Any,
-        event: AdaptedEvent,
-        *,
-        now: float,
-    ) -> tuple[bool, dict[str, Any] | None]:
-        if event.raw_type not in {
-            "tool.execution_progress",
-            "tool.execution_complete",
-        }:
-            return False, None
-        data = event.raw_payload.get("data", event.raw_payload)
-        if not isinstance(data, dict):
-            return False, None
-        tool_call_id = _value(data, "toolCallId")
-        if tool_call_id is None:
-            return False, None
-        cursor = await connection.execute(
-            """
-            SELECT content, spilled, artifact_emitted, finalized
-            FROM tool_output_streams
-            WHERE session_id = ? AND tool_call_id = ?
-            """,
-            (event.sdk_session_id, tool_call_id),
-        )
-        row = await cursor.fetchone()
-        await cursor.close()
-        if row is None:
-            if event.raw_type != "tool.execution_complete":
-                return False, None
-            await connection.execute(
-                """
-                INSERT INTO tool_output_streams(
-                    session_id, tool_call_id, content, spilled,
-                    artifact_emitted, finalized, updated_at
-                ) VALUES (?, ?, '', 0, 0, 0, ?)
-                """,
-                (event.sdk_session_id, tool_call_id, now),
-            )
-            cursor = await connection.execute(
-                """
-                SELECT content, spilled, artifact_emitted, finalized
-                FROM tool_output_streams
-                WHERE session_id = ? AND tool_call_id = ?
-                """,
-                (event.sdk_session_id, tool_call_id),
-            )
-            row = await cursor.fetchone()
-            await cursor.close()
-            if row is None:
-                raise RuntimeError("completion stream initialization failed")
-        if event.raw_type == "tool.execution_progress" and bool(row["finalized"]):
-            return True, None
-        if event.raw_type == "tool.execution_complete" and bool(row["finalized"]):
-            return True, None
-        if event.raw_type == "tool.execution_progress" and _tool_partial_text(data) is None:
-            return bool(row["spilled"]), None
-        cursor = await connection.execute(
-            """
-            SELECT local_path, byte_size, sha256, finalized
-            FROM tool_spill_artifacts
-            WHERE session_id = ? AND tool_call_id = ?
-            """,
-            (event.sdk_session_id, tool_call_id),
-        )
-        artifact = await cursor.fetchone()
-        await cursor.close()
-        source = "durable-stream"
-        verbatim = True
-        completion_bytes = b""
-        completion_already_written = False
-        if event.raw_type == "tool.execution_complete":
-            completion, completion_source, completion_verbatim = _tool_display_text(
-                data,
-                success=bool(data.get("success")),
-            )
-            if completion:
-                source = f"durable-stream+{completion_source}"
-                verbatim = completion_verbatim
-                canonical_bytes = completion.encode()
-                if artifact is None:
-                    stream_bytes = str(row["content"]).encode()
-                    completion_matches_stream = stream_bytes == canonical_bytes
-                else:
-                    stream_bytes = b""
-                    completion_matches_stream = await asyncio.to_thread(
-                        _spill_matches_bytes,
-                        Path(str(artifact["local_path"])),
-                        int(artifact["byte_size"]),
-                        canonical_bytes,
-                    )
-                if not completion_matches_stream:
-                    completion_bytes = (
-                        canonical_bytes
-                        if artifact is None and not stream_bytes
-                        else (
-                            f"\n\n--- completion payload ({completion_source}) ---\n{completion}"
-                        ).encode()
-                    )
-        if artifact is None and event.raw_type == "tool.execution_complete":
-            accumulated_bytes = str(row["content"]).encode()
-            combined = (
-                completion_bytes if not accumulated_bytes else accumulated_bytes + completion_bytes
-            )
-            if len(combined) >= 64 * 1024:
-                path = _tool_spill_path(
-                    self._artifact_root,
-                    event.sdk_session_id,
-                    tool_call_id,
-                )
-                await asyncio.to_thread(_write_spill_bytes, path, combined)
-                digest = await asyncio.to_thread(_spill_sha256, path)
-                await connection.execute(
-                    """
-                    INSERT INTO tool_spill_artifacts(
-                        session_id, tool_call_id, local_path, byte_size,
-                        sha256, finalized, retention_until, updated_at
-                    ) VALUES (?, ?, ?, ?, ?, 1, ?, ?)
-                    """,
-                    (
-                        event.sdk_session_id,
-                        tool_call_id,
-                        str(path),
-                        len(combined),
-                        digest,
-                        now + _TOOL_SPILL_RETENTION_SECONDS,
-                        now,
-                    ),
-                )
-                artifact = {
-                    "local_path": str(path),
-                    "byte_size": len(combined),
-                    "sha256": digest,
-                    "finalized": 1,
-                }
-                completion_already_written = True
-            else:
-                await connection.execute(
-                    """
-                    UPDATE tool_output_streams
-                    SET finalized = 1, updated_at = ?
-                    WHERE session_id = ? AND tool_call_id = ?
-                    """,
-                    (now, event.sdk_session_id, tool_call_id),
-                )
-                return False, None
-        if artifact is None:
-            return False, None
-        path = Path(str(artifact["local_path"]))
-        byte_size = int(artifact["byte_size"])
-        digest = None if artifact["sha256"] is None else str(artifact["sha256"])
-        if event.raw_type == "tool.execution_complete":
-            if completion_bytes and not completion_already_written:
-                byte_size = await asyncio.to_thread(
-                    _append_spill_bytes,
-                    path,
-                    byte_size,
-                    completion_bytes,
-                )
-            digest = await asyncio.to_thread(_spill_sha256, path)
-            await connection.execute(
-                """
-                UPDATE tool_output_streams
-                SET content = '', spilled = 1, finalized = 1, updated_at = ?
-                WHERE session_id = ? AND tool_call_id = ?
-                """,
-                (now, event.sdk_session_id, tool_call_id),
-            )
-            await connection.execute(
-                """
-                UPDATE tool_spill_artifacts
-                SET byte_size = ?, sha256 = ?, finalized = 1,
-                    retention_until = MAX(retention_until, ?),
-                    updated_at = ?
-                WHERE session_id = ? AND tool_call_id = ?
-                """,
-                (
-                    byte_size,
-                    digest,
-                    now + _TOOL_SPILL_RETENTION_SECONDS,
-                    now,
-                    event.sdk_session_id,
-                    tool_call_id,
-                ),
-            )
-        if not bool(row["artifact_emitted"]):
-            await connection.execute(
-                """
-                UPDATE tool_output_streams
-                SET artifact_emitted = 1, spilled = 1, updated_at = ?
-                WHERE session_id = ? AND tool_call_id = ?
-                  AND artifact_emitted = 0
-                """,
-                (now, event.sdk_session_id, tool_call_id),
-            )
-        filename = f"tool-partial-{tool_call_id[:12]}.txt"
-        finalized = event.raw_type == "tool.execution_complete"
-        return True, {
-            "type": "tool_output_artifact",
-            "content": (
-                f"**Tool partial spill** — `{byte_size:,}` bytes; "
-                f"verbatim durable stream attached as `{filename}`."
-            ),
-            "finalized": finalized,
-            "coalesce_key": f"tool-spill:{tool_call_id}",
-            "stable_outbox_key": f"tool-spill:{tool_call_id}",
-            "tool_source": source,
-            "verbatim": verbatim,
-            "status": (
-                ("completed" if bool(data.get("success")) else "failed")
-                if finalized
-                else "partial spill"
-            ),
-            "byte_count": byte_size,
-            "attachments": [
-                {
-                    "filename": filename,
-                    "media_type": "text/plain",
-                    "path": str(path),
-                    "byte_size": byte_size,
-                    "sha256": digest,
-                }
-            ],
-        }
+        return content
 
     async def _apply_domain_state(
         self,
@@ -2171,95 +2367,12 @@ class JournalReducer:
         data = event.raw_payload.get("data", event.raw_payload)
         if not isinstance(data, dict):
             return
-        if event.raw_type == "session.workspace_file_changed" and event.source == "sdk":
-            path = data.get("path")
-            if isinstance(path, str) and path.strip():
-                operation = str(data.get("operation", "modified")).lower()
-                if operation in {"delete", "deleted", "remove", "removed"}:
-                    await connection.execute(
-                        """
-                        DELETE FROM trusted_local_artifacts
-                        WHERE session_id = ? AND path = ?
-                        """,
-                        (event.sdk_session_id, path),
-                    )
-                    await connection.execute(
-                        """
-                        DELETE FROM trusted_local_artifact_snapshots
-                        WHERE session_id = ? AND source_path = ?
-                        """,
-                        (event.sdk_session_id, path),
-                    )
-                else:
-                    await connection.execute(
-                        """
-                        INSERT INTO trusted_local_artifacts(
-                            session_id, path, observed_at
-                        ) VALUES (?, ?, ?)
-                        ON CONFLICT(session_id, path) DO UPDATE SET
-                            observed_at = excluded.observed_at
-                        """,
-                        (event.sdk_session_id, path, event.received_at),
-                    )
-                    binding_cursor = await connection.execute(
-                        """
-                        SELECT cwd_snapshot FROM session_bindings
-                        WHERE sdk_session_id = ?
-                        """,
-                        (event.sdk_session_id,),
-                    )
-                    binding = await binding_cursor.fetchone()
-                    await binding_cursor.close()
-                    snapshot = None
-                    if binding is not None:
-                        try:
-                            snapshot = await asyncio.to_thread(
-                                _snapshot_trusted_local_artifact,
-                                self._artifact_root,
-                                Path(str(binding["cwd_snapshot"])),
-                                self._managed_session_state_root,
-                                event.sdk_session_id,
-                                path,
-                            )
-                        except OSError:
-                            snapshot = None
-                    if snapshot is None:
-                        await connection.execute(
-                            """
-                            DELETE FROM trusted_local_artifact_snapshots
-                            WHERE session_id = ? AND source_path = ?
-                            """,
-                            (event.sdk_session_id, path),
-                        )
-                    else:
-                        snapshot_path, byte_size, digest = snapshot
-                        await connection.execute(
-                            """
-                            INSERT INTO trusted_local_artifact_snapshots(
-                                session_id, source_path, snapshot_path,
-                                byte_size, sha256, observed_at
-                            ) VALUES (?, ?, ?, ?, ?, ?)
-                            ON CONFLICT(session_id, source_path) DO UPDATE SET
-                                snapshot_path = excluded.snapshot_path,
-                                byte_size = excluded.byte_size,
-                                sha256 = excluded.sha256,
-                                observed_at = excluded.observed_at
-                            """,
-                            (
-                                event.sdk_session_id,
-                                path,
-                                str(snapshot_path),
-                                byte_size,
-                                digest,
-                                event.received_at,
-                            ),
-                        )
-        stream_content: str | None = None
         if (
             event.raw_type in {"assistant.message_delta", "assistant.message"}
             and event.message_id is not None
+            and event.agent_id is None
         ):
-            stream_content = await self._accumulate_render_stream(
+            await self._accumulate_render_stream(
                 connection,
                 event,
                 data=data,
@@ -2277,7 +2390,7 @@ class JournalReducer:
                 """,
                 (
                     event.sdk_session_id,
-                    json.dumps(data, ensure_ascii=False, sort_keys=True),
+                    state_only_json(data),
                     event.received_at,
                 ),
             )
@@ -2308,14 +2421,13 @@ class JournalReducer:
                     event.received_at,
                 ),
             )
-        if event.raw_type.startswith("tool.execution_"):
-            await self._append_tool_output(
-                connection,
-                event,
-                data=data,
-                now=now,
-            )
-        await apply_protocol_event(connection, event, data, now=now)
+        await apply_protocol_event(
+            connection,
+            event,
+            data,
+            now=now,
+            content_store=self._content_store,
+        )
         if event.raw_type == "copilotd.operation.pending":
             await connection.execute(
                 """
@@ -2486,11 +2598,7 @@ class JournalReducer:
                     str(data["kind"]),
                     event.inbox_seq,
                     event.sdk_receive_seq,
-                    json.dumps(
-                        data.get("detail", {}),
-                        ensure_ascii=False,
-                        sort_keys=True,
-                    ),
+                    state_only_json(data.get("detail", {})),
                 ),
             )
         elif event.raw_type == "copilotd.tasks.snapshot":
@@ -2634,18 +2742,11 @@ class JournalReducer:
                 data=data,
                 now=now,
             )
-        elif _is_task_projection_event(event):
-            projection_data = data
-            if event.agent_id is not None and stream_content is not None:
-                projection_data = {
-                    **data,
-                    "content": stream_content,
-                    "deltaContent": stream_content,
-                }
-            await self._update_task_projection(
+        elif event.raw_type in {"subagent.started", "subagent.completed", "subagent.failed"}:
+            await self._update_subagent_liveness(
                 connection,
                 event,
-                data=projection_data,
+                data=data,
                 now=now,
             )
         elif event.raw_type == "copilotd.hook.audit":
@@ -2667,12 +2768,12 @@ class JournalReducer:
                     str(data["hook_name"]),
                     str(data["hook_invocation_id"]),
                     str(data["phase"]),
-                    data.get("tool_name"),
+                    None,
                     data.get("tool_call_id"),
                     data.get("correlation_id"),
                     data.get("classification"),
                     str(data["payload_hash"]),
-                    json.dumps(data.get("payload", {}), sort_keys=True),
+                    state_only_json(data.get("payload", {})),
                     float(data.get("observed_at", now)),
                 ),
             )
@@ -2784,7 +2885,7 @@ class JournalReducer:
                 data.get("hookInvocationId") or data.get("hook_invocation_id") or event.event_id
             )
             audit_id = str(event.event_id or f"{invocation_id}:{event.raw_type}")
-            payload_json = json.dumps(data, ensure_ascii=False, sort_keys=True)
+            payload_json = state_only_json(data)
             await connection.execute(
                 """
                 INSERT INTO hook_audit_events(
@@ -2803,7 +2904,7 @@ class JournalReducer:
                     str(data.get("hookType") or data.get("hook_type") or "unknown"),
                     invocation_id,
                     event.raw_type.rsplit(".", 1)[-1],
-                    data.get("toolName") or data.get("tool_name"),
+                    None,
                     event.tool_call_id,
                     event.correlation_id,
                     (str(data.get("status")) if data.get("status") is not None else None),
@@ -2814,14 +2915,39 @@ class JournalReducer:
             )
         if event.raw_type == "copilotd.interaction.requested":
             interaction_id = str(data["interaction_id"])
+            interaction_key = str(
+                data.get("content_key")
+                or opaque_content_key(
+                    "interaction-request",
+                    event.sdk_session_id,
+                    interaction_id,
+                )
+            )
+            volatile_interaction = {
+                key: value
+                for key, value in data.items()
+                if key
+                not in {
+                    "protocol_request_id",
+                    "content_key",
+                    "request_hash",
+                    "sensitive_response",
+                }
+            }
+            interaction_ref = self._content_store.put(
+                volatile_interaction,
+                key=interaction_key,
+            )
             await connection.execute(
                 """
                 INSERT INTO pending_interactions(
                     interaction_id, protocol_request_id, sdk_session_id, runtime_generation,
                     owner_fence_token, thread_id, kind, response_plane,
                     expires_at, state, payload, response, form_schema,
-                    sensitive_response, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, NULL, ?, ?, ?, ?)
+                    sensitive_response, content_key, request_hash,
+                    created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', '{}', NULL,
+                          NULL, ?, ?, ?, ?, ?)
                 ON CONFLICT(interaction_id) DO NOTHING
                 """,
                 (
@@ -2834,17 +2960,9 @@ class JournalReducer:
                     str(data["kind"]),
                     str(data.get("response_plane", "direct_handler")),
                     float(data["expires_at"]),
-                    json.dumps(data, ensure_ascii=False, sort_keys=True),
-                    (
-                        None
-                        if data.get("form_schema") is None
-                        else json.dumps(
-                            data["form_schema"],
-                            ensure_ascii=False,
-                            sort_keys=True,
-                        )
-                    ),
                     int(bool(data.get("sensitive_response"))),
+                    interaction_ref.key,
+                    interaction_ref.sha256,
                     now,
                     now,
                 ),
@@ -2880,17 +2998,26 @@ class JournalReducer:
             interaction_id = str(data["interaction_id"])
             state = str(data["state"])
             target_mode = data.get("target_mode") or interaction_target_mode(data.get("response"))
+            response_ref = self._content_store.put(
+                data.get("response"),
+                key=opaque_content_key(
+                    "interaction-response",
+                    event.sdk_session_id,
+                    interaction_id,
+                ),
+            )
             await connection.execute(
                 """
                 UPDATE pending_interactions
-                SET state = ?, response = ?, target_mode = ?, updated_at = ?
+                SET state = ?, response = NULL, response_hash = ?,
+                    target_mode = ?, updated_at = ?
                 WHERE interaction_id = ? AND sdk_session_id = ?
                   AND runtime_generation = ? AND owner_fence_token = ?
                   AND state = 'pending'
                 """,
                 (
                     state,
-                    json.dumps(data.get("response"), ensure_ascii=False, sort_keys=True),
+                    response_ref.sha256,
                     target_mode,
                     now,
                     interaction_id,
@@ -2919,6 +3046,16 @@ class JournalReducer:
         elif event.raw_type == "copilotd.submission.queued":
             submission_id = str(data["submission_id"])
             origin = str(data.get("origin", "app_message"))
+            prompt = str(data.get("prompt", ""))
+            prompt_content_key = str(
+                data.get("prompt_content_key")
+                or opaque_content_key(
+                    "submission-prompt",
+                    event.sdk_session_id,
+                    submission_id,
+                )
+            )
+            prompt_ref = self._content_store.put(prompt, key=prompt_content_key)
             typed_attachment_reason = (
                 "scheduler_run"
                 if origin == "app_schedule"
@@ -2963,6 +3100,7 @@ class JournalReducer:
                 ),
             )
             if admission is None:
+                self._content_store.delete(prompt_content_key)
                 return
             await connection.execute(
                 """
@@ -2979,7 +3117,7 @@ class JournalReducer:
                     event.sdk_session_id,
                     origin,
                     data.get("attachment_manifest_id"),
-                    data.get("prompt_hash"),
+                    prompt_ref.sha256,
                     data.get("requested_mode"),
                     data.get("requested_delivery", "enqueue"),
                     data.get("correlation_id"),
@@ -3021,19 +3159,23 @@ class JournalReducer:
             await connection.execute(
                 """
                 INSERT INTO message_queue(
-                    id, thread_id, discord_message_id, prompt,
+                    id, thread_id, discord_message_id, discord_channel_id, prompt,
+                    prompt_content_key, prompt_hash,
                     attachment_manifest_id, requested_mode_snapshot,
                     requested_model_config_snapshot, requested_agent_snapshot,
                     requested_session_config_version, position, state,
                     created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'local_queued', ?, ?)
+                ) VALUES (?, ?, ?, ?, '', ?, ?, ?, ?, ?, ?, ?, ?,
+                          'local_queued', ?, ?)
                 ON CONFLICT(id) DO NOTHING
                 """,
                 (
                     submission_id,
                     str(data["thread_id"]),
                     data.get("discord_message_id"),
-                    str(data.get("prompt", "")),
+                    data.get("discord_channel_id"),
+                    prompt_ref.key,
+                    prompt_ref.sha256,
                     data.get("attachment_manifest_id"),
                     str(data.get("requested_mode", "interactive")),
                     json.dumps(data.get("requested_model_config", {}), sort_keys=True),
@@ -3186,6 +3328,7 @@ class JournalReducer:
                     completion_basis="queue_cancelled",
                     error_code=None,
                     now=now,
+                    content_store=self._content_store,
                 )
         elif event.raw_type == "copilotd.submission.pre_send_deferred":
             submission_id = str(data["submission_id"])
@@ -3229,6 +3372,19 @@ class JournalReducer:
         elif event.raw_type == "copilotd.queue.replaced":
             old_id = str(data["old_submission_id"])
             new_id = str(data["new_submission_id"])
+            replacement_prompt = str(data["prompt"])
+            replacement_key = str(
+                data.get("prompt_content_key")
+                or opaque_content_key(
+                    "submission-prompt",
+                    event.sdk_session_id,
+                    new_id,
+                )
+            )
+            replacement_ref = self._content_store.put(
+                replacement_prompt,
+                key=replacement_key,
+            )
             allowed = [str(state) for state in data.get("allowed_states", [])]
             if not allowed:
                 return
@@ -3309,7 +3465,7 @@ class JournalReducer:
                     old_id,
                     schedule_run_id,
                     old["attachment_manifest_id"],
-                    str(data["prompt_hash"]),
+                    replacement_ref.sha256,
                     str(data["requested_mode"]),
                     json.dumps(data.get("requested_model_config", {}), sort_keys=True),
                     str(data["requested_agent"]),
@@ -3325,20 +3481,25 @@ class JournalReducer:
             await connection.execute(
                 """
                 INSERT INTO message_queue(
-                    id, thread_id, discord_message_id, schedule_run_id, prompt,
+                    id, thread_id, discord_message_id, discord_channel_id,
+                    schedule_run_id, prompt,
+                    prompt_content_key, prompt_hash,
                     attachment_manifest_id, requested_mode_snapshot,
                     requested_model_config_snapshot, requested_agent_snapshot,
                     requested_session_config_version, position, state, replaces_id,
                     created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'local_queued', ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, '', ?, ?, ?, ?, ?, ?, ?, ?,
+                          'local_queued', ?, ?, ?)
                 ON CONFLICT(id) DO NOTHING
                 """,
                 (
                     new_id,
                     old["thread_id"],
                     old["discord_message_id"],
+                    old["discord_channel_id"],
                     schedule_run_id,
-                    str(data["prompt"]),
+                    replacement_ref.key,
+                    replacement_ref.sha256,
                     old["attachment_manifest_id"],
                     str(data["requested_mode"]),
                     json.dumps(data.get("requested_model_config", {}), sort_keys=True),
@@ -3435,6 +3596,7 @@ class JournalReducer:
                     completion_basis=None,
                     error_code="runtime_active_unknown",
                     now=now,
+                    content_store=self._content_store,
                 )
         elif event.raw_type == "copilotd.submission.accepted":
             submission_id = str(data["submission_id"])
@@ -3668,6 +3830,7 @@ class JournalReducer:
                         completion_basis=None,
                         error_code="send_acceptance_unknown",
                         now=now,
+                        content_store=self._content_store,
                     )
                 else:
                     await connection.execute(
@@ -3773,6 +3936,7 @@ class JournalReducer:
                         completion_basis=None,
                         error_code="submission_rejected",
                         now=now,
+                        content_store=self._content_store,
                     )
         elif event.raw_type == "copilotd.queue.blocked":
             await connection.execute(
@@ -3781,28 +3945,6 @@ class JournalReducer:
                 WHERE id = ? AND state = 'local_queued'
                 """,
                 (str(data["state"]), now, str(data["submission_id"])),
-            )
-        elif event.raw_type == "copilotd.taskdeck.view_changed":
-            await connection.execute(
-                """
-                INSERT INTO taskdeck_panel_state(
-                    sdk_session_id, panel_id, selected_card_token,
-                    page, expanded, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?)
-                ON CONFLICT(sdk_session_id) DO UPDATE SET
-                    selected_card_token = excluded.selected_card_token,
-                    page = excluded.page,
-                    expanded = excluded.expanded,
-                    updated_at = excluded.updated_at
-                """,
-                (
-                    event.sdk_session_id,
-                    str(data["panel_id"]),
-                    data.get("selected_card_token"),
-                    int(data.get("page", 0)),
-                    int(bool(data.get("expanded"))),
-                    now,
-                ),
             )
         elif event.raw_type == "copilotd.readiness.observed":
             observed_at = float(data.get("observed_at", now))
@@ -3882,14 +4024,13 @@ class JournalReducer:
             if "tasks" in unknown:
                 await connection.execute(
                     """
-                    UPDATE task_card_projections
-                    SET state = 'unknown', progress_summary = ?,
-                        last_progress_at = ?, revision = revision + 1
+                    UPDATE background_observations
+                    SET observed_state = 'unknown', last_progress_at = ?
                     WHERE sdk_session_id = ?
-                      AND state IN ('running', 'idle', 'unknown')
+                      AND terminal_evidence IS NULL
+                      AND observed_state IN ('running', 'idle', 'unknown')
                     """,
                     (
-                        "Forced teardown could not prove task termination.",
                         observed_at,
                         event.sdk_session_id,
                     ),
@@ -4011,7 +4152,7 @@ class JournalReducer:
                     event.fence_token,
                     event.raw_type,
                     event.event_id or event.internal_event_id,
-                    json.dumps(values, ensure_ascii=False, sort_keys=True),
+                    state_only_json(values),
                     observed_at,
                     observed_at if event.source != "sdk" else None,
                 ),
@@ -4082,7 +4223,7 @@ class JournalReducer:
                     event.fence_token,
                     event.raw_type,
                     event.event_id or event.internal_event_id,
-                    json.dumps(values, ensure_ascii=False, sort_keys=True),
+                    state_only_json(values),
                     observed_at,
                     observed_at if event.source != "sdk" else None,
                 ),
@@ -4127,7 +4268,7 @@ class JournalReducer:
                     event.fence_token,
                     _find_nested_value(data, "maxAiCredits"),
                     _find_nested_value(data, "usedAiCredits"),
-                    json.dumps(data, ensure_ascii=False, sort_keys=True),
+                    state_only_json(data),
                     event.event_id,
                     event.received_at,
                 ),
@@ -4234,7 +4375,7 @@ class JournalReducer:
                     extension_kind,
                     event.generation,
                     event.fence_token,
-                    json.dumps(data, ensure_ascii=False, sort_keys=True),
+                    state_only_json(data),
                     event.event_id,
                     now,
                 ),
@@ -4260,7 +4401,7 @@ class JournalReducer:
                     event.sdk_session_id,
                     event.generation,
                     event.fence_token,
-                    json.dumps(data, ensure_ascii=False, sort_keys=True),
+                    state_only_json(data),
                     event.event_id,
                     now,
                 ),
@@ -4293,7 +4434,7 @@ class JournalReducer:
                     data.get("transport"),
                     str(data.get("status") or data.get("state") or "unknown"),
                     data.get("errorCode") or data.get("error_code"),
-                    json.dumps(data, ensure_ascii=False, sort_keys=True),
+                    state_only_json(data),
                     event.event_id,
                     now,
                 ),
@@ -4877,19 +5018,160 @@ class JournalReducer:
             await connection.execute(
                 """
                 UPDATE session_bindings
-                SET attachment_state = 'terminal',
+                SET attachment_state = 'recovery_unknown',
+                    attachment_reason = COALESCE(
+                        attachment_reason,
+                        'unexpected_runtime_shutdown'
+                    ),
                     permission_posture = 'unknown',
                     permission_verified_at = NULL,
                     updated_at = ?, row_version = row_version + 1
                 WHERE sdk_session_id = ? AND runtime_generation = ?
                   AND owner_fence_token = ?
-                  AND binding_intent != 'closed'
+                  AND binding_intent = 'active'
                 """,
                 (
                     now,
                     event.sdk_session_id,
                     event.generation,
                     event.fence_token,
+                ),
+            )
+        elif event.raw_type == "session.resume" and event.parent_id is not None:
+            cursor = await connection.execute(
+                """
+                SELECT 1 FROM event_journal
+                WHERE sdk_session_id = ? AND generation = ?
+                  AND event_id = ? AND raw_type = 'session.shutdown'
+                LIMIT 1
+                """,
+                (event.sdk_session_id, event.generation, event.parent_id),
+            )
+            resumes_shutdown = await cursor.fetchone()
+            await cursor.close()
+            if resumes_shutdown is not None:
+                await connection.execute(
+                    """
+                    UPDATE session_bindings
+                    SET attachment_state = 'attached',
+                        attachment_reason = CASE
+                            WHEN attachment_reason = 'unexpected_runtime_shutdown'
+                            THEN NULL ELSE attachment_reason
+                        END,
+                        permission_posture = 'verified_allow_all',
+                        permission_verified_at = ?,
+                        updated_at = ?, row_version = row_version + 1
+                    WHERE sdk_session_id = ? AND runtime_generation = ?
+                      AND owner_fence_token = ?
+                      AND binding_intent = 'active'
+                      AND attachment_state = 'recovery_unknown'
+                    """,
+                    (
+                        now,
+                        now,
+                        event.sdk_session_id,
+                        event.generation,
+                        event.fence_token,
+                    ),
+                )
+                await self._compensate_shutdown_renders(
+                    connection,
+                    event,
+                    now=now,
+                )
+                await self._restore_shutdown_reactions(
+                    connection,
+                    event,
+                    now=now,
+                )
+
+    async def _compensate_shutdown_renders(
+        self,
+        connection: Any,
+        event: AdaptedEvent,
+        *,
+        now: float,
+    ) -> None:
+        if event.parent_id is None:
+            return
+        rows = await _fetchall_rows(
+            connection,
+            """
+            SELECT id, payload
+            FROM render_outbox
+            WHERE session_id = ? AND lane = 'status'
+              AND state IN ('pending', 'sending', 'blocked', 'sent')
+              AND render_kind = 'session.shutdown'
+              AND json_extract(payload, '$.shutdown_event_id') = ?
+              AND json_extract(payload, '$.shutdown_generation') = ?
+            """,
+            (event.sdk_session_id, event.parent_id, event.generation),
+        )
+        for row in rows:
+            previous = json.loads(str(row["payload"]))
+            recovered = {
+                key: previous[key]
+                for key in (
+                    "stable_outbox_key",
+                    "stable_render_key",
+                    "render_lane",
+                    "turn_render_key",
+                    "submission_id",
+                )
+                if key in previous
+            }
+            recovered.update(
+                {
+                    "type": "session.resume",
+                    "content": (
+                        "**Session resumed**\nThe runtime recovered after the linked shutdown."
+                    ),
+                    "status": {
+                        "title": "Session resumed",
+                        "detail": "The runtime recovered after the linked shutdown.",
+                        "event_type": "session.resume",
+                    },
+                    "shutdown_event_id": event.parent_id,
+                    "shutdown_generation": event.generation,
+                    "resume_event_id": event.event_id,
+                    "recovered": True,
+                    "finalized": True,
+                }
+            )
+            recovered_ref = self._content_store.put(
+                recovered,
+                key=opaque_content_key("render-outbox", str(row["id"])),
+            )
+            await connection.execute(
+                """
+                UPDATE render_outbox
+                SET logical_seq = ?,
+                    payload = ?, content_key = ?, content_hash = ?,
+                    render_kind = 'session.resume', finalized = 1,
+                    payload_revision = payload_revision + 1,
+                    state = CASE
+                        WHEN state = 'sending' THEN 'sending'
+                        ELSE 'pending'
+                    END,
+                    next_attempt_at = MIN(next_attempt_at, ?),
+                    last_error = NULL,
+                    updated_at = ?
+                WHERE id = ?
+                  AND state IN ('pending', 'sending', 'blocked', 'sent')
+                  AND render_kind = 'session.shutdown'
+                  AND json_extract(payload, '$.shutdown_event_id') = ?
+                  AND json_extract(payload, '$.shutdown_generation') = ?
+                """,
+                (
+                    event.inbox_seq,
+                    render_payload_receipt(recovered, recovered_ref),
+                    recovered_ref.key,
+                    recovered_ref.sha256,
+                    now,
+                    now,
+                    str(row["id"]),
+                    event.parent_id,
+                    event.generation,
                 ),
             )
 
@@ -4997,16 +5279,20 @@ class JournalReducer:
                 item_id = str(item.get("id") or item.get("itemId") or "").strip()
                 if not item_id:
                     item_id = f"opaque:{snapshot_id}:{index}"
+                display_text = item.get("displayText")
+                display_text_hash = None if display_text is None else payload_sha256(display_text)
                 seen_ids.append(item_id)
                 await connection.execute(
                     """
                     INSERT INTO native_queue_items(
                         sdk_session_id, item_id, agent_mode, display_text,
+                        display_text_hash,
                         state, last_snapshot_id, last_seen_epoch, updated_at
-                    ) VALUES (?, ?, ?, ?, 'present', ?, ?, ?)
+                    ) VALUES (?, ?, ?, NULL, ?, 'present', ?, ?, ?)
                     ON CONFLICT(sdk_session_id, item_id) DO UPDATE SET
                         agent_mode = excluded.agent_mode,
-                        display_text = excluded.display_text,
+                        display_text = NULL,
+                        display_text_hash = excluded.display_text_hash,
                         state = 'present',
                         last_snapshot_id = excluded.last_snapshot_id,
                         last_seen_epoch = excluded.last_seen_epoch,
@@ -5016,7 +5302,7 @@ class JournalReducer:
                         event.sdk_session_id,
                         item_id,
                         item.get("agentMode"),
-                        item.get("displayText"),
+                        display_text_hash,
                         snapshot_id,
                         epoch,
                         observed_at,
@@ -5304,11 +5590,7 @@ class JournalReducer:
                         else int(bool(values.get("steerable")))
                     ),
                     observed_at,
-                    json.dumps(
-                        values.get("metadata", {}),
-                        ensure_ascii=False,
-                        sort_keys=True,
-                    ),
+                    state_only_json(values.get("metadata", {})),
                     now,
                     event.sdk_session_id,
                     event.generation,
@@ -5339,7 +5621,7 @@ class JournalReducer:
                         extension_kind,
                         event.generation,
                         event.fence_token,
-                        json.dumps(detail, ensure_ascii=False, sort_keys=True),
+                        state_only_json(detail),
                         event.internal_event_id,
                         observed_at,
                     ),
@@ -5365,7 +5647,7 @@ class JournalReducer:
                     event.sdk_session_id,
                     event.generation,
                     event.fence_token,
-                    json.dumps(values, ensure_ascii=False, sort_keys=True),
+                    state_only_json(values),
                     event.internal_event_id,
                     observed_at,
                 ),
@@ -5382,6 +5664,17 @@ class JournalReducer:
                 recurring = bool(item.get("recurring"))
                 schedule_kind = "every" if recurring else "after"
                 prompt = str(item.get("prompt") or "")
+                self._content_store.put(
+                    {
+                        "prompt": prompt,
+                        "display_prompt": item.get("displayPrompt"),
+                    },
+                    key=opaque_content_key(
+                        "runtime-schedule",
+                        event.sdk_session_id,
+                        schedule_id,
+                    ),
+                )
                 await connection.execute(
                     """
                     INSERT INTO runtime_schedules(
@@ -5417,7 +5710,7 @@ class JournalReducer:
                         event.sdk_session_id,
                         schedule_id,
                         schedule_kind,
-                        prompt,
+                        "",
                         (
                             item.get("cron")
                             or item.get("intervalMs")
@@ -5429,7 +5722,7 @@ class JournalReducer:
                         observed_at,
                         int(recurring),
                         schedule_kind,
-                        item.get("displayPrompt"),
+                        None,
                         stable_hash(prompt),
                         snapshot_id,
                         observed_at,
@@ -5580,16 +5873,28 @@ class JournalReducer:
                 ),
             )
             return
+        result = data.get("result")
+        result_hash = None
+        if result is not None:
+            result_ref = self._content_store.put(
+                result,
+                key=opaque_content_key(
+                    "native-command-result",
+                    event.sdk_session_id,
+                    data["invocation_id"],
+                ),
+            )
+            result_hash = result_ref.sha256
         await connection.execute(
             """
             UPDATE runtime_command_invocations
-            SET result_kind = ?, result_json = ?, state = ?,
+            SET result_kind = ?, result_json = NULL, result_hash = ?, state = ?,
                 agent_submission_id = ?, selection_token = ?, settled_at = ?
             WHERE invocation_id = ? AND sdk_session_id = ?
             """,
             (
                 data.get("result_kind"),
-                _json_or_none(data.get("result")),
+                result_hash,
                 str(data["state"]),
                 data.get("agent_submission_id"),
                 data.get("selection_token"),
@@ -5598,6 +5903,14 @@ class JournalReducer:
                 event.sdk_session_id,
             ),
         )
+        if str(data.get("result_kind") or "") != "select-subcommand":
+            self._content_store.delete(
+                opaque_content_key(
+                    "native-command-result",
+                    event.sdk_session_id,
+                    data["invocation_id"],
+                )
+            )
 
     async def _apply_ephemeral_query_event(
         self,
@@ -6225,13 +6538,15 @@ class JournalReducer:
         now: float,
     ) -> None:
         if event.raw_type == "copilotd.schedule_action.pending":
-            await connection.execute(
+            baseline = data.get("baseline_ids")
+            baseline_hash = None if baseline is None else payload_sha256(baseline)
+            cursor = await connection.execute(
                 """
                 INSERT INTO runtime_schedule_actions(
                     action_id, sdk_session_id, operation_id, invocation_id,
                     runtime_schedule_id, builtin_name, action, input_hash,
-                    baseline_json, state, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?)
+                    baseline_json, baseline_hash, state, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, 'pending', ?)
                 ON CONFLICT(action_id) DO NOTHING
                 """,
                 (
@@ -6243,28 +6558,48 @@ class JournalReducer:
                     str(data["builtin_name"]),
                     str(data["action"]),
                     str(data["input_hash"]),
-                    _json_or_none(data.get("baseline_ids")),
+                    baseline_hash,
                     float(data.get("created_at", now)),
                 ),
             )
+            was_inserted = cursor.rowcount == 1
+            await cursor.close()
+            if baseline is not None and was_inserted:
+                self._content_store.put(
+                    baseline,
+                    key=opaque_content_key(
+                        "runtime-schedule-action-baseline",
+                        event.sdk_session_id,
+                        data["action_id"],
+                    ),
+                )
             return
+        result = data.get("result")
+        result_hash = None if result is None else payload_sha256(result)
         await connection.execute(
             """
             UPDATE runtime_schedule_actions
             SET runtime_schedule_id = COALESCE(?, runtime_schedule_id),
                 invocation_id = COALESCE(?, invocation_id),
-                state = ?, result_json = ?, settled_at = ?
+                state = ?, result_json = NULL, result_hash = ?, settled_at = ?
             WHERE action_id = ? AND sdk_session_id = ?
             """,
             (
                 data.get("runtime_schedule_id"),
                 data.get("invocation_id"),
                 str(data["state"]),
-                _json_or_none(data.get("result")),
+                result_hash,
                 float(data.get("settled_at", now)),
                 str(data["action_id"]),
                 event.sdk_session_id,
             ),
+        )
+        self._content_store.delete(
+            opaque_content_key(
+                "runtime-schedule-action-baseline",
+                event.sdk_session_id,
+                data["action_id"],
+            )
         )
         if str(data["state"]) == "confirmed" and data.get("runtime_schedule_id") is not None:
             action = str(data.get("action") or "")
@@ -6295,6 +6630,14 @@ class JournalReducer:
                     str(data["runtime_schedule_id"]),
                 ),
             )
+            if action == "cancel":
+                self._content_store.delete(
+                    opaque_content_key(
+                        "runtime-schedule",
+                        event.sdk_session_id,
+                        data["runtime_schedule_id"],
+                    )
+                )
 
     async def _apply_runtime_schedule_event(
         self,
@@ -6324,6 +6667,13 @@ class JournalReducer:
                     event.sdk_session_id,
                     schedule_id,
                 ),
+            )
+            self._content_store.delete(
+                opaque_content_key(
+                    "runtime-schedule",
+                    event.sdk_session_id,
+                    schedule_id,
+                )
             )
             return
         if event.raw_type == "session.schedule_rearmed":
@@ -6356,6 +6706,17 @@ class JournalReducer:
         )
         schedule_kind = "every" if recurring else "after"
         prompt = str(data.get("prompt") or "")
+        self._content_store.put(
+            {
+                "prompt": prompt,
+                "display_prompt": data.get("displayPrompt") or data.get("display_prompt"),
+            },
+            key=opaque_content_key(
+                "runtime-schedule",
+                event.sdk_session_id,
+                schedule_id,
+            ),
+        )
         recurrence = data.get("cron") or data.get("interval") or data.get("at") or data.get("tz")
         await connection.execute(
             """
@@ -6386,13 +6747,13 @@ class JournalReducer:
                 event.sdk_session_id,
                 schedule_id,
                 schedule_kind,
-                prompt,
+                "",
                 None if recurrence is None else str(recurrence),
                 event.event_id,
                 now,
                 int(recurring),
                 schedule_kind,
-                data.get("displayPrompt") or data.get("display_prompt"),
+                None,
                 stable_hash(prompt),
                 now,
             ),
@@ -6622,7 +6983,6 @@ class JournalReducer:
             "model_turns",
             "submission_task_links",
             "background_observations",
-            "task_card_projections",
             "autopilot_objectives",
         ):
             await connection.execute(
@@ -7035,7 +7395,7 @@ class JournalReducer:
         schedule_run = await _fetchone_row(
             connection,
             """
-            SELECT run_id, render_intent_id
+            SELECT run_id, schedule_id, render_intent_id
             FROM schedule_runs
             WHERE result_submission_id = ?
               AND status = 'outcome_unknown'
@@ -7057,34 +7417,38 @@ class JournalReducer:
         render_intent_id = schedule_run["render_intent_id"]
         if render_intent_id is None:
             return
-        outbox = await _fetchone_row(
-            connection,
-            "SELECT payload FROM render_outbox WHERE id = ?",
-            (str(render_intent_id),),
+        payload = {
+            "content": (
+                f"Scheduled run `{schedule_run['run_id']}` resumed after delayed "
+                "runtime correlation."
+            ),
+            "finalized": False,
+            "schedule_run": {
+                "run_id": str(schedule_run["run_id"]),
+                "schedule_id": str(schedule_run["schedule_id"]),
+                "status": "accepted",
+                "completion_basis": None,
+                "error_code": None,
+            },
+        }
+        render_ref = self._content_store.put(
+            payload,
+            key=opaque_content_key("render-outbox", str(render_intent_id)),
         )
-        if outbox is None:
-            return
-        payload = json.loads(str(outbox["payload"]))
-        payload["content"] = (
-            f"Scheduled run `{schedule_run['run_id']}` resumed after delayed runtime correlation."
-        )
-        payload["finalized"] = False
-        schedule_payload = payload.get("schedule_run")
-        if isinstance(schedule_payload, dict):
-            schedule_payload["status"] = "accepted"
-            schedule_payload["completion_basis"] = None
-            schedule_payload["error_code"] = None
         await connection.execute(
             """
             UPDATE render_outbox
-            SET payload = ?,
+            SET payload = ?, content_key = ?, content_hash = ?,
+                render_kind = 'schedule', finalized = 0,
                 payload_revision = payload_revision + 1,
                 state = CASE WHEN state = 'sending' THEN 'sending' ELSE 'pending' END,
                 next_attempt_at = ?, updated_at = ?
             WHERE id = ?
             """,
             (
-                json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")),
+                render_payload_receipt(payload, render_ref),
+                render_ref.key,
+                render_ref.sha256,
                 now,
                 now,
                 str(render_intent_id),
@@ -7692,6 +8056,7 @@ class JournalReducer:
                     completion_basis=None,
                     error_code="session_idle_without_user_correlation",
                     now=now,
+                    content_store=self._content_store,
                 )
             await self._record_runtime_incident_once(
                 connection,
@@ -7748,7 +8113,7 @@ class JournalReducer:
                 kind,
                 event.inbox_seq,
                 event.sdk_receive_seq,
-                json.dumps(detail, ensure_ascii=False, sort_keys=True),
+                state_only_json(detail),
             ),
         )
 
@@ -7760,7 +8125,7 @@ class JournalReducer:
         kind: str,
         detail: dict[str, Any],
     ) -> None:
-        encoded = json.dumps(detail, ensure_ascii=False, sort_keys=True)
+        encoded = state_only_json(detail)
         cursor = await connection.execute(
             """
             SELECT 1 FROM runtime_incidents
@@ -7810,7 +8175,7 @@ class JournalReducer:
             row is not None and int(row["supported"]) == 1 and row["evidence_status"] != "unknown"
         )
 
-    async def _update_task_projection(
+    async def _update_subagent_liveness(
         self,
         connection: Any,
         event: AdaptedEvent,
@@ -7818,129 +8183,10 @@ class JournalReducer:
         data: dict[str, Any],
         now: float,
     ) -> None:
-        facts = _task_projection_facts(event, data)
-        if facts is None:
+        card_id = _value(data, "toolCallId") or event.agent_id or event.event_id
+        if card_id is None:
             return
-        card_key, kind, title, state, progress, task_id, agent_id = facts
-        dependencies = _string_list(
-            data.get("dependencies") or data.get("dependsOn") or data.get("blockedBy")
-        )
-        artifact_links = _artifact_links(
-            data.get("artifacts") or data.get("artifactLinks") or data.get("links")
-        )
-        can_promote = bool(
-            data.get("canPromoteToBackground") or data.get("can_promote_to_background")
-        )
-        detail_artifact = progress if progress is not None and len(progress) > 900 else None
-        if detail_artifact is not None:
-            progress = _bounded_text(progress, 500)
-        if event.agent_id is not None and event.raw_type.startswith("assistant."):
-            existing_cursor = await connection.execute(
-                """
-                SELECT card_key, kind FROM task_card_projections
-                WHERE sdk_session_id = ? AND agent_id = ?
-                ORDER BY first_seen_at LIMIT 1
-                """,
-                (event.sdk_session_id, event.agent_id),
-            )
-            existing = await existing_cursor.fetchone()
-            await existing_cursor.close()
-            if existing is not None:
-                card_key = str(existing["card_key"])
-                kind = str(existing["kind"])
-                title = ""
-        panel_id = str(
-            uuid.uuid5(
-                uuid.NAMESPACE_URL,
-                f"copilotd:{event.sdk_session_id}:taskdeck",
-            )
-        )[:16]
-        if not title:
-            title_cursor = await connection.execute(
-                """
-                SELECT title FROM task_card_projections
-                WHERE sdk_session_id = ? AND panel_id = ? AND card_key = ?
-                """,
-                (event.sdk_session_id, panel_id, card_key),
-            )
-            title_row = await title_cursor.fetchone()
-            await title_cursor.close()
-            existing_title = None if title_row is None else str(title_row["title"]).strip()
-            title = existing_title or _task_projection_default_title(kind)
-        card_token = str(
-            uuid.uuid5(
-                uuid.NAMESPACE_URL,
-                f"copilotd:{event.sdk_session_id}:taskdeck:{card_key}",
-            )
-        )[:16]
-        terminal_at = now if state in {"completed", "failed", "cancelled"} else None
-        await connection.execute(
-            """
-            INSERT INTO task_card_projections(
-                sdk_session_id, panel_id, card_token, card_key, task_id, agent_id,
-                kind, title, state, progress_summary, detail_artifact,
-                dependencies_json, artifact_links_json, can_promote,
-                first_seen_at, terminal_at, last_progress_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(sdk_session_id, panel_id, card_key) DO UPDATE SET
-                task_id = COALESCE(excluded.task_id, task_card_projections.task_id),
-                agent_id = COALESCE(excluded.agent_id, task_card_projections.agent_id),
-                kind = excluded.kind,
-                title = CASE
-                    WHEN excluded.title = '' THEN task_card_projections.title
-                    ELSE excluded.title
-                END,
-                state = CASE
-                    WHEN task_card_projections.terminal_at IS NOT NULL
-                    THEN task_card_projections.state
-                    ELSE excluded.state
-                END,
-                progress_summary = CASE
-                    WHEN task_card_projections.terminal_at IS NOT NULL
-                    THEN task_card_projections.progress_summary
-                    ELSE COALESCE(excluded.progress_summary,
-                                  task_card_projections.progress_summary)
-                END,
-                detail_artifact = COALESCE(
-                    excluded.detail_artifact,
-                    task_card_projections.detail_artifact
-                ),
-                dependencies_json = CASE
-                    WHEN excluded.dependencies_json = '[]'
-                    THEN task_card_projections.dependencies_json
-                    ELSE excluded.dependencies_json
-                END,
-                artifact_links_json = CASE
-                    WHEN excluded.artifact_links_json = '[]'
-                    THEN task_card_projections.artifact_links_json
-                    ELSE excluded.artifact_links_json
-                END,
-                can_promote = MAX(task_card_projections.can_promote, excluded.can_promote),
-                terminal_at = COALESCE(task_card_projections.terminal_at,
-                                       excluded.terminal_at),
-                last_progress_at = excluded.last_progress_at,
-                revision = task_card_projections.revision + 1
-            """,
-            (
-                event.sdk_session_id,
-                panel_id,
-                card_token,
-                card_key,
-                task_id,
-                agent_id,
-                kind,
-                title,
-                state,
-                progress,
-                detail_artifact,
-                json.dumps(dependencies, ensure_ascii=False),
-                json.dumps(artifact_links, ensure_ascii=False),
-                int(can_promote),
-                now,
-                terminal_at,
-                now,
-            ),
-        )
+        card_key = f"agent:{card_id}"
         if event.raw_type == "subagent.started":
             await connection.execute(
                 """
@@ -8466,12 +8712,6 @@ class JournalReducer:
         evidence_time = float(data.get("observed_at", now))
         seen: set[str] = set()
         terminal_states = {"completed", "failed", "cancelled"}
-        panel_id = str(
-            uuid.uuid5(
-                uuid.NAMESPACE_URL,
-                f"copilotd:{event.sdk_session_id}:taskdeck",
-            )
-        )[:16]
         for task in tasks:
             task_id = str(task.get("id", "")).strip()
             state = str(task.get("status", "")).lower()
@@ -8485,32 +8725,6 @@ class JournalReducer:
                 continue
             seen.add(task_id)
             kind = str(task.get("type", "background"))
-            title = str(
-                task.get("description")
-                or task.get("command")
-                or task.get("agentType")
-                or f"Background task {task_id[:12]}"
-            )
-            progress = next(
-                (
-                    str(task[key])
-                    for key in ("error", "result", "latestResponse", "recentOutput")
-                    if task.get(key)
-                ),
-                None,
-            )
-            dependencies = _string_list(
-                task.get("dependencies") or task.get("dependsOn") or task.get("blockedBy")
-            )
-            artifact_links = _artifact_links(
-                task.get("artifacts") or task.get("artifactLinks") or task.get("links")
-            )
-            can_promote = bool(
-                task.get("canPromoteToBackground") or task.get("can_promote_to_background")
-            )
-            detail_artifact = progress if progress is not None and len(progress) > 900 else None
-            if detail_artifact is not None:
-                progress = _bounded_text(progress, 500)
             card_key = f"task:{task_id}"
             submission_id, correlation_basis, objective_id = await self._resolve_task_submission(
                 connection,
@@ -8519,76 +8733,7 @@ class JournalReducer:
                 task_id=task_id,
                 evidence_time=evidence_time,
             )
-            card_token = str(
-                uuid.uuid5(
-                    uuid.NAMESPACE_URL,
-                    f"copilotd:{event.sdk_session_id}:taskdeck:{card_key}",
-                )
-            )[:16]
             terminal_at = evidence_time if state in terminal_states else None
-            await connection.execute(
-                """
-                INSERT INTO task_card_projections(
-                    sdk_session_id, panel_id, card_token, card_key, task_id,
-                    submission_id, kind, title, state, progress_summary,
-                    detail_artifact,
-                    dependencies_json, artifact_links_json, can_promote,
-                    first_seen_at, terminal_at, last_progress_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(sdk_session_id, panel_id, card_key) DO UPDATE SET
-                    submission_id = COALESCE(
-                        task_card_projections.submission_id,
-                        excluded.submission_id
-                    ),
-                    kind = excluded.kind,
-                    title = excluded.title,
-                    state = CASE
-                        WHEN task_card_projections.terminal_at IS NOT NULL
-                        THEN task_card_projections.state
-                        ELSE excluded.state
-                    END,
-                    progress_summary = CASE
-                        WHEN task_card_projections.terminal_at IS NOT NULL
-                        THEN task_card_projections.progress_summary
-                        ELSE COALESCE(
-                            excluded.progress_summary,
-                            task_card_projections.progress_summary
-                        )
-                    END,
-                    detail_artifact = COALESCE(
-                        excluded.detail_artifact,
-                        task_card_projections.detail_artifact
-                    ),
-                    dependencies_json = excluded.dependencies_json,
-                    artifact_links_json = excluded.artifact_links_json,
-                    can_promote = excluded.can_promote,
-                    terminal_at = COALESCE(
-                        task_card_projections.terminal_at,
-                        excluded.terminal_at
-                    ),
-                    last_progress_at = excluded.last_progress_at,
-                    revision = task_card_projections.revision + 1
-                """,
-                (
-                    event.sdk_session_id,
-                    panel_id,
-                    card_token,
-                    card_key,
-                    task_id,
-                    submission_id,
-                    kind,
-                    title,
-                    state,
-                    progress,
-                    detail_artifact,
-                    json.dumps(dependencies, ensure_ascii=False),
-                    json.dumps(artifact_links, ensure_ascii=False),
-                    int(can_promote),
-                    evidence_time,
-                    terminal_at,
-                    now,
-                ),
-            )
             await connection.execute(
                 """
                 INSERT INTO background_observations(
@@ -8776,25 +8921,6 @@ class JournalReducer:
                 )
                 await connection.execute(
                     """
-                    UPDATE task_card_projections
-                    SET state = 'completed',
-                        progress_summary = 'Shell task exited.',
-                        terminal_at = ?,
-                        last_progress_at = ?,
-                        revision = revision + 1
-                    WHERE sdk_session_id = ? AND panel_id = ? AND card_key = ?
-                      AND terminal_at IS NULL
-                    """,
-                    (
-                        evidence_time,
-                        evidence_time,
-                        event.sdk_session_id,
-                        panel_id,
-                        card_key,
-                    ),
-                )
-                await connection.execute(
-                    """
                     UPDATE submission_task_links
                     SET state = 'completed',
                         terminal_evidence = 'task_snapshot_absent',
@@ -8839,17 +8965,6 @@ class JournalReducer:
                     event.generation,
                     card_key,
                 ),
-            )
-            await connection.execute(
-                """
-                UPDATE task_card_projections
-                SET state = 'unknown',
-                    progress_summary = 'Task disappeared without terminal evidence.',
-                    revision = revision + 1
-                WHERE sdk_session_id = ? AND panel_id = ? AND card_key = ?
-                  AND terminal_at IS NULL
-                """,
-                (event.sdk_session_id, panel_id, card_key),
             )
             await connection.execute(
                 """
@@ -9045,7 +9160,80 @@ def _snapshot_has_positive_evidence(topic: str, values: dict[str, Any]) -> bool:
 
 
 def _json_or_none(value: Any) -> str | None:
-    return None if value is None else json.dumps(value, ensure_ascii=False, sort_keys=True)
+    return None if value is None else state_only_json(value)
+
+
+def _text_leaf_hashes(value: Any, *, limit: int = 64) -> tuple[str, ...]:
+    hashes: list[str] = []
+
+    def visit(item: Any) -> None:
+        if len(hashes) >= limit:
+            return
+        if isinstance(item, str):
+            hashes.append(hashlib.sha256(item.encode("utf-8")).hexdigest())
+        elif isinstance(item, dict):
+            for nested in item.values():
+                visit(nested)
+        elif isinstance(item, (list, tuple)):
+            for nested in item:
+                visit(nested)
+
+    visit(value)
+    return tuple(sorted(set(hashes)))
+
+
+def _encode_shutdown_reaction_state(
+    event: AdaptedEvent,
+    *,
+    previous_state: str,
+    previous_resume_state: Any,
+    previous_terminal: bool,
+    previous_last_error: Any,
+) -> str:
+    return json.dumps(
+        {
+            "kind": "shutdown_failure",
+            "event_id": event.event_id,
+            "generation": event.generation,
+            "previous_state": previous_state,
+            "previous_resume_state": previous_resume_state,
+            "previous_terminal": previous_terminal,
+            "previous_last_error": previous_last_error,
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+
+
+def _shutdown_reaction_state(value: Any) -> dict[str, Any] | None:
+    if not isinstance(value, str) or not value.startswith("{"):
+        return None
+    try:
+        state = json.loads(value)
+    except ValueError:
+        return None
+    if not isinstance(state, dict) or state.get("kind") != "shutdown_failure":
+        return None
+    return state
+
+
+def _render_failure_reaction_state(value: Any) -> dict[str, Any] | None:
+    if value == "render_failed":
+        return {"kind": "render_failed"}
+    if not isinstance(value, str) or not value.startswith("{"):
+        return None
+    try:
+        state = json.loads(value)
+    except ValueError:
+        return None
+    if not isinstance(state, dict) or state.get("kind") != "render_failed":
+        return None
+    return state
+
+
+def _is_render_failure_reaction_state(value: Any) -> bool:
+    return _render_failure_reaction_state(value) is not None
 
 
 def _safe_agent_metadata(value: dict[str, Any]) -> dict[str, Any]:
@@ -9078,135 +9266,6 @@ def _runtime_schedule_id(
         event.raw_payload,
         "runtimeScheduleId",
     )
-
-
-def _is_task_projection_event(event: AdaptedEvent) -> bool:
-    return event.raw_type in RenderPlanner._TASK_TYPES or (
-        event.agent_id is not None
-        and event.raw_type
-        in {
-            "assistant.message_start",
-            "assistant.message_delta",
-            "assistant.message",
-        }
-    )
-
-
-def _task_projection_facts(
-    event: AdaptedEvent,
-    data: dict[str, Any],
-) -> tuple[str, str, str, str, str | None, str | None, str | None] | None:
-    raw_type = event.raw_type
-    tool_call_id = _value(data, "toolCallId")
-    task_id = _value(data, "taskId")
-    if raw_type.startswith("subagent."):
-        card_id = tool_call_id or event.agent_id or event.event_id
-        if card_id is None:
-            return None
-        title = _value(data, "agentDisplayName") or _value(data, "agentName") or "Copilot subagent"
-        if raw_type == "subagent.started":
-            return (
-                f"agent:{card_id}",
-                "agent",
-                title,
-                "running",
-                _value(data, "agentDescription"),
-                task_id,
-                event.agent_id,
-            )
-        if raw_type == "subagent.completed":
-            summary = _metric_summary(data)
-            return (
-                f"agent:{card_id}",
-                "agent",
-                title,
-                "completed",
-                summary or "Subagent completed.",
-                task_id,
-                event.agent_id,
-            )
-        if raw_type == "subagent.failed":
-            return (
-                f"agent:{card_id}",
-                "agent",
-                title,
-                "failed",
-                _value(data, "error") or "Subagent failed.",
-                task_id,
-                event.agent_id,
-            )
-        return None
-
-    if raw_type.startswith("tool.execution_"):
-        if tool_call_id is None:
-            return None
-        card_key = f"tool:{tool_call_id}"
-        if raw_type == "tool.execution_start":
-            title = _value(data, "toolName") or "Copilot tool"
-            return card_key, "tool", title, "running", "Started.", task_id, event.agent_id
-        if raw_type == "tool.execution_progress":
-            return (
-                card_key,
-                "tool",
-                "",
-                "running",
-                _value(data, "progressMessage"),
-                task_id,
-                event.agent_id,
-            )
-        success = bool(data.get("success"))
-        error = data.get("error")
-        if success:
-            display, source, verbatim = _tool_display_text(data, success=True)
-            if display and len(display) < 8000:
-                summary = (
-                    f"Completed successfully · "
-                    f"{'verbatim' if verbatim else 'runtime fallback'} `{source}` · "
-                    f"{_bounded_text(display, 220)}"
-                )
-            else:
-                summary = "Completed successfully."
-        else:
-            summary = _bounded_text(str(error), 300)
-        return (
-            card_key,
-            "tool",
-            "",
-            "completed" if success else "failed",
-            summary,
-            task_id,
-            event.agent_id,
-        )
-
-    if event.agent_id is not None and raw_type.startswith("assistant."):
-        content = _value(data, "deltaContent") or _value(data, "content")
-        return (
-            f"agent:{event.agent_id}",
-            "orphan",
-            f"Agent {event.agent_id[:12]}",
-            "running",
-            content,
-            task_id,
-            event.agent_id,
-        )
-    return None
-
-
-def _task_projection_default_title(kind: str) -> str:
-    return {
-        "agent": "Copilot subagent",
-        "orphan": "Copilot agent",
-        "tool": "Copilot tool",
-    }.get(kind, "Copilot task")
-
-
-def _metric_summary(data: dict[str, Any]) -> str:
-    values: list[str] = []
-    if data.get("totalTokens") is not None:
-        values.append(f"{int(data['totalTokens']):,} tokens")
-    if data.get("totalToolCalls") is not None:
-        values.append(f"{int(data['totalToolCalls']):,} tool calls")
-    return ", ".join(values)
 
 
 def _usage_summary_values(data: dict[str, Any]) -> dict[str, Any]:
@@ -9381,248 +9440,16 @@ def _status_detail(raw_type: str, data: dict[str, Any], *, fallback: str) -> str
     )
 
 
-def _tool_output_artifact(event: AdaptedEvent) -> dict[str, Any] | None:
-    if event.raw_type not in {"tool.execution_progress", "tool.execution_complete"}:
-        return None
-    data = event.raw_payload.get("data", event.raw_payload)
-    if not isinstance(data, dict):
-        return None
-    if event.raw_type == "tool.execution_progress":
-        text = _tool_partial_text(data)
-        source = "progress"
-        success: bool | None = None
-        threshold = 64 * 1024
-        verbatim = True
-    else:
-        success = bool(data.get("success"))
-        text, source, verbatim = _tool_display_text(data, success=success)
-        threshold = 8000
-    if text is None or len(text) < threshold:
-        return None
-    tool_call_id = str(data.get("toolCallId", "tool"))
-    prefix = "tool-partial" if success is None else "tool-output" if success else "tool-error"
-    filename = f"{prefix}-{tool_call_id[:12]}.txt"
-    line_count = text.count("\n") + 1
-    caveat = " Runtime fallback content may be truncated." if not verbatim else ""
-    status = "partial spill" if success is None else "completed" if success else "failed"
-    return {
-        "type": "tool_output_artifact",
-        "content": (
-            f"**Tool {status}** — `{len(text):,}` characters / `{line_count:,}` lines; "
-            f"{'verbatim' if verbatim else 'runtime fallback'} `{source}` attached as "
-            f"`{filename}`.{caveat}"
-        ),
-        "finalized": True,
-        "tool_source": source,
-        "verbatim": verbatim,
-        "status": status,
-        "character_count": len(text),
-        "line_count": line_count,
-        "attachments": [
-            {
-                "filename": filename,
-                "media_type": "text/plain",
-                "content": text,
-            }
-        ],
-    }
-
-
-def _tool_display_text(
-    data: dict[str, Any],
-    *,
-    success: bool,
-) -> tuple[str | None, str, bool]:
-    if success:
-        result = data.get("result")
-        if isinstance(result, dict):
-            detailed = result.get("detailedContent")
-            if isinstance(detailed, str) and detailed:
-                return detailed, "detailedContent", True
-            if result.get("contents"):
-                return _structured_tool_text(result["contents"]), "contents", True
-            if result.get("structuredContent") is not None:
-                return (
-                    json.dumps(
-                        result["structuredContent"],
-                        ensure_ascii=False,
-                        indent=2,
-                        sort_keys=True,
-                    ),
-                    "structuredContent",
-                    True,
-                )
-            if isinstance(result.get("content"), str):
-                return str(result["content"]), "content", False
-        return None, "missing", False
-    error = data.get("error")
-    if isinstance(error, dict):
-        if set(error) == {"message"}:
-            return str(error["message"]), "error", True
-        return (
-            json.dumps(error, ensure_ascii=False, indent=2, sort_keys=True),
-            "error",
-            True,
-        )
-    if error is not None:
-        return str(error), "error", True
-    return None, "error", True
-
-
-def _tool_partial_text(data: dict[str, Any]) -> str | None:
-    for key in (
-        "output",
-        "outputDelta",
-        "partialOutput",
-        "progressOutput",
-    ):
-        value = data.get(key)
-        if isinstance(value, str) and value:
-            return value
-    return None
-
-
-def _diff_render_payload(event: AdaptedEvent) -> dict[str, Any] | None:
-    if event.raw_type != "tool.execution_complete":
-        return None
-    data = event.raw_payload.get("data", event.raw_payload)
-    if not isinstance(data, dict) or not bool(data.get("success")):
-        return None
-    result = data.get("result")
-    if not isinstance(result, dict):
-        result = {}
-    patch: str | None = None
-    source = "structured"
-    for key in ("diff", "patch", "unifiedDiff"):
-        value = result.get(key)
-        if isinstance(value, str) and value:
-            patch = value
-            break
-    structured = result.get("structuredContent")
-    if patch is None and isinstance(structured, dict):
-        for key in ("diff", "patch", "unifiedDiff"):
-            value = structured.get(key)
-            if isinstance(value, str) and value:
-                patch = value
-                break
-    if patch is None:
-        return None
-    encoded_patch = patch.encode("utf-8", errors="replace")
-    if len(encoded_patch) > _DIFF_OUTPUT_LIMIT:
-        return {
-            "type": "diff",
-            "content": (
-                "**Code changes**\nStructured diff exceeds the 8 MiB render safety "
-                "limit; exact source remains in the durable event journal."
-            ),
-            "source": source,
-            "oversized": True,
-            "byte_count": len(encoded_patch),
-            "stats": {},
-            "finalized": True,
-            "attachments": [],
-        }
-    patch = encoded_patch.decode("utf-8")
-    stats = _diff_stats(patch)
-    tool_call_id = str(data.get("toolCallId", "diff"))
-    if len(patch) <= 1600 and "```" not in patch:
-        content = f"**Code changes** · `{source}`\n```diff\n{patch}\n```"
-        attachments: list[dict[str, str]] = []
-    else:
-        filename = f"changes-{tool_call_id[:12]}.diff"
-        content = f"**Code changes** · `{source}` attached as `{filename}`."
-        attachments = [
-            {
-                "filename": filename,
-                "media_type": "text/x-diff",
-                "content": patch,
-            }
-        ]
-    return {
-        "type": "diff",
-        "content": content,
-        "source": source,
-        "byte_count": len(encoded_patch),
-        "stats": stats,
-        "finalized": True,
-        "attachments": attachments,
-    }
-
-
-def _diff_stats(patch: str) -> dict[str, int]:
-    lines = patch.splitlines()
-    files = sum(line.startswith("diff --git ") for line in lines)
-    has_hunks = any(_DIFF_HUNK_PATTERN.match(line) for line in lines)
-    fallback_files = 0
-    in_hunk = False
-    old_remaining = 0
-    new_remaining = 0
-    additions = 0
-    deletions = 0
-    for index, line in enumerate(lines):
-        hunk = _DIFF_HUNK_PATTERN.match(line)
-        if hunk is not None:
-            in_hunk = True
-            old_remaining = int(hunk.group(1) or 1)
-            new_remaining = int(hunk.group(2) or 1)
-            continue
-        if in_hunk:
-            if line.startswith("\\"):
-                continue
-            if line.startswith("+"):
-                additions += 1
-                new_remaining = max(0, new_remaining - 1)
-            elif line.startswith("-"):
-                deletions += 1
-                old_remaining = max(0, old_remaining - 1)
-            else:
-                old_remaining = max(0, old_remaining - 1)
-                new_remaining = max(0, new_remaining - 1)
-            if old_remaining == 0 and new_remaining == 0:
-                in_hunk = False
-            continue
-        if (
-            files == 0
-            and has_hunks
-            and line.startswith("+++ ")
-            and index > 0
-            and lines[index - 1].startswith("--- ")
-            and index + 1 < len(lines)
-            and _DIFF_HUNK_PATTERN.match(lines[index + 1])
-        ):
-            fallback_files += 1
-        if has_hunks:
-            continue
-        if line.startswith("+++ "):
-            fallback_files += 1
-            continue
-        if line.startswith("--- "):
-            continue
-        additions += int(line.startswith("+"))
-        deletions += int(line.startswith("-"))
-    if files == 0:
-        files = fallback_files
-    stats = {
-        "additions": additions,
-        "deletions": deletions,
-    }
-    if files > 0:
-        stats["files"] = files
-    return stats
-
-
-def _structured_tool_text(value: Any) -> str:
-    if isinstance(value, str):
-        return value
-    if isinstance(value, list):
-        pieces = [_structured_tool_text(item) for item in value]
-        return "\n".join(piece for piece in pieces if piece)
-    if isinstance(value, dict):
-        for key in ("text", "content", "value"):
-            if isinstance(value.get(key), str):
-                return str(value[key])
-        return json.dumps(value, ensure_ascii=False, indent=2, sort_keys=True)
-    return str(value)
+def _merge_final_stream_content(accumulated: str, final: str) -> str:
+    if not final.strip():
+        return accumulated
+    if not accumulated:
+        return final
+    if final == accumulated or final.startswith(accumulated):
+        return final
+    if accumulated.startswith(final) or final in accumulated:
+        return accumulated
+    return f"{accumulated}\n\n{final}"
 
 
 def _format_elapsed(seconds: float) -> str:
@@ -9634,54 +9461,6 @@ def _format_elapsed(seconds: float) -> str:
     if minutes:
         return f"{minutes}m {remainder:02d}s"
     return f"{remainder}s"
-
-
-def _string_list(value: Any) -> list[str]:
-    if value is None:
-        return []
-    if isinstance(value, dict):
-        values = value.values()
-    elif isinstance(value, list | tuple | set):
-        values = value
-    else:
-        values = (value,)
-    result: list[str] = []
-    for item in values:
-        if isinstance(item, dict):
-            text = next(
-                (
-                    str(item[key])
-                    for key in ("id", "taskId", "name", "title")
-                    if item.get(key) is not None
-                ),
-                "",
-            )
-        else:
-            text = str(item)
-        normalized = " ".join(text.split())
-        if normalized and normalized not in result:
-            result.append(normalized)
-    return result[:25]
-
-
-def _artifact_links(value: Any) -> list[str]:
-    if value is None:
-        return []
-    values = value if isinstance(value, list | tuple) else (value,)
-    result: list[str] = []
-    for item in values:
-        if isinstance(item, dict):
-            label = next(
-                (str(item[key]) for key in ("name", "title", "path", "url") if item.get(key)),
-                "",
-            )
-            url = item.get("url")
-            text = f"[{label}]({url})" if label and url else label
-        else:
-            text = str(item)
-        if text and text not in result:
-            result.append(text)
-    return result[:25]
 
 
 def _bounded_text(value: str, limit: int) -> str:
@@ -9697,6 +9476,7 @@ async def _finalize_schedule_run_from_reducer(
     completion_basis: str | None,
     error_code: str | None,
     now: float,
+    content_store: VolatileContentStore | None = None,
 ) -> None:
     row = await _fetchone_row(
         connection,
@@ -9740,32 +9520,39 @@ async def _finalize_schedule_run_from_reducer(
         content += f" Completion basis: `{completion_basis}`."
     if error_code:
         content += f" Error: `{error_code}`."
-    payload = json.dumps(
-        {
-            "content": content,
-            "finalized": True,
-            "schedule_run": {
-                "run_id": run_id,
-                "schedule_id": str(row["schedule_id"]),
-                "status": status,
-                "completion_basis": completion_basis,
-                "error_code": error_code,
-            },
-            "render_destination": session_id,
+    render_payload = {
+        "content": content,
+        "finalized": True,
+        "schedule_run": {
+            "run_id": run_id,
+            "schedule_id": str(row["schedule_id"]),
+            "status": status,
+            "completion_basis": completion_basis,
+            "error_code": error_code,
         },
-        ensure_ascii=False,
-        sort_keys=True,
-        separators=(",", ":"),
+        "render_destination": session_id,
+    }
+    store = content_store or process_content_store()
+    render_ref = store.put(
+        render_payload,
+        key=opaque_content_key("render-outbox", render_id),
     )
+    payload = render_payload_receipt(render_payload, render_ref)
     await connection.execute(
         """
         INSERT INTO render_outbox(
             id, session_id, logical_seq, lane, coalesce_key,
             idempotency_key, payload, state, attempts,
-            next_attempt_at, created_at, updated_at
-        ) VALUES (?, ?, ?, 'schedule', ?, ?, ?, 'pending', 0, ?, ?, ?)
+            next_attempt_at, created_at, updated_at,
+            content_key, content_hash, render_kind, finalized
+        ) VALUES (?, ?, ?, 'schedule', ?, ?, ?, 'pending', 0, ?, ?, ?,
+                 ?, ?, 'schedule', 1)
         ON CONFLICT(idempotency_key) DO UPDATE SET
             payload = excluded.payload,
+            content_key = excluded.content_key,
+            content_hash = excluded.content_hash,
+            render_kind = excluded.render_kind,
+            finalized = excluded.finalized,
             payload_revision = render_outbox.payload_revision + 1,
             state = CASE
                 WHEN render_outbox.state = 'sending' THEN 'sending'
@@ -9787,6 +9574,8 @@ async def _finalize_schedule_run_from_reducer(
             now,
             now,
             now,
+            render_ref.key,
+            render_ref.sha256,
         ),
     )
     await connection.execute(
@@ -10016,178 +9805,3 @@ def _model_config_matches(
         key in known_fields and observed.get(key) == requested.get(key)
         for key in _model_confirmation_mask(requested)
     )
-
-
-def _tool_spill_path(root: Path, session_id: str, tool_call_id: str) -> Path:
-    session_token = uuid.uuid5(uuid.NAMESPACE_URL, f"session:{session_id}").hex[:16]
-    tool_token = uuid.uuid5(uuid.NAMESPACE_URL, f"tool:{tool_call_id}").hex[:16]
-    return root / session_token / "artifacts" / f"tool-{tool_token}.txt"
-
-
-def _snapshot_trusted_local_artifact(
-    root: Path,
-    cwd: Path,
-    managed_session_state_root: Path | None,
-    session_id: str,
-    source_path: str,
-) -> tuple[Path, int, str] | None:
-    resolved_cwd = cwd.resolve(strict=False)
-    candidate = Path(source_path)
-    source_candidate = candidate if candidate.is_absolute() else resolved_cwd / candidate
-    resolved_session_state_root = (
-        None
-        if managed_session_state_root is None
-        else managed_session_state_root.resolve(strict=False)
-    )
-    managed_files = _managed_session_files_root(managed_session_state_root, session_id)
-    if source_candidate.suffix.lower() not in _TRUSTED_LOCAL_IMAGE_SUFFIXES:
-        return None
-    try:
-        source_file = _open_trusted_local_artifact(
-            source_candidate,
-            cwd=resolved_cwd,
-            managed_session_state_root=resolved_session_state_root,
-            managed_files=managed_files,
-        )
-    except OSError:
-        return None
-
-    session_token = uuid.uuid5(uuid.NAMESPACE_URL, f"session:{session_id}").hex[:16]
-    source_token = uuid.uuid5(uuid.NAMESPACE_URL, f"local-image:{source_path}").hex[:16]
-    snapshot_root = root / session_token / "artifacts" / "local-images"
-    with source_file as input_file:
-        snapshot_root.mkdir(parents=True, exist_ok=True)
-        temporary = snapshot_root / f".{source_token}.{uuid.uuid4().hex}.tmp"
-        digest = hashlib.sha256()
-        byte_size = 0
-        try:
-            with temporary.open("xb") as output_file:
-                for chunk in iter(lambda: input_file.read(1024 * 1024), b""):
-                    output_file.write(chunk)
-                    digest.update(chunk)
-                    byte_size += len(chunk)
-                output_file.flush()
-                os.fsync(output_file.fileno())
-            digest_text = digest.hexdigest()
-            suffix = source_candidate.suffix.lower()
-            snapshot_path = snapshot_root / f"{source_token}-{digest_text}{suffix}"
-            if snapshot_path.exists():
-                temporary.unlink(missing_ok=True)
-            else:
-                os.replace(temporary, snapshot_path)
-            return snapshot_path, byte_size, digest_text
-        finally:
-            temporary.unlink(missing_ok=True)
-
-
-def _managed_session_files_root(root: Path | None, session_id: str) -> Path | None:
-    if root is None or Path(session_id).name != session_id or session_id in {".", ".."}:
-        return None
-    resolved_root = root.resolve(strict=False)
-    session_root = resolved_root / session_id
-    files_root = session_root / "files"
-    if session_root.is_symlink() or files_root.is_symlink():
-        return None
-    return files_root.resolve(strict=False)
-
-
-def _open_trusted_local_artifact(
-    source: Path,
-    *,
-    cwd: Path,
-    managed_session_state_root: Path | None,
-    managed_files: Path | None,
-) -> BinaryIO:
-    flags = (
-        os.O_RDONLY
-        | getattr(os, "O_CLOEXEC", 0)
-        | getattr(os, "O_NOFOLLOW", 0)
-        | getattr(os, "O_NONBLOCK", 0)
-    )
-    descriptor = os.open(source, flags)
-    try:
-        opened = os.fstat(descriptor)
-        if not stat.S_ISREG(opened.st_mode):
-            raise OSError("trusted local image is not a regular file")
-        resolved = source.resolve(strict=True)
-        current = resolved.stat()
-        if (opened.st_dev, opened.st_ino) != (current.st_dev, current.st_ino):
-            raise OSError("trusted local image changed while opening")
-        if managed_session_state_root is not None and _path_is_within(
-            resolved,
-            managed_session_state_root,
-        ):
-            if managed_files is None or not _path_is_within(resolved, managed_files):
-                raise OSError("managed local image belongs to another session")
-        elif not _path_is_within(resolved, cwd):
-            raise OSError("trusted local image is outside approved roots")
-        return os.fdopen(descriptor, "rb")
-    except BaseException:
-        os.close(descriptor)
-        raise
-
-
-def _path_is_within(path: Path, root: Path) -> bool:
-    try:
-        path.relative_to(root)
-    except ValueError:
-        return False
-    return True
-
-
-def _write_spill_bytes(path: Path, content: bytes) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
-    try:
-        with temporary.open("wb") as file:
-            file.write(content)
-            file.flush()
-            os.fsync(file.fileno())
-        os.replace(temporary, path)
-    finally:
-        temporary.unlink(missing_ok=True)
-
-
-def _append_spill_bytes(path: Path, expected_size: int, content: bytes) -> int:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    mode = "r+b" if path.exists() else "w+b"
-    with path.open(mode) as file:
-        file.seek(0, os.SEEK_END)
-        current_size = file.tell()
-        if current_size < expected_size:
-            raise RuntimeError(
-                f"tool spill artifact is truncated: {current_size} < {expected_size}"
-            )
-        if current_size > expected_size:
-            file.truncate(expected_size)
-        file.seek(expected_size)
-        file.write(content)
-        file.flush()
-        os.fsync(file.fileno())
-    return expected_size + len(content)
-
-
-def _spill_sha256(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as file:
-        for chunk in iter(lambda: file.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
-
-
-def _spill_matches_bytes(path: Path, byte_size: int, expected: bytes) -> bool:
-    if byte_size != len(expected):
-        return False
-    expected_digest = hashlib.sha256(expected).digest()
-    actual_digest = hashlib.sha256()
-    consumed = 0
-    with path.open("rb") as file:
-        while consumed < byte_size:
-            chunk = file.read(min(1024 * 1024, byte_size - consumed))
-            if not chunk:
-                return False
-            actual_digest.update(chunk)
-            consumed += len(chunk)
-        if file.read(1):
-            return False
-    return actual_digest.digest() == expected_digest

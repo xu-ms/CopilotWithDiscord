@@ -37,7 +37,8 @@ async def test_extension_config_generations_are_immutable_and_idempotent(
     for path in (home, project_path, skills, plugins):
         path.mkdir()
 
-    async with Database(tmp_path / "extensions.sqlite3") as database:
+    database_path = tmp_path / "extensions.sqlite3"
+    async with Database(database_path) as database:
         projects = ProjectRegistry(database, resolved_home=home)
         await projects.initialize()
         project = await projects.bind("channel-1", project_path)
@@ -106,11 +107,17 @@ async def test_extension_config_generations_are_immutable_and_idempotent(
                 (SELECT COUNT(*) FROM project_extension_disabled_skills) AS disabled_count
             """
         )
+    async with Database(database_path) as database:
+        projects = ProjectRegistry(database, resolved_home=home)
+        await projects.initialize()
+        reopened_project = await projects.resolve("channel-1")
+        reopened = await ExtensionConfigRepository(database).latest(reopened_project)
 
     assert first.version == same.version == 1
     assert second.version == 2
     assert reverted.version == 3
     assert reverted.config_hash == first.config_hash
+    assert reopened == reverted
     assert first.config.skill_directories == (str(skills.resolve()),)
     assert first.config.plugin_directories == (str(plugins.resolve()),)
     assert first.config_hash != second.config_hash

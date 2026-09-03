@@ -23,9 +23,10 @@ async def test_stall_monitor_marks_only_active_execution_suspect_and_never_guess
             INSERT INTO session_bindings(
                 thread_id, project_source, cwd_snapshot, sdk_session_id,
                 attachment_state, runtime_remote_mode, last_event_at,
+                runtime_generation, owner_fence_token,
                 created_at, updated_at
             ) VALUES ('thread-1', 'home', '/tmp', 'session-1',
-                      'attached', 'on', 100, 100, 100)
+                      'attached', 'on', 100, 1, 7, 100, 100)
             """
         )
         await database.execute(
@@ -34,7 +35,7 @@ async def test_stall_monitor_marks_only_active_execution_suspect_and_never_guess
                 sdk_session_id, runtime_schedule_id, builtin_name,
                 invocation_input, next_run_at, state, updated_at
             ) VALUES ('session-1', 'future-schedule', 'after',
-                      'tomorrow', 10000, 'active', 100)
+                      '', 10000, 'active', 100)
             """
         )
         monitor = ExecutionStallMonitor(
@@ -53,6 +54,16 @@ async def test_stall_monitor_marks_only_active_execution_suspect_and_never_guess
                 submission_id, sdk_session_id, origin, state, created_at
             ) VALUES ('submission-1', 'session-1', 'app_message',
                       'observed_active', 100)
+            """
+        )
+        await database.execute(
+            """
+            INSERT INTO liveness_leases(
+                sdk_session_id, lease_id, kind, source_id,
+                runtime_generation, owner_fence_token, state,
+                acquired_at, refreshed_at
+            ) VALUES ('session-1', 'submission:submission-1', 'submission',
+                      'submission-1', 1, 7, 'active', 100, 100)
             """
         )
         suspects = await monitor.check(now=1000)
@@ -107,9 +118,10 @@ async def test_stall_monitor_persists_transient_ping_failure_and_keeps_running(
             """
             INSERT INTO session_bindings(
                 thread_id, project_source, cwd_snapshot, sdk_session_id,
-                attachment_state, last_event_at, created_at, updated_at
+                attachment_state, last_event_at, runtime_generation,
+                owner_fence_token, created_at, updated_at
             ) VALUES ('thread-1', 'home', '/tmp', 'session-1',
-                      'attached', 100, 100, 100)
+                      'attached', 100, 1, 7, 100, 100)
             """
         )
         await database.execute(
@@ -118,6 +130,16 @@ async def test_stall_monitor_persists_transient_ping_failure_and_keeps_running(
                 submission_id, sdk_session_id, origin, state, created_at
             ) VALUES ('submission-1', 'session-1', 'app_message',
                       'observed_active', 100)
+            """
+        )
+        await database.execute(
+            """
+            INSERT INTO liveness_leases(
+                sdk_session_id, lease_id, kind, source_id,
+                runtime_generation, owner_fence_token, state,
+                acquired_at, refreshed_at
+            ) VALUES ('session-1', 'submission:submission-1', 'submission',
+                      'submission-1', 1, 7, 'active', 100, 100)
             """
         )
         monitor = ExecutionStallMonitor(
@@ -138,3 +160,60 @@ async def test_stall_monitor_persists_transient_ping_failure_and_keeps_running(
     assert second[0].ping["status"] == "error"
     assert health["state"] == "suspect"
     assert "ConnectionError" in health["detail"]
+
+
+@pytest.mark.asyncio
+async def test_stall_monitor_ignores_stale_generation_progress(
+    tmp_path: Path,
+) -> None:
+    async def ping() -> dict[str, object]:
+        return {"status": "ok"}
+
+    async with Database(tmp_path / "stall-generation.sqlite3") as database:
+        await database.execute(
+            """
+            INSERT INTO session_bindings(
+                thread_id, project_source, cwd_snapshot, sdk_session_id,
+                attachment_state, last_event_at, runtime_generation,
+                owner_fence_token, created_at, updated_at
+            ) VALUES ('thread-1', 'home', '/workspace', 'session-1',
+                      'attached', 100, 2, 8, 100, 100)
+            """
+        )
+        await database.execute(
+            """
+            INSERT INTO submissions(
+                submission_id, sdk_session_id, origin, state, created_at
+            ) VALUES ('submission-current', 'session-1', 'app_message',
+                      'observed_active', 100)
+            """
+        )
+        await database.execute(
+            """
+            INSERT INTO liveness_leases(
+                sdk_session_id, lease_id, kind, source_id,
+                runtime_generation, owner_fence_token, state,
+                acquired_at, refreshed_at
+            ) VALUES ('session-1', 'submission:current', 'submission',
+                      'submission-current', 2, 8, 'active', 100, 100)
+            """
+        )
+        await database.execute(
+            """
+            INSERT INTO background_observations(
+                sdk_session_id, runtime_generation, source_event_id,
+                observed_state, last_progress_at
+            ) VALUES ('session-1', 1, 'stale-task', 'running', 990)
+            """
+        )
+        monitor = ExecutionStallMonitor(
+            database,
+            ping,
+            stall_seconds=600,
+            interval_seconds=60,
+        )
+
+        suspects = await monitor.check(now=1000)
+
+    assert len(suspects) == 1
+    assert suspects[0].last_progress_at == 100

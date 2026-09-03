@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 from dataclasses import dataclass
 from enum import StrEnum
@@ -79,8 +80,15 @@ class SchedulerCommandService:
         name: str | None = None,
         misfire_policy: MisfirePolicy = MisfirePolicy.LATEST,
         now: float | None = None,
+        source_channel_id: str | None = None,
+        source_message_id: str | None = None,
     ) -> ScheduleDefinition:
-        async with self._database.transaction() as connection:
+        if source_channel_id is None or source_message_id is None:
+            raise LifecycleCommandError(
+                "schedule creation requires a durable Discord source message",
+                code="CD-SCHEDULE-SOURCE-001",
+            )
+        async with self._repository.coupled_transaction() as connection:
             cursor = await connection.execute(
                 """
                 SELECT * FROM session_bindings
@@ -154,6 +162,9 @@ class SchedulerCommandService:
                 misfire_policy=misfire_policy,
                 now=now,
                 connection=connection,
+                source_channel_id=source_channel_id,
+                source_message_id=source_message_id,
+                prompt_hash=hashlib.sha256(text.encode()).hexdigest(),
             )
 
     async def create_new_session(
@@ -168,7 +179,14 @@ class SchedulerCommandService:
         thread_name: str = "Scheduled Copilot session",
         misfire_policy: MisfirePolicy = MisfirePolicy.LATEST,
         now: float | None = None,
+        source_channel_id: str | None = None,
+        source_message_id: str | None = None,
     ) -> ScheduleDefinition:
+        if source_channel_id is None or source_message_id is None:
+            raise LifecycleCommandError(
+                "schedule creation requires a durable Discord source message",
+                code="CD-SCHEDULE-SOURCE-001",
+            )
         project = await self._projects.resolve(channel_id)
         config = await self._projects.config_snapshot(project)
         target = {
@@ -193,6 +211,9 @@ class SchedulerCommandService:
             created_by=created_by,
             misfire_policy=misfire_policy,
             now=now,
+            source_channel_id=source_channel_id,
+            source_message_id=source_message_id,
+            prompt_hash=hashlib.sha256(text.encode()).hexdigest(),
         )
 
     async def list(

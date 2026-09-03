@@ -18,27 +18,45 @@ The implementation follows [`docs/copilotD-detailed-design.md`](docs/copilotD-de
   conservative unknown outcomes across crash windows.
 - Explicit channel project bindings with immutable cwd snapshots; unbound channels
   always resolve to the service user's `$HOME`.
-- Durable SQLite event journal with strict UUID SDK IDs, app FIFO, reducer-owned
-  operation receipts, liveness leases, epoch/watermark snapshots, render outbox,
-  and attachment manifests.
-- Forty-seven applied migrations use unique reserved namespaces: Foundation
+- State-only SQLite journal with strict UUID SDK IDs, app FIFO metadata,
+  reducer-owned operation receipts, liveness leases, content hashes, render
+  receipts, and attachment manifests. Conversation, model, tool, interaction,
+  scheduler, and Discord render bodies never enter SQLite.
+- Application configuration remains durable: project/channel settings, immutable
+  create/binding snapshots, custom-agent definitions, MCP/extension generations,
+  and runtime command/agent manifests survive restart and migration. Optimistic
+  version checks reject stale configuration writes atomically.
+- Fifty-one applied migrations use unique reserved namespaces: Foundation
   `0001`-`0009`, Native `0010`-`0014`, Protocol `0015`-`0019`, Scheduler
   `0020`-`0028`, Protocol compatibility `0029`, and Discord `0030`-`0037`;
   `0038`-`0039` are reserved, Operations uses forward-only `0040`-`0044`,
   session deletion and attachment lifecycle recovery are `0045`-`0046`,
-  background-liveness compatibility is `0047`, reaction delivery is `0048`, and
-  single-turn Discord rendering is `0049`.
+  background-liveness compatibility is `0047`, reaction delivery is `0048`,
+  legacy turn-render state is `0049`, Discord queue provenance is `0050`, and
+  per-message/tool-card rendering state is `0051`; `0052` removes legacy content
+  and installs state-only write guards. Applying `0052` automatically performs
+  post-commit managed-artifact deletion, secure-delete, WAL truncation, and
+  vacuum before `Database.open()` returns. A durable pending marker makes every
+  later open retry interrupted cleanup until the secure erase is checkpointed.
+  `0053` preserves validated scheduled thread names as application state and
+  removes the obsolete TaskDeck schema.
 - Durable event-log backfill with cursor rebase/gap diagnostics and ingress-overflow
   freeze/backfill/generation replacement; unrecoverable ephemeral gaps remain
   explicitly outcome-unknown.
 - Restart-recoverable input attachment preparation, ready-orphan resubmission,
-  reference-aware release, and seven-day retained-file garbage collection.
-- One durable Discord card per user turn: stable running status, final-answer in-place
-  editing, restart-safe replay, and requested final file/image delivery. Tool/subagent
-  output remains in the journal and spill store rather than becoming channel messages.
-- Durable Copilot input requests: ask-user choices/freeform, Plan exit actions, and
-  auto-mode-switch prompts render in-place and settle exactly once without blocking
-  event reduction.
+  source refetch after process restart, reference-aware release, and seven-day
+  retained-file garbage collection. Managed attachment paths use only opaque
+  index/content-hash names; original filenames exist only in live memory.
+- Each live assistant `message_id` has an independent in-memory render family, so streaming
+  edits and long multi-message responses cannot overwrite another assistant message.
+  Each active submission segment has one in-place tool card showing the current tool and
+  redacted command. Tool arguments/output/results are discarded after live reduction.
+- Session recovery is isolated and resumable: startup connects Discord before bounded
+  protected-session recovery, attach transitions are serialized per thread, event replay
+  must finish before READY, transient health/lease failures retry locally, and unexpected
+  shutdown converges to `recovery_unknown` instead of an unresumable terminal binding.
+- State-only Copilot input receipts: request IDs/deadlines/states are durable while
+  questions, forms, and answers remain process-memory-only.
 - Immutable, versioned create/resume configuration for custom agents, skill/plugin
   directories, disabled skills, stdio/HTTP MCP servers, and environment references,
   including same-owner-fence config reattach and restart recovery.
@@ -49,8 +67,8 @@ The implementation follows [`docs/copilotD-detailed-design.md`](docs/copilotD-de
 - Durable mode/model per-field reconciliation (including gated reasoning-summary
   readback), MCP/extension health, and stale-aware usage/context projections.
 - Background task `refresh/list` reconciliation, disappearance-to-unknown handling,
-  durable internal tool-output spills, and main-turn progress merging without exposing
-  tool names, parameters, raw output, or diagnostic attachments in Discord.
+  state-only task counters, and live main-turn progress merging. Background lifecycle
+  remains available through `/tasks`; there is no rolling TaskDeck message or component UI.
 - Capability-backed registration for core commands plus exact native `/ask`,
   `/session compact`, `/fleet`, `/tasks`, `/agent`, `/after`, `/every`, `/remote`,
   `/review`, `/security-review`, `/research`, and `/rubber-duck` surfaces. Each native
@@ -58,8 +76,8 @@ The implementation follows [`docs/copilotD-detailed-design.md`](docs/copilotD-de
   verified.
 - Runtime command-manifest refresh through `commands.list(include_builtins=true)` and
   `commands.changed`, full typed `commands.invoke` result-union handling, fenced
-  idempotent task/agent/remote transitions, and reducer-owned native schedule/TaskDeck
-  projections.
+  idempotent task/agent/remote transitions, and reducer-owned native schedule/background
+  lifecycle projections.
 - Resume reconciles crash-pending agent transitions against current state, conservatively
   forces uncertain remote exposure off, and blocks all ordinary submissions while a
   compaction outcome remains unknown. Every SDK RPC revalidates owner generation, fence,
@@ -67,8 +85,14 @@ The implementation follows [`docs/copilotD-detailed-design.md`](docs/copilotD-de
 - Capability-backed registration for core `/session`, `/project`, `/model`,
   `/autopilot`, `/plan`, `/steer`, `/context`, `/usage`, and `/queue` commands.
 - Application-owned `/schedule` message/new-session jobs with durable leases, DST-safe
-  IANA time handling, FIFO coupling, crash recovery, semantic completion evidence, and
-  fatal-loop reporting through the shared task supervisor.
+  IANA time handling, FIFO coupling, semantic completion evidence, and durable Discord
+  source channel/message locators. Prompt text is fetched through the shared Discord HTTP
+  limiter at execution and is never stored locally.
+- The semantic Discord coordinator preserves per-target order and coalescing while
+  running up to 16 independent targets concurrently, so a rate-limited normal route
+  cannot delay a deadline-critical interaction acknowledgement.
+- Tool arguments, results, and diffs never produce automatic Discord artifacts. Only
+  explicitly requested user-facing attachments and table/image render assets are delivered.
 - Intent-first `/project worktree` lifecycle with exact Git ownership checks, durable
   compensation/recovery, reference blockers, and capability-gated history forks.
 - Default always-on definitions for macOS LaunchAgents and Windows Scheduled Tasks,
@@ -79,6 +103,37 @@ The implementation follows [`docs/copilotD-detailed-design.md`](docs/copilotD-de
 Unsupported native capabilities fail closed and remain unregistered. The verified
 sidecar does not retain sessions after client transport disconnect, so the current
 topology is bundled-runtime rather than detached execution.
+
+## State-only storage
+
+SQLite is a lifecycle/state database, not a transcript. Full prompts, assistant
+deltas/finals, reasoning, tool commands/output/errors, interaction and protocol
+bodies, schedule prompts, and Discord content/embed payloads live only in the bounded
+`VolatileContentStore` or in the Copilot SDK/Discord source systems. The journal and
+render outbox retain IDs, hashes, enums, counters, sequence numbers, and timestamps.
+
+A process crash can therefore lose locally accepted content that was not yet accepted
+by the SDK. Missing render content atomically creates a metadata-only, retryable
+`content_unavailable` outbox delivery before the original receipt becomes terminal;
+transient Discord failures and restarts retain that fixed status work. Recovery never
+submits an empty prompt or claims successful delivery. SDK replay may repopulate live
+content when the SDK re-emits an event.
+Migration `0052` automatically checkpoints and truncates WAL, enables secure
+deletion, and `VACUUM`s purged pages. Interrupted cleanup is retried on every open
+until its durable completion marker is checkpointed.
+
+Volatile entries are reclaimed when their owner no longer needs them: finalized or
+superseded renders, accepted/rejected submissions, settled interactions, consumed
+operation results, deleted/recreated schedules, and permanent session deletion all
+remove their keys idempotently. Enabled schedules retain only the live prompt needed
+for dispatch.
+
+SQLite commit and rollback settlement is cancellation-safe. Commit runs in a shielded
+child task; cancellation after a successful commit raises `CommittedCancellation`, so
+coupled volatile state is retained, while rollback and commit failure restore it.
+Mailbox results are one-shot unless a caller explicitly retains replay data. Tool
+acceptance evidence is captured only by an explicit acceptance-probe runtime and is
+deleted immediately after correlation.
 
 ## Setup
 
@@ -253,21 +308,30 @@ session lifetime:
 | Durable event-log read page | 500 events |
 | SQLite busy wait | 5 s |
 | App scheduler | 1 s poll, at most 100 due runs per tick; pre-dispatch retries at 5 s, 30 s, 2 m, 10 m, and 30 m |
-| Discord REST coordinator | 20 requests/s, burst 10; 5 requests/s and burst 5 per route; 512 queued |
-| Discord interaction / stream / TaskDeck / reaction cadence | 2.5 s deadline / 1 s / 4 s / 0.25 s |
+| Discord REST HTTP limiter | Strict rolling 40 physical attempts/s; dynamic route headers at 80%; 8,000 invalid/in-flight attempts per 600 s |
+| Discord semantic coordinator | Priority/coalescing/deadline scheduling; 512 queued |
+| Discord interaction / stream / reaction cadence | 2.5 s deadline / 1 s / 0.25 s |
 
-These Discord defaults use the `COPILOTD_DISCORD_*` settings matching the field names
-(`REQUESTS_PER_SECOND`, `REQUEST_BURST`, `ROUTE_REQUESTS_PER_SECOND`, `ROUTE_BURST`,
-`REQUEST_QUEUE_LIMIT`, `INTERACTION_DEADLINE_SECONDS`, and the three
-`*_INTERVAL_SECONDS` settings). All production REST operations share this coordinator.
+The non-increasable Discord transport constants reserve 20% headroom below Discord's
+documented [50 requests/s global and 10,000 invalid requests/10 min
+limits](https://discord.com/developers/docs/topics/rate-limits). One mandatory
+`aiohttp.TraceConfig` disables aiohttp's transparent reused-connection retry before the
+wire, admits every explicit discord.py REST attempt, and learns `X-RateLimit-*` bucket
+limits from every response; protected cooldown/pacing/reset/in-flight buckets are never
+evicted, and Discord REST redirects fail closed before being followed. There is no
+hard-coded per-route requests/s default.
+`COPILOTD_DISCORD_*` settings remain only for
+`REQUEST_QUEUE_LIMIT`, `INTERACTION_DEADLINE_SECONDS`, and the two
+`*_INTERVAL_SECONDS` semantic scheduling controls.
 The bot requires **Add Reactions** and **Read Message History** in session channels;
 `doctor` reports these requirements and runtime readiness logs missing guild permissions.
 
-Input attachment preparation and eager session resume are intentionally conservative.
-Attachment files within one manifest are processed serially to bound memory. Eager resume
-retries owner conflicts through the prior 60-second lease window and is cancelled during
-shutdown. The app scheduler currently dispatches claimed runs serially; per-session durable
-fences preserve correctness, but one slow target can delay unrelated due runs.
+Input attachment preparation and protected-session recovery are intentionally conservative.
+Attachment files within one manifest are processed serially to bound memory. Startup recovery
+runs after Gateway setup in bounded, durable pages with per-thread serialized attachment;
+owner conflicts retry through and beyond the configured lease expiry, while idle sessions
+attach lazily. The app scheduler currently dispatches claimed runs serially; per-session
+durable fences preserve correctness, but one slow target can delay unrelated due runs.
 Runtime command discovery requests builtins only (`include_client_commands=false`,
 `include_skills=false`); configured skills remain available to the Agent rather than being
 mirrored as Discord commands. Model option input is limited to runtime-confirmable values:

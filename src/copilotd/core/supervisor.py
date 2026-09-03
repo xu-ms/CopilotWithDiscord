@@ -1,12 +1,12 @@
 from __future__ import annotations
 
 import asyncio
-import json
 import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 
 from copilotd.storage.database import Database
+from copilotd.storage.state_only import state_only_json
 
 TransportPing = Callable[[], Awaitable[dict[str, object]]]
 
@@ -49,15 +49,29 @@ class ExecutionStallMonitor:
                        COALESCE((
                            SELECT MAX(observed_at) FROM reconciliation_state AS snapshot
                            WHERE snapshot.sdk_session_id = binding.sdk_session_id
+                             AND snapshot.runtime_generation = binding.runtime_generation
                        ), 0),
                        COALESCE((
                            SELECT MAX(last_progress_at)
                            FROM background_observations AS background
                            WHERE background.sdk_session_id = binding.sdk_session_id
+                             AND background.runtime_generation = binding.runtime_generation
                        ), 0),
                        COALESCE((
-                           SELECT MAX(created_at) FROM submissions AS submission
+                           SELECT MAX(submission.created_at)
+                           FROM submissions AS submission
+                           JOIN liveness_leases AS submission_lease
+                             ON submission_lease.sdk_session_id =
+                                  submission.sdk_session_id
+                            AND submission_lease.source_id =
+                                  submission.submission_id
+                            AND submission_lease.kind = 'submission'
                            WHERE submission.sdk_session_id = binding.sdk_session_id
+                             AND submission_lease.runtime_generation =
+                                  binding.runtime_generation
+                             AND submission_lease.owner_fence_token =
+                                  binding.owner_fence_token
+                             AND submission_lease.state = 'active'
                        ), 0)
                    ) AS last_progress_at
             FROM session_bindings AS binding
@@ -70,15 +84,34 @@ class ExecutionStallMonitor:
                             'submitting', 'submitted', 'observed_active',
                             'loop_idle', 'continuation_expected'
                         )
+                        AND EXISTS (
+                             SELECT 1 FROM liveness_leases AS submission_lease
+                             WHERE submission_lease.sdk_session_id =
+                                     submission.sdk_session_id
+                               AND submission_lease.source_id =
+                                     submission.submission_id
+                               AND submission_lease.kind = 'submission'
+                               AND submission_lease.runtime_generation =
+                                     binding.runtime_generation
+                               AND submission_lease.owner_fence_token =
+                                     binding.owner_fence_token
+                               AND submission_lease.state = 'active'
+                        )
                   )
                   OR EXISTS (
                       SELECT 1 FROM background_observations AS background
                       WHERE background.sdk_session_id = binding.sdk_session_id
+                        AND background.runtime_generation =
+                             binding.runtime_generation
                         AND background.observed_state IN ('running', 'idle')
                   )
                   OR EXISTS (
                       SELECT 1 FROM pending_interactions AS interaction
                       WHERE interaction.sdk_session_id = binding.sdk_session_id
+                        AND interaction.runtime_generation =
+                             binding.runtime_generation
+                        AND interaction.owner_fence_token =
+                             binding.owner_fence_token
                         AND interaction.state = 'pending'
                   )
               )
@@ -156,7 +189,7 @@ class ExecutionStallMonitor:
                     last_progress,
                     timestamp,
                     timestamp if should_ping else None,
-                    json.dumps(ping, sort_keys=True),
+                    state_only_json(ping),
                     timestamp,
                     should_ping,
                 ),
@@ -173,13 +206,12 @@ class ExecutionStallMonitor:
                     """,
                     (
                         timestamp,
-                        json.dumps(
+                        state_only_json(
                             {
                                 "last_progress_at": last_progress,
                                 "silent_seconds": silent_seconds,
                                 "ping": ping,
-                            },
-                            sort_keys=True,
+                            }
                         ),
                         session_id,
                     ),

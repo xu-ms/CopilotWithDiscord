@@ -1,5 +1,5 @@
 import asyncio
-import json
+import hashlib
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -7,15 +7,48 @@ import pytest
 
 from copilotd.cli import build_parser
 from copilotd.config import Settings
+from copilotd.core.bindings import SessionBindingRepository
+from copilotd.core.models import AdaptedEvent
+from copilotd.core.reducer import JournalReducer
+from copilotd.core.volatile_content import VolatileContentStore
 from copilotd.sdk import extension_probe
 from copilotd.sdk.extension_probe import (
     ExtensionAcceptanceProbe,
     LiveAcceptanceAuthError,
     _correlate_mcp_tool_evidence,
     _delete_session,
+    _load_volatile_tool_evidence,
     _protocol_response_evidence,
     _send_and_wait_for_message,
 )
+from copilotd.storage.database import Database
+from copilotd.storage.state_only import payload_sha256
+
+
+def _tool_start_evidence(data: dict[str, object]) -> dict[str, object]:
+    return {
+        "kind": "tool.execution_start",
+        "tool_call_id": str(data["toolCallId"]),
+        "server_name": str(data.get("mcpServerName") or ""),
+        "tool_name": str(data.get("mcpToolName") or ""),
+        "arguments_hash": payload_sha256(data.get("arguments")),
+    }
+
+
+def _tool_completion_evidence(
+    tool_call_id: str,
+    *,
+    success: bool,
+    result_texts: tuple[str, ...],
+) -> dict[str, object]:
+    return {
+        "kind": "tool.execution_complete",
+        "tool_call_id": tool_call_id,
+        "success": success,
+        "result_text_hashes": tuple(
+            hashlib.sha256(value.encode("utf-8")).hexdigest() for value in result_texts
+        ),
+    }
 
 
 @pytest.mark.asyncio
@@ -151,32 +184,18 @@ def test_protocol_response_evidence_passes_only_settled_completion() -> None:
 
 def test_reattach_evidence_rejects_unrelated_tool_completion() -> None:
     rows = [
-        {
-            "raw_type": "tool.execution_start",
-            "tool_call_id": "builtin-1",
-            "raw_payload": json.dumps(
-                {
-                    "data": {
-                        "toolCallId": "builtin-1",
-                        "toolName": "shell",
-                        "arguments": {"command": "echo REATTACH_TOOL_OK"},
-                    }
-                }
-            ),
-        },
-        {
-            "raw_type": "tool.execution_complete",
-            "tool_call_id": "builtin-1",
-            "raw_payload": json.dumps(
-                {
-                    "data": {
-                        "toolCallId": "builtin-1",
-                        "success": True,
-                        "result": "REATTACH_TOOL_OK",
-                    }
-                }
-            ),
-        },
+        _tool_start_evidence(
+            {
+                "toolCallId": "builtin-1",
+                "toolName": "shell",
+                "arguments": {"command": "echo REATTACH_TOOL_OK"},
+            }
+        ),
+        _tool_completion_evidence(
+            "builtin-1",
+            success=True,
+            result_texts=("REATTACH_TOOL_OK",),
+        ),
     ]
 
     evidence = _correlate_mcp_tool_evidence(
@@ -190,35 +209,20 @@ def test_reattach_evidence_rejects_unrelated_tool_completion() -> None:
 
 
 def test_reattach_evidence_rejects_marker_outside_result_and_duplicate_identity() -> None:
-    start = {
-        "raw_type": "tool.execution_start",
-        "tool_call_id": "mcp-1",
-        "raw_payload": json.dumps(
-            {
-                "data": {
-                    "toolCallId": "mcp-1",
-                    "toolName": "second/echo",
-                    "mcpServerName": "second",
-                    "mcpToolName": "echo",
-                    "arguments": {"text": "REATTACH_TOOL_OK"},
-                }
-            }
-        ),
-    }
-    completion = {
-        "raw_type": "tool.execution_complete",
-        "tool_call_id": "mcp-1",
-        "raw_payload": json.dumps(
-            {
-                "data": {
-                    "toolCallId": "mcp-1",
-                    "success": True,
-                    "result": {"content": "WRONG_RESULT"},
-                    "mcpMeta": {"note": "REATTACH_TOOL_OK"},
-                }
-            }
-        ),
-    }
+    start = _tool_start_evidence(
+        {
+            "toolCallId": "mcp-1",
+            "toolName": "second/echo",
+            "mcpServerName": "second",
+            "mcpToolName": "echo",
+            "arguments": {"text": "REATTACH_TOOL_OK"},
+        }
+    )
+    completion = _tool_completion_evidence(
+        "mcp-1",
+        success=True,
+        result_texts=("WRONG_RESULT",),
+    )
 
     marker_outside_result = _correlate_mcp_tool_evidence(
         [start, completion],
@@ -239,36 +243,20 @@ def test_reattach_evidence_rejects_marker_outside_result_and_duplicate_identity(
 
 def test_reattach_evidence_correlates_exact_mcp_request_and_result() -> None:
     rows = [
-        {
-            "raw_type": "tool.execution_start",
-            "tool_call_id": "mcp-1",
-            "raw_payload": json.dumps(
-                {
-                    "data": {
-                        "toolCallId": "mcp-1",
-                        "toolName": "second/echo",
-                        "mcpServerName": "second",
-                        "mcpToolName": "echo",
-                        "arguments": {"text": "REATTACH_TOOL_OK"},
-                    }
-                }
-            ),
-        },
-        {
-            "raw_type": "tool.execution_complete",
-            "tool_call_id": "mcp-1",
-            "raw_payload": json.dumps(
-                {
-                    "data": {
-                        "toolCallId": "mcp-1",
-                        "success": True,
-                        "result": {
-                            "content": "REATTACH_TOOL_OK",
-                        },
-                    }
-                }
-            ),
-        },
+        _tool_start_evidence(
+            {
+                "toolCallId": "mcp-1",
+                "toolName": "second/echo",
+                "mcpServerName": "second",
+                "mcpToolName": "echo",
+                "arguments": {"text": "REATTACH_TOOL_OK"},
+            }
+        ),
+        _tool_completion_evidence(
+            "mcp-1",
+            success=True,
+            result_texts=("REATTACH_TOOL_OK",),
+        ),
     ]
 
     evidence = _correlate_mcp_tool_evidence(
@@ -280,6 +268,132 @@ def test_reattach_evidence_correlates_exact_mcp_request_and_result() -> None:
 
     assert evidence["correlated"] is True
     assert evidence["request_identity_matched"] is True
+
+
+@pytest.mark.asyncio
+async def test_live_reduction_keeps_tool_acceptance_evidence_only_in_memory(
+    tmp_path: Path,
+) -> None:
+    session_id = "extension-probe-session"
+    async with Database(tmp_path / "extension-probe.sqlite3") as database:
+        await SessionBindingRepository(database).create(
+            thread_id="extension-probe-thread",
+            sdk_session_id=session_id,
+            cwd_snapshot=tmp_path,
+            project_source="implicit-home",
+        )
+        await database.execute(
+            """
+            UPDATE session_bindings
+            SET runtime_generation = 1, owner_fence_token = 7
+            WHERE sdk_session_id = ?
+            """,
+            (session_id,),
+        )
+        data = (
+            {
+                "toolCallId": "mcp-1",
+                "toolName": "second/echo",
+                "mcpServerName": "second",
+                "mcpToolName": "echo",
+                "arguments": {"text": "REATTACH_TOOL_OK"},
+            },
+            {
+                "toolCallId": "mcp-1",
+                "success": True,
+                "result": {"content": "REATTACH_TOOL_OK"},
+            },
+        )
+        events = [
+            AdaptedEvent(
+                sdk_session_id=session_id,
+                generation=1,
+                fence_token=7,
+                inbox_seq=index,
+                source="sdk",
+                raw_type=kind,
+                raw_payload={"type": kind, "data": payload},
+                reducer_hash=f"{index:064x}",
+                persistence_class="durable",
+                received_at=float(index),
+                event_id=f"tool-event-{index}",
+                tool_call_id="mcp-1",
+            )
+            for index, (kind, payload) in enumerate(
+                zip(
+                    ("tool.execution_start", "tool.execution_complete"),
+                    data,
+                    strict=True,
+                ),
+                start=1,
+            )
+        ]
+        assert (
+            await JournalReducer(
+                database,
+                capture_tool_acceptance_evidence=True,
+            ).persist(events)
+            == 2
+        )
+        rows = await database.fetchall(
+            """
+            SELECT raw_type, tool_call_id, raw_payload
+            FROM event_journal ORDER BY inbox_seq
+            """
+        )
+        evidence = _load_volatile_tool_evidence(
+            database.content_store,
+            rows,
+            session_id=session_id,
+            generation=1,
+        )
+        assert database.content_store.item_count == 0
+
+    assert all("REATTACH_TOOL_OK" not in str(row["raw_payload"]) for row in rows)
+    assert _correlate_mcp_tool_evidence(
+        evidence,
+        server_name="second",
+        tool_name="echo",
+        marker="REATTACH_TOOL_OK",
+    )["correlated"]
+
+
+def test_normal_tool_events_do_not_consume_acceptance_evidence_capacity() -> None:
+    database = Database(Path(":memory:"))
+    database.content_store = VolatileContentStore(max_items=2, max_bytes=1_024)
+    reducer = JournalReducer(database)
+
+    for index in range(3_000):
+        for offset, kind in enumerate(
+            ("tool.execution_start", "tool.execution_complete"),
+        ):
+            tool_call_id = f"tool-{index}"
+            reducer._capture_tool_event_evidence(
+                AdaptedEvent(
+                    sdk_session_id="production-session",
+                    generation=1,
+                    fence_token=1,
+                    inbox_seq=index * 2 + offset + 1,
+                    source="sdk",
+                    raw_type=kind,
+                    raw_payload={
+                        "type": kind,
+                        "data": {
+                            "toolCallId": tool_call_id,
+                            "arguments": {"index": index},
+                            "success": True,
+                            "result": {"content": "normal tool result"},
+                        },
+                    },
+                    reducer_hash=f"{index * 2 + offset + 1:064x}",
+                    persistence_class="durable",
+                    received_at=float(index),
+                    event_id=f"event-{index}-{offset}",
+                    tool_call_id=tool_call_id,
+                )
+            )
+
+    assert database.content_store.item_count == 0
 
 
 @pytest.mark.parametrize(
@@ -310,24 +424,12 @@ def test_reattach_evidence_requires_exact_server_tool_request_and_result(
         **start_overrides,
     }
     rows = [
-        {
-            "raw_type": "tool.execution_start",
-            "tool_call_id": "mcp-1",
-            "raw_payload": json.dumps({"data": start}),
-        },
-        {
-            "raw_type": "tool.execution_complete",
-            "tool_call_id": completion_id,
-            "raw_payload": json.dumps(
-                {
-                    "data": {
-                        "toolCallId": completion_id,
-                        "success": True,
-                        "result": {"content": completion_marker},
-                    }
-                }
-            ),
-        },
+        _tool_start_evidence(start),
+        _tool_completion_evidence(
+            completion_id,
+            success=True,
+            result_texts=(completion_marker,),
+        ),
     ]
 
     evidence = _correlate_mcp_tool_evidence(

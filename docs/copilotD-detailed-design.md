@@ -50,10 +50,10 @@ GitHub 已提供官方 Python SDK：
 |---|---|---|
 | Discord 消息双向桥接 | `session.send()` + session event subscription | 直接支持 |
 | 实时打字机输出 | `assistant.message_delta` | 直接支持 |
-| Thinking 展示 | `assistant.reasoning(_delta)` | 支持，是否产生取决于模型 |
-| 工具状态、结果、Diff | `tool.execution_start/progress/complete`，读取 structured result | 直接支持，Renderer 要重写 |
+| Thinking 观察 | `assistant.reasoning(_delta)` | 仅处理 metadata/hash；SQLite 不保存 reasoning，Discord 不渲染内部 reasoning/intent |
+| 工具状态、结果、Diff | `tool.execution_start/progress/complete` | 只显示脱敏状态；result/output/diff 不自动发布到 Discord |
 | 线程对应会话 | 自定义 `session_id` + `create_session`/`resume_session` | 直接支持 |
-| 重启后恢复 | persisted session + `resume_session()`；ephemeral idle/delta 不做 durable restart replay | transcript 可恢复；in-flight 默认 unknown |
+| 重启后恢复 | persisted session + `resume_session()`；内容只依赖 SDK 重放 | SDK 重发可恢复；本地未发送内容标记 `content_unavailable` |
 | 中断当前任务 | `session.abort()` | 直接支持 |
 | 切换模型/推理强度 | `set_model(model, reasoning_effort=..., reasoning_summary=..., context_tier=...)` | 高层 API 直接支持；按 model capability 校验参数 |
 | 自动/手动 compact | infinite sessions + `session.rpc.history.compact()` | 支持，手动 RPC 需原型验证 |
@@ -63,7 +63,7 @@ GitHub 已提供官方 Python SDK：
 | 图片附件 | file/blob image attachments | 直接支持 |
 | 代码、文档附件 | 异步落盘，再使用 SDK file attachment | 应用层生命周期管理 |
 | MCP server | `mcp_servers`，支持 stdio 和 HTTP | 直接支持 |
-| Custom Agents/Subagents | `custom_agents` + subagent/task events | 直接支持；原 thread 内折叠 TaskDeck，不为 worker 新建 thread |
+| Custom Agents/Subagents | `custom_agents` + subagent/task events | 直接支持；只维护 lifecycle evidence，不为 worker 新建 thread 或滚动任务 UI |
 | Skills | `skill_directories` / `disabled_skills` | 直接支持 |
 | Plugins | `plugin_directories` 或 runtime `--plugin-dir` | 直接支持 |
 | Hooks | Copilot session hooks | 支持 SDK 1.0.8 实际可调用子集；`onUserPromptTransformed`/`onAgentStop` 不注册 |
@@ -102,7 +102,7 @@ generated session events、文档和 E2E 测试交叉审计。实现时仍以最
 |---|---|---|
 | create/resume registration | local create 与 resume 都在 RPC 前注册 session handlers 和 `on_event`；cloud server-ID create 在 reader 收到 response 时 inline 注册 | app 必须把唯一 ingress 直接传入 create/resume，不得 return 后补订阅 |
 | post-create options patch | create/resume server RPC 成功后，SDK 还可能调用 `session.options.update`；patch 失败会移除 local registration、best-effort disconnect 后抛错 | 从发起 create/resume 起，除非错误明确证明 server side effect 未发生，否则都按 attachment unknown 对账；create 只 reconcile 预分配 ID，禁止第二次 create |
-| Event envelope | native 字段是 `id/timestamp/type/agent_id/ephemeral/parent_id/raw_type`；没有 `persisted`；SDK 1.0.8 generated enum 共 114 个值（含 `unknown`），main branch 另有 `factory.run_updated`、`session.context_cleared` | `ephemeral is True` 才归 ephemeral，否则归 durable；unknown type 保留 raw_type/raw payload；升级必须全量 diff enum，不能把 main-only 事件计入 1.0.8 |
+| Event envelope | native 字段是 `id/timestamp/type/agent_id/ephemeral/parent_id/raw_type`；没有 `persisted`；SDK 1.0.8 generated enum 共 114 个值（含 `unknown`），main branch 另有 `factory.run_updated`、`session.context_cleared` | reducer 使用 live event 后只写 type/IDs/seq/timestamp/payload SHA-256；raw payload 不落 SQLite |
 | `parentId` | 文档定义为“前一个 event”的 linked-list predecessor | 用于链完整性与 replay order；语义关联使用 explicit IDs |
 | `send()` | 返回 server `messageId`，官方说明可用于 event correlation；generated `QueuePendingItems` 有 stable opaque `id`，但 `UserMessageData` 没有 messageId，只有 envelope event UUID | acceptance/native-queue/user-event ID 分列持久化；fixture 固定三者关系，未证明时仅严格单候选 fallback；crash gap/歧义进入 submitted unknown |
 | queue delivery | `mode` 省略时默认 `enqueue`；immediate 若错过 current turn 会移入普通 queue | app FIFO 是唯一 durable queue，但每次只 dispatch 一项，并 query native pending snapshot |
@@ -140,9 +140,9 @@ Discord
       -> CopilotBridge
          create/resume/on_event/send/abort/model/mode + capability-gated RPC
       -> EventAdapter -> SessionReducer
-         raw SDK events -> versioned internal events -> durable state/render intents
-      -> RenderScheduler -> RenderOutbox
-         Markdown block assembler、表格缓冲/PNG、流式文本、可折叠 TaskDeck、final flush
+         live SDK events -> versioned internal events -> durable metadata receipts
+      -> VolatileContentStore -> RenderScheduler -> metadata-only RenderOutbox
+         有界内存流、Markdown block assembler、表格缓冲/PNG、live final flush
       -> InteractionGateway
          ask_user、elicitation、plan；不处理工具确认
       -> UsageService / Scheduler / RuntimeSupervisor
@@ -162,6 +162,61 @@ Discord
    SDK 内部 broadcast response RPC 和 app generated handle-pending response 走独立
    ResponseCoordinator，否则 ask-user/permission 会与等待它们的 turn 互相死锁。所有 response
    task 仍受 owner fence、request/interaction exactly-once 与 TaskRegistry 管理。
+
+### SQLite 只保存状态
+
+`0052_state_only_storage.sql` 将 SQLite 明确定义为状态数据库，而不是 transcript 或 render
+缓存。conversation/runtime content 的可持久化字段限于 opaque ID、SHA-256、枚举状态、计数器、
+序号、时间戳和生命周期所需路径。user prompt、assistant delta/final、reasoning、tool
+command/output/error、interaction/protocol body、scheduler prompt、Discord text/embed/attachment
+payload 均不得写入 DB/WAL。应用配置不是 conversation content：project/channel settings、
+custom-agent definition/prompt/tools、MCP/extension generation、create/binding config snapshot 以及
+runtime command/agent manifest metadata 必须正常持久化，跨重启可读；optimistic version mismatch
+必须在同一 transaction 内拒绝，不能改变已接受配置。
+
+conversation content 进入进程级、有 count/bytes 上限的 `VolatileContentStore`。默认 entry
+不设 TTL，也不做 LRU/TTL silent eviction；deterministic key 可原子替换，但新增或替换超过
+容量时以固定 `content_capacity_exceeded` 明确失败，并保留全部旧 entry。RenderOutbox 和
+message queue 只保存 opaque content key + hash；dispatcher/runtime 在当前进程中解析。
+重启后 key 缺失必须进入 `content_unavailable`，关联 reaction 变为失败，绝不发送空 prompt、
+伪造成功或从 metadata 重建原文。render 缺失时，原 receipt 与一条 metadata-only、固定模板的
+`content_unavailable` outbox delivery 在同一 transaction 内落库；只有该 retryable delivery
+存在后原 receipt 才可 terminal。Discord transient failure 和进程重启都继续重试该状态消息，
+且 DB 中不保存模板正文。SDK event log 如重新发出完整 event，可重新填充内存并渲染，但本地
+已接收、尚未送达 SDK 的内容不具备 crash durability。
+
+SQLite/volatile coupled transaction 对 cancellation 有明确 outcome：`COMMIT` 在 shielded child
+task 中执行并等待 definitive result；commit 成功后才收到 caller cancellation 时抛
+`CommittedCancellation`，volatile frame 保留，普通 `CancelledError`、commit failure 或业务异常
+都等待 shielded rollback 完成后恢复 frame。Reducer commit acknowledgement 也传播同一 outcome。
+
+App scheduler 只把 prompt 保存在 volatile store，并持久化 Discord source channel/message ID、
+prompt hash 以及不含 conversation content 的 application target/config snapshot；执行时通过统一
+Discord HTTP limiter 取回 source message。locator 可用时重启不丢失 new-session target；
+custom `thread_name` 是 1–100 字符、无首尾空白的 application config，单独持久化并在重启后
+原值执行，不进入 conversation payload。只有 prompt 无法取回的旧 schedule 才为
+`needs_recreate`。0052 migration transaction 先把 legacy
+managed artifact path 复制到专用 cleanup state table，再删除旧表；commit 后才删除 managed-root
+内文件并执行 `secure_delete=ON`、WAL checkpoint/truncate、`VACUUM`、再次 checkpoint。durable
+`pending/complete` marker 使每次 `Database.open()` 都重试未完成 cleanup；secure erase 成功且
+completion marker checkpoint 后才视为完成。
+
+attachment managed file 使用 `item_index + content SHA-256` opaque physical name，原始文件名只在
+live `VolatileContentStore` 中用于 SDK `displayName`。重启或 0052 legacy purge 后若 durable Discord
+source 可用，manifest 进入 source refetch；0052 在 commit 前清空 filename-bearing path row，并把旧
+managed attachment path 纳入 post-commit secure cleanup。released/failed/GC/session-delete 都回收
+recovery prompt 与 display-name key。
+
+volatile key 按 owner 生命周期显式回收：final/superseded render、SDK 已接受或拒绝的
+submission、resolved/expired interaction、已消费 operation result、deleted/needs-recreate
+schedule、final tool/assistant delivery 以及永久 session delete 都执行 idempotent delete。
+enabled/disabled 且仍可执行的 schedule 保留 dispatch 所需 prompt；容量不足明确拒绝新内容，
+绝不通过 LRU 驱逐仍受 DB 非终态引用的内容。
+
+CommandMailbox confirmed result 默认只向成功 caller delivery 提供一次并立即清除 `result_ref`；
+确需重复读取的调用点必须显式 retain，已消费 replay 返回 durable confirmed-without-result。
+tool acceptance evidence 只在显式 probe flag 下采集，probe correlation 后立即删除，production tool
+event 不占用 evidence capacity。
 
 ## 单用户 `--yolo` 与常驻部署基线
 
@@ -366,8 +421,12 @@ restart interval/count、无 execution time limit，并在 45 秒内看到 heart
 
 watchdog 通过 PowerShell 查询最近的
 `Microsoft-Windows-Power-Troubleshooter/Operational` resume event，60 秒内跳过。重启
-风暴写 alerts.log，并尽力发送 Windows toast。TableRenderer 字体候选必须包含
-`C:\Windows\Fonts\msyh.ttc`、`simsun.ttc`、`arial.ttf`，对应 #289 的中文表格 tofu 问题。
+风暴写 alerts.log，并尽力发送 Windows toast。TableRenderer 字体候选必须包含 macOS 的
+Hiragino/Arial Unicode/Menlo、Windows 的 `msyh.ttc`/`simsun.ttc`/`arial.ttf`，以及 Linux
+Noto/WenQuanYi 路径；每个字符必须与字体的 missing-glyph mask 比较后才可选用。没有支持该字符
+的本地字体时退回可复制的 code/Markdown，不得生成 tofu 方框 PNG。combining mark、variation
+selector、ZWJ 与 emoji modifier 按 grapheme cluster 测量/换行/绘制；固定字阶 color emoji
+先按可用 strike 渲染，再缩放到目标字号。
 
 ## 设计门禁
 
@@ -421,8 +480,9 @@ watchdog 通过 PowerShell 查询最近的
 10. app 只保存一个 `sdk_session_id`。`resume_session(id)` 成功或失败是权威结果；SDK 不返回
    可供比对的第二个 actual ID。恢复失败不能静默 create 新 session 覆盖原 thread。
 11. subagent、Fleet worker、background agent/shell/task 都是当前 Copilot session 的内部执行单元，
-   永不创建 Discord child thread。只有显式 new/fork/worktree/new-session
-   schedule 能创建 thread；后台执行统一投影为原 thread 内可折叠 TaskDeck 卡片。
+   永不创建 Discord child thread，也不创建滚动 Discord task panel。只有显式
+   new/fork/worktree/new-session schedule 能创建 thread；观察与控制统一通过 durable lifecycle
+   state 和 `/tasks`。
 12. macOS LaunchAgent 和 Windows Scheduled Tasks 在 `copilotd setup` 时默认安装并立即启动。
 13. 表格不能直接按普通 Markdown delta 输出；必须完整缓冲后一次性渲染。
 14. raw reasoning 默认只展示 intent/concise summary，不展示 opaque/encrypted payload。
@@ -441,7 +501,7 @@ watchdog 通过 PowerShell 查询最近的
 
 首版包括可选项目绑定、未绑定 `$HOME` 默认 cwd、thread 会话、文本/图片/文件、
 create/eager-resume/send/abort/set-model/disconnect、预注册 event ingress/单 reducer、后台
-observation、工具/diff/usage/subagent 渲染、表格 PNG/附件、ask-user/elicitation/
+observation、脱敏工具状态/usage 渲染、显式表格 PNG/附件、ask-user/elicitation/
 autopilot/plan 交互、SQLite 状态、render outbox、macOS/Windows 默认 service/watchdog。
 命令面优先交付 Core session/model/autopilot/plan/steer 与 Projection context/usage，再按
 specific RPC/invocation probe 加入 Fleet、Tasks、agents、after/every/remote 及 selected
@@ -491,7 +551,7 @@ full allow-all。SDK 若仍发送普通 typed permission request 则返回 owner
 | `ModeController` | desired/runtime mode、`mode.get/set`、plan-exit confirmation 与 message mode snapshot |
 | `SdkEventIngress` | create/resume RPC 前注册的唯一 `on_event` callback；无阻塞 enqueue，异常显式上报 |
 | `ReducerInbox` | 单 session 有界 MPSC queue；接收 SDK receipt，以及带 owner fence/generation 的 command receipt/internal snapshot |
-| `EventReducerWorker` | ReducerInbox 单一 consumer；ID/parent/agent correlation、journal、state 与 durable render intent |
+| `EventReducerWorker` | ReducerInbox 单一 consumer；ID/parent/agent correlation、metadata journal、state 与 volatile render intent |
 | `SnapshotReconciler` | 合并 activity/task/queue/cursor change trigger，在 reducer 外执行 read RPC，再把带 generation/fence 的 snapshot event enqueue 到 ReducerInbox |
 | `ResponseCoordinator` | 管理 direct handler future、SDK broadcast response 与 app-owned handle-pending RPC；不经过可能导致 turn deadlock 的 CommandMailbox |
 | `LivenessController` | submission/observed-background/interaction lease 与 stall watchdog |
@@ -500,7 +560,7 @@ full allow-all。SDK 若仍发送普通 typed permission request 则返回 owner
 | `CopilotBridge` | SDK public API 与 capability-gated RPC facade |
 | `CapabilityRegistry` | public API、低层 RPC 和模型 capability 探测 |
 | `EventAdapter` | raw SDK event 到 versioned internal event |
-| `SessionReducer` | 持久事件去重、submission/model-turn/background observation 与 durable render intent |
+| `SessionReducer` | 持久事件去重、submission/model-turn/background observation 与 metadata-only render receipt |
 | `RenderScheduler` | 单 session 顺序队列、coalescing、Discord rate limit 和 final flush |
 | `MarkdownAssembler` | block-aware streaming；保护 fence、blockquote 和 table |
 | `TableRenderer` | 完整表格解析、code block/PNG/MD/CSV 输出和降级 |
@@ -537,19 +597,20 @@ closed 的 binding，绝不自动重发结果未知的 prompt。
 | `reconciliation_state` | sdk_session_id, topic, requested_epoch, applied_epoch, status(idle/querying/stale/failed), runtime_generation, owner_fence_token, query_start_sdk_receive_seq?, query_end_sdk_receive_seq?, observed_at?；防止迟到的 negative snapshot 覆盖更新的 event evidence |
 | `submissions` | submission_id, sdk_session_id, origin(app_message/app_queue/app_schedule/fleet/runtime_observed), source_operation_id?, parent_submission_id?, discord_message_id?, schedule_run_id?(unique), runtime_schedule_id?, attachment_manifest_id?, prompt_hash?, requested_mode?, requested_model_config?, requested_agent?, requested_session_config_version?, requested_delivery?, observed_delivery?, state, accepted_message_id?, native_queue_item_id?, observed_user_event_id?, observed_origin_hint?(fleet/remote/native_schedule/autopilot_continuation/unknown), correlation_basis?, autopilot_objective_id?, task_completion_outcome?, completion_basis?, created_at, idle_at |
 | `model_turns` | sdk_turn_id, submission_id?, agent_id?, interaction_id?, state, started_at, ended_at；一个 turn 只代表一次 LLM call |
-| `message_queue` | id, thread_id, discord_message_id?, schedule_run_id?, prompt, attachment_manifest_id?, requested_mode_snapshot, requested_model_config_snapshot, requested_agent_snapshot?, requested_session_config_version, position, state, replaces_id?；只属于 app，不镜像 SDK queue；每个 `schedule_run_id` 最多一个 nonterminal row（partial unique），resubmit 创建新 row 而不改旧 snapshot |
-| `attachment_manifests` | id, source_kind, source_id, source_channel_id?, source_message_id?, session_id?, recovery_prompt?, recovery_idempotency_key?, recovery_origin?, state(preparing/ready/failed/released), error_code?, error_detail?, total_bytes, created_at, updated_at, retention_until?；creation/queue/submission/outbox 的 durable owner 与 restart recovery locator |
-| `attachment_items` | manifest_id, item_index, discord_attachment_id?, original_name, mime_type, byte_size, sha256, local_path, sdk_attachment_kind, state；`manifest_id+item_index` 唯一 |
+| `message_queue` | id, thread_id, discord_message_id?, schedule_run_id?, prompt_content_key?, prompt_hash?, attachment_manifest_id?, requested_mode_snapshot, requested_model_config_snapshot, requested_agent_snapshot?, requested_session_config_version, position, state, replaces_id?；`prompt` 固定为空，只属于 app，不镜像 SDK queue；每个 `schedule_run_id` 最多一个 nonterminal row |
+| `attachment_manifests` | id, source_kind, source_id, source_channel_id?, source_message_id?, session_id?, recovery_prompt_hash?, recovery_idempotency_key?, recovery_origin?, state(preparing/ready/failed/released), error_code?, total_bytes, created_at, updated_at, retention_until?；`recovery_prompt/error_detail` 固定为空；creation/queue/submission/outbox 的 durable owner 与 restart recovery locator |
+| `attachment_items` | manifest_id, item_index, discord_attachment_id?, original_name(固定空串), mime_type, byte_size, sha256, local_path(opaque index/hash basename), sdk_attachment_kind, state；`manifest_id+item_index` 唯一，display name 仅在 volatile store |
 | `background_observations` | sdk_session_id, runtime_generation, task_id?, task_type?, agent_id?, source_event_id, observed_state, terminal_evidence?, last_progress_at；不声明超出 task RPC snapshot 的 lifecycle |
-| `task_card_projections` | sdk_session_id, panel_id, card_token, card_key(task-id 或 orphan-agent-id), task_id?, agent_id?, kind(agent/shell/fleet/orphan), title, state, progress_summary, detail_artifact?, dependencies, artifact_links, can_promote, first_seen_at, last_progress_at, terminal_at?, revision；TaskDeck 可重建 read model，不拥有 lifecycle |
+| `submission_task_links` | sdk_session_id, task_id, submission_id, objective_id?, state, terminal_evidence?, correlation_basis, linked_at, last_progress_at, terminal_at?；支持 task lifecycle/reopen 判断，不包含展示正文 |
+| `tool_render_state` | sdk_session_id, turn_key, submission_id, segment_index, tool_call_id, state, started_seq, updated_seq, created_at, updated_at；只保存当前 tool card 的状态关联，name/command/progress 仅在 volatile store |
 | `liveness_leases` | session_id, lease_id, kind, source_id, runtime_generation, owner_fence_token, state(active/released/orphaned), acquired_at, refreshed_at, released_at?；无 duration TTL，但只对当前 generation/fence 生效 |
 | `event_journal` | sdk_session_id, generation, inbox_seq, source(sdk/internal), sdk_receive_seq?, event_id?, internal_event_id?, ephemeral?, persistence_class, raw_type, parent_id?, agent_id?, message_id?, turn_id?, interaction_id?, request_id?, reducer_hash, received_at；SDK event 以 `(sdk_session_id,event_id)` 跨 generation/cursor 去重；command/snapshot receipt 以 app `internal_event_id` 幂等 |
-| `render_outbox` | id, session_id, logical_seq, lane, coalesce_key, idempotency_key(unique), payload, state, attempts, next_attempt_at |
+| `render_outbox` | id, session_id, logical_seq, lane, coalesce_key, idempotency_key(unique), metadata-only payload, content_key?, content_hash?, render_kind, finalized, state, attempts, next_attempt_at, error_code?；缺失内容另建 retryable fixed-status row |
 | `render_messages` | session_id, logical_key, discord_message_id, content_hash, finalized；`session_id+logical_key` 唯一 |
-| `pending_interactions` | interaction_id, protocol_request_id?, sdk_session_id, runtime_generation, owner_fence_token, thread_id, kind, response_plane, expires_at, state, payload；typed handler 未暴露 requestId 时使用 app ID，旧 generation component 只返回 expired |
+| `pending_interactions` | interaction_id, protocol_request_id?, sdk_session_id, runtime_generation, owner_fence_token, thread_id, kind, response_plane, expires_at, state, content_key?, request_hash?, response_hash?；payload/response/form 固定为空 |
 | `protocol_requests` | sdk_session_id, generation, request_id, requested_type, requested_event_id, completed_event_id?, state；只记录 wire requested/completed pair |
 | `usage_samples` | session_id, turn_id, model, token fields, nano_aiu, premium_requests |
-| `schedules` | id, project_id?, thread_id?, kind, expression, timezone, payload, target_snapshot, misfire_policy, state |
+| `schedules` | id, project_id?, thread_id?, kind, expression, timezone, metadata-only payload, target_snapshot, prompt_hash, source channel/message, validated thread_name?, misfire_policy, state |
 | `schedule_runs` | run_id, schedule_id, planned_key, planned_at_utc, status, lease_owner, lease_expires_at, fence_token, attempt, claimed_at, creation_intent_id?, session_create_started_at?, send_started_at?, accepted_message_id?, terminal_turn_id?, completion_basis?, result_thread_id?, result_session_id?, dispatch_key；`schedule_id+planned_key` 唯一，manual key 为 `manual:<uuid>` |
 | `runtime_schedules` | sdk_session_id, runtime_schedule_id, builtin_name, invocation_input, recurrence, next_run_at, state(active/triggered/cancelled/unknown), last_event_id；只表示 `/after`/`/every` 的 runtime-owned registry；triggered 仅用于能按 explicit ID 证明已触发的 one-shot |
 | `capabilities` | runtime_version, sdk_version, capability, supported, probe_detail |
@@ -602,7 +663,7 @@ attachment_state:
 ABSENT -> CREATING/RESUMING -> ATTACHED -> DISCONNECTING -> ABSENT
                 \                 \-> RECOVERY_UNKNOWN -> RESUMING | OWNER_CONFLICT | ABSENT
                  \-> OWNER_CONFLICT -> RESUMING
-                 \-> ABSENT        \-> TERMINAL -> ABSENT
+                 \-> ABSENT
 ```
 
 binding row 的存在与 SDK transcript persistence 是两件事：`CLOSED` 表示不 eager resume，
@@ -613,17 +674,20 @@ CREATING/RESUMING 前必须原子获取 DB owner lease/fence；旧 fence 的 cal
 message 仍拒绝，只有用户 `/session resume` 才把 intent 改回 ACTIVE。临时 run terminal 且
 detach-safe 后恢复 `CLOSED + ABSENT`；run 未决/unknown 时继续 attached 观察，不为满足旧 closed
 intent 误杀工作。
-`session.shutdown` 使当前 handle terminal；只有 explicit close 已在进行时才提交
-`binding_intent=CLOSED`，其他 routine/error shutdown 均先进入 recovery/diagnostics，不能从
-`shutdownType` 猜用户意图。resume callback 可能随后重放其 `session.resume.parentId` 指向的
-上一代 durable shutdown；该 shutdown 仅入 journal 供审计，不得终止新 handle、改变 attachment、
-finalize turn 或生成 “session ended” UI。
+`session.shutdown` 只使当前 handle 暂时停止接受新发送；只有 explicit close 已在进行时才提交
+`binding_intent=CLOSED`。其他 routine/error shutdown 在有界 successor 窗口后进入
+`RECOVERY_UNKNOWN`，启动恢复也会把 active binding 遗留的旧 `TERMINAL` 归一化为
+`RECOVERY_UNKNOWN`，不能形成重启后不可 attach 的死状态。resume callback 可能随后重放其
+`session.resume.parentId` 指向的 durable shutdown；每个 shutdown 使用独立 waiter，只有匹配
+parentId 的 resume 才能取消该次结算。被 supersede 的 shutdown 只留 journal 审计，不得终止新
+handle、改变 attachment、finalize turn 或留下失败 reaction/status。
 
 owner lease TTL 固定 60 秒、每 15 秒续租，保留 40 秒 mutation headroom 与至少 5 秒调度抖动
 余量；每次 takeover 在 SQLite transaction 内分配严格
 递增的 `fence_token`。所有 mutating RPC dispatch、snapshot commit 和 callback reduction 都
-必须携带并重新校验当前 token，不能只在 attach 时检查一次。续租失败后立即暂停新 mutating
-RPC；一旦发现 token 已被替换，旧 runtime 进入 fenced/quarantined，旧 callback 只计 incident，
+必须携带并重新校验当前 token，不能只在 attach 时检查一次。续租遇到 SQLite/IO transient 时先做
+有界重试；重试耗尽后才暂停新 mutating RPC 并隔离当前 session，不得让单 session 任务异常关闭
+Discord Gateway。发现 token 已被替换时，旧 runtime 进入 fenced/quarantined，旧 callback 只计 incident，
 且不得主动 disconnect/abort 可能已由新 owner 接管的 server session。只有仍持有当前 fence 的
 owner 才能 teardown handle。该 token 不是 runtime/server-side fence，不能撤回 takeover 前已
 发出的 RPC：每个 mutating call 前必须 durable 写 started intent 并确保 lease remaining >= 40
@@ -1075,8 +1139,8 @@ unarchive/复用其原 Discord thread；原 thread 已删除时返回可行动�
 | `/session compact focus?` | CLI `/compact`；operationally quiet | `session.rpc.history.compact(custom_instructions=focus)` 为 generated RPC；probe 后注册 |
 | `/session fork name?` | CLI experimental `/fork`；source detach-safe | fork RPC 成功并返回新 session ID 后注册；新建 thread；target remote exposure 必须不可 steer、native schedule list 必须为空，否则 quarantine/cleanup，不能复制执行入口 |
 | `/plan action=show` | persisted plan | `session.rpc.plan.read()` probe 后才把 `show` choice 加入 `/plan` manifest；不存在时不从 transcript 猜 plan |
-| `/fleet prompt` | Copilot Fleet；operationally quiet | `session.rpc.fleet.start()` 明确 experimental；在当前 thread 的可折叠 TaskDeck 渲染 parent/subagent/todo dependency，不为 worker 新建 thread |
-| `/tasks action id? message?` | generated task RPC；list/show 为 active-safe read，message/promote/cancel 为 fenced priority operation，remove 只允许 terminal task | action=`list|show|message|promote|cancel|remove`；root 以 `list()` 为门禁，其余 action 分别 probe `get_progress()`、`send_message()`、`get_current_promotable()`/`promote_to_background()`、`cancel()`、`remove()` 后动态注册；id 除 list/current-promotable lookup 外必填，`cancel id=all` 先 snapshot 后逐 task cancel，不把 agent-only bulk cancel 冒充 shell cancel；list/show 更新或聚焦同一 TaskDeck，不创建 thread |
+| `/fleet prompt` | Copilot Fleet；operationally quiet | `session.rpc.fleet.start()` 明确 experimental；worker 只进入当前 session 的 lifecycle evidence，不创建 worker thread 或自动 Discord panel |
+| `/tasks action id? message?` | generated task RPC；list/show 为 active-safe read，message/promote/cancel 为 fenced priority operation，remove 只允许 terminal task | action=`list|show|message|promote|cancel|remove`；root 以 `list()` 为门禁，其余 action 分别 probe 对应 typed RPC 后动态注册；`cancel id=all` 先 snapshot 后逐 task cancel；所有观察/控制结果仅由 slash command 返回 |
 | `/agent action name?` | generated agent RPC；select/deselect operationally quiet | action=`list|current|select|deselect`；name 只对 select 必填；分别 probe `list/get_current/select/deselect`，显示 builtin/custom/inferable 来源 |
 | `/after create delay prompt`、`list`、`cancel id` | CLI experimental `/after`；create quiet，list read-only，cancel 为 fenced priority stop | create 用 strict builtin `commands.list/invoke` fixture；list/cancel 用 public generated schedule list/stop；写独立 `runtime_schedules`，不调用 private schedule add RPC |
 | `/every create interval prompt`、`list`、`cancel id` | CLI experimental `/every`；create quiet，list read-only，cancel 为 fenced priority stop | create 同上；list 只筛 recurring，cancel 先校验 kind；无 app lease/exactly-once 保证 |
@@ -1213,7 +1277,7 @@ Catch-up 最多执行最近一次遗漏。SDK acceptance 不确定时不重发�
 | `/shell` mode command | `user.message` 可观察 per-message `agentMode=shell`，但 `SessionMode` 不含 shell，Discord 也不是交互 shell；只保留 message fact，不注册命令 |
 | CLI `/keep-alive`、`/caffeinate` | 它们控制终端进程的 machine-sleep assertion，不等同 daemon/service 保活；首版允许系统睡眠并做 wake grace，不制造无 SDK 契约的 Discord command |
 | `/btw` | 不迁移；纠正当前执行使用官方 SDK steering `/steer` |
-| `/diff` | 不迁移 terminal UI；diff 自动进入 tool/review renderer |
+| `/diff` | 不迁移；structured diff 和 tool result 不自动进入 Discord renderer |
 | session export/tag/open/history/diff/notifications | 不进入首版；list/resume/Discord thread 已覆盖实际需求 |
 | project system-prompt/add-dir | 不进入；使用 Copilot instructions 和固定 cwd |
 | terminal UI/process 命令 | `/copy`、`/theme`、`/voice`、`/cwd`、`/cd`、`/ide`、`/lsp`、`/exit`、`/login`、`/update`、`/feedback`、`/help`、`/share` 等不映射到 Discord |
@@ -1265,8 +1329,8 @@ InternalEvent {
   active/positive evidence 仅在同 entity 没有 query-start 后的 terminal evidence 时保守合并；
   terminal 状态单调且不被旧 running snapshot 回退。empty/false/absence 不得关闭现有 evidence，
   必须立即再跑最新 epoch；只有 `applied_epoch=requested_epoch` 且 reducer 已追平 end watermark 时，
-  negative snapshot 才可参与 quiet/terminal 判定。internal observation 以 app durable journal
-  记录，但不得反推成 SDK persisted event。
+  negative snapshot 才可参与 quiet/terminal 判定。internal observation 只以 app
+  metadata journal receipt 记录，不保存 body，也不得反推成 SDK persisted event。
 - CommandMailbox receipt 同样使用 durable `internal_event_id`、generation/fence 与 reducer ack；
   它可与 SDK callback 在一个 inbox 中排序，但没有 SDK event ID/parentId/ephemeral 语义。
 - subagent 归属取 envelope `agentId` + explicit task/tool/turn mapping；`parentId` 只辅助链遍历，
@@ -1341,17 +1405,17 @@ InternalEvent {
 | `model.call_start`, `model.call_failure` | metrics/error precursor | start 无；孤立 failure 可见 |
 | `abort` | abort observed；后续 `session.idle(aborted=true)` 才关闭可关联 submission | 已中止，清 controls |
 | `tool.user_requested` | ToolRequested | 标注 user-requested |
-| `tool.execution_start` | ToolStarted | rolling row；args redacted |
-| `tool.execution_partial_result` | ToolOutput | detail buffer，不逐 chunk 发消息 |
-| `tool.execution_progress` | ToolProgress | rolling row |
-| `tool.execution_complete` | ToolCompleted | success/failure、diff/detail |
+| `tool.execution_start` | ToolStarted | 当前 turn 的脱敏 tool status；args 不显示 |
+| `tool.execution_partial_result` | ToolOutput | 不渲染、不持久化正文 |
+| `tool.execution_progress` | ToolProgress | 当前 status 原位更新 |
+| `tool.execution_complete` | ToolCompleted | 只显示 success/failure；output/result/diff 丢弃 |
 | `tool_search.activated` | capability/telemetry | verbose 可选 |
 | `skill.invoked` | SkillInvoked | 显示名称，不显示完整 content |
 | `subagent.selected`, `subagent.deselected` | AgentSelected/Deselected；仅 root-scoped、可唯一关联 pending select 的 event 更新 runtime selected-agent，agent-scoped event 只更新 worker projection | agent badge |
-| `subagent.started`, `subagent.completed`, `subagent.failed` | subagent lifecycle；更新 task card projection，不分配 Discord thread | 原 thread 的 collapsed TaskDeck 与统计 |
+| `subagent.started`, `subagent.completed`, `subagent.failed` | subagent lifecycle；更新 liveness evidence，不分配 Discord thread | 无自动 Discord 消息；由 `/tasks` 查询 |
 | `hook.start`, `hook.progress`, `hook.end` | audit/debug | normal 无；verbose 摘要 |
 | `system.message` | prompt provenance | UI 无，只存 hash/source |
-| `system.notification` | 按 generated discriminated subtype 形成 background evidence；未关联 notification 进 orphan diagnostics，不假设 terminal/continuation | 原 thread TaskDeck evidence；未知进 orphan card/diagnostics |
+| `system.notification` | 按 generated discriminated subtype 形成 background evidence；未关联 notification 进 diagnostics，不假设 terminal/continuation | normal UI 无 |
 | `session.binary_asset` | ArtifactAvailable（experimental） | MIME/size 校验后附件 |
 | `permission.requested`, `permission.completed` | approve-all 正常会 short-circuit handler；若仍收到普通 typed request（shell/write/read/MCP/URL/memory/custom-tool）则按 requestId auto approve + latency；managed request 显式 platform-blocked | 普通 UI 无；managed limitation 显示错误 |
 | `user_input.requested`, `user_input.completed` | wire request journal；实际响应走 SDK awaitable `on_user_input_request`，typed handler 不暴露 requestId | handler 创建 buttons/select/modal；event 不重复建 UI |
@@ -1419,6 +1483,44 @@ child task 必须由调用方立即 await/cancel，不得脱离其 owner corouti
 Discord 不原生渲染 GFM 表格，且 2000 字符限制、message edit rate limit、附件上限会破坏
 普通 Markdown 流。因此 Renderer 必须先生成逻辑 block，再决定 Discord 载体。
 
+#### REST transport 与 rate limit
+
+- Discord 官方规则为 bot global 50 requests/s 与 invalid request 10,000/10 min；实现固定保留
+  20% headroom，即任意滚动 1 秒最多放行 40 个 **physical REST attempts**，并在滚动 600 秒内
+  最多保留 8,000 个 `401`、`403`、non-shared `429` 与尚未返回的 reservation。规则来源：
+  [Discord Rate Limits](https://discord.com/developers/docs/topics/rate-limits)。官方 interaction
+  callback 与 application interaction webhook/followup 不占 bot-global window/cooldown，但仍受
+  learned route bucket 与 invalid-request guard 约束。
+- discord.py `HTTPClient` 在 `static_login` 前必须安装唯一 mandatory `aiohttp.TraceConfig`。
+  login `/users/@me`、application info、Gateway discovery、command sync、message/thread/fetch/edit/
+  delete/pin/reaction、interaction initial response/followup 以及 E2E 的直接 discord.py 调用都共享
+  该 session。trace 在 wire 前关闭 aiohttp transparent reused-connection retry；discord.py 每次显式
+  429/5xx/network retry 都重新经过 physical admission，因此一次 trace admission 恰好对应一次
+  physical attempt。
+  trace 只匹配 Discord REST API host 的 `/api[/vN]/...`；Gateway WebSocket 和 CDN 下载不占 bot
+  REST token traffic。可选 test observer 只能追加 callbacks，不能替换 mandatory limiter；observer
+  start 必须先于 admission，避免 observer 异常泄漏 reservation。
+- route 不设静态 5 requests/s。所有 HTTP response（包括 `4xx`/`5xx`）动态学习 `X-RateLimit-Limit`、
+  `X-RateLimit-Remaining`、`X-RateLimit-Reset-After`/`Reset` 与
+  `X-RateLimit-Bucket`，按 learned reset window 的 80% 速率 pacing。bucket key 为 server bucket
+  hash + channel/guild/webhook-token/interaction major parameters。可用整数预算为
+  `floor(limit*0.8)`；结果至少为 1 时按 `window/budget` pacing，否则按 fractional
+  `window/(limit*0.8)` pacing，因此 limit 2/5/1 分别为每 window 1/4/平均 0.8 次。
+  bucket hash 改变时立即改用新 key。带 active cooldown、`next_at` pacing、未过期 reset window 或
+  in-flight reservation 的 bucket 永不 eviction；cache 满时只删除无保护 bucket，全部受保护时
+  允许有硬上限的临时扩容，达到上限后固定拒绝新 route。
+- `429` body 在 aiohttp response cache 中读取，不能夺走 discord.py 后续读取；header/body
+  `retry_after` 均安全解析并取不缩短 cooldown 的 deadline。body scope 未解析前以 barrier 阻止
+  新 admission，也不唤醒 waiters；异常路径必须释放 barrier。header cooldown 必须先在锁内发布，
+  body 只能延长 cooldown，不能缩短。`global` cooldown 阻塞 bot-global REST，`shared` 与普通 route cooldown 只阻塞
+  对应 bucket + major parameters；shared 429 不计 invalid guard。request exception 必须释放
+  in-flight reservation。Discord REST redirect 在 `on_request_redirect` 中释放 reservation 并
+  fail closed，aiohttp 不得跟随第二跳。route/hash cache 有 TTL 和数量上限。
+- `DiscordRequestCoordinator` 只做 logical priority、coalescing、deadline 与 target min-interval；
+  callback 恰好调用一次，不做 token bucket、route alias/cooldown 或 HTTP 429/5xx retry。
+  discord.py 拥有 physical retry，durable outbox 只处理其最终交付结果。heartbeat 分别暴露
+  semantic queue 与 physical limiter attempts/waits/cooldowns/invalid reservations。
+
 #### Render pipeline
 
 ```text
@@ -1426,8 +1528,8 @@ InternalEvent
   -> SessionReducer
   -> RenderIntent(logical_seq, lane, coalesce_key)
   -> MarkdownAssembler(block state machine)
-  -> RenderPlan[text segments | table assets | files | TaskDeck]
-  -> durable RenderOutbox
+  -> RenderPlan[text segments | table assets | explicit user files]
+  -> metadata-only RenderOutbox + VolatileContentStore key/hash
   -> Discord API
   -> render_messages checkpoint
 ```
@@ -1435,27 +1537,51 @@ InternalEvent
 - `assistant.message_delta` 只追加到 `(messageId, agentId)` 对应 block assembler；delta payload
   不保证带 turnId，final `assistant.message` 的 optional turnId 只用于补充关联；
   最终 `assistant.message` 只 canonicalize 同 messageId 的 delta。一个 submission 的多个
-  complete message 不能互相覆盖。
+  complete message 不能互相覆盖。assembler 结果为空或只有 whitespace 且没有用户交付附件时，
+  不创建 RenderIntent，也绝不能用 `U+200B` 零宽字符制造 Discord 空白消息。
 - 每条文本目标 1850 字符，预留 fence、continuation marker 和 footer 空间。
 - splitter 按 Markdown block AST 切分：paragraph、list、blockquote、fenced code、table、
   thematic break。不得在 code fence、blockquote 或 table 内跨消息。
 - 单个 block 超过限制时不截断：code/text 输出 `.md`/`.txt` 附件，正文只放摘要和文件名。
-- text lane 最快 1 秒一次 edit；TaskDeck lane 最快 4 秒一次 edit。计时从 Discord edit
+- streaming text lane 最快 1 秒一次 edit；reaction 最快 0.25 秒一次。计时从 Discord edit
   完成时开始，而不是 request 发起时。
 - 普通 assistant streaming/final 正文使用 Discord message content，保留原生 Markdown、复制和
-  引用体验，不放进 embed。reasoning/status/warning/error、interaction、diff、tool artifact
-  等结构化状态继续使用 typed embed。
+  引用体验，不放进 embed。final 为空或比已累计 delta 更短时不得清空/截短已接收正文。
+  `assistant.intent` 与 `assistant.reasoning(_delta)` 只产生 metadata/hash receipt，不形成 Discord status card。
+  普通 top-level `tool.execution_*` 只更新本 submission/segment 的一张 typed activity embed，
+  动态显示当前 tool name、脱敏后的 command 和累计数量，但不展示 secrets、env/header 值、原始参数、
+  命令输出、result 或 diff；subagent 内部 tools 不形成 parent card 或独立 Discord 消息。
+  warning/error、interaction 等确实需要用户注意的结构化状态继续使用
+  typed embed。
 - `assistant.usage`、`session.usage_info` 和 `session.usage_checkpoint` 只更新 durable usage
   projection，不单独发卡片；`session.idle` 把 model、tokens、duration、context 和 credits
   合并成 ClaudeD 风格的 `-#` compact subtext footer（如 `-# 📥 1234 │ 📤 56`）。
+- Discord-origin submission 在 `submissions` 和 `submission_reactions` 中持久化原
+  channel/message provenance。reaction 依次表达 `👀 accepted -> 🧠 reasoning -> 🛠️ action`；
+  等待用户输入时为 `❓`，恢复后回到此前 reasoning/action。只有真实 semantic success 才进入
+  terminal `✅`；submission rejected/blocked/unknown/aborted、model/session failure 或无法恢复的
+  render failure 进入 terminal `❌`。`send()` 返回只表示排队/接受，绝不能提前显示成功。
+- reaction 与普通 render 共用 durable outbox 和 Discord request coordinator。非终态 reaction 必须
+  校验当前 generation/fence/owner lease；terminal reaction 可在 owner lease 已过期或进程重启后继续
+  投递。新 revision 会 supersede 旧 emoji，Forbidden/NotFound 只记录 delivery failure，不能改变
+  Agent 业务结果。中间 render revision 失败会暂时标 `❌`，但同一 family 的更高 revision 成功后
+  原子恢复此前 reaction，再由后续 semantic terminal 决定 `✅/❌`；无 submission 关联的 status
+  render 失败不得污染其他请求。
+- `session.shutdown` 产生的失败 status/reaction 带 shutdown event ID 和 generation；匹配
+  `session.resume.parentId` 时只 supersede/恢复由该 shutdown 产生的 UI，不清除无关错误。
+- migrations `0048`–`0051` 分别提供 reaction delivery、legacy turn state、Discord queue
+  provenance 和 per-message/tool-card state。启动时只对三个已知旧本地 migration 名称做严格 schema
+  验证与身份归一化，保留旧 tool/reaction 数据；未知编号冲突直接 fail closed。
 - 每条 Discord message 最多 10 个 embed，所有 embed 合计最多 6000 字符；decorator 在发送前
   统一约束 title/description/field/footer 预算。usage 使用结构化字段和 context progress bar；
   interaction 明确区分 pending/resolved/expired；`session.task_complete` 明确区分
   completed/continue/blocked，不能把继续或阻塞显示成绿色成功。
-- diff card 显示 source、byte size 和 hunk-aware files/additions/deletions；超过 reducer 安全上限
-  时统计显示 unknown、delivery 显示 omitted，并明确原始事实仅保留在 durable event journal，
-  不能伪造 `0 changes` 或 inline preview。tool artifact 没有可信 status 时显示 unknown；只有
-  legacy 标题明确为 failed/error 才保守恢复失败语义。
+- tool result、stdout 和 structured diff 不自动发布到 Discord；live reducer 使用后立即丢弃，
+  不进入 journal、spill 或 artifact 文件。只有 assistant 最终回复明确生成的用户交付附件或
+  显式交互请求才进入 volatile attachment lane，不能因输出长度自动刷出卡片。`0052` 删除
+  `tool_output_streams`、`tool_spill_artifacts` 与 trusted snapshot pipeline。
+  migration `0049` supersede 尚未投递的空 assistant、reasoning/intent 和旧自动 artifact intent；
+  `0053` 删除遗留 rolling task-panel schema，避免升级后补发零宽空行或选择控件。
 - PNG/table/image 使用 `attachment://<unique-safe-name>` 预览；同一 message 内 basename
   规范化并去重。Discord 可能把仅由 embed 引用的图片折叠出普通 attachments 数组，因此真实
   验收同时接受 attachment metadata 和 `cdn.discordapp.com/attachments/...` 原图，并按 SHA-256
@@ -1465,32 +1591,13 @@ InternalEvent
   原子更新 payload hash，并按原 nonce 查找/编辑可能已发送的消息；sent 或已有 message ID 的
   hash 不一致继续 fail closed。旧数据库只有 delivered checkpoint、没有 intent 时可一次性回填
   sent intent，避免升级后永久阻塞。
-- task/subagent/background evidence 使用原 session thread 中的一张 rolling `TaskDeck`，默认
-  collapsed；绝不为 subagent/task/Fleet worker 创建 child thread，也不为每个 ToolUse 单独
-  发消息。主回答只接收已按 agent/message/parent ID 归属到 main submission 的文本；agent-scoped
-  内容只进入对应 task card，orphan agent 内容只进入专用 orphan card。
-- Discord 没有原生 collapsible embed，TaskDeck 用“编辑同一 durable message”实现折叠：
-  compact view 显示每项 `state/title/type/elapsed/progress`；select menu 选择 card，
-  `Expand/Collapse` 在同一 message 原位切换 bounded detail；`Prev/Next` 分页。单页最多 8 张
-  embed card、全部 embed 合计不超过 Discord 的 6000 字符限制，select 最多 25 项；超过后
-  分页，不创建额外 thread。
-- expanded detail 只显示最近进度、最终摘要、错误、tool/artifact links 和依赖；raw reasoning
-  不显示。详情超过 embed/message 限制时写 `.md`/`.txt` artifact，卡片只保留摘要与下载按钮。
-  下载按钮返回 ephemeral attachment follow-up，不替换 TaskDeck message 的 attachment set，也不
-  创建 thread。terminal card 默认在 final flush 后重新折叠，但用户可再次展开；`remove` 成功才
-  从 deck 删除。
-- card action 只在对应 typed RPC/state gate 成立时出现：running/idle 可 `Cancel`，sync +
-  `canPromoteToBackground=true` 可 `Promote`，agent task 可 `Message`（modal），terminal 可
-  `Remove`；它们与 `/tasks` 共用同一个 idempotent operation handler，不实现第二套 lifecycle。
-- component `custom_id` 只带 DB 生成的短 `panel_id/card_token/revision/action`，总长硬限制
-  < 100 chars；真实 session/task ID 由 DB lookup，不直接塞入 component。stale revision 只
-  refresh 当前 TaskDeck，不重复执行 cancel/promote/message。折叠状态是 UI projection，
-  runtime 重启后可默认 collapsed，不影响 task lifecycle 或 completion evidence。
-- bot 启动时注册 timeout=None 的 persistent/dynamic component router，不为历史 message
-  逐条常驻 View；interaction 按短 token 查 DB 并验证 guild/channel/thread/message/panel/revision。
-  DB row 已清理或 message 不匹配时只返回 ephemeral expired/refresh，不执行 task RPC。
+- task/subagent/background evidence 只进入 `background_observations`、
+  `submission_task_links` 和 liveness lease。绝不为 subagent/task/Fleet worker 创建 child thread，
+  也不创建 rolling task message、select、展开按钮或下载 component。
+- 主回答只消费 `agent_id is None` 且已归属 main submission 的文本；agent-scoped delta 不进入
+  Discord。typed task list/show/progress/message/promote/cancel/remove 统一通过 `/tasks`。
 - message final、correlated idle/abort、observed task terminal、session shutdown 和 ingress
-  retire 前都执行 trailing/final flush，绕过普通 throttle 但仍服从 Discord retry-after。
+  retire 前都执行 trailing/final flush；所有请求仍服从官方 limiter 与 Discord retry-after。
 - 每次 late send/edit 前先 fetch thread state；已自动 archived 且未 locked 时原位 unarchive 后
   重试，不创建 replacement thread。locked/deleted/权限错误只把 RenderOutbox 标 blocked 并在
   原 channel 发有界诊断（若可用），SessionRuntime/后台任务继续存活。
@@ -1529,12 +1636,9 @@ InternalEvent
 #### 其他内容
 
 - reasoning 只显示 intent/concise summary；opaque/encrypted reasoning 不显示。
-- partial tool output 每 tool 内存上限 64 KiB，溢出写文件；complete display payload 优先取
-  `result.detailedContent`，其次规范化 structured `result.contents`，最后才是可能为模型截断的
-  `result.content`。实际收到的 display payload >= 8000 chars 或任何 spill 必须生成 `.txt`
-  attachment + char/line count，不能只留 success icon；只有收到 detailed/structured 完整数据时
-  才标 verbatim，fallback content 附件显式注明 runtime 可能截断；error 仍使用有界 inline 摘要。
-- diff 优先使用 SDK structured result，否则本地 `git diff`；超长 patch 附件化。
+- partial tool output 只存在于 SDK callback/reducer 调用期间；不写 volatile artifact、spill、
+  journal body 或自动 Discord 附件。失败 card 的 tool name、脱敏 command 与有界错误仅在当前进程显示；
+  SQLite 只保留 tool call ID/state/seq/hash。structured diff 也不持久化正文。
 - interaction 卡记录 app interaction ID/expiry；只有 high-level request 明确暴露时才附 protocol
   request ID；完成/超时后禁用组件。
 - correlated `session.idle` 后发送 model、tokens、AI Credits、context 和 duration；若仍有
@@ -1561,13 +1665,13 @@ copilotD 设计输入，具体 Copilot event 必须由 spike/fixture 验证。
 | [#327](https://github.com/HXYerror/claudeD/pull/327) merged | `/compact`、turn、stop 并发消费/断开同一 stream，文本交错或崩溃 | CommandMailbox 串行 SDK calls；唯一 ingress + inbox + ReducerWorker；disconnect 前不 unsubscribe | send/compact/close race，断言单 reducer 和 final flush |
 | [#328](https://github.com/HXYerror/claudeD/pull/328) merged | 无强引用 fire-and-forget task 被回收；heartbeat 异常后静默停止；缺终态 task 永久 running | TaskRegistry 强引用/done callback；loop 异常上报；task GC/unknown 终态 | 强制 GC、heartbeat throw、缺 terminal event |
 | [#333](https://github.com/HXYerror/claudeD/pull/333) merged | 慢 slash command 错过 3 秒 ACK，报 Discord 10062 | command 第一行 defer；10062 不取消 SDK task | 注入 4 秒磁盘/SDK 延迟仍先 ACK |
-| [#337](https://github.com/HXYerror/claudeD/pull/337) merged | 无 parent ToolUseBlock 的 background subagent 文本泄到主频道 | main/task/subagent/continuation 明确 render target；未知 agent 只进原 thread 的 collapsed orphan card；任何 subagent/task 都不新建 thread | orphan agent event 不进入 main text，且 Discord thread count 不变 |
-| [#340](https://github.com/HXYerror/claudeD/pull/340) + [#341](https://github.com/HXYerror/claudeD/pull/341) merged | 1.2 秒 task-card edit 产生 29 个 429；被 throttle 的最后状态未落屏 | 4 秒 panel cadence、从 edit 完成计时、trailing/final flush | burst 100 updates + 429，最终状态必须一致 |
-| [#346](https://github.com/HXYerror/claudeD/pull/346) + [#350](https://github.com/HXYerror/claudeD/pull/350) merged | continuation 每 ToolUse 发一条消息导致刷屏，最终回退为 text + footer | 工具进度聚合到单 panel，阶段变化/最终结果才发消息 | 100 个 tool events 消息数保持有界 |
+| [#337](https://github.com/HXYerror/claudeD/pull/337) merged | 无 parent ToolUseBlock 的 background subagent 文本泄到主频道 | parent 文本只接收 `agent_id is None`；未知 agent 只进 state-only diagnostics；任何 subagent/task 都不新建 thread 或消息 | orphan agent event 不进入 main text，且 Discord thread/message count 不变 |
+| [#340](https://github.com/HXYerror/claudeD/pull/340) + [#341](https://github.com/HXYerror/claudeD/pull/341) merged | 高频 task-card edit 产生 429 且最终状态丢失 | 删除自动 task panel；lifecycle state 由 `/tasks` 按需读取 | burst 100 updates 产生零 task-panel REST attempt |
+| [#346](https://github.com/HXYerror/claudeD/pull/346) + [#350](https://github.com/HXYerror/claudeD/pull/350) merged | continuation 每 ToolUse 发一条消息导致刷屏，最终回退为 text + footer | 每个 submission 的工具进度只更新一条 compact activity；成功只留计数，失败留单行摘要 | 100 个 tool events 只映射一个 Discord message |
 | [#274](https://github.com/HXYerror/claudeD/issues/274) closed + [#276](https://github.com/HXYerror/claudeD/pull/276) merged + [#308](https://github.com/HXYerror/claudeD/issues/308) closed | 2000 字符 smart split 破坏 code fence/blockquote/table；即使 splitter block-aware，typewriter 若在 table extraction 前发走 buffer，长表仍退化成 code block | block-aware splitter；table candidate/extraction 必须先于任何 typewriter split；单块超限附件化 | >2000 字符 text-table-text 与 fence/quote snapshot；table 只产一个 PNG/MD asset，不先泄漏 code block |
 | [#314](https://github.com/HXYerror/claudeD/pull/314) merged | typewriter 先流出 table，final PNG 阶段重复或无法渲染 | table candidate 全程 hold，final 单次提交 | streamed table + canonical final 只产生一个 asset |
-| [#181](https://github.com/HXYerror/claudeD/issues/181) closed + [#238](https://github.com/HXYerror/claudeD/pull/238) merged | tool result >= 8000 chars 落入 bare success 分支，用户只见 `✅ Tool`、完整内容消失 | xlong/spilled tool output 始终 `.txt` 附件化，rolling panel 显示 char/line count；error 保留有界 inline | 7999/8000 边界、12000-char verbatim round-trip、xlong error 不误发 success attachment |
-| [#222](https://github.com/HXYerror/claudeD/issues/222) closed | 本地 Markdown image path 不会自动在 Discord 显示；附件每消息最多 10 个 | 抽取本地 image、与文本按序发送、10 个分批、失败保留路径文本 | 12 张图、缺失图和混合 text-image-text |
+| [#181](https://github.com/HXYerror/claudeD/issues/181) closed + [#238](https://github.com/HXYerror/claudeD/pull/238) merged | tool result >= 8000 chars 落入 bare success 分支；upstream 选择自动附件，但长 workflow 会再次刷屏 | output 不落盘、不按长度自动发布；live error 仅保留有界 inline | 7999/8000/100 MiB capacity rejection 保留既有 volatile entry、Discord artifact lane 始终为空 |
+| [#222](https://github.com/HXYerror/claudeD/issues/222) closed | 本地 Markdown image path 不会自动在 Discord 显示；附件每消息最多 10 个 | 不解引用 assistant 提供的本地路径；只发送已验证的显式附件并按 10 个分批 | 私有路径零读取；12 个显式附件保持顺序 |
 | [#331](https://github.com/HXYerror/claudeD/issues/331) closed + [#332](https://github.com/HXYerror/claudeD/pull/332) merged | 1.23 MB NDJSON 超 SDK 默认 1 MB buffer，bridge teardown | probe/configure frame limit；超限事件失败不销毁 session | 1/5/10 MB tool/image frame 压测 |
 | [#318](https://github.com/HXYerror/claudeD/pull/318) merged | Claude resume 失败时静默创建新 session | Copilot SDK 不返回第二个 actual ID；resume error 保留原 mapping，禁止 fallback create | fake resume error，断言 mapping/sdk_session_id 不变 |
 | [#342](https://github.com/HXYerror/claudeD/pull/342) merged | 启动/resume 失败只显示占位 ProcessError，真实 stderr 未捕获 | runtime 启动即注册有界 stderr tail | 失败卡包含 exit code、tail、generation |
@@ -1606,7 +1710,7 @@ sequenceDiagram
     end
     Bot->>DB: kind-specific reconcile of unsettled operations + reclaim expired schedule-run leases
     Bot->>Discord: connect REST/gateway; reconcile thread creation tokens; sync commands
-    Bot->>Discord: flush durable RenderOutbox
+    Bot->>Discord: resolve volatile key and flush RenderOutbox receipt
     Bot-->>Discord: ready/degraded + recovery-unknown/stalled notices
 ```
 
@@ -2016,28 +2120,28 @@ sequenceDiagram
     participant S as SDK
     participant I as Ingress/Inbox/Reducer
     participant T as TaskRegistry
-    participant R as RenderScheduler
     U->>M: /fleet prompt
     M->>S: fleet.start(prompt)
     S-->>I: subagent.started (N)
     I->>T: acquire/update observed agent tasks
-    I-->>R: create/update one collapsed TaskDeck in current thread
     loop workers
       S-->>I: agent-scoped events
-      I-->>R: card detail buffer + consolidated deck
+      I->>T: refresh lifecycle/liveness evidence
       S-->>I: subagent.completed/failed
     end
     S-->>I: session.task_complete(outcome?)? + session.idle
-    R-->>U: in-place deck edit + consolidated result/stats
+    U->>M: /tasks list/show
+    M->>S: typed task RPC
+    S-->>U: explicit command response
 ```
 
-事件按 envelope `agent_id` 分流；父文本只消费 `agent_id is None`，subagent 文本进入 worker
-card detail。没有 parent mapping 的 agent event 不进入 main text，只更新 orphan card。
+事件按 envelope `agent_id` 分流；父文本只消费 `agent_id is None`，subagent 文本不进入
+Discord。没有 parent mapping 的 agent event 不进入 main text，只保留 state-only diagnostics。
 `fleet.start()` 前先建立 origin=fleet submission/operation；RPC 不返回 `send()` message ID 时，
 只按 Fleet result、explicit task/agent IDs 或严格单 operation window 关联首个 user/turn event，
 歧义则保留 runtime-observed row，不按 prompt 文本强绑。
-整个过程复用当前 session thread 和一条 durable TaskDeck message；不调用 Discord create-thread
-API。用户通过 select + Expand/Collapse 在同一卡片原位查看 worker，terminal 时 final flush。
+整个过程复用当前 session，不调用 Discord create-thread API，也不创建 durable rolling task
+message。用户通过 `/tasks` 显式查询或控制 worker。
 
 App Scheduler 先为 `(schedule_id, planned_key)` 原子 claim lease/fence，再进入 dispatching。
 message kind 先验证 immutable target session；`ACTIVE + attachment ABSENT` 先 normal resume，
@@ -2122,8 +2226,8 @@ desired=autopilot 自动重跑旧 prompt，也不能在 unknown 时自动重复 
 | Model API rate limit | 遵循 retry-after；不切换 app fallback model；选择 `Auto` 时由 Copilot 自己路由 |
 | Tool failure | 交回 Agent；不重试非幂等 tool |
 | MCP disconnect | 结果未知不重试；下次 call 前 reconnect |
-| Discord 429 | retry-after + renderer coalescing |
-| Discord 5xx | 最多 3 次；失败持久化 render，不重跑 turn |
+| Discord 429 | discord.py 按 retry-after 显式 retry；每次 retry 仍经过 mandatory trace cooldown/admission；aiohttp transparent retry 已禁用；renderer 只 coalesce logical updates |
+| Discord 5xx | discord.py 内部有界 retry；logical coordinator 不重调 callback；最终失败持久化 render，不重跑 turn |
 | DB busy | busy timeout + 短事务；事务内不等待 Discord/SDK |
 | Compact/fork/fleet | 不通用自动重试；先做 version/capability 判断 |
 | Quota exhausted | 显示真实 account quota/rate error；不提供本地 limits 设置 |
@@ -2256,13 +2360,12 @@ frame-too-large、MCP、tool、Discord、storage 和 internal bug。rate limit �
 - RenderOutbox 幂等、Discord message hash、429 retry-after、trailing/final flush。
 - quiet gap 后 Discord thread auto-archive 的 late background render 会原位 unarchive；locked/
   deleted thread 阻塞 outbox 但不停止 SessionRuntime，且 thread count 不增加。
-- TaskDeck 的 task/agent correlation、single-message projection、8-card/25-option pagination、
-  collapsed/expanded revision、stale component refresh、orphan isolation、terminal refold 和
-  oversized detail attachment、bot restart 后 dynamic component routing 与 wrong-message token
-  rejection；所有 background worker case 断言 create-thread 调用为零。
+- task/agent correlation、disappearance-to-unknown、terminal monotonicity、orphan isolation 和
+  `/tasks` typed control；所有 background worker case 断言零 rolling message/component 且
+  create-thread 调用为零。
 - Markdown block assembler 的 paragraph/list/fence/blockquote/table 边界；TableRenderer 的
   CJK/emoji/wrap/alignment/pagination/PNG fallback/MD/CSV snapshot；tool output 7999/8000
-  boundary、spill 与 `.txt` verbatim attachment。
+  boundary、volatile-content capacity failure 保留旧 entry 与 Discord 零自动附件。
 - busy message attachment manifest 的 preparing/ready/restart/resubmit 引用、source message
   refetch、send 前完整性 hash，以及 queue/submission/outbox 全部释放前禁止 cleanup。
 - direct handler 的 app interaction ID、wire request/completed ID、response-plane 分离、
@@ -2281,7 +2384,7 @@ Autopilot multi-turn、ephemeral query no-history、image/file、abort + idle(ab
 continue_pending_work fixture、`set_model` typed options、compact、session-limit auto-cancel、
 quota error、subagent success/failure、background change -> refresh/list snapshot、queue change ->
 pending-items/activity snapshot、fresh/resumed processing state、Autopilot continuation marker、
-task promote/message/cancel/remove、TaskDeck fold/unfold/pagination/no-child-thread、
+task promote/message/cancel/remove/no-child-thread/no-automatic-panel、
 commands list/invoke union、
 review/security-review/research/rubber-duck builtin、native schedule create under
 `manage_schedule_enabled=false`、empty message + later message、MCP OAuth、runtime crash、
@@ -2335,8 +2438,8 @@ claudeD issue 回归门禁：
 4. `background_tasks_changed` 触发 refresh/list；task snapshot、typed notification、agent event
    和 metadata activity 按 IDs/状态形成 evidence；activity=false 不单独标成功，无 terminal 时
    UNKNOWN，不把 task disappearance 伪装成功。
-   Fleet/subagent/background shell 全程只更新原 thread 的一张 collapsed TaskDeck；展开/折叠为
-   同一 message 原位 edit，orphan agent 不泄到 main text，Discord thread count 不变。
+   Fleet/subagent/background shell 全程只更新 state-only lifecycle evidence；不产生 rolling
+   Discord message/component，orphan agent 不泄到 main text，Discord thread count 不变。
 5. macOS fresh account 的 `copilotd setup` 按 topology 安装 sidecar 的
    runtime/bot/watchdog 或 bundled 的 bot/watchdog LaunchAgent 并立即启动；
    重启、登录、sleep/wake 后均恢复，effective interval 与磁盘 plist 一致。
@@ -2410,12 +2513,13 @@ claudeD issue 回归门禁：
   `action=exit` 回 interactive；mode transition 本身不携带 prompt，不提供本地 Autopilot limit。
 - `/session resume` 在 thread 内默认使用该 thread 持久化的原 session ID，不显示 picker。
 - fork 和 `/project worktree create` 创建新 Discord thread。
-- subagent、Fleet worker、background agent/shell/task 永不创建 thread；只在当前 thread 的
-  TaskDeck 折叠卡片展示。
+- subagent、Fleet worker、background agent/shell/task 永不创建 thread 或自动任务面板；
+  只由 `/tasks` 显式展示。
 - project cwd/variables 使用 versioned immutable snapshot；修改只影响未来 session。
 - 表格流式阶段 hold；small -> code block，medium -> PNG + MD，large -> preview + MD/CSV。
-- TaskDeck 默认折叠、4 秒 cadence；select + Expand/Collapse 原位编辑同一 message，所有
-  terminal 点执行 final flush，超长 detail 附件化。
+- 普通 top-level tool activity 为一张动态 tool-name 卡片，同 submission 原位 edit；只显示
+  脱敏 name/command/state，不自动附加 output/result/diff。task/subagent/background 无自动
+  Discord render；本地 stream cadence defer 不计入 Discord transient delivery attempt。
 - app scheduler 只接收 RFC3339/cron + timezone；runtime `/after`/`/every` 使用独立 registry。
 - raw reasoning 默认不流式展示。
 - Native-Gated specific RPC/builtin invocation fixture 缺失时不注册对应 Discord command；
@@ -2438,8 +2542,11 @@ claudeD issue 回归门禁：
   `5s/30s/2m/10m/30m`。当前 claimed run 全局串行 dispatch；这是保守实现边界，慢 target
   可能延迟其他 due run，后续并发化必须同时证明 claim lease renewal、adapter reentrancy 与
   crash recovery，不能仅用无界 `gather()`。
-- eager resume 遇到旧 owner lease 时按 `1s/2s/5s/10s/15s/15s/15s` 有界重试覆盖
-  60 秒 lease window；shutdown 显式取消 retry task。
+- protected-session startup recovery 在 Gateway 启动后按持久 cursor 分页，默认最多 4 个并发 attach；
+  每个 thread 的 startup、foreground 和 scheduler attach 共用同一 transition。owner conflict retry
+  按配置 TTL 的 `1/12, 1/6, 1/4, 1/3` 分段并保证至少一次跨过实际 lease expiry；shutdown 显式取消
+  retry/transition task。event-log 每批最多 20 页但会在同一 attach deadline 内继续下一批，只有
+  `has_more=false` 才允许 runtime 进入 READY。
 - runtime command manifest 只请求 builtin，固定
   `include_client_commands=false/include_skills=false`；skills 供 Agent 使用，不镜像为 Discord
   commands。model options 只接受当前可确认 vocabulary：context tier
@@ -2448,7 +2555,7 @@ claudeD issue 回归门禁：
   foreground 与 managed service 互斥，任意 HOME/XDG/LOCALAPPDATA 或 data/cache/log override 都不能绕过。doctor、
   sdk-probe、native acceptance 不获取该锁；直接构造 bot 的 Discord E2E harness 也不受影响。
 
-### 当前实现快照（2026-08-07）
+### 当前实现快照（2026-09-02）
 
 repository implementation 已按本设计完成对齐，credentialed Bridge 全矩阵与真实 Discord
 gallery 均已完成；剩余工作是 macOS/Windows 实机与长时稳定性验收，不再以 mock/fixture
@@ -2457,12 +2564,12 @@ gallery 均已完成；剩余工作是 macOS/Windows 实机与长时稳定性验
 | 已实现 | 当前边界 |
 |---|---|
 | 官方 `github-copilot-sdk==1.0.8` + bundled runtime 1.0.73，stdio `--yolo`，create/resume 后 full allow-all 对账；client 默认 `enable_remote_sessions=false`，create/resume 显式 `RemoteSessionMode.OFF`，attach 再确认 disable；空 session 在首次 activity 前不会出现在 metadata/list，首次 prompt 后可 resume | sidecar client transport 断开后 session retention 实测失败，因此不声明 detached continuation；crash window 保守标 outcome unknown |
-| 45 个唯一版本 SQLite migration：Foundation `0001`–`0009`、Native RPC `0010`–`0014`、Protocol `0015`–`0019`、Scheduler `0020`–`0028`、Protocol compatibility `0029`、Discord surface `0030`–`0037`、保留 `0038`–`0039`、Operations `0040`–`0044`、session deletion `0045`、attachment lifecycle `0046`、background liveness compatibility `0047`；project `$HOME` fallback/cwd snapshot、owner fence、creation saga、strict-UUID event journal、reducer-owned operation/submission/native-command receipts、submission-task links、liveness leases、startup recovery inventory 与 eager resume；attach 时按 current state 结算 pending agent、强制 uncertain remote off；force restart 使用 producer/journal dual epoch、loss watermark admission fence 与 owner handoff | bundled runtime 进程死亡后的 in-flight execution 仍只能标 outcome unknown |
+| 49 个唯一版本 SQLite migration：Foundation `0001`–`0009`、Native RPC `0010`–`0014`、Protocol `0015`–`0019`、Scheduler `0020`–`0028`、Protocol compatibility `0029`、Discord surface `0030`–`0037`、保留 `0038`–`0039`、Operations `0040`–`0044`、session deletion `0045`、attachment lifecycle `0046`、background liveness compatibility `0047`、reaction delivery `0048`、legacy turn state `0049`、Discord queue provenance `0050`、per-message/tool-card rendering `0051`；已知旧本地 48–50 migration identity 可严格验证后原位归一化并保留数据；project `$HOME` fallback/cwd snapshot、owner fence、creation saga、strict-UUID event journal、reducer-owned operation/submission/native-command receipts、submission-task links、liveness leases、startup recovery inventory 与 bounded protected recovery；attach 时按 current state 结算 pending agent、强制 uncertain remote off；force restart 使用 producer/journal dual epoch、loss watermark admission fence 与 owner handoff | bundled runtime 进程死亡后的 in-flight execution 仍只能标 outcome unknown |
 | eventLog `read/tail` durable backfill（固定过滤 ephemeral）、cursor epoch/rebase/predecessor-gap diagnostics、overflow freeze/backfill/generation replacement；activity/queue/task/remote/schedule snapshot requested/applied epoch 与 query watermark；crossing command/agent snapshot 禁止 merge 并强制 requery | ephemeral idle/delta 离开 live window 后不可恢复，不从 transcript 猜 terminal；compaction 无 completion evidence 时保持 unknown 并阻塞普通 submission |
 | durable app FIFO；fresh readiness snapshot、reducer caught-up、config/agent/remote/schedule/task known gate 后只派发队首；`session.idle` 会把没有对应 `user.message` 的已接受提交保守结算为 `outcome_unknown` 并释放队首，避免 accepted/event ID 契约漂移永久堵塞 FIFO；attachment manifest READY + hash/size 复验，无 attachment-free fallback；`/queue add/list/remove/clear`；project variables 只解析到 typed MCP/environment reference，不作为任意 process environment 注入 | native queue entry 没有 stable opaque ID 时只以 snapshot-local opaque key 诊断；transport ambiguity 不自动重放 |
 | Discord core 命令；strict dynamic builtin manifest；Native-Gated `/ask`、`/session compact`、`/fleet`、`/tasks`（含真实 promote）、`/agent list`、`/agent current`、`/after list`、`/after cancel`、`/every list`、`/every cancel`、`/remote status`、`/remote off`、`/review`、`/security-review`、`/research`、`/rubber-duck`；thread-first `/session delete session-id?`；JSON-Schema elicitation 与 MCP OAuth typed/exactly-once response plane；全部 action 由 exact capability 决定 | current-runtime fork 仍 capability-gated 且不注册；`/after create` 与 `/every create` 因 real invoke 返回 `text` 而非 required `completed` 不注册；agent select/deselect、remote on/export 的 real gate 未通过 |
-| durable input attachment manifest、hash/size 复验、图片 blob 压缩；中断的 `preparing` 可按 Discord channel/message locator 重启恢复，ready orphan 幂等重提，引用释放后默认保留 7 天再 GC；stream/final RenderOutbox；table hold 与 code/PNG/MD/CSV assets；Discord HTTP/rate-limit 错误分类，超上限 artifact 按序无损分片；全部 destination/multi-batch 共用 durable nonce/checkpoint；prepared intent 可安全跨 renderer 升级恢复，sent mismatch fail closed，旧 delivered-without-intent 可回填；真实 gallery 已验证三个 outbox intent、附件上传及主 CDN 逐字节回读 | Discord archived/locked thread、attachment edit、exact 429 retry-after 仍需真实 gateway fixture；Discord cached-media 代理在当前网络不可达，不影响主 CDN 原件 |
-| assistant stream/final 使用普通 Discord message content；usage snapshot 不单独发送，turn summary 合并为 ClaudeD 风格 `-#` compact footer。reasoning、status/warning/error、interaction、diff、tool artifact 保留 typed rich embed；单消息最多 10 embeds/6000 字符；pending/resolved/expired、task completed/continue/blocked、hunk-aware diff stats、oversized omitted/unknown、legacy artifact unknown/failed 语义均有确定颜色和字段；图片/table 使用消息内唯一 `attachment://` 名称。tool/subagent/agent-scoped output 仍归并为原 thread 的单条 embed-backed TaskDeck；每页最多 8 张 embed，4 秒 cadence、pending coalescing、terminal flush、select/expand/collapse/prev/next，embed/asset hash 与 crash recovery 保持原位 edit；terminal-first tool event 会恢复既有标题或生成稳定默认标题，Discord select 对空 label/description 有合法回退；structured tool diff 与 local workspace diff artifact lane；typed task list/show/progress/message/promote/cancel-all/remove/wait 与 Fleet projection；>=8000 字符 tool result/error 逐字附件化；零 child-thread 路径 | Discord 上的 diff 附件/图片 delivery 仍受 upload limit 与 archived/locked thread 约束；81 项 slash/component 操作保留给人工 driver review |
+| durable input attachment manifest 只含 source ID/hash/size/state/path；图片 blob 压缩；中断的 `preparing` 按 Discord channel/message locator 取回 source；per-message stream/final 使用 volatile content + metadata-only RenderOutbox；table hold 与 code/PNG/MD/CSV live assets；Discord HTTP/rate-limit 错误分类；multi-batch 只持久化 ID/hash/checkpoint | live partial render 不能跨进程恢复，除非 SDK 重发；Discord archived/locked thread、attachment edit、exact 429 retry-after 仍需真实 gateway fixture |
+| 每个 assistant `message_id` 使用独立普通 Discord text family；delta 立即更新，长于 1850 字符时所有 batch 累积原位更新，空/短 final 不得清空或截短已累计 delta，同 turn 多条 assistant message 互不覆盖。internal intent/reasoning 不发卡；usage snapshot 不单独发送，turn summary 使用 compact footer。每个 submission segment 的 top-level `tool.execution_*` 只原位更新一张独立 tool embed，显示当前 tool name 与脱敏 command；顺序工具可重新打开同一卡片，重叠工具直到 active_count=0 才 final；nested subagent tools 不计入 parent，raw arguments/stdout/result/diff 使用后丢弃。reaction 按 accepted/reasoning/action/waiting/success/failure 持久演进，错误 status 与 reaction 一致 | live partial content 只在 bounded volatile store；进程崩溃后仅 SDK 重发可恢复。用户明确需要的最终附件、图片和 table 仍受 Discord upload limit 与 archived/locked thread 约束 |
 | durable `DELETING → DELETE_UNKNOWN/DELETED` permanent-delete saga；stable SDK `delete_session(session_id)` + metadata not-found reconcile；non-deleted app schedule reference fail-closed；active target force teardown、15 秒 bounded native task/schedule/queue/remote cleanup、unprovable result unknown；confirmed delete 后才清 attachment/worktree metadata；abort 等 correlated abort + aborted-idle；unexpected `session.shutdown` terminalizes current handle and enters recovery | SDK response loss 仍需显式 retry，同一 mapping/session ID 保留；缺失 native capability 明确记录 unknown；只有 explicit close 可完成 CLOSED |
 | 共享 TaskRegistry、failure consumer、app scheduler fatal-loop supervision、10 分钟 active-execution SUSPECT + non-destructive ping、结构化 heartbeat、完整 setup preflight、fresh PID/generation/current-fence status、bounded restart saga、restart-storm alert、10 MiB × 7 JSON log、macOS LaunchAgent 与 Windows Scheduled Task 的 bundled 2-unit / sidecar 3-unit install/status/uninstall/effective-definition contract；owned Git 在 POSIX 使用 inherited `flock`，Windows 使用 `msvcrt` byte lock、独立进程组与 `taskkill /T /F` | 默认 bundled runtime 没有独立 runtime service；sidecar 三组件需要显式 runtime argv/URI/connection token；真实 credentialed install、sleep/wake、macOS soak 与 Windows 实机未在 deterministic suite 中验证 |
 
@@ -2471,12 +2578,12 @@ core send/abort/disconnect/history、transport、Native、protocol/extension 与
 调用全部走 typed wrapper。67 个 public operation 均在 `BRIDGE_ACCEPTANCE_LANES` 中分档，
 新增未分类 operation 会令 deterministic gate 失败。
 
-当前 deterministic 验证基线为 831 个 pytest case、`ruff check .`、`ruff format --check .`、
+当前 deterministic 验证基线为 885 个 pytest case、`ruff check .`、`ruff format --check .`、
 `compileall`、ops/design audit、CLI JSON/error contract、service definition/effective-state
 simulations，以及 wheel/sdist 的 isolated build/install；全量 pytest 还把
 `PytestUnhandledThreadExceptionWarning` 升级为 error，已修复 failure-path tests 遗留的
 aiosqlite worker。`copilotd doctor` 已真实启动 bundled runtime并确认 SDK 1.0.8 /
-runtime 1.0.73 / protocol 3、authentication 与 migration 47。
+runtime 1.0.73 / protocol 3、authentication 与 migration 50。
 
 真实 Copilot phase-2 evidence 使用同一 pinned identity，均为 disposable workspace/session 且
 cleanup 已确认：
@@ -2560,8 +2667,9 @@ unsupported/unprobed action 保存真实 discovery/gate，不由 deterministic f
 
 - 建立内部事件模型和 Copilot event adapter。
 - 实现 submission/model-turn reducer、background evidence/UNKNOWN 与 liveness leases。
-- 渲染 reasoning、tool、diff、subagent、可折叠 TaskDeck、compaction 和 usage；后台 worker
-  不创建 Discord thread。
+- journal 只保留 reasoning receipt/hash 且 Discord 不渲染；仅渲染 compact top-level tool
+  status、compaction 和 usage；subagent/background worker 只写 lifecycle evidence，不创建
+  Discord thread 或 rolling UI。
 - 实现 block-aware splitter、表格 hold/code/PNG/MD/CSV、rate limit 和 final flush。
 - 把 user-input/plan 映射为 Discord buttons/select/modal；SDK 工具确认事件直接批准。
 - 支持异步图片/file、本地 Markdown image 抽取、10 附件分批和 frame-size fallback。
@@ -2593,9 +2701,9 @@ unsupported/unprobed action 保存真实 discovery/gate，不由 deterministic f
 1. [完成] 运行完整 Ruff/pytest/compile/ops/design deterministic gate。
 2. [完成] 对真实 Copilot 逐项执行 Bridge broad/Native/protocol/scheduler-worktree 功能矩阵和
    负能力门禁，保存脱敏 evidence；未执行或未观测结果继续标 unsupported/unprobed。
-3. [完成] 向真实 Discord 发送 text/stream/reasoning/tool/diff/table/image/file/interaction/
-   TaskDeck/error/usage 等完整 gallery；94 项自动证据通过，消息现场与稳定 Discord ID 已保留供
-   人工 review，81 项 slash/component 操作明确标为 `pending_human_driver`。
+3. [完成] 向真实 Discord 发送 text/stream/tool-status/table/image/explicit-file/interaction/
+   error/usage gallery；自动 diff/tool-output/task-panel 被断言不存在，消息现场与稳定 Discord ID
+   已保留供人工 review。
 4. 实机验证 macOS LaunchAgent 与 Windows Scheduled Task 的 install/login/sleep/wake/crash/
    restart-storm；完成 90 分钟 liveness soak 与平台字体/时区检查。
 5. 将通过上述 gate 的提交集中到默认 `master`；不得把未通过的真实能力提升为 supported。

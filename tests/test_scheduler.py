@@ -1,5 +1,9 @@
 import asyncio
+import hashlib
+import json
+from dataclasses import replace
 from pathlib import Path
+from uuid import NAMESPACE_URL, uuid5
 
 import pytest
 
@@ -17,8 +21,13 @@ from copilotd.core.scheduler import (
     ScheduleRun,
     ScheduleRunState,
     SchedulerWorker,
+    ScheduleState,
 )
 from copilotd.core.task_registry import TaskRegistry
+from copilotd.core.volatile_content import (
+    VolatileContentStore,
+    opaque_content_key,
+)
 from copilotd.ops.heartbeat import HeartbeatWriter
 from copilotd.storage.database import Database
 
@@ -79,6 +88,337 @@ def _target(thread_id: str = "thread-1", session_id: str = "session-1") -> dict:
             "session_config_version": 1,
         },
     }
+
+
+async def _create_source_queued_run(
+    database: Database,
+    repository: SchedulerRepository,
+    *,
+    prompt: str = "durable source prompt",
+) -> tuple[ScheduleDefinition, ScheduleRun]:
+    await _insert_binding(database)
+    definition = await repository.create(
+        kind=ScheduleKind.MESSAGE,
+        expression="at:2030-01-01T00:00:00Z",
+        timezone="UTC",
+        payload={"text": prompt},
+        target_snapshot=_target(),
+        thread_id="thread-1",
+        source_channel_id="source-channel",
+        source_message_id="source-message",
+        now=1,
+    )
+    run = await repository.run_now(definition.id, now=2, manual_id="source-queued")
+    prompt_hash = hashlib.sha256(prompt.encode()).hexdigest()
+    await database.execute(
+        """
+        INSERT INTO submissions(
+            submission_id, sdk_session_id, origin, schedule_run_id,
+            prompt_hash, requested_mode, requested_model_config,
+            requested_agent, requested_session_config_version,
+            requested_delivery, attachment_count, state, created_at,
+            discord_source_channel_id, discord_source_message_id
+        ) VALUES ('source-queued', 'session-1', 'app_schedule', ?, ?,
+                  'interactive', '{}', 'default', 1, 'enqueue', 0,
+                  'local_queued', 2, 'source-channel', 'source-message')
+        """,
+        (run.run_id, prompt_hash),
+    )
+    await database.execute(
+        """
+        INSERT INTO message_queue(
+            id, thread_id, schedule_run_id, prompt, prompt_content_key,
+            prompt_hash, requested_mode_snapshot,
+            requested_model_config_snapshot, requested_agent_snapshot,
+            requested_session_config_version, position, state,
+            created_at, updated_at
+        ) VALUES ('source-queued', 'thread-1', ?, '', 'vc:missing', ?,
+                  'interactive', '{}', 'default', 1, 1, 'local_queued', 2, 2)
+        """,
+        (run.run_id, prompt_hash),
+    )
+    await database.execute(
+        """
+        INSERT INTO submission_reactions(
+            submission_id, sdk_session_id, source_channel_id, source_message_id,
+            desired_state, revision, runtime_generation, owner_fence_token,
+            created_at, updated_at
+        ) VALUES ('source-queued', 'session-1', 'source-channel', 'source-message',
+                  'accepted', 1, 1, 1, 2, 2)
+        """
+    )
+    await database.execute(
+        """
+        UPDATE schedule_runs
+        SET status = 'submitting', attempt = 1,
+            result_submission_id = 'source-queued',
+            result_thread_id = 'thread-1', result_session_id = 'session-1'
+        WHERE run_id = ?
+        """,
+        (run.run_id,),
+    )
+    return definition, await repository.get_run(run.run_id)
+
+
+@pytest.mark.asyncio
+async def test_deleted_source_terminalizes_queued_submission(tmp_path: Path) -> None:
+    class DeletedSourceError(RuntimeError):
+        status = 404
+
+    async def deleted(_channel_id: str, _message_id: str) -> str:
+        raise DeletedSourceError("source message deleted")
+
+    async with Database(tmp_path / "deleted-source.sqlite3") as database:
+        repository = SchedulerRepository(database, prompt_resolver=deleted)
+        await repository.recover(now=0)
+        _, run = await _create_source_queued_run(database, repository)
+
+        assert await repository.rehydrate_source_backed_queues(now=10) == 0
+        recovered = await repository.get_run(run.run_id)
+        queue = await database.fetchone(
+            "SELECT state FROM message_queue WHERE id = 'source-queued'"
+        )
+        submission = await database.fetchone(
+            """
+            SELECT state, completion_basis FROM submissions
+            WHERE submission_id = 'source-queued'
+            """
+        )
+        reaction = await database.fetchone(
+            """
+            SELECT desired_state, resume_state, terminal, last_error
+            FROM submission_reactions WHERE submission_id = 'source-queued'
+            """
+        )
+
+    assert recovered.status == ScheduleRunState.FAILED
+    assert recovered.error_code == "source_deleted"
+    assert queue["state"] == "content_unavailable"
+    assert dict(submission) == {
+        "state": "rejected",
+        "completion_basis": "content_unavailable",
+    }
+    assert dict(reaction) == {
+        "desired_state": "failed",
+        "resume_state": "content_unavailable",
+        "terminal": 1,
+        "last_error": "content_unavailable",
+    }
+
+
+@pytest.mark.asyncio
+async def test_source_hash_mismatch_blocks_queued_submission(tmp_path: Path) -> None:
+    async def changed(_channel_id: str, _message_id: str) -> str:
+        return "edited source prompt"
+
+    async with Database(tmp_path / "source-hash-mismatch.sqlite3") as database:
+        repository = SchedulerRepository(database, prompt_resolver=changed)
+        await repository.recover(now=0)
+        _, run = await _create_source_queued_run(database, repository)
+
+        await repository.rehydrate_source_backed_queues(now=10)
+        recovered = await repository.get_run(run.run_id)
+        queue = await database.fetchone(
+            "SELECT state FROM message_queue WHERE id = 'source-queued'"
+        )
+        reaction = await database.fetchone(
+            """
+            SELECT desired_state, resume_state, last_error
+            FROM submission_reactions WHERE submission_id = 'source-queued'
+            """
+        )
+
+    assert recovered.status == ScheduleRunState.BLOCKED
+    assert recovered.error_code == "source_hash_mismatch"
+    assert queue["state"] == "content_unavailable"
+    assert dict(reaction) == {
+        "desired_state": "failed",
+        "resume_state": "content_unavailable",
+        "last_error": "content_unavailable",
+    }
+
+
+@pytest.mark.asyncio
+async def test_transient_source_rehydration_uses_durable_backoff(
+    tmp_path: Path,
+) -> None:
+    calls = 0
+
+    async def transient_then_ready(_channel_id: str, _message_id: str) -> str:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise OSError("temporary Discord fetch failure")
+        return "durable source prompt"
+
+    async with Database(tmp_path / "source-retry.sqlite3") as database:
+        repository = SchedulerRepository(database, prompt_resolver=transient_then_ready)
+        await repository.recover(now=0)
+        definition, run = await _create_source_queued_run(database, repository)
+        adapter = DeterministicSchedulerAdapter(
+            {definition.id: ScheduledTarget(None, "thread-1", "session-1")}
+        )
+        clock = FakeClock(10)
+        worker = SchedulerWorker(repository, adapter, owner_id="worker", clock=clock)
+
+        await repository.rehydrate_source_backed_queues(now=clock.now())
+        retrying = await repository.get_run(run.run_id)
+        assert retrying.status == ScheduleRunState.RETRY_WAIT
+        assert retrying.retry_at == 15
+        assert retrying.error_code == "source_content_unavailable"
+
+        clock.value = 14
+        assert await worker.tick() == 0
+        assert calls == 1
+        clock.value = 15
+        assert await worker.tick() == 1
+        recovered = await repository.get_run(run.run_id)
+
+    assert calls == 2
+    assert recovered.status == ScheduleRunState.SUBMITTING
+    assert recovered.attempt == 2
+    assert adapter.queue_notifications == [("thread-1", run.run_id)]
+
+
+@pytest.mark.asyncio
+async def test_transient_source_rehydration_exhausts_bounded_retries(
+    tmp_path: Path,
+) -> None:
+    calls = 0
+
+    async def unavailable(_channel_id: str, _message_id: str) -> str:
+        nonlocal calls
+        calls += 1
+        raise OSError("Discord source fetch remains unavailable")
+
+    async with Database(tmp_path / "source-retry-exhausted.sqlite3") as database:
+        repository = SchedulerRepository(database, prompt_resolver=unavailable)
+        await repository.recover(now=0)
+        definition, run = await _create_source_queued_run(database, repository)
+        clock = FakeClock(10)
+        worker = SchedulerWorker(
+            repository,
+            DeterministicSchedulerAdapter(
+                {definition.id: ScheduledTarget(None, "thread-1", "session-1")}
+            ),
+            owner_id="worker",
+            clock=clock,
+        )
+
+        await repository.rehydrate_source_backed_queues(now=10)
+        expected_retry_times = [15, 45, 165, 765, 2_565]
+        for retry_at in expected_retry_times:
+            retrying = await repository.get_run(run.run_id)
+            assert retrying.status == ScheduleRunState.RETRY_WAIT
+            assert retrying.retry_at == retry_at
+            clock.value = retry_at
+            await worker.tick()
+
+        failed = await repository.get_run(run.run_id)
+        queue = await database.fetchone(
+            "SELECT state FROM message_queue WHERE id = 'source-queued'"
+        )
+        submission = await database.fetchone(
+            """
+            SELECT state, completion_basis FROM submissions
+            WHERE submission_id = 'source-queued'
+            """
+        )
+
+    assert calls == 6
+    assert failed.status == ScheduleRunState.FAILED
+    assert failed.attempt == 6
+    assert failed.error_code == "source_content_unavailable"
+    assert queue["state"] == "content_unavailable"
+    assert dict(submission) == {
+        "state": "rejected",
+        "completion_basis": "content_unavailable",
+    }
+
+
+@pytest.mark.asyncio
+async def test_source_queue_waits_for_stale_scheduler_fence_before_redrive(
+    tmp_path: Path,
+) -> None:
+    calls = 0
+
+    async def resolve(_channel_id: str, _message_id: str) -> str:
+        nonlocal calls
+        calls += 1
+        return "durable source prompt"
+
+    async with Database(tmp_path / "source-stale-fence.sqlite3") as database:
+        repository = SchedulerRepository(database, prompt_resolver=resolve)
+        await repository.recover(now=0)
+        definition, run = await _create_source_queued_run(database, repository)
+        await database.execute(
+            """
+            UPDATE schedule_runs
+            SET status = 'claimed', target_started_at = 2,
+                lease_owner = 'stale-worker', lease_expires_at = 20,
+                fence_token = 7
+            WHERE run_id = ?
+            """,
+            (run.run_id,),
+        )
+        adapter = DeterministicSchedulerAdapter(
+            {definition.id: ScheduledTarget(None, "thread-1", "session-1")}
+        )
+        clock = FakeClock(10)
+        worker = SchedulerWorker(repository, adapter, owner_id="new-worker", clock=clock)
+
+        assert await worker.tick() == 0
+        assert calls == 0
+        owned = await repository.get_run(run.run_id)
+        assert owned.lease_owner == "stale-worker"
+
+        clock.value = 20
+        assert await worker.tick() == 0
+        recovered = await repository.get_run(run.run_id)
+
+    assert calls == 1
+    assert recovered.status == ScheduleRunState.SUBMITTING
+    assert recovered.lease_owner is None
+    assert recovered.fence_token == 7
+    assert adapter.queue_notifications == [("thread-1", run.run_id)]
+
+
+@pytest.mark.asyncio
+async def test_schedule_delete_reclaims_volatile_prompt(tmp_path: Path) -> None:
+    async with Database(tmp_path / "schedule-prompt-cleanup.sqlite3") as database:
+        repository = SchedulerRepository(database)
+        definition = await repository.create(
+            kind=ScheduleKind.MESSAGE,
+            expression="at:2030-01-01T00:00:00Z",
+            timezone="UTC",
+            payload={"text": "temporary schedule prompt"},
+            target_snapshot=_target(),
+            now=1,
+        )
+        key = opaque_content_key("schedule-prompt", definition.id)
+        assert database.content_store.require(key) == "temporary schedule prompt"
+
+        await repository.delete(definition.id, now=2)
+
+        assert database.content_store.get(key) is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("thread_name", ["x" * 101, "line\nbreak", " padded "])
+async def test_scheduled_thread_name_is_strictly_bounded(
+    tmp_path: Path,
+    thread_name: str,
+) -> None:
+    async with Database(tmp_path / "invalid-schedule-thread-name.sqlite3") as database:
+        with pytest.raises(ScheduleConflict, match="1-100 trimmed"):
+            await SchedulerRepository(database).create(
+                kind=ScheduleKind.NEW_SESSION,
+                expression="at:2030-01-01T00:00:00Z",
+                timezone="UTC",
+                payload={"text": "prompt", "thread_name": thread_name},
+                target_snapshot={},
+                now=1,
+            )
 
 
 @pytest.mark.asyncio
@@ -1082,7 +1422,7 @@ async def test_recovery_classifies_every_dispatch_boundary_without_reenqueue(
                 requested_mode_snapshot, requested_model_config_snapshot,
                 requested_agent_snapshot, requested_session_config_version,
                 position, state, created_at, updated_at
-            ) VALUES ('queued-submission', 'thread-1', ?, 'scheduled',
+            ) VALUES ('queued-submission', 'thread-1', ?, '',
                       'interactive', '{}', 'default', 1, 1, 'local_queued', 1, 1)
             """,
             (queued.run_id,),
@@ -1484,3 +1824,168 @@ async def test_close_race_before_enqueue_retries_without_stranding_queue(
 
     assert state == ScheduleRunState.RETRY_WAIT
     assert queued[0] == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure_mode", ["draining", "lost_fence"])
+async def test_enqueue_failure_reclaims_prompt_under_tiny_capacity(
+    tmp_path: Path,
+    failure_mode: str,
+) -> None:
+    store = VolatileContentStore(max_items=2, max_bytes=4096)
+    async with Database(tmp_path / f"enqueue-{failure_mode}.sqlite3") as database:
+        database.content_store = store
+        await _insert_binding(database)
+        repository = SchedulerRepository(database)
+        await repository.recover(now=0)
+        definition = await repository.create(
+            kind=ScheduleKind.MESSAGE,
+            expression="at:1970-01-01T00:01:00Z",
+            timezone="UTC",
+            payload={"text": "scheduled prompt"},
+            target_snapshot=_target(),
+            thread_id="thread-1",
+            now=0,
+        )
+        await repository.plan_due("planner", now=60)
+        claimed = await repository.claim_next("worker", now=60)
+        assert claimed is not None
+        started = await repository.mark_target_started(
+            claimed,
+            "worker",
+            new_session=False,
+            now=60,
+        )
+        target = ScheduledTarget(None, "thread-1", "session-1")
+        started = await repository.record_target(
+            started,
+            "worker",
+            target,
+            now=60,
+        )
+        attempted_run = started
+        expected_error = "fence was lost"
+        if failure_mode == "draining":
+            expected_error = "scheduler is draining"
+            await database.execute(
+                """
+                UPDATE scheduler_state
+                SET worker_state = 'draining'
+                WHERE singleton = 1
+                """
+            )
+        else:
+            attempted_run = replace(started, fence_token=started.fence_token + 1)
+        prompt_key = opaque_content_key(
+            "submission-prompt",
+            target.sdk_session_id,
+            str(
+                uuid5(
+                    NAMESPACE_URL,
+                    f"copilotd:schedule-run:{started.run_id}:submission",
+                )
+            ),
+        )
+
+        for _ in range(16):
+            with pytest.raises(ScheduleConflict, match=expected_error):
+                await repository.enqueue(
+                    definition,
+                    attempted_run,
+                    "worker",
+                    target,
+                    now=61,
+                )
+            assert store.get(prompt_key) is None
+            assert store.item_count == 1
+        queue = await database.fetchone(
+            "SELECT COUNT(*) FROM message_queue WHERE schedule_run_id = ?",
+            (started.run_id,),
+        )
+
+    assert queue[0] == 0
+
+
+@pytest.mark.asyncio
+async def test_new_session_schedule_restart_keeps_target_and_refetches_prompt(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "new-session-source-restart.sqlite3"
+    target = {
+        "project": {
+            "project_id": "project-1",
+            "channel_id": "channel-1",
+            "source": "explicit",
+            "root_path": str(tmp_path),
+            "cwd": str(tmp_path),
+            "config_version": 7,
+            "timezone": "UTC",
+        },
+        "project_config": {
+            "project_id": "project-1",
+            "source": "explicit",
+            "cwd": str(tmp_path),
+            "timezone": "UTC",
+            "config_version": 7,
+            "variables": [{"name": "MODE", "value": "configured"}],
+            "mcp_servers": [],
+            "skill_dirs": [],
+            "plugin_dirs": [],
+            "custom_agents": [
+                {
+                    "name": "configured-agent",
+                    "description": "application configuration",
+                    "prompt": "configured agent instructions",
+                    "tools": ["read"],
+                    "enabled": True,
+                }
+            ],
+        },
+        "execution_config": {
+            "mode": "interactive",
+            "model_config": {"model": "configured-model"},
+            "agent": "configured-agent",
+            "session_config_version": 7,
+        },
+    }
+    database = Database(path)
+    await database.open()
+    definition = await SchedulerRepository(database).create(
+        kind=ScheduleKind.NEW_SESSION,
+        expression="at:2030-01-01T00:00:00Z",
+        timezone="UTC",
+        payload={"text": "volatile scheduled prompt"},
+        target_snapshot=target,
+        channel_id="channel-1",
+        source_channel_id="source-channel",
+        source_message_id="source-message",
+        now=0,
+    )
+    await database.close()
+
+    resolved: list[tuple[str, str]] = []
+
+    async def resolve_prompt(channel_id: str, message_id: str) -> str:
+        resolved.append((channel_id, message_id))
+        return "volatile scheduled prompt"
+
+    database = Database(path)
+    await database.open()
+    repository = SchedulerRepository(database, prompt_resolver=resolve_prompt)
+    await repository.recover(now=1)
+    recovered = await repository.require(definition.id)
+    prompt = await repository._resolve_schedule_prompt(recovered)
+    raw = await database.fetchone(
+        "SELECT payload, target_snapshot, state FROM schedules WHERE id = ?",
+        (definition.id,),
+    )
+    await database.close()
+
+    assert recovered.state == ScheduleState.ENABLED
+    assert recovered.target_snapshot == target
+    assert prompt == "volatile scheduled prompt"
+    assert resolved == [("source-channel", "source-message")]
+    assert raw is not None
+    assert raw["payload"] == "{}"
+    assert json.loads(str(raw["target_snapshot"])) == target
+    assert b"volatile scheduled prompt" not in path.read_bytes()

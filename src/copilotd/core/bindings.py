@@ -163,8 +163,33 @@ class SessionBindingRepository:
         )
         return None if row is None else _row_to_binding(row)
 
-    async def eager_bindings(self) -> list[SessionBinding]:
+    async def eager_bindings(
+        self,
+        *,
+        protected_only: bool = False,
+        limit: int | None = None,
+        after_thread_id: str | None = None,
+        through_thread_id: str | None = None,
+    ) -> list[SessionBinding]:
+        if limit is not None and limit < 1:
+            raise ValueError("eager binding limit must be positive")
         async with self._database.transaction() as connection:
+            await connection.execute(
+                """
+                UPDATE session_bindings
+                SET attachment_state = 'recovery_unknown',
+                    attachment_reason = COALESCE(
+                        attachment_reason,
+                        'unexpected_runtime_shutdown'
+                    ),
+                    permission_posture = 'unknown',
+                    permission_verified_at = NULL,
+                    updated_at = ?, row_version = row_version + 1
+                WHERE binding_intent = 'active'
+                  AND attachment_state = 'terminal'
+                """,
+                (time.time(),),
+            )
             await connection.execute(
                 """
                 UPDATE session_bindings AS binding
@@ -186,8 +211,47 @@ class SessionBindingRepository:
                 """,
                 (time.time(),),
             )
-            cursor = await connection.execute(
+            protected_predicate = (
                 """
+                  AND (
+                      binding.runtime_has_active_work = 1
+                      OR EXISTS (
+                          SELECT 1 FROM liveness_leases AS lease
+                          WHERE lease.sdk_session_id = binding.sdk_session_id
+                            AND lease.runtime_generation = binding.runtime_generation
+                            AND lease.owner_fence_token = binding.owner_fence_token
+                            AND lease.state = 'active'
+                      )
+                      OR EXISTS (
+                          SELECT 1 FROM pending_interactions AS interaction
+                          WHERE interaction.sdk_session_id = binding.sdk_session_id
+                            AND interaction.runtime_generation = binding.runtime_generation
+                            AND interaction.owner_fence_token = binding.owner_fence_token
+                            AND interaction.state = 'pending'
+                      )
+                      OR EXISTS (
+                          SELECT 1 FROM message_queue AS queue
+                          WHERE queue.thread_id = binding.thread_id
+                            AND queue.state = 'local_queued'
+                      )
+                  )
+                """
+                if protected_only
+                else ""
+            )
+            limit_clause = "" if limit is None else " LIMIT ?"
+            cursor_predicate = ""
+            parameters: list[object] = []
+            if after_thread_id is not None:
+                cursor_predicate += " AND binding.thread_id > ?"
+                parameters.append(after_thread_id)
+            if through_thread_id is not None:
+                cursor_predicate += " AND binding.thread_id <= ?"
+                parameters.append(through_thread_id)
+            if limit is not None:
+                parameters.append(limit)
+            cursor = await connection.execute(
+                f"""
                 SELECT * FROM session_bindings AS binding
                 WHERE binding.attachment_state != 'terminal'
                   AND (
@@ -208,12 +272,49 @@ class SessionBindingRepository:
                           )
                       )
                   )
-                ORDER BY binding.created_at, binding.thread_id
-                """
+                  {protected_predicate}
+                  {cursor_predicate}
+                ORDER BY binding.thread_id
+                {limit_clause}
+                """,
+                tuple(parameters),
             )
             rows = list(await cursor.fetchall())
             await cursor.close()
         return [_row_to_binding(row) for row in rows]
+
+    async def protected_recovery_cursor(self) -> str | None:
+        row = await self._database.fetchone(
+            "SELECT value FROM global_config WHERE key = 'protected_recovery_cursor'"
+        )
+        return None if row is None else str(row["value"])
+
+    async def set_protected_recovery_cursor(self, thread_id: str | None) -> None:
+        if thread_id is None:
+            await self._database.execute(
+                "DELETE FROM global_config WHERE key = 'protected_recovery_cursor'"
+            )
+            return
+        await self._database.execute(
+            """
+            INSERT INTO global_config(key, value, updated_at)
+            VALUES ('protected_recovery_cursor', ?, ?)
+            ON CONFLICT(key) DO UPDATE SET
+                value = excluded.value,
+                updated_at = excluded.updated_at
+            """,
+            (thread_id, time.time()),
+        )
+
+    async def owner_lease_expiration(self, sdk_session_id: str) -> float | None:
+        row = await self._database.fetchone(
+            """
+            SELECT expires_at FROM session_owner_leases
+            WHERE sdk_session_id = ?
+            """,
+            (sdk_session_id,),
+        )
+        return None if row is None else float(row["expires_at"])
 
     async def set_attachment_reason(
         self,
@@ -362,6 +463,29 @@ class SessionBindingRepository:
                 """,
                 (timestamp, lease.sdk_session_id, generation, lease.fence_token),
             )
+            await connection.execute(
+                """
+                UPDATE background_observations
+                SET observed_state = 'unknown', last_progress_at = ?
+                WHERE sdk_session_id = ? AND runtime_generation != ?
+                  AND terminal_evidence IS NULL
+                  AND observed_state IN ('running', 'idle')
+                """,
+                (timestamp, lease.sdk_session_id, generation),
+            )
+            await connection.execute(
+                """
+                UPDATE reconciliation_state
+                SET status = 'stale', uncertainty_reason = 'generation_replaced',
+                    observed_at = ?
+                WHERE sdk_session_id = ? AND runtime_generation != ?
+                """,
+                (timestamp, lease.sdk_session_id, generation),
+            )
+            await connection.execute(
+                "DELETE FROM execution_health WHERE sdk_session_id = ?",
+                (lease.sdk_session_id,),
+            )
 
         result = await self.by_thread(thread_id)
         if result is None:
@@ -472,6 +596,29 @@ class SessionBindingRepository:
                   AND runtime_generation != ?
                 """,
                 (timestamp, lease.sdk_session_id, generation),
+            )
+            await connection.execute(
+                """
+                UPDATE background_observations
+                SET observed_state = 'unknown', last_progress_at = ?
+                WHERE sdk_session_id = ? AND runtime_generation != ?
+                  AND terminal_evidence IS NULL
+                  AND observed_state IN ('running', 'idle')
+                """,
+                (timestamp, lease.sdk_session_id, generation),
+            )
+            await connection.execute(
+                """
+                UPDATE reconciliation_state
+                SET status = 'stale', uncertainty_reason = 'generation_replaced',
+                    observed_at = ?
+                WHERE sdk_session_id = ? AND runtime_generation != ?
+                """,
+                (timestamp, lease.sdk_session_id, generation),
+            )
+            await connection.execute(
+                "DELETE FROM execution_health WHERE sdk_session_id = ?",
+                (lease.sdk_session_id,),
             )
         result = await self.by_thread(thread_id)
         if result is None:

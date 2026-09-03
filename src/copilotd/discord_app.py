@@ -51,7 +51,6 @@ from copilotd.core.commands import (
     OpsSurfaceAdapter,
     ScheduleOriginAdapter,
     SessionNamingAdapter,
-    TaskActionAdapter,
     UnknownInteractionError,
     fenced_code_block,
 )
@@ -72,7 +71,12 @@ from copilotd.core.lifecycle_commands import (
 )
 from copilotd.core.projects import ProjectRegistry, ProjectSnapshot, ProjectSource
 from copilotd.core.recovery import RecoveryInventoryReport, StartupRecoveryInventory
-from copilotd.core.scheduler import SchedulerRepository, SchedulerWorker
+from copilotd.core.scheduler import (
+    SchedulerDispatchError,
+    SchedulerErrorCategory,
+    SchedulerRepository,
+    SchedulerWorker,
+)
 from copilotd.core.scheduler_adapter import ApplicationSchedulerAdapter
 from copilotd.core.session_deletion import (
     SessionDeletionBlocked,
@@ -91,10 +95,11 @@ from copilotd.core.sessions import (
     SessionRegistry,
     ThreadReference,
 )
-from copilotd.core.spill_artifacts import garbage_collect_tool_spills
 from copilotd.core.supervisor import ExecutionStallMonitor
 from copilotd.core.task_registry import TaskRegistry
+from copilotd.core.volatile_content import opaque_content_key
 from copilotd.core.worktrees import SessionCreationWorktreeAdapter, WorktreeManager
+from copilotd.discord_http_limiter import DiscordHttpRateLimiter
 from copilotd.discord_native import NativeDiscordRegistrar
 from copilotd.discord_requests import (
     DiscordCoordinatorConfig,
@@ -110,12 +115,10 @@ from copilotd.ops.gateway_lock import GatewayInstanceLock
 from copilotd.ops.heartbeat import HeartbeatWriter
 from copilotd.ops.service import ServiceManager, SqliteRestartCoordinator
 from copilotd.ops.surface import LocalOpsSurface
-from copilotd.render.diffs import render_diff
 from copilotd.render.markdown import (
     MarkdownAssembler,
     TableBlock,
     TextBlock,
-    extract_local_markdown_images,
     plan_markdown_messages,
 )
 from copilotd.render.outbox import (
@@ -124,6 +127,7 @@ from copilotd.render.outbox import (
     RenderPermanentError,
     RenderRateLimited,
     RenderTransientError,
+    queue_admission_reaction,
     recover_reaction_outbox,
 )
 from copilotd.render.tables import TableAsset, render_table
@@ -131,10 +135,10 @@ from copilotd.sdk.bridge import CopilotBridge
 from copilotd.sdk.capabilities import CapabilityManifest, CapabilityRegistry
 from copilotd.storage.database import Database
 from copilotd.storage.leases import OwnerLeaseStore
+from copilotd.storage.state_only import state_only_json
 
 logger = structlog.get_logger(__name__)
 T = TypeVar("T")
-_TABLE_DELIMITER = re.compile(r"^\s*\|?\s*:?-{3,}:?\s*(?:\|\s*:?-{3,}:?\s*)+\|?\s*$")
 _COLOR_BLURPLE = 0x5865F2
 _COLOR_GREEN = 0x57F287
 _COLOR_YELLOW = 0xFEE75C
@@ -152,7 +156,6 @@ class CopilotDiscordBot(commands.Bot):
         session_naming_adapter: SessionNamingAdapter | None = None,
         model_summary_adapter: ModelReasoningSummaryAdapter | None = None,
         schedule_origin_adapter: ScheduleOriginAdapter | None = None,
-        task_action_adapter: TaskActionAdapter | None = None,
         discord_connector: aiohttp.BaseConnector | None = None,
         discord_http_trace: aiohttp.TraceConfig | None = None,
     ) -> None:
@@ -160,28 +163,25 @@ class CopilotDiscordBot(commands.Bot):
             settings = settings.ensure_service_handoff_token()
         intents = discord.Intents.default()
         intents.message_content = True
+        self.discord_http_limiter = DiscordHttpRateLimiter()
+        mandatory_http_trace = self.discord_http_limiter.trace_config(discord_http_trace)
         super().__init__(
             command_prefix=commands.when_mentioned,
             intents=intents,
             connector=discord_connector,
-            http_trace=discord_http_trace,
+            http_trace=mandatory_http_trace,
         )
         self.settings = settings
         self.discord_requests = DiscordRequestCoordinator(
             DiscordCoordinatorConfig(
-                requests_per_second=settings.discord_requests_per_second,
-                burst=settings.discord_request_burst,
-                route_requests_per_second=settings.discord_route_requests_per_second,
-                route_burst=settings.discord_route_burst,
                 queue_limit=settings.discord_request_queue_limit,
                 interaction_deadline_seconds=settings.discord_interaction_deadline_seconds,
                 stream_edit_interval_seconds=settings.discord_stream_edit_interval_seconds,
-                taskdeck_edit_interval_seconds=settings.discord_taskdeck_edit_interval_seconds,
                 reaction_interval_seconds=settings.discord_reaction_interval_seconds,
-                transient_attempts=settings.discord_request_transient_attempts,
             )
         )
         self.database = Database(settings.database_path)
+        self.content_store = self.database.content_store
         self.bridge = CopilotBridge(settings)
         self.capability_registry = CapabilityRegistry(settings)
         self.capabilities: CapabilityManifest = self.capability_registry.load_checked()
@@ -199,6 +199,7 @@ class CopilotDiscordBot(commands.Bot):
                 runtime_inline_blob_max_bytes=settings.attachment_blob_max_bytes,
                 runtime_serialized_frame_max_bytes=(settings.attachment_runtime_frame_max_bytes),
             ),
+            content_store=self.content_store,
         )
         self.heartbeat = HeartbeatWriter(
             self.database,
@@ -207,13 +208,12 @@ class CopilotDiscordBot(commands.Bot):
             gateway_down_seconds=settings.gateway_down_restart_seconds,
             resume_suppression_seconds=settings.resume_suppression_seconds,
             metrics_provider=self._heartbeat_metrics,
-            discord_metrics_provider=self.discord_requests.snapshot,
+            discord_metrics_provider=self._discord_metrics_snapshot,
         )
         self.ops_service = ops_service or LocalOpsSurface(self.database, settings)
         self.session_naming_adapter = session_naming_adapter
         self.model_summary_adapter = model_summary_adapter
         self.schedule_origin_adapter = schedule_origin_adapter
-        self.task_action_adapter = task_action_adapter
         self.command_executor = CommandExecutor(error_mapper=_map_command_error)
         self.projects: ProjectRegistry | None = None
         self.bindings: SessionBindingRepository | None = None
@@ -252,6 +252,12 @@ class CopilotDiscordBot(commands.Bot):
         if self.sessions is None:
             return 0, 0, None
         return self.sessions.heartbeat_metrics()
+
+    def _discord_metrics_snapshot(self) -> dict[str, Any]:
+        return {
+            "semantic_coordinator": self.discord_requests.snapshot(),
+            "http_limiter": self.discord_http_limiter.snapshot(),
+        }
 
     async def _discord_request(
         self,
@@ -313,10 +319,10 @@ class CopilotDiscordBot(commands.Bot):
                 old_process_identity_alive=old_process_alive,
                 now=time.time(),
             )
-        await garbage_collect_tool_spills(self.database)
         self.projects = ProjectRegistry(
             self.database,
             resolved_home=self.settings.resolved_home,
+            content_store=self.content_store,
         )
         await self.projects.initialize()
         self.bindings = SessionBindingRepository(self.database)
@@ -334,7 +340,10 @@ class CopilotDiscordBot(commands.Bot):
         except BaseException:
             await self.bridge.stop()
             raise
-        self.recovery_inventory = await StartupRecoveryInventory(self.database).run()
+        self.recovery_inventory = await StartupRecoveryInventory(
+            self.database,
+            content_store=self.content_store,
+        ).run()
         self.heartbeat.durable_replay_capable = self.capabilities.supports("event_log")
         self.stall_monitor = ExecutionStallMonitor(
             self.database,
@@ -353,20 +362,23 @@ class CopilotDiscordBot(commands.Bot):
                 ingress_capacity=self.settings.ingress_capacity,
                 reducer_batch_size=self.settings.reducer_batch_size,
                 owner_renew_seconds=self.settings.owner_lease_renew_seconds,
+                owner_renew_retry_attempts=self.settings.owner_lease_renew_retry_attempts,
                 interaction_timeout_seconds=self.settings.interaction_timeout_seconds,
+                event_replay_max_pages=self.settings.event_replay_max_pages,
                 attachment_resolver=self.attachment_service.sdk_attachments_for_send,
                 capabilities=self.capabilities,
                 task_registry=self._tasks,
                 send_frame_max_bytes=(self.settings.attachment_runtime_frame_max_bytes),
                 model_summary_adapter=self.model_summary_adapter,
-                task_action_adapter=self.task_action_adapter,
                 extension_configs=self.extension_configs,
-                managed_session_state_root=(
-                    self.settings.resolved_home / ".copilot" / "session-state"
-                ),
+                content_store=self.content_store,
             )
 
-        self.sessions = SessionRegistry(self.bindings, runtime_factory)
+        self.sessions = SessionRegistry(
+            self.bindings,
+            runtime_factory,
+            owner_lease_ttl_seconds=self.settings.owner_lease_ttl_seconds,
+        )
         self.deletions = SessionDeletionService(
             self.database,
             self.bindings,
@@ -383,7 +395,11 @@ class CopilotDiscordBot(commands.Bot):
             extension_configs=self.extension_configs,
             extension_config_source=self.extension_config_source,
         )
-        self.scheduler_repository = SchedulerRepository(self.database)
+        self.scheduler_repository = SchedulerRepository(
+            self.database,
+            content_store=self.content_store,
+            prompt_resolver=self._resolve_schedule_prompt,
+        )
         await self.scheduler_repository.recover()
         self.scheduler_commands = SchedulerCommandService(
             self.database,
@@ -410,14 +426,15 @@ class CopilotDiscordBot(commands.Bot):
             name="active-execution-stall-monitor",
             source="stall-monitor",
         )
-        failures = await self.sessions.eager_resume()
-        for thread_id, error in failures.items():
-            await logger.awarning(
-                "session_eager_resume_failed",
-                thread_id=thread_id,
-                error=error,
-            )
-        await recover_reaction_outbox(self.database)
+        self._tasks.create(
+            self._recover_startup_sessions(),
+            name="protected-session-recovery",
+            source="session-recovery",
+        )
+        await recover_reaction_outbox(
+            self.database,
+            content_store=self.content_store,
+        )
         self.scheduler_worker = SchedulerWorker(
             self.scheduler_repository,
             ApplicationSchedulerAdapter(
@@ -431,7 +448,11 @@ class CopilotDiscordBot(commands.Bot):
             task_registry=self._tasks,
         )
         await self.scheduler_worker.start()
-        self.dispatcher = RenderOutboxDispatcher(self.database, self)
+        self.dispatcher = RenderOutboxDispatcher(
+            self.database,
+            self,
+            content_store=self.content_store,
+        )
         self._render_task = self._tasks.create(
             self._render_loop(),
             name="discord-render-outbox",
@@ -503,6 +524,10 @@ class CopilotDiscordBot(commands.Bot):
         self._accepting_handlers = False
         errors: list[Exception] = []
         try:
+            await self.discord_http_limiter.close()
+        except Exception as error:
+            errors.append(error)
+        try:
             await super().close()
         except Exception as error:
             errors.append(error)
@@ -565,11 +590,6 @@ class CopilotDiscordBot(commands.Bot):
         while True:
             failure = await self._tasks.errors.get()
             try:
-                self._fatal_worker_error = failure.error
-                self._fatal_session_id = failure.session_id
-                self._shutdown_initiator = asyncio.current_task()
-                self.heartbeat.runtime_state = "down"
-                self.heartbeat.set_gateway("down")
                 try:
                     await logger.aerror(
                         "background_task_failed",
@@ -592,26 +612,75 @@ class CopilotDiscordBot(commands.Bot):
                                 time.time(),
                                 failure.runtime_generation or 0,
                                 failure.session_id,
-                                json.dumps(
+                                state_only_json(
                                     {
                                         "task_name": failure.name,
                                         "source": failure.source,
                                         "error_type": type(failure.error).__name__,
                                         "message": str(failure.error),
-                                    },
-                                    sort_keys=True,
+                                    }
                                 ),
                             ),
                         )
+                    if failure.session_id is not None and self.sessions is not None:
+                        await self.sessions.quarantine_failure(
+                            failure.session_id,
+                            runtime_generation=failure.runtime_generation,
+                        )
+                        continue
                 except Exception as diagnostic_error:
                     self._fatal_diagnostic_error = diagnostic_error
-                finally:
-                    await self.close()
+                self._fatal_worker_error = failure.error
+                self._fatal_session_id = failure.session_id
+                self._shutdown_initiator = asyncio.current_task()
+                self.heartbeat.runtime_state = "down"
+                self.heartbeat.set_gateway("down")
+                await self.close()
                 return
             finally:
                 self._tasks.errors.task_done()
 
+    async def _recover_startup_sessions(self) -> None:
+        retry_seconds = min(
+            30.0,
+            self.settings.startup_recovery_total_timeout_seconds,
+        )
+        while True:
+            try:
+                async with asyncio.timeout(self.settings.startup_recovery_total_timeout_seconds):
+                    failures = await self._require_sessions().recover_protected_bindings(
+                        page_size=self.settings.startup_recovery_limit,
+                        concurrency=self.settings.startup_recovery_concurrency,
+                        attach_timeout_seconds=self.settings.startup_attach_timeout_seconds,
+                    )
+            except asyncio.CancelledError:
+                raise
+            except TimeoutError:
+                await logger.awarning(
+                    "protected_session_recovery_budget_exhausted",
+                    page_size=self.settings.startup_recovery_limit,
+                    timeout_seconds=self.settings.startup_recovery_total_timeout_seconds,
+                    retry_seconds=retry_seconds,
+                )
+            except Exception as error:
+                await logger.aerror(
+                    "protected_session_recovery_pass_failed",
+                    error_type=type(error).__name__,
+                    error=str(error),
+                    retry_seconds=retry_seconds,
+                )
+            else:
+                for thread_id, error in failures.items():
+                    await logger.awarning(
+                        "protected_session_recovery_failed",
+                        thread_id=thread_id,
+                        error=error,
+                    )
+                return
+            await asyncio.sleep(retry_seconds)
+
     async def _runtime_health_loop(self) -> None:
+        consecutive_failures = 0
         while True:
             try:
                 async with asyncio.timeout(10):
@@ -619,15 +688,49 @@ class CopilotDiscordBot(commands.Bot):
             except asyncio.CancelledError:
                 raise
             except Exception as error:
-                self.heartbeat.runtime_state = "down"
-                await logger.aerror(
+                consecutive_failures += 1
+                threshold_reached = (
+                    consecutive_failures >= self.settings.runtime_health_failure_threshold
+                )
+                self.heartbeat.runtime_state = "down" if threshold_reached else "reconnecting"
+                await logger.awarning(
                     "runtime_healthcheck_failed",
+                    consecutive_failures=consecutive_failures,
+                    failure_threshold=self.settings.runtime_health_failure_threshold,
                     error_type=type(error).__name__,
                     error=str(error),
                 )
+                if threshold_reached and self.settings.runtime_uri is None:
+                    try:
+                        await self._recover_bundled_runtime()
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception as recovery_error:
+                        await logger.aerror(
+                            "bundled_runtime_recovery_failed",
+                            error_type=type(recovery_error).__name__,
+                            error=str(recovery_error),
+                        )
+                    else:
+                        consecutive_failures = 0
+                        self.heartbeat.runtime_state = "ready"
             else:
+                consecutive_failures = 0
                 self.heartbeat.runtime_state = "ready"
-            await asyncio.sleep(self.settings.heartbeat_interval_seconds)
+            backoff = min(
+                self.settings.runtime_health_backoff_max_seconds,
+                self.settings.heartbeat_interval_seconds * (2 ** min(consecutive_failures, 4)),
+            )
+            await asyncio.sleep(backoff)
+
+    async def _recover_bundled_runtime(self) -> None:
+        sessions = self._require_sessions()
+        await sessions.quarantine_all()
+        await self.bridge.stop()
+        await self.bridge.start()
+        async with asyncio.timeout(10):
+            await self.bridge.healthcheck()
+        await self._recover_startup_sessions()
 
     async def on_ready(self) -> None:
         self.heartbeat.set_gateway("ready")
@@ -661,14 +764,7 @@ class CopilotDiscordBot(commands.Bot):
                 guilds=missing_permissions,
                 required=["Add Reactions", "Read Message History"],
             )
-        if self._accepting_handlers and (
-            self._attachment_recovery_task is None or self._attachment_recovery_task.done()
-        ):
-            self._attachment_recovery_task = self._tasks.create(
-                self._recover_attachment_manifests(),
-                name="attachment-source-recovery",
-                source="attachments",
-            )
+        self._schedule_attachment_recovery()
         await logger.ainfo(
             "discord_ready",
             user=None if self.user is None else str(self.user),
@@ -680,12 +776,9 @@ class CopilotDiscordBot(commands.Bot):
         for recovery in recoveries:
             if (
                 recovery.session_id is None
-                or recovery.prompt is None
                 or recovery.idempotency_key is None
-                or (
-                    recovery.state == "preparing"
-                    and (recovery.source_channel_id is None or recovery.source_message_id is None)
-                )
+                or recovery.source_channel_id is None
+                or recovery.source_message_id is None
             ):
                 await self.attachment_service.record_recovery_error(
                     recovery.manifest_id,
@@ -695,32 +788,40 @@ class CopilotDiscordBot(commands.Bot):
                 )
                 continue
             try:
-                if recovery.state == "preparing":
-                    channel_id = int(recovery.source_channel_id or "")
-                    message_id = int(recovery.source_message_id or "")
-                    channel = self.get_channel(channel_id)
-                    if channel is None:
-                        channel = await self._discord_request(
-                            DiscordOperation.FETCH,
-                            lambda channel_id=channel_id: self.fetch_channel(channel_id),
-                            route_key="channels.fetch",
-                            target_key=f"channel:{channel_id}",
-                            priority=DiscordPriority.MAINTENANCE,
-                        )
-                    fetch_message = getattr(channel, "fetch_message", None)
-                    if fetch_message is None:
-                        raise AttachmentError(
-                            "the durable Discord attachment source is not message-addressable"
-                        )
-                    message = await self._discord_request(
+                if recovery.origin != "discord_message":
+                    raise AttachmentError("content_unavailable")
+                channel_id = int(recovery.source_channel_id or "")
+                message_id = int(recovery.source_message_id or "")
+                channel = self.get_channel(channel_id)
+                if channel is None:
+                    channel = await self._discord_request(
                         DiscordOperation.FETCH,
-                        lambda fetch_message=fetch_message, message_id=message_id: fetch_message(
-                            message_id
-                        ),
-                        route_key="channels.messages.fetch",
-                        target_key=f"channel:{channel_id}:message:{message_id}",
+                        lambda channel_id=channel_id: self.fetch_channel(channel_id),
+                        route_key="channels.fetch",
+                        target_key=f"channel:{channel_id}",
                         priority=DiscordPriority.MAINTENANCE,
                     )
+                fetch_message = getattr(channel, "fetch_message", None)
+                if fetch_message is None:
+                    raise AttachmentError(
+                        "the durable Discord attachment source is not message-addressable"
+                    )
+                message = await self._discord_request(
+                    DiscordOperation.FETCH,
+                    lambda fetch_message=fetch_message, message_id=message_id: fetch_message(
+                        message_id
+                    ),
+                    route_key="channels.messages.fetch",
+                    target_key=f"channel:{channel_id}:message:{message_id}",
+                    priority=DiscordPriority.MAINTENANCE,
+                )
+                prompt = self._clean_prompt(message) or "Please inspect the attached files."
+                if (
+                    recovery.prompt_hash is not None
+                    and hashlib.sha256(prompt.encode("utf-8")).hexdigest() != recovery.prompt_hash
+                ):
+                    raise AttachmentError("source_hash_mismatch")
+                if recovery.state in {"preparing", "needs_refetch"}:
                     prepared = await self.attachment_service.prepare(
                         source_kind=recovery.source_kind,
                         source_id=recovery.source_id,
@@ -728,7 +829,7 @@ class CopilotDiscordBot(commands.Bot):
                         attachments=list(message.attachments),
                         source_channel_id=recovery.source_channel_id,
                         source_message_id=recovery.source_message_id,
-                        recovery_prompt=recovery.prompt,
+                        recovery_prompt=prompt,
                         recovery_idempotency_key=recovery.idempotency_key,
                         recovery_origin=recovery.origin,
                     )
@@ -747,7 +848,7 @@ class CopilotDiscordBot(commands.Bot):
                     prepared.manifest_id
                 )
                 await runtime.send(
-                    recovery.prompt,
+                    prompt,
                     idempotency_key=recovery.idempotency_key,
                     attachments=sdk_attachments,
                     attachment_manifest_id=recovery.manifest_id,
@@ -756,9 +857,14 @@ class CopilotDiscordBot(commands.Bot):
                     origin=recovery.origin or "discord_message",
                 )
             except (discord.NotFound, discord.Forbidden, AttachmentError) as error:
+                error_code = (
+                    str(error)
+                    if str(error) in {"content_unavailable", "source_hash_mismatch"}
+                    else "source_recovery_failed"
+                )
                 await self.attachment_service.record_recovery_error(
                     recovery.manifest_id,
-                    code="source_recovery_failed",
+                    code=error_code,
                     detail=f"{type(error).__name__}: {error}",
                     terminal=True,
                 )
@@ -791,8 +897,20 @@ class CopilotDiscordBot(commands.Bot):
             else:
                 await self.attachment_service.record_recovery_success(recovery.manifest_id)
 
+    def _schedule_attachment_recovery(self) -> None:
+        if not self._accepting_handlers or (
+            self._attachment_recovery_task is not None and not self._attachment_recovery_task.done()
+        ):
+            return
+        self._attachment_recovery_task = self._tasks.create(
+            self._recover_attachment_manifests(),
+            name="attachment-source-recovery",
+            source="attachments",
+        )
+
     async def _attachment_maintenance_loop(self) -> None:
         while True:
+            self._schedule_attachment_recovery()
             released = await self.attachment_service.release_unreferenced()
             removed = await self.attachment_service.garbage_collect()
             if released or removed:
@@ -808,6 +926,7 @@ class CopilotDiscordBot(commands.Bot):
 
     async def on_resumed(self) -> None:
         self.heartbeat.set_gateway("ready")
+        self._schedule_attachment_recovery()
 
     async def on_interaction(self, interaction: discord.Interaction) -> None:
         task = self._admit_handler()
@@ -823,123 +942,6 @@ class CopilotDiscordBot(commands.Bot):
         custom_id = str(data.get("custom_id", "")) if isinstance(data, dict) else ""
         if interaction.type == discord.InteractionType.component and custom_id.startswith("cdi:"):
             await self._handle_direct_interaction(interaction, custom_id)
-            return
-        if (
-            interaction.type != discord.InteractionType.component
-            or not isinstance(data, dict)
-            or not custom_id.startswith("cdtd:")
-        ):
-            return
-        parts = str(data["custom_id"]).split(":")
-        if len(parts) not in {4, 5}:
-            await self._send_component_text(
-                interaction,
-                "TaskDeck",
-                "This TaskDeck control is invalid.",
-            )
-            return
-        _, panel_id, revision_text, action_text, *token_part = parts
-        if (
-            len(parts) == 5
-            and action_text == "message"
-            and revision_text.isdigit()
-            and interaction.message is not None
-        ):
-            await DiscordInteractionResponder(
-                self,
-                interaction,
-                name="TaskDeck message",
-            ).send_modal(
-                TaskMessageModal(
-                    self,
-                    panel_id=panel_id,
-                    card_token=token_part[0],
-                    revision=int(revision_text),
-                    message_id=str(interaction.message.id),
-                )
-            )
-            return
-        action_map = {
-            "select": "select",
-            "toggle": "toggle",
-            "prev": "previous",
-            "next": "next",
-        }
-        action = action_map.get(action_text)
-        if (
-            (action is None and len(parts) == 4)
-            or (
-                len(parts) == 5
-                and action_text
-                not in {
-                    "cancel",
-                    "promote",
-                    "remove",
-                    "download",
-                }
-            )
-            or not revision_text.isdigit()
-            or interaction.message is None
-        ):
-            await self._send_component_text(
-                interaction,
-                "TaskDeck",
-                "This TaskDeck control is invalid.",
-            )
-            return
-        responder = DiscordInteractionResponder(self, interaction, name="TaskDeck")
-        try:
-            await responder.defer()
-        except UnknownInteractionError:
-            pass
-        try:
-            runtime = await self._interaction_runtime(interaction)
-            if len(parts) == 5:
-                result_data = await runtime.perform_taskdeck_action(
-                    panel_id=panel_id,
-                    card_token=token_part[0],
-                    expected_revision=int(revision_text),
-                    action=action_text,
-                    message_id=str(interaction.message.id),
-                    interaction_id=str(interaction.id),
-                )
-                result = str(result_data["status"])
-                if result == "download":
-                    await responder.send_file(
-                        "Task detail attached.",
-                        content=str(result_data["content"]).encode("utf-8"),
-                        filename=str(result_data["filename"]),
-                    )
-                    return
-            else:
-                values = data.get("values")
-                card_token = (
-                    str(values[0])
-                    if action == "select" and isinstance(values, list) and values
-                    else None
-                )
-                result = (
-                    "invalid"
-                    if runtime.inbox is None
-                    else await runtime.update_taskdeck_view(
-                        panel_id=panel_id,
-                        expected_revision=int(revision_text),
-                        action=action,
-                        card_token=card_token,
-                        message_id=str(interaction.message.id),
-                        interaction_id=str(interaction.id),
-                    )
-                )
-        except Exception as error:
-            mapped = _map_command_error(error)
-            await responder.send_followup(f"[{mapped.code}] {mapped.message}")
-            return
-        if result != "updated":
-            await responder.send_followup(
-                "TaskDeck changed; use the latest controls."
-                if result == "stale"
-                else "This TaskDeck control has expired."
-            )
 
     async def _send_component_text(
         self,
@@ -977,19 +979,33 @@ class CopilotDiscordBot(commands.Bot):
         if action == "form":
             row = await self.database.fetchone(
                 """
-                SELECT form_schema FROM pending_interactions
+                SELECT sdk_session_id, content_key, request_hash
+                FROM pending_interactions
                 WHERE interaction_id = ? AND state = 'pending'
                 """,
                 (interaction_id,),
             )
-            if row is None or row["form_schema"] is None:
+            payload = (
+                None
+                if row is None
+                else self.content_store.get(
+                    row["content_key"]
+                    or opaque_content_key(
+                        "interaction-request",
+                        row["sdk_session_id"],
+                        interaction_id,
+                    ),
+                    expected_hash=row["request_hash"],
+                )
+            )
+            if not isinstance(payload, dict) or not isinstance(payload.get("form"), Mapping):
                 await self._send_component_text(
                     interaction,
                     "Copilot form",
                     "This Copilot form has expired.",
                 )
                 return
-            form = ElicitationForm.from_dict(json.loads(str(row["form_schema"])))
+            form = ElicitationForm.from_dict(cast(Mapping[str, Any], payload["form"]))
             await DiscordInteractionResponder(
                 self,
                 interaction,
@@ -1065,8 +1081,13 @@ class CopilotDiscordBot(commands.Bot):
                     )
                 return
             sessions = self._require_sessions()
-            runtime = await sessions.ensure_attached(binding)
+            await self._queue_message_admission_reaction(
+                message,
+                state="accepted",
+                session_id=binding.sdk_session_id,
+            )
             try:
+                runtime = await sessions.ensure_attached(binding)
                 prepared = await self.attachment_service.prepare(
                     source_kind="discord-message",
                     source_id=str(message.id),
@@ -1092,14 +1113,24 @@ class CopilotDiscordBot(commands.Bot):
                     discord_source_message_id=str(message.id),
                 )
             except AttachmentError as error:
+                await self._queue_message_admission_reaction(
+                    message,
+                    state="failed",
+                    session_id=binding.sdk_session_id,
+                )
                 await self._reply_message(
                     message,
                     f"copilotD could not prepare the attachments: `{error}`",
                 )
             except Exception as error:
+                await self._queue_message_admission_reaction(
+                    message,
+                    state="failed",
+                    session_id=binding.sdk_session_id,
+                )
                 await self._reply_message(
                     message,
-                    f"copilotD could not submit this message: `{error}`",
+                    f"copilotD could not attach or submit this message: `{error}`",
                 )
             return
 
@@ -1110,6 +1141,7 @@ class CopilotDiscordBot(commands.Bot):
             return
         if not prompt and not message.attachments:
             return
+        await self._queue_message_admission_reaction(message, state="accepted")
         try:
             effective_prompt = prompt or "Please inspect the attached files."
             runtime = await self._require_creation().create_from_source(
@@ -1155,15 +1187,34 @@ class CopilotDiscordBot(commands.Bot):
                 sdk_session_id=runtime.binding.sdk_session_id,
             )
         except AttachmentError as error:
+            await self._queue_message_admission_reaction(message, state="failed")
             await self._reply_message(
                 message,
                 f"copilotD could not prepare the attachments: `{error}`",
             )
         except Exception as error:
+            await self._queue_message_admission_reaction(message, state="failed")
             await self._reply_message(
                 message,
                 f"copilotD could not create the session: `{error}`",
             )
+
+    async def _queue_message_admission_reaction(
+        self,
+        message: discord.Message,
+        *,
+        state: str,
+        session_id: str | None = None,
+    ) -> None:
+        await queue_admission_reaction(
+            self.database,
+            source_channel_id=str(message.channel.id),
+            source_message_id=str(message.id),
+            state=state,
+            emoji="👀" if state == "accepted" else "❌",
+            previous_emoji="👀" if state == "failed" else None,
+            session_id=session_id,
+        )
 
     async def _reply_message(self, message: discord.Message, content: str) -> None:
         await self._discord_request(
@@ -1204,7 +1255,6 @@ class CopilotDiscordBot(commands.Bot):
                 thread = await self._thread_for_session(session_id)
                 plan = await _discord_render_plan(
                     payload,
-                    allowed_roots=(binding.cwd_snapshot,),
                     max_bytes=self.settings.discord_upload_max_bytes,
                 )
                 message_id = await self._deliver_render_plan(
@@ -1276,7 +1326,6 @@ class CopilotDiscordBot(commands.Bot):
                 )
                 plan = await _discord_render_plan(
                     payload,
-                    allowed_roots=(binding.cwd_snapshot,),
                     max_bytes=self.settings.discord_upload_max_bytes,
                 )
                 await self._deliver_render_plan(
@@ -1535,13 +1584,13 @@ class CopilotDiscordBot(commands.Bot):
                 index,
             )
             payload_hash = _render_batch_hash(batch)
-            previous_intent = await self.database.fetchone(
+            previous_intents = await self.database.fetchall(
                 """
                 SELECT nonce, payload_hash, discord_message_id, created_at
                 FROM render_batch_intents
                 WHERE session_id = ? AND delivery_family = ? AND agent_id = ?
                   AND batch_index = ? AND render_message_id != ?
-                ORDER BY updated_at DESC LIMIT 1
+                ORDER BY updated_at DESC, created_at DESC
                 """,
                 (
                     session_id,
@@ -1631,7 +1680,9 @@ class CopilotDiscordBot(commands.Bot):
                     nonce,
                     created_at=float(intent["created_at"]),
                 )
-            if recovery_message is None and previous_intent is not None:
+            for previous_intent in previous_intents:
+                if recovery_message is not None:
+                    break
                 if previous_intent["discord_message_id"] is not None:
                     try:
                         recovery_message_id = int(previous_intent["discord_message_id"])
@@ -1664,14 +1715,7 @@ class CopilotDiscordBot(commands.Bot):
                             content=batch.content or "\u200b",
                             attachments=_discord_files(list(batch.assets)),
                             embeds=_discord_embeds(batch.embeds),
-                            view=(
-                                _render_view(
-                                    payload,
-                                    enable_task_actions=self.task_action_adapter is not None,
-                                )
-                                if index == 0
-                                else None
-                            ),
+                            view=(_render_view(payload) if index == 0 else None),
                         )
                     ),
                     route_key="channels.messages.edit",
@@ -1695,14 +1739,7 @@ class CopilotDiscordBot(commands.Bot):
                         content=batch.content or "\u200b",
                         files=_discord_files(list(batch.assets)),
                         embeds=_discord_embeds(batch.embeds),
-                        view=(
-                            _render_view(
-                                payload,
-                                enable_task_actions=self.task_action_adapter is not None,
-                            )
-                            if index == 0
-                            else None
-                        ),
+                        view=(_render_view(payload) if index == 0 else None),
                         silent=True,
                         nonce=nonce,
                     ),
@@ -1745,11 +1782,11 @@ class CopilotDiscordBot(commands.Bot):
                 agent_id,
             ),
         )
-        if first_message is not None:
+        if first_message_id is not None:
             await self._prune_previous_render_batches(
                 thread=thread,
                 session_id=session_id,
-                first_message_id=str(first_message.id),
+                first_message_id=str(first_message_id),
                 current_delivery_id=delivery_id,
             )
         return str(first_message_id)
@@ -2079,6 +2116,61 @@ class CopilotDiscordBot(commands.Bot):
         except RuntimeError as error:
             raise RenderPermanentError(str(error)) from error
 
+    async def _resolve_schedule_prompt(
+        self,
+        source_channel_id: str,
+        source_message_id: str,
+    ) -> str:
+        channel = self.get_channel(int(source_channel_id))
+        if channel is None:
+            channel = await self._discord_request(
+                DiscordOperation.FETCH,
+                lambda: self.fetch_channel(int(source_channel_id)),
+                route_key="channels.fetch",
+                target_key=f"channel:{source_channel_id}",
+                priority=DiscordPriority.MAINTENANCE,
+            )
+        if not hasattr(channel, "fetch_message"):
+            raise SchedulerDispatchError(
+                "schedule source channel cannot fetch messages",
+                category=SchedulerErrorCategory.TARGET,
+                code="source_channel_invalid",
+                blocked=True,
+            )
+        message = await self._discord_request(
+            DiscordOperation.FETCH,
+            lambda: channel.fetch_message(int(source_message_id)),
+            route_key="channels.messages.fetch",
+            target_key=f"channel:{source_channel_id}:message:{source_message_id}",
+            priority=DiscordPriority.MAINTENANCE,
+        )
+        content = str(message.content)
+        if not content:
+            raise SchedulerDispatchError(
+                "schedule source message has no text content",
+                category=SchedulerErrorCategory.INPUT,
+                code="source_content_empty",
+                blocked=True,
+            )
+        return content
+
+    async def _create_schedule_source(
+        self,
+        interaction: discord.Interaction,
+        text: str,
+    ) -> tuple[str, str]:
+        channel = interaction.channel
+        if channel is None or not hasattr(channel, "send"):
+            raise CDScopeError("schedule source channel is unavailable")
+        message = await self._discord_request(
+            DiscordOperation.SEND,
+            lambda: channel.send(text, silent=True),
+            route_key="channels.messages.send",
+            target_key=_channel_target_key(channel),
+            priority=DiscordPriority.FOREGROUND,
+        )
+        return str(message.channel.id), str(message.id)
+
     async def _find_thread_for_message(self, message_id: str) -> discord.Thread:
         mapping = await self.database.fetchone(
             """
@@ -2099,29 +2191,30 @@ class CopilotDiscordBot(commands.Bot):
         display_name: str | None,
     ) -> None:
         now = time.time()
+        if display_name is not None:
+            self.content_store.put(
+                display_name,
+                key=opaque_content_key("session-display-name", binding.sdk_session_id),
+            )
         await self.database.execute(
             """
             INSERT INTO session_ui_metadata(
                 session_id, thread_id, parent_channel_id, display_name,
                 native_name_state, created_at, updated_at
-            ) VALUES (?, ?, ?, ?, 'unsupported', ?, ?)
+            ) VALUES (?, ?, ?, NULL, 'unsupported', ?, ?)
             ON CONFLICT(session_id) DO UPDATE SET
                 thread_id = excluded.thread_id,
                 parent_channel_id = COALESCE(
                     excluded.parent_channel_id,
                     session_ui_metadata.parent_channel_id
                 ),
-                display_name = COALESCE(
-                    excluded.display_name,
-                    session_ui_metadata.display_name
-                ),
+                display_name = NULL,
                 updated_at = excluded.updated_at
             """,
             (
                 binding.sdk_session_id,
                 binding.thread_id,
                 parent_channel_id,
-                display_name,
                 now,
                 now,
             ),
@@ -2175,7 +2268,14 @@ class CopilotDiscordBot(commands.Bot):
             ) VALUES (?, ?, ?, ?, 'pending', ?, ?)
             ON CONFLICT(idempotency_key) DO UPDATE SET updated_at = excluded.updated_at
             """,
-            (key, binding.sdk_session_id, parent_channel_id, reason, now, now),
+            (
+                key,
+                binding.sdk_session_id,
+                parent_channel_id,
+                "render_unavailable",
+                now,
+                now,
+            ),
         )
         if parent_channel_id is None:
             await self.database.execute(
@@ -2291,7 +2391,12 @@ class CopilotDiscordBot(commands.Bot):
             if not config:
                 config = _json_object(row["desired_model_config"])
             model = config.get("modelId") or "default"
-            display = row["display_name"] or f"Session {str(row['sdk_session_id'])[:8]}"
+            display = (
+                self.content_store.get(
+                    opaque_content_key("session-display-name", row["sdk_session_id"])
+                )
+                or f"Session {str(row['sdk_session_id'])[:8]}"
+            )
             last_event = (
                 "never"
                 if row["last_event_at"] is None
@@ -2328,7 +2433,7 @@ class CopilotDiscordBot(commands.Bot):
             if table not in {
                 "submissions",
                 "message_queue",
-                "task_card_projections",
+                "submission_task_links",
                 "schedules",
                 "runtime_schedules",
                 "liveness_leases",
@@ -2397,7 +2502,7 @@ class CopilotDiscordBot(commands.Bot):
         )
         queue_states = await state_counts("message_queue", "thread_id", binding.thread_id)
         task_states = await state_counts(
-            "task_card_projections",
+            "submission_task_links",
             "sdk_session_id",
             binding.sdk_session_id,
         )
@@ -2424,6 +2529,7 @@ class CopilotDiscordBot(commands.Bot):
             "SELECT value FROM global_config WHERE key = 'discord_permission_diagnostics'"
         )
         coordinator = self.discord_requests.snapshot()
+        http_limiter = self.discord_http_limiter.snapshot()
         permission_text = (
             "ok"
             if permission_diagnostics is None or permission_diagnostics["value"] == "{}"
@@ -2466,8 +2572,11 @@ class CopilotDiscordBot(commands.Bot):
         native_queue_count = row["native_queue_count"]
         native_steering_count = row["native_steering_count"]
         last_sdk_receive_seq = binding.last_sdk_receive_seq
+        display_name = self.content_store.get(
+            opaque_content_key("session-display-name", binding.sdk_session_id)
+        )
         lines = [
-            f"**{row['display_name'] or 'Copilot session'}**",
+            f"**{display_name or 'Copilot session'}**",
             f"SDK session: `{binding.sdk_session_id}`",
             f"Discord: thread <#{binding.thread_id}> · parent "
             f"`{row['parent_channel_id'] or 'unknown'}`",
@@ -2518,10 +2627,16 @@ class CopilotDiscordBot(commands.Bot):
             f"reactions tracked/diagnostic failures: "
             f"`{0 if reaction_diagnostics is None else int(reaction_diagnostics['tracked'])}` / "
             f"`{0 if reaction_diagnostics is None else int(reaction_diagnostics['failed'] or 0)}`",
-            f"Discord REST queue current/peak: `{coordinator['queue_depth']}` / "
-            f"`{coordinator['queue_peak']}` · 429 `{coordinator['rate_limited_429']}` · "
+            f"Discord logical queue current/peak: `{coordinator['queue_depth']}` / "
+            f"`{coordinator['queue_peak']}` · failures `{coordinator['logical_failures']}` · "
             f"coalesced/dropped `{coordinator['coalesced']}/{coordinator['dropped']}` · "
             f"deadline misses `{coordinator['deadline_misses']}`",
+            f"Discord HTTP physical/rolling/ceiling: "
+            f"`{http_limiter['physical_attempts']}/{http_limiter['rolling_global_attempts']}/"
+            f"{http_limiter['global_ceiling']}` · 429 global/shared/route "
+            f"`{http_limiter['global_429']}/{http_limiter['shared_429']}/"
+            f"{http_limiter['route_429']}` · invalid completed/in-flight "
+            f"`{http_limiter['invalid_completed']}/{http_limiter['invalid_in_flight']}`",
             f"Discord permissions Add Reactions / Read Message History: `{permission_text}`",
             f"context: {context_text}",
             f"usage: {usage_text}",
@@ -3800,7 +3915,7 @@ class CopilotDiscordBot(commands.Bot):
                     INSERT INTO pinned_message_provenance(
                         discord_message_id, channel_id, guild_id, author_id,
                         jump_url, attachments_json, pinned_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                    ) VALUES (?, ?, ?, ?, ?, '[]', ?)
                     ON CONFLICT(discord_message_id) DO UPDATE SET
                         jump_url = excluded.jump_url,
                         attachments_json = excluded.attachments_json,
@@ -3812,19 +3927,6 @@ class CopilotDiscordBot(commands.Bot):
                         None if target.guild is None else str(target.guild.id),
                         str(target.author.id),
                         target.jump_url,
-                        json.dumps(
-                            [
-                                {
-                                    "id": str(item.id),
-                                    "filename": item.filename,
-                                    "size": item.size,
-                                    "content_type": item.content_type,
-                                    "url": item.url,
-                                }
-                                for item in target.attachments
-                            ],
-                            sort_keys=True,
-                        ),
                         time.time(),
                     ),
                 )
@@ -3847,6 +3949,10 @@ class CopilotDiscordBot(commands.Bot):
         ) -> None:
             async def operation(_: CommandInvocation) -> str:
                 binding = await self._interaction_binding(interaction)
+                source_channel_id, source_message_id = await self._create_schedule_source(
+                    interaction,
+                    text,
+                )
                 definition = await self._require_scheduler_commands().create_message(
                     thread_id=binding.thread_id,
                     expression=when,
@@ -3854,6 +3960,8 @@ class CopilotDiscordBot(commands.Bot):
                     timezone=timezone,
                     created_by=str(interaction.user.id),
                     channel_id=_parent_channel_id(interaction),
+                    source_channel_id=source_channel_id,
+                    source_message_id=source_message_id,
                 )
                 return (
                     f"Schedule `{definition.id}` enabled; next UTC run "
@@ -3871,15 +3979,22 @@ class CopilotDiscordBot(commands.Bot):
             when: str,
             text: str,
             timezone: str | None = None,
+            thread_name: str = "Scheduled Copilot session",
         ) -> None:
             async def operation(_: CommandInvocation) -> str:
+                source_channel_id, source_message_id = await self._create_schedule_source(
+                    interaction,
+                    text,
+                )
                 definition = await self._require_scheduler_commands().create_new_session(
                     channel_id=_parent_channel_id(interaction),
                     expression=when,
                     text=text,
                     timezone=timezone,
                     created_by=str(interaction.user.id),
-                    thread_name=_thread_name(text),
+                    thread_name=thread_name,
+                    source_channel_id=source_channel_id,
+                    source_message_id=source_message_id,
                 )
                 return (
                     f"New-session schedule `{definition.id}` enabled; next UTC run "
@@ -4231,7 +4346,34 @@ class DiscordThreadGateway:
         else:
             return None
         match = next((thread for thread in threads if f"[cd:{token}]" in thread.name), None)
+        if match is None:
+            archived = await self._archived_threads(channel, channel_id=channel_id)
+            match = next(
+                (thread for thread in archived if f"[cd:{token}]" in thread.name),
+                None,
+            )
         return None if match is None else ThreadReference(str(match.id))
+
+    async def _archived_threads(
+        self,
+        channel: discord.TextChannel | discord.ForumChannel,
+        *,
+        channel_id: str,
+    ) -> list[discord.Thread]:
+        archived_threads = getattr(channel, "archived_threads", None)
+        if not callable(archived_threads):
+            return []
+
+        async def collect() -> list[discord.Thread]:
+            return [thread async for thread in archived_threads(limit=None)]
+
+        return await self._bot._discord_request(
+            DiscordOperation.FETCH,
+            collect,
+            route_key="channels.threads.archived",
+            target_key=f"channel:{channel_id}:archived-threads",
+            priority=DiscordPriority.MAINTENANCE,
+        )
 
     async def create_thread(
         self,
@@ -4551,62 +4693,6 @@ class DiscordInteractionResponder(CommandResponder):
         )
 
 
-class TaskMessageModal(discord.ui.Modal):
-    message = discord.ui.TextInput(
-        label="Message",
-        style=discord.TextStyle.paragraph,
-        required=True,
-        max_length=4000,
-    )
-
-    def __init__(
-        self,
-        bot: CopilotDiscordBot,
-        *,
-        panel_id: str,
-        card_token: str,
-        revision: int,
-        message_id: str,
-    ) -> None:
-        super().__init__(title="Message Copilot task")
-        self._bot = bot
-        self._panel_id = panel_id
-        self._card_token = card_token
-        self._revision = revision
-        self._message_id = message_id
-
-    async def on_submit(self, interaction: discord.Interaction) -> None:
-        responder = DiscordInteractionResponder(
-            self._bot,
-            interaction,
-            name="TaskDeck message",
-        )
-        try:
-            await responder.defer(ephemeral=True)
-        except UnknownInteractionError:
-            pass
-        try:
-            runtime = await self._bot._interaction_runtime(interaction)
-            result = await runtime.perform_taskdeck_action(
-                panel_id=self._panel_id,
-                card_token=self._card_token,
-                expected_revision=self._revision,
-                action="message",
-                message_id=self._message_id,
-                interaction_id=str(interaction.id),
-                message=str(self.message.value),
-            )
-            text = (
-                "TaskDeck changed; use the latest controls."
-                if result["status"] == "stale"
-                else "Message sent to the task."
-            )
-        except Exception as error:
-            mapped = _map_command_error(error)
-            text = f"[{mapped.code}] {mapped.message}"
-        await responder.send_followup(text, ephemeral=True)
-
-
 class InteractionResponseModal(discord.ui.Modal):
     response = discord.ui.TextInput(
         label="Response",
@@ -4770,11 +4856,8 @@ async def _discord_render(
 async def _discord_render_plan(
     payload: dict[str, Any],
     *,
-    allowed_roots: tuple[Path, ...] = (),
     max_bytes: int | None = None,
 ) -> DiscordRenderPlan:
-    if payload.get("type") in {"diff", "tool_output_artifact"}:
-        raise RenderPermanentError("internal tool diagnostics are not Discord-renderable")
     content = str(payload.get("content", ""))
     payload_type = str(payload.get("type") or "")
     if payload_type in {
@@ -4785,9 +4868,8 @@ async def _discord_render_plan(
         content = _compact_usage_subtext(payload)
     elif payload_type == "idle_footer":
         content = _compact_turn_subtext(payload)
-    taskdeck_embeds = _taskdeck_embed_payloads(payload)
-    if not payload.get("finalized") and not taskdeck_embeds:
-        batches = [DiscordRenderBatch(_safe_stream_content(content))]
+    if not payload.get("finalized"):
+        batches = [DiscordRenderBatch(part) for part in _stream_content_batches(content)]
         return DiscordRenderPlan(tuple(_decorate_discord_batches(payload, batches)))
 
     explicit_assets: list[TableAsset] = []
@@ -4821,91 +4903,6 @@ async def _discord_render_plan(
                     content=encoded,
                 )
             )
-    if payload.get("local_git") and allowed_roots:
-        try:
-            local_diff = await render_diff(cwd=allowed_roots[0])
-        except (OSError, RuntimeError, ValueError) as error:
-            content = (
-                "**Code changes** · `local-git`\n"
-                f"Local diff is unavailable: `{type(error).__name__}`."
-            )
-        else:
-            if local_diff is None:
-                content = "**Code changes** · `local-git`\nNo uncommitted diff."
-            else:
-                content = local_diff.content
-                explicit_assets.extend(local_diff.assets)
-
-    local_image_assets: list[TableAsset] = []
-    image_warnings: list[str] = []
-    trusted_local_artifacts = payload.get("trusted_local_image_artifacts")
-    if (
-        allowed_roots
-        and payload.get("trusted_local_images") is True
-        and isinstance(trusted_local_artifacts, list)
-    ):
-        artifact_paths: dict[str, str] = {}
-        artifact_metadata: dict[str, tuple[int, str]] = {}
-        for artifact in trusted_local_artifacts:
-            if not isinstance(artifact, dict):
-                continue
-            source_path = artifact.get("source_path")
-            snapshot_path = artifact.get("snapshot_path")
-            byte_size = artifact.get("byte_size")
-            digest = artifact.get("sha256")
-            if (
-                isinstance(source_path, str)
-                and isinstance(snapshot_path, str)
-                and isinstance(byte_size, int)
-                and isinstance(digest, str)
-            ):
-                resolved_snapshot = str(
-                    await asyncio.to_thread(
-                        Path(snapshot_path).resolve,
-                        strict=False,
-                    )
-                )
-                artifact_paths[source_path] = resolved_snapshot
-                artifact_metadata[resolved_snapshot] = (byte_size, digest)
-        extraction = await asyncio.to_thread(
-            lambda: extract_local_markdown_images(
-                content,
-                allowed_roots=allowed_roots,
-                trusted_paths=(
-                    payload.get("trusted_local_image_paths")
-                    if isinstance(payload.get("trusted_local_image_paths"), list)
-                    else ()
-                ),
-                trusted_artifacts=artifact_paths,
-            )
-        )
-        content = extraction.content
-        image_warnings.extend(warning.message for warning in extraction.warnings)
-        for attachment in extraction.attachments:
-            snapshot_path = Path(attachment.resolved_path)
-            try:
-                image_content = await asyncio.to_thread(snapshot_path.read_bytes)
-            except OSError as error:
-                raise RenderPermanentError(
-                    f"trusted local image snapshot disappeared: {snapshot_path}"
-                ) from error
-            expected_size, expected_digest = artifact_metadata[str(snapshot_path)]
-            if len(image_content) != expected_size:
-                raise RenderPermanentError(
-                    f"trusted local image snapshot size changed: {snapshot_path}"
-                )
-            if hashlib.sha256(image_content).hexdigest() != expected_digest:
-                raise RenderPermanentError(
-                    f"trusted local image snapshot digest changed: {snapshot_path}"
-                )
-            local_image_assets.append(
-                TableAsset(
-                    filename=attachment.filename,
-                    media_type=_image_media_type(attachment.filename),
-                    content=image_content,
-                )
-            )
-
     assembler = MarkdownAssembler()
     assembler.append(content)
     blocks = assembler.finalize(content)
@@ -4960,61 +4957,10 @@ async def _discord_render_plan(
             )
     flush_text()
 
-    if image_warnings:
-        warning_text = "\n\n".join(
-            f"⚠️ {_bounded_discord_text(warning, 300)}" for warning in image_warnings
-        )
-        warning_plan = plan_markdown_messages(warning_text, max_chars=1850)
-        for segment in warning_plan.segments:
-            warning_assets = tuple(
-                TableAsset(
-                    filename=attachment.filename,
-                    media_type=attachment.media_type,
-                    content=attachment.content.encode("utf-8"),
-                )
-                for attachment in segment.attachments
-            )
-            if (
-                not warning_assets
-                and batches
-                and len(batches[-1].content) + len(segment.content) + 2 <= 1850
-            ):
-                last = batches[-1]
-                batches[-1] = DiscordRenderBatch(
-                    content=f"{last.content}\n\n{segment.content}".strip(),
-                    assets=last.assets,
-                    embeds=last.embeds,
-                )
-            else:
-                batches.append(
-                    DiscordRenderBatch(
-                        content=segment.content,
-                        assets=warning_assets,
-                    )
-                )
     if not batches:
         batches.append(DiscordRenderBatch(""))
 
-    if taskdeck_embeds:
-        first = batches[0]
-        batches[0] = DiscordRenderBatch(
-            content=first.content,
-            assets=first.assets,
-            embeds=taskdeck_embeds,
-        )
-
     batches = _append_assets_to_batches(batches, explicit_assets)
-    for index in range(0, len(local_image_assets), 10):
-        group = local_image_assets[index : index + 10]
-        batches.append(
-            DiscordRenderBatch(
-                content=(
-                    f"Local image attachment batch "
-                    f"{index // 10 + 1}/{(len(local_image_assets) + 9) // 10}."
-                ),
-                assets=tuple(group),
-            )
-        )
 
     prepared_batches: list[DiscordRenderBatch] = []
     for batch in batches:
@@ -5156,127 +5102,6 @@ def _rich_content_embed(
     if payload_type == "idle_footer":
         return None
 
-    if payload_type == "diff":
-        stats = payload.get("stats")
-        stats = stats if isinstance(stats, dict) else {}
-        oversized = bool(payload.get("oversized"))
-        files_value = (
-            f"`{int(stats['files']):,}`" if stats.get("files") is not None else "`unknown`"
-        )
-        changes_value = (
-            (
-                f"🟢 `+{int(stats.get('additions') or 0):,}` · "
-                f"🔴 `-{int(stats.get('deletions') or 0):,}`"
-            )
-            if stats.get("additions") is not None or stats.get("deletions") is not None
-            else "`unknown`"
-        )
-        if oversized:
-            delivery = "`omitted: render safety limit`"
-        elif batch.assets:
-            delivery = "`attachment`"
-        else:
-            delivery = "`inline preview`"
-        fields = [
-            {
-                "name": "Source",
-                "value": f"`{_bounded_discord_text(str(payload.get('source') or 'unknown'), 80)}`",
-                "inline": True,
-            },
-            {
-                "name": "Files",
-                "value": files_value,
-                "inline": True,
-            },
-            {
-                "name": "Changes",
-                "value": changes_value,
-                "inline": True,
-            },
-            {
-                "name": "Size",
-                "value": f"`{_format_asset_size(int(payload.get('byte_count') or 0))}`",
-                "inline": True,
-            },
-            {
-                "name": "Delivery",
-                "value": delivery,
-                "inline": True,
-            },
-        ]
-        if attachment_field is not None:
-            fields.append(attachment_field)
-        return _embed_payload(
-            title="🧩 Code changes",
-            description=_content_without_heading(content)
-            or "Structured code changes are available.",
-            color=_COLOR_YELLOW if oversized else _COLOR_GREEN,
-            fields=fields,
-            footer=(
-                "Patch omitted from Discord; exact source remains in the durable event journal"
-                if oversized
-                else "Exact patch is preserved when attached"
-            ),
-        )
-
-    if payload_type == "tool_output_artifact":
-        status_value = payload.get("status")
-        if status_value is None:
-            heading = content.splitlines()[0].lower() if content else ""
-            status_value = (
-                "failed" if "tool failed" in heading or "tool error" in heading else "unknown"
-            )
-        status_text = str(status_value).lower()
-        fields = [
-            {
-                "name": "Status",
-                "value": f"`{_bounded_discord_text(status_text, 40)}`",
-                "inline": True,
-            },
-            {
-                "name": "Source",
-                "value": (
-                    "`"
-                    + _bounded_discord_text(
-                        str(payload.get("tool_source") or "unknown"),
-                        80,
-                    )
-                    + "`"
-                ),
-                "inline": True,
-            },
-            {
-                "name": "Fidelity",
-                "value": "`verbatim`" if payload.get("verbatim") else "`runtime fallback`",
-                "inline": True,
-            },
-            {
-                "name": "Output",
-                "value": _tool_output_size_text(payload),
-                "inline": False,
-            },
-        ]
-        if attachment_field is not None:
-            fields.append(attachment_field)
-        failed = status_text == "failed"
-        unknown = status_text == "unknown"
-        if failed:
-            title = "❌ Tool output"
-            color = _COLOR_RED
-        elif unknown:
-            title = "⚠️ Tool output"
-            color = _COLOR_NEUTRAL
-        else:
-            title = "📎 Tool output"
-            color = _COLOR_CYAN
-        return _embed_payload(
-            title=title,
-            description=_content_without_heading(content) or "Detailed tool output is attached.",
-            color=color,
-            fields=fields,
-            footer="Durable output artifact",
-        )
-
     status = payload.get("status")
     if isinstance(status, dict):
         event_type = str(status.get("event_type") or payload_type)
@@ -5333,7 +5158,9 @@ def _status_embed_style(
         }.get(outcome, ("🔹", _COLOR_CYAN))
     if event_type in {
         "session.error",
+        "session.shutdown",
         "model.call_failure",
+        "render.failure",
         "turn.failed",
         "turn.tool_failed",
         "turn.subagent_failed",
@@ -5346,7 +5173,7 @@ def _status_embed_style(
         "session.snapshot_rewind",
     }:
         return "⚠️", _COLOR_YELLOW
-    if event_type in {"abort", "session.shutdown"}:
+    if event_type == "abort":
         return "⏹️", _COLOR_NEUTRAL
     if event_type in {
         "session.compaction_complete",
@@ -5536,16 +5363,6 @@ def _format_metric(value: Any) -> str:
     return _bounded_discord_text(str(value), 80)
 
 
-def _tool_output_size_text(payload: dict[str, Any]) -> str:
-    character_count = payload.get("character_count")
-    line_count = payload.get("line_count")
-    if character_count is not None or line_count is not None:
-        return f"`{int(character_count or 0):,}` chars · `{int(line_count or 0):,}` lines"
-    if payload.get("byte_count") is not None:
-        return f"`{_format_asset_size(int(payload['byte_count']))}`"
-    return "`unknown`"
-
-
 def _format_asset_size(byte_count: int) -> str:
     value = max(0, int(byte_count))
     if value < 1024:
@@ -5569,21 +5386,24 @@ def _format_render_duration(value: Any) -> str:
     return f"{seconds}s"
 
 
-def _safe_stream_content(content: str) -> str:
-    lines = content.splitlines(keepends=True)
-    for index in range(1, len(lines)):
-        if "|" in lines[index - 1] and _TABLE_DELIMITER.match(lines[index]):
-            prefix = "".join(lines[: index - 1]).rstrip()
-            marker = "\n\n*(rendering table...)*"
-            return (prefix + marker).strip()
-    plan = plan_markdown_messages(content, max_chars=1750)
-    if not plan.segments:
-        return ""
-    first = plan.segments[0]
-    rendered = first.content
-    if len(plan.segments) > 1:
-        rendered += "\n\n*(stream continues; complete block-preserving output will follow)*"
-    return rendered[:1850]
+def _stream_content_batches(content: str) -> tuple[str, ...]:
+    if not content:
+        return ("",)
+    batches: list[str] = []
+    remaining = content
+    while len(remaining) > 1850:
+        split_at = max(
+            remaining.rfind("\n", 900, 1851),
+            remaining.rfind(" ", 900, 1851),
+        )
+        if split_at < 1:
+            split_at = 1850
+        else:
+            split_at += 1
+        batches.append(remaining[:split_at])
+        remaining = remaining[split_at:]
+    batches.append(remaining)
+    return tuple(batches)
 
 
 def _bounded_discord_text(content: str, limit: int) -> str:
@@ -5595,145 +5415,11 @@ def _discord_embeds(payloads: tuple[dict[str, Any], ...]) -> list[discord.Embed]
     return [discord.Embed.from_dict(payload) for payload in payloads]
 
 
-def _taskdeck_embed_payloads(payload: dict[str, Any]) -> tuple[dict[str, Any], ...]:
-    if payload.get("type") != "taskdeck":
-        return ()
-    cards = payload.get("cards")
-    if not isinstance(cards, list):
-        raise RenderPermanentError("TaskDeck render payload has no card list")
-    if not cards:
-        return (
-            {
-                "title": "TaskDeck",
-                "description": "No observed tasks.",
-                "color": 0x747F8D,
-            },
-        )
-    metadata = payload.get("taskdeck")
-    if not isinstance(metadata, dict):
-        raise RenderPermanentError("TaskDeck render payload has no panel metadata")
-    try:
-        page = max(0, int(metadata.get("page", 0)))
-    except (TypeError, ValueError) as error:
-        raise RenderPermanentError("TaskDeck render payload has an invalid page") from error
-    visible = cards[page * 8 : (page + 1) * 8]
-    selected_token = str(metadata.get("selected_card_token") or "")
-    expanded = bool(metadata.get("expanded"))
-    embeds: list[dict[str, Any]] = []
-    for card in visible:
-        if not isinstance(card, dict):
-            raise RenderPermanentError("TaskDeck render payload contains an invalid card")
-        title = _bounded_discord_text(str(card.get("title") or "Untitled task"), 100)
-        state = _bounded_discord_text(str(card.get("state") or "unknown"), 40)
-        kind = _bounded_discord_text(str(card.get("kind") or "unknown"), 40)
-        token = str(card.get("card_token") or "")
-        is_selected = token == selected_token
-        is_expanded = is_selected and expanded
-        progress = _bounded_discord_text(
-            str(card.get("progress_summary") or "No progress reported."),
-            360,
-        )
-        description = progress
-        if is_expanded and card.get("detail_artifact"):
-            filename = f"task-{token}-detail.md"
-            description = (
-                f"{progress}\n\nFull detail is attached as `{filename}` and remains "
-                "available from Download."
-            )
-        fields = [
-            {"name": "State", "value": f"`{state}`", "inline": True},
-            {"name": "Type", "value": f"`{kind}`", "inline": True},
-            {
-                "name": "Elapsed",
-                "value": f"`{_taskdeck_elapsed(card)}`",
-                "inline": True,
-            },
-        ]
-        dependencies = card.get("dependencies")
-        if is_expanded and isinstance(dependencies, list) and dependencies:
-            fields.append(
-                {
-                    "name": "Dependencies",
-                    "value": _bounded_discord_text(
-                        ", ".join(f"`{value}`" for value in dependencies[:10]),
-                        140,
-                    ),
-                    "inline": False,
-                }
-            )
-        artifact_links = card.get("artifact_links")
-        if is_expanded and isinstance(artifact_links, list) and artifact_links:
-            fields.append(
-                {
-                    "name": "Artifacts",
-                    "value": _bounded_discord_text(
-                        "\n".join(str(value) for value in artifact_links[:8]),
-                        160,
-                    ),
-                    "inline": False,
-                }
-            )
-        embed: dict[str, Any] = {
-            "title": f"{_taskdeck_state_icon(state)} {title}",
-            "description": _bounded_discord_text(description, 780),
-            "color": _taskdeck_state_color(state),
-            "fields": fields,
-        }
-        if is_selected:
-            embed["footer"] = {"text": "Selected · expanded" if expanded else "Selected"}
-        embeds.append(embed)
-    return tuple(embeds)
-
-
-def _taskdeck_elapsed(card: dict[str, Any]) -> str:
-    elapsed = card.get("elapsed")
-    if isinstance(elapsed, str) and elapsed:
-        return _bounded_discord_text(elapsed, 32)
-    first_seen = card.get("first_seen_at")
-    observed_end = card.get("terminal_at") or card.get("last_progress_at")
-    if not isinstance(first_seen, (int, float)) or not isinstance(observed_end, (int, float)):
-        return "unknown"
-    total = max(0, int(observed_end - first_seen))
-    minutes, seconds = divmod(total, 60)
-    hours, minutes = divmod(minutes, 60)
-    if hours:
-        return f"{hours}h {minutes}m"
-    if minutes:
-        return f"{minutes}m {seconds}s"
-    return f"{seconds}s"
-
-
-def _taskdeck_state_icon(state: str) -> str:
-    return {
-        "running": "▶",
-        "idle": "⏸",
-        "completed": "✅",
-        "failed": "❌",
-        "cancelled": "⏹",
-        "unknown": "⚠️",
-    }.get(state, "•")
-
-
-def _taskdeck_state_color(state: str) -> int:
-    return {
-        "running": 0x5865F2,
-        "idle": 0xFEE75C,
-        "completed": 0x57F287,
-        "failed": 0xED4245,
-        "cancelled": 0x747F8D,
-        "unknown": 0xF0B232,
-    }.get(state, 0x747F8D)
-
-
-def _render_view(
-    payload: dict[str, Any],
-    *,
-    enable_task_actions: bool = False,
-) -> discord.ui.View | None:
+def _render_view(payload: dict[str, Any]) -> discord.ui.View | None:
     interaction = payload.get("interaction")
     if isinstance(interaction, dict) and interaction.get("state") == "pending":
         return _interaction_view(interaction)
-    return _taskdeck_view(payload, enable_task_actions=enable_task_actions)
+    return None
 
 
 def _interaction_view(metadata: dict[str, Any]) -> discord.ui.View:
@@ -5845,86 +5531,6 @@ def _coerce_elicitation_value(field: ElicitationField, value: str) -> Any:
     if not isinstance(decoded, list):
         raise ValueError(f"{field.name} must be a JSON array")
     return decoded
-
-
-def _taskdeck_view(
-    payload: dict[str, Any],
-    *,
-    enable_task_actions: bool = False,
-) -> discord.ui.View | None:
-    metadata = payload.get("taskdeck")
-    if not isinstance(metadata, dict):
-        return None
-    panel_id = str(metadata["panel_id"])
-    revision = int(metadata["revision"])
-    options = metadata.get("options")
-    if not isinstance(options, list) or not options:
-        return None
-    selected = str(metadata.get("selected_card_token") or "")
-    view = discord.ui.View(timeout=None)
-    view.add_item(
-        discord.ui.Select(
-            custom_id=f"cdtd:{panel_id}:{revision}:select",
-            placeholder="Select a task",
-            options=[
-                discord.SelectOption(
-                    label=str(option.get("label") or "Untitled task"),
-                    value=str(option["value"]),
-                    description=str(option.get("state") or "unknown"),
-                    default=str(option["value"]) == selected,
-                )
-                for option in options[:25]
-            ],
-        )
-    )
-    view.add_item(
-        discord.ui.Button(
-            label="Collapse" if metadata.get("expanded") else "Expand",
-            style=discord.ButtonStyle.secondary,
-            custom_id=f"cdtd:{panel_id}:{revision}:toggle",
-        )
-    )
-    page = int(metadata.get("page", 0))
-    page_count = int(metadata.get("page_count", 1))
-    view.add_item(
-        discord.ui.Button(
-            label="Previous",
-            style=discord.ButtonStyle.secondary,
-            custom_id=f"cdtd:{panel_id}:{revision}:prev",
-            disabled=page <= 0,
-        )
-    )
-    view.add_item(
-        discord.ui.Button(
-            label="Next",
-            style=discord.ButtonStyle.secondary,
-            custom_id=f"cdtd:{panel_id}:{revision}:next",
-            disabled=page + 1 >= page_count,
-        )
-    )
-    actions = metadata.get("actions")
-    if isinstance(actions, list):
-        action_styles = {
-            "cancel": discord.ButtonStyle.danger,
-            "promote": discord.ButtonStyle.primary,
-            "message": discord.ButtonStyle.primary,
-            "remove": discord.ButtonStyle.secondary,
-            "download": discord.ButtonStyle.secondary,
-        }
-        for action in actions:
-            action_name = str(action)
-            if action_name != "download" and not enable_task_actions:
-                continue
-            if action_name not in action_styles:
-                continue
-            view.add_item(
-                discord.ui.Button(
-                    label=action_name.title(),
-                    style=action_styles[action_name],
-                    custom_id=(f"cdtd:{panel_id}:{revision}:{action_name}:{selected}"),
-                )
-            )
-    return view
 
 
 def _interaction_result_text(result: str) -> str:
@@ -6301,8 +5907,6 @@ def _discord_parent_type(interaction: discord.Interaction) -> DiscordParentType:
 def _render_min_interval(bot: CopilotDiscordBot, lane: str) -> float:
     if lane == "assistant_stream":
         return bot.settings.discord_stream_edit_interval_seconds
-    if lane == "taskdeck":
-        return bot.settings.discord_taskdeck_edit_interval_seconds
     return 0.0
 
 

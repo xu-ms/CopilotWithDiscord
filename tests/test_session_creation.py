@@ -20,7 +20,7 @@ from copilotd.core.projects import (
     ProjectValidationError,
 )
 from copilotd.core.session_config import SessionConfigSnapshotError
-from copilotd.core.session_runtime import RuntimeState, SessionRuntime
+from copilotd.core.session_runtime import RuntimeState, SessionOwnerConflict, SessionRuntime
 from copilotd.core.sessions import (
     CreationIntentRepository,
     CreationState,
@@ -644,7 +644,7 @@ async def test_eager_resume_retries_after_stale_owner_lease_expires(
         assert "thread-eager-owner-retry" in failures
         assert "thread-eager-owner-retry" in sessions._eager_retry_tasks
 
-        for _ in range(50):
+        for _ in range(100):
             runtime = sessions.for_thread("thread-eager-owner-retry")
             if runtime is not None and runtime.state == RuntimeState.READY:
                 break
@@ -676,6 +676,264 @@ async def test_session_registry_shutdown_cancels_pending_eager_retry(tmp_path: P
 
         assert task.cancelled()
         assert sessions._eager_retry_tasks == {}
+
+
+@pytest.mark.asyncio
+async def test_protected_startup_recovery_is_limited_timed_and_leaves_idle_lazy(
+    tmp_path: Path,
+) -> None:
+    home = tmp_path / "home"
+    await asyncio.to_thread(home.mkdir)
+    async with Database(tmp_path / "bounded-startup-recovery.sqlite3") as database:
+        bindings = SessionBindingRepository(database)
+        idle = await bindings.create(
+            thread_id="thread-idle",
+            sdk_session_id="session-idle",
+            cwd_snapshot=home,
+            project_source="implicit-home",
+        )
+        protected = await bindings.create(
+            thread_id="thread-protected",
+            sdk_session_id="session-protected",
+            cwd_snapshot=home,
+            project_source="implicit-home",
+        )
+        await database.execute(
+            """
+            UPDATE session_bindings SET runtime_has_active_work = 1
+            WHERE thread_id = 'thread-protected'
+            """
+        )
+        attach_started = asyncio.Event()
+
+        class Runtime:
+            def __init__(self, binding) -> None:
+                self.binding = binding
+                self.state = RuntimeState.DETACHED
+
+            async def attach_resume(self, *, reactivate: bool = False) -> None:
+                del reactivate
+                attach_started.set()
+                await asyncio.Event().wait()
+
+            async def shutdown(self, *, emergency: bool = False) -> None:
+                del emergency
+                self.state = RuntimeState.CLOSED
+
+        created: list[str] = []
+
+        def factory(binding):
+            created.append(binding.thread_id)
+            return Runtime(binding)
+
+        sessions = SessionRegistry(bindings, factory)  # type: ignore[arg-type]
+        failures = await sessions.eager_resume(
+            protected_only=True,
+            max_bindings=1,
+            concurrency=2,
+            attach_timeout_seconds=0.01,
+        )
+
+        assert attach_started.is_set()
+        assert created == [protected.thread_id]
+        assert idle.thread_id not in created
+        assert protected.thread_id in failures
+        await sessions.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_protected_startup_recovery_exhausts_all_bounded_pages(
+    tmp_path: Path,
+) -> None:
+    home = tmp_path / "home"
+    await asyncio.to_thread(home.mkdir)
+    async with Database(tmp_path / "paged-startup-recovery.sqlite3") as database:
+        bindings = SessionBindingRepository(database)
+        for index in range(5):
+            await bindings.create(
+                thread_id=f"thread-protected-{index}",
+                sdk_session_id=f"session-protected-{index}",
+                cwd_snapshot=home,
+                project_source="implicit-home",
+            )
+        await database.execute("UPDATE session_bindings SET runtime_has_active_work = 1")
+
+        class Runtime:
+            def __init__(self, binding) -> None:
+                self.binding = binding
+                self.state = RuntimeState.DETACHED
+
+            async def attach_resume(self, *, reactivate: bool = False) -> None:
+                del reactivate
+                self.state = RuntimeState.READY
+
+            async def shutdown(self, *, emergency: bool = False) -> None:
+                del emergency
+                self.state = RuntimeState.CLOSED
+
+        created: list[str] = []
+
+        def factory(binding):
+            created.append(binding.thread_id)
+            return Runtime(binding)
+
+        sessions = SessionRegistry(bindings, factory)  # type: ignore[arg-type]
+        failures = await sessions.recover_protected_bindings(
+            page_size=2,
+            concurrency=2,
+            attach_timeout_seconds=1,
+        )
+
+        assert failures == {}
+        assert created == [f"thread-protected-{index}" for index in range(5)]
+        assert await bindings.protected_recovery_cursor() is None
+        await sessions.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_eager_and_user_attach_share_one_serialized_transition(
+    tmp_path: Path,
+) -> None:
+    home = tmp_path / "home"
+    await asyncio.to_thread(home.mkdir)
+    async with Database(tmp_path / "eager-user-single-flight.sqlite3") as database:
+        bindings = SessionBindingRepository(database)
+        binding = await bindings.create(
+            thread_id="thread-eager-user-single-flight",
+            sdk_session_id="session-eager-user-single-flight",
+            cwd_snapshot=home,
+            project_source="implicit-home",
+        )
+        entered = asyncio.Event()
+        release = asyncio.Event()
+        attach_calls = 0
+
+        class Runtime:
+            def __init__(self, current) -> None:
+                self.binding = current
+                self.state = RuntimeState.DETACHED
+
+            async def attach_resume(self, *, reactivate: bool = False) -> None:
+                nonlocal attach_calls
+                del reactivate
+                attach_calls += 1
+                entered.set()
+                await release.wait()
+                self.state = RuntimeState.READY
+
+            async def shutdown(self, *, emergency: bool = False) -> None:
+                del emergency
+                self.state = RuntimeState.CLOSED
+
+        created: list[Runtime] = []
+
+        def factory(current):
+            runtime = Runtime(current)
+            created.append(runtime)
+            return runtime
+
+        sessions = SessionRegistry(bindings, factory)  # type: ignore[arg-type]
+        eager = asyncio.create_task(sessions.eager_resume())
+        await entered.wait()
+        foreground = asyncio.create_task(sessions.ensure_attached(binding))
+        await asyncio.sleep(0)
+        release.set()
+
+        failures, runtime = await asyncio.gather(eager, foreground)
+
+        assert failures == {}
+        assert created == [runtime]
+        assert attach_calls == 1
+        await sessions.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_sdk_owner_conflict_uses_ttl_derived_background_retry(
+    tmp_path: Path,
+) -> None:
+    home = tmp_path / "home"
+    await asyncio.to_thread(home.mkdir)
+    async with Database(tmp_path / "sdk-owner-conflict-retry.sqlite3") as database:
+        bindings = SessionBindingRepository(database)
+        binding = await bindings.create(
+            thread_id="thread-sdk-owner-conflict",
+            sdk_session_id="session-sdk-owner-conflict",
+            cwd_snapshot=home,
+            project_source="implicit-home",
+        )
+
+        class Runtime:
+            def __init__(self, current) -> None:
+                self.binding = current
+                self.state = RuntimeState.DETACHED
+
+            async def attach_resume(self, *, reactivate: bool = False) -> None:
+                del reactivate
+                raise SessionOwnerConflict("SDK owner is still active")
+
+            async def shutdown(self, *, emergency: bool = False) -> None:
+                del emergency
+                self.state = RuntimeState.CLOSED
+
+        sessions = SessionRegistry(
+            bindings,
+            Runtime,  # type: ignore[arg-type]
+            owner_lease_ttl_seconds=120,
+        )
+        failures = await sessions.eager_resume()
+
+        assert binding.thread_id in failures
+        assert binding.thread_id in sessions._eager_retry_tasks
+        assert sessions._eager_retry_delays == pytest.approx((10, 20, 30, 40, 20.1))
+        assert sum(sessions._eager_retry_delays) > 120
+        await sessions.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_degraded_runtime_is_replaced_and_reattached(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    await asyncio.to_thread(home.mkdir)
+    async with Database(tmp_path / "degraded-runtime-replacement.sqlite3") as database:
+        bindings = SessionBindingRepository(database)
+        binding = await bindings.create(
+            thread_id="thread-degraded",
+            sdk_session_id="session-degraded",
+            cwd_snapshot=home,
+            project_source="implicit-home",
+        )
+
+        class Runtime:
+            def __init__(self, current, *, state: RuntimeState = RuntimeState.DETACHED) -> None:
+                self.binding = current
+                self.state = state
+                self.shutdown_calls = 0
+
+            async def attach_resume(self, *, reactivate: bool = False) -> None:
+                del reactivate
+                self.state = RuntimeState.READY
+
+            async def shutdown(self, *, emergency: bool = False) -> None:
+                del emergency
+                self.shutdown_calls += 1
+                self.state = RuntimeState.CLOSED
+
+        created: list[Runtime] = []
+
+        def factory(current):
+            runtime = Runtime(current)
+            created.append(runtime)
+            return runtime
+
+        sessions = SessionRegistry(bindings, factory)  # type: ignore[arg-type]
+        degraded = Runtime(binding, state=RuntimeState.DEGRADED)
+        sessions.register(degraded)  # type: ignore[arg-type]
+
+        recovered = await sessions.ensure_attached(binding)
+
+        assert degraded.shutdown_calls == 1
+        assert recovered is created[0]
+        assert recovered.state == RuntimeState.READY
+        await sessions.shutdown()
 
 
 @pytest.mark.asyncio

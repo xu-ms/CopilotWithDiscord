@@ -3,7 +3,7 @@ from __future__ import annotations
 import hashlib
 import re
 import shlex
-from collections.abc import Mapping, Sequence
+from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -304,37 +304,16 @@ def extract_local_markdown_images(
     *,
     allowed_roots: Sequence[Path | str],
     trusted_paths: Sequence[Path | str] | None = None,
-    trusted_artifacts: Mapping[Path | str, Path | str] | None = None,
 ) -> MarkdownImageExtractionPlan:
     roots = tuple(Path(root).resolve() for root in allowed_roots)
-    artifact_paths = (
-        None
-        if trusted_artifacts is None
-        else {
-            source_candidate: Path(snapshot_path).resolve(strict=False)
-            for source_path, snapshot_path in trusted_artifacts.items()
-            for source_candidate in _trusted_artifact_candidates(Path(source_path), roots)
-        }
-    )
-    external_trusted_paths = (
-        set()
-        if trusted_artifacts is None
-        else {
-            path.resolve(strict=False)
-            for value in trusted_paths or ()
-            if (path := Path(value)).is_absolute()
-        }
-    )
     trusted = (
         None
-        if trusted_paths is None and artifact_paths is None
+        if trusted_paths is None
         else {
             resolved
             for value in trusted_paths or ()
             for resolved in _trusted_path_candidates(Path(value), roots)
         }
-        | set(artifact_paths or ())
-        | external_trusted_paths
     )
     redact_local_references = trusted is not None
     warnings: list[MarkdownImageWarning] = []
@@ -411,9 +390,7 @@ def extract_local_markdown_images(
             attachments,
             inline_code_delim,
             trusted,
-            artifact_paths,
             redact_local_references,
-            external_trusted_paths,
         )
         if previous_inline_delim is None and inline_code_delim is not None:
             inline_container_path = container_path
@@ -458,9 +435,7 @@ def _extract_images_from_line(
     attachments: list[MarkdownImageAttachmentPlan],
     inline_code_delim: int | None,
     trusted_paths: set[Path] | None,
-    trusted_artifacts: dict[Path, Path] | None,
     redact_local_references: bool,
-    external_trusted_paths: set[Path],
 ) -> tuple[str, int | None]:
     pieces: list[str] = []
     index = 0
@@ -511,7 +486,6 @@ def _extract_images_from_line(
             resolved, warning = _resolve_markdown_image_path(
                 path_text,
                 roots,
-                exact_paths=external_trusted_paths,
             )
             if warning is not None:
                 warnings.append(
@@ -556,10 +530,7 @@ def _extract_images_from_line(
                 )
                 index = end
                 continue
-            materialized = (
-                resolved if trusted_artifacts is None else trusted_artifacts.get(resolved)
-            )
-            if materialized is None or not materialized.is_file():
+            if resolved is None or not resolved.is_file():
                 warnings.append(
                     MarkdownImageWarning(
                         kind="missing-image",
@@ -572,7 +543,7 @@ def _extract_images_from_line(
                 )
                 index = end
                 continue
-            if not _is_supported_image(materialized):
+            if not _is_supported_image(resolved):
                 warnings.append(
                     MarkdownImageWarning(
                         kind="unsupported-image",
@@ -589,7 +560,7 @@ def _extract_images_from_line(
                 MarkdownImageAttachmentPlan(
                     source=source_text,
                     path=path_text,
-                    resolved_path=str(materialized),
+                    resolved_path=str(resolved),
                     alt_text=alt_text,
                     title=title,
                     filename=resolved.name,
@@ -1207,13 +1178,11 @@ def _is_fence_closer(text: str, fence_char: str, fence_len: int) -> bool:
 def _resolve_markdown_image_path(
     path_text: str,
     roots: tuple[Path, ...],
-    *,
-    exact_paths: set[Path] | None = None,
 ) -> tuple[Path | None, str | None]:
     candidate = Path(path_text)
     if candidate.is_absolute():
         resolved = candidate.resolve(strict=False)
-        if resolved in (exact_paths or ()) or any(_within_root(resolved, root) for root in roots):
+        if any(_within_root(resolved, root) for root in roots):
             return resolved, None
         return None, "invalid-root"
     for root in roots:
@@ -1232,12 +1201,6 @@ def _trusted_path_candidates(path: Path, roots: tuple[Path, ...]) -> tuple[Path,
         for root in roots
         if _within_root(resolved := (root / path).resolve(strict=False), root)
     )
-
-
-def _trusted_artifact_candidates(path: Path, roots: tuple[Path, ...]) -> tuple[Path, ...]:
-    if path.is_absolute():
-        return (path.resolve(strict=False),)
-    return _trusted_path_candidates(path, roots)
 
 
 def _within_root(path: Path, root: Path) -> bool:

@@ -1,13 +1,16 @@
 from __future__ import annotations
 
-import hashlib
-import json
 import time
 import uuid
 from dataclasses import dataclass
 from typing import Any, Protocol
 
 from copilotd.core.models import AdaptedEvent
+from copilotd.core.volatile_content import (
+    VolatileContentStore,
+    opaque_content_key,
+    process_content_store,
+)
 from copilotd.storage.database import Database
 
 REQUEST_COMPLETION_TYPES: dict[str, str] = {
@@ -52,8 +55,14 @@ class ProtocolResponseClaim:
 
 
 class ProtocolResponseRepository:
-    def __init__(self, database: Database) -> None:
+    def __init__(
+        self,
+        database: Database,
+        *,
+        content_store: VolatileContentStore | None = None,
+    ) -> None:
         self._database = database
+        self._content_store = content_store or database.content_store
 
     async def claim(
         self,
@@ -71,71 +80,77 @@ class ProtocolResponseRepository:
                 f"copilotd:{sdk_session_id}:{generation}:protocol:{request_id}",
             )
         )
-        encoded = json.dumps(
-            response_payload,
-            ensure_ascii=False,
-            sort_keys=True,
-            separators=(",", ":"),
+        response_key = opaque_content_key(
+            "protocol-response",
+            sdk_session_id,
+            generation,
+            request_id,
         )
-        response_digest = hashlib.sha256(encoded.encode()).hexdigest()
-        async with self._database.transaction() as connection:
-            cursor = await connection.execute(
-                """
-                SELECT requested_type, response_plane, response_state,
-                       requested_event_id, completed_event_id
-                FROM protocol_requests
-                WHERE sdk_session_id = ? AND generation = ? AND request_id = ?
-                """,
-                (sdk_session_id, generation, request_id),
-            )
-            row = await cursor.fetchone()
-            await cursor.close()
-            if (
-                row is None
-                or row["requested_event_id"] is None
-                or row["completed_event_id"] is not None
-                or row["response_plane"] != "app_rpc"
-                or row["response_state"] != "pending"
-            ):
-                return None
-            update = await connection.execute(
-                """
-                UPDATE protocol_requests
-                SET response_state = 'responding', response_attempt_id = ?,
-                    response_payload = ?, updated_at = ?
-                WHERE sdk_session_id = ? AND generation = ? AND request_id = ?
-                  AND response_state = 'pending' AND completed_event_id IS NULL
-                """,
-                (
-                    attempt_id,
-                    encoded,
-                    now,
-                    sdk_session_id,
-                    generation,
-                    request_id,
-                ),
-            )
-            if update.rowcount != 1:
+        with self._content_store.transaction():
+            async with self._database.transaction() as connection:
+                response_ref = self._content_store.put(
+                    response_payload,
+                    key=response_key,
+                )
+                response_digest = response_ref.sha256
+                cursor = await connection.execute(
+                    """
+                    SELECT requested_type, response_plane, response_state,
+                           requested_event_id, completed_event_id
+                    FROM protocol_requests
+                    WHERE sdk_session_id = ? AND generation = ? AND request_id = ?
+                    """,
+                    (sdk_session_id, generation, request_id),
+                )
+                row = await cursor.fetchone()
+                await cursor.close()
+                if (
+                    row is None
+                    or row["requested_event_id"] is None
+                    or row["completed_event_id"] is not None
+                    or row["response_plane"] != "app_rpc"
+                    or row["response_state"] != "pending"
+                ):
+                    self._content_store.delete(response_key)
+                    return None
+                update = await connection.execute(
+                    """
+                    UPDATE protocol_requests
+                    SET response_state = 'responding', response_attempt_id = ?,
+                        response_payload = NULL, updated_at = ?
+                    WHERE sdk_session_id = ? AND generation = ? AND request_id = ?
+                      AND response_state = 'pending' AND completed_event_id IS NULL
+                    """,
+                    (
+                        attempt_id,
+                        now,
+                        sdk_session_id,
+                        generation,
+                        request_id,
+                    ),
+                )
+                if update.rowcount != 1:
+                    await update.close()
+                    self._content_store.delete(response_key)
+                    return None
                 await update.close()
-                return None
-            await update.close()
-            await connection.execute(
-                """
-                INSERT INTO protocol_response_attempts(
-                    attempt_id, sdk_session_id, generation, owner_fence_token,
-                    request_id, response_plane, response_hash, state, started_at
-                ) VALUES (?, ?, ?, ?, ?, 'app_rpc', ?, 'started', ?)
-                """,
-                (
-                    attempt_id,
-                    sdk_session_id,
-                    generation,
-                    owner_fence_token,
-                    request_id,
-                    response_digest,
-                    now,
-                ),
-            )
+                await connection.execute(
+                    """
+                    INSERT INTO protocol_response_attempts(
+                        attempt_id, sdk_session_id, generation, owner_fence_token,
+                        request_id, response_plane, response_hash, state, started_at
+                    ) VALUES (?, ?, ?, ?, ?, 'app_rpc', ?, 'started', ?)
+                    """,
+                    (
+                        attempt_id,
+                        sdk_session_id,
+                        generation,
+                        owner_fence_token,
+                        request_id,
+                        response_digest,
+                        now,
+                    ),
+                )
         return ProtocolResponseClaim(
             attempt_id=attempt_id,
             sdk_session_id=sdk_session_id,
@@ -186,6 +201,14 @@ class ProtocolResponseRepository:
                     claim.attempt_id,
                 ),
             )
+        self._content_store.delete(
+            opaque_content_key(
+                "protocol-response",
+                claim.sdk_session_id,
+                claim.generation,
+                claim.request_id,
+            )
+        )
 
     async def mark_unsupported(
         self,
@@ -198,18 +221,26 @@ class ProtocolResponseRepository:
         await self._database.execute(
             """
             UPDATE protocol_requests
-            SET response_state = 'unsupported', response_payload = ?, updated_at = ?
+            SET response_state = 'unsupported', response_payload = NULL, updated_at = ?
             WHERE sdk_session_id = ? AND generation = ? AND request_id = ?
               AND response_state = 'pending'
             """,
             (
-                json.dumps({"reason": reason}, sort_keys=True),
                 time.time(),
                 sdk_session_id,
                 generation,
                 request_id,
             ),
         )
+        self._content_store.delete(
+            opaque_content_key(
+                "protocol-response",
+                sdk_session_id,
+                generation,
+                request_id,
+            )
+        )
+        del reason
 
 
 class ProtocolResponder(Protocol):
@@ -240,6 +271,7 @@ async def apply_protocol_event(
     data: dict[str, Any],
     *,
     now: float,
+    content_store: VolatileContentStore | None = None,
 ) -> bool:
     request_id = data.get("requestId")
     if request_id is None:
@@ -259,7 +291,15 @@ async def apply_protocol_event(
     )
     current = await cursor.fetchone()
     await cursor.close()
-    encoded = json.dumps(data, ensure_ascii=False, sort_keys=True)
+    store = content_store or process_content_store()
+    body_key = opaque_content_key(
+        "protocol-body",
+        event.sdk_session_id,
+        event.generation,
+        request_id_text,
+        raw_type,
+    )
+    body_ref = store.put(data, key=body_key)
     if is_requested:
         response_plane = _RESPONSE_PLANES.get(raw_type, "journal")
         initial_response_state = (
@@ -275,9 +315,10 @@ async def apply_protocol_event(
                 INSERT INTO protocol_requests(
                     sdk_session_id, generation, request_id,
                     requested_type, requested_event_id, requested_payload,
+                    requested_hash,
                     requested_at, wire_state, response_plane,
                     response_state, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, 'requested', ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, NULL, ?, ?, 'requested', ?, ?, ?)
                 """,
                 (
                     event.sdk_session_id,
@@ -285,7 +326,7 @@ async def apply_protocol_event(
                     request_id_text,
                     raw_type,
                     event.event_id,
-                    encoded,
+                    body_ref.sha256,
                     now,
                     response_plane,
                     initial_response_state,
@@ -305,7 +346,8 @@ async def apply_protocol_event(
                 UPDATE protocol_requests
                 SET requested_type = COALESCE(requested_type, ?),
                     requested_event_id = COALESCE(requested_event_id, ?),
-                    requested_payload = COALESCE(requested_payload, ?),
+                    requested_payload = NULL,
+                    requested_hash = COALESCE(requested_hash, ?),
                     requested_at = COALESCE(requested_at, ?),
                     wire_state = ?, response_plane = ?,
                     response_state = ?, updated_at = ?
@@ -314,7 +356,7 @@ async def apply_protocol_event(
                 (
                     raw_type,
                     event.event_id,
-                    encoded,
+                    body_ref.sha256,
                     now,
                     wire_state,
                     response_plane,
@@ -325,6 +367,7 @@ async def apply_protocol_event(
                     request_id_text,
                 ),
             )
+        store.delete(body_key)
         return True
 
     requested_type = COMPLETION_REQUEST_TYPES[raw_type]
@@ -335,9 +378,10 @@ async def apply_protocol_event(
             INSERT INTO protocol_requests(
                 sdk_session_id, generation, request_id,
                 completed_type, completed_event_id, completed_payload,
+                completed_hash,
                 completed_at, wire_state, response_plane,
                 response_state, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, 'completed_before_requested', ?,
+            ) VALUES (?, ?, ?, ?, ?, NULL, ?, ?, 'completed_before_requested', ?,
                       'completed', ?)
             """,
             (
@@ -346,7 +390,7 @@ async def apply_protocol_event(
                 request_id_text,
                 raw_type,
                 event.event_id,
-                encoded,
+                body_ref.sha256,
                 now,
                 response_plane,
                 now,
@@ -368,7 +412,8 @@ async def apply_protocol_event(
             UPDATE protocol_requests
             SET completed_type = COALESCE(completed_type, ?),
                 completed_event_id = COALESCE(completed_event_id, ?),
-                completed_payload = COALESCE(completed_payload, ?),
+                completed_payload = NULL,
+                completed_hash = COALESCE(completed_hash, ?),
                 completed_at = COALESCE(completed_at, ?),
                 wire_state = CASE
                     WHEN requested_event_id IS NULL
@@ -380,7 +425,7 @@ async def apply_protocol_event(
             (
                 raw_type,
                 event.event_id,
-                encoded,
+                body_ref.sha256,
                 now,
                 response_state,
                 now,
@@ -389,4 +434,5 @@ async def apply_protocol_event(
                 request_id_text,
             ),
         )
+    store.delete(body_key)
     return True

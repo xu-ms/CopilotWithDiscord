@@ -366,50 +366,6 @@ class OpsSurfaceAdapter(Protocol):
     async def event_dump(self, *, session_id: str | None = None) -> Mapping[str, Any]: ...
 
 
-class TaskActionAdapter(Protocol):
-    async def list_tasks(
-        self,
-        *,
-        session_id: str,
-    ) -> Sequence[Mapping[str, Any]]: ...
-
-    async def show_task(
-        self,
-        *,
-        session_id: str,
-        task_id: str,
-    ) -> Mapping[str, Any]: ...
-
-    async def cancel_task(
-        self,
-        *,
-        session_id: str,
-        task_id: str,
-    ) -> Mapping[str, Any]: ...
-
-    async def promote_task(
-        self,
-        *,
-        session_id: str,
-        task_id: str,
-    ) -> Mapping[str, Any]: ...
-
-    async def message_task(
-        self,
-        *,
-        session_id: str,
-        task_id: str,
-        message: str,
-    ) -> Mapping[str, Any]: ...
-
-    async def remove_task(
-        self,
-        *,
-        session_id: str,
-        task_id: str,
-    ) -> Mapping[str, Any]: ...
-
-
 class ElicitationAdapter(Protocol):
     async def ask(
         self,

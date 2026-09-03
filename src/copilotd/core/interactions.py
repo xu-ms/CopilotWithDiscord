@@ -10,6 +10,10 @@ from dataclasses import dataclass
 from typing import Any, Literal, cast
 
 from copilotd.core.inbox import ReducerInbox
+from copilotd.core.volatile_content import (
+    VolatileContentStore,
+    opaque_content_key,
+)
 from copilotd.storage.database import Database
 
 InteractionKind = Literal[
@@ -192,11 +196,13 @@ class InteractionGateway:
         inbox: ReducerInbox,
         scope: InteractionScope,
         timeout_seconds: float,
+        content_store: VolatileContentStore | None = None,
     ) -> None:
         self._database = database
         self._inbox = inbox
         self._scope = scope
         self._timeout_seconds = timeout_seconds
+        self._content_store = content_store or database.content_store
         self._futures: dict[str, asyncio.Future[InteractionResponse]] = {}
 
     async def request(
@@ -247,21 +253,41 @@ class InteractionGateway:
             payload["form"] = form.to_dict()
         if validation_error is not None:
             payload["schema_error"] = validation_error
+        content_key = opaque_content_key(
+            "interaction-request",
+            self._scope.sdk_session_id,
+            interaction_id,
+        )
+        content_ref = self._content_store.put(payload, key=content_key)
 
         future: asyncio.Future[InteractionResponse] = asyncio.get_running_loop().create_future()
         self._futures[interaction_id] = future
-        await self._inbox.commit_internal(
-            {
-                "type": "copilotd.interaction.requested",
-                "data": {
-                    **payload,
-                    "protocol_request_id": protocol_request_id,
-                    "form_schema": None if form is None else form.to_dict(),
-                    "sensitive_response": kind == "mcp_oauth",
+        try:
+            await self._inbox.commit_internal(
+                {
+                    "type": "copilotd.interaction.requested",
+                    "data": {
+                        **payload,
+                        "protocol_request_id": protocol_request_id,
+                        "content_key": content_ref.key,
+                        "request_hash": content_ref.sha256,
+                        "sensitive_response": kind == "mcp_oauth",
+                    },
                 },
-            },
-            internal_event_id=f"interaction:{interaction_id}:requested",
-        )
+                internal_event_id=f"interaction:{interaction_id}:requested",
+            )
+        except BaseException:
+            admitted = await self._database.fetchone(
+                """
+                SELECT 1 FROM pending_interactions
+                WHERE interaction_id = ? AND sdk_session_id = ?
+                """,
+                (interaction_id, self._scope.sdk_session_id),
+            )
+            if admitted is None:
+                self._content_store.delete(content_key)
+            self._futures.pop(interaction_id, None)
+            raise
         if validation_error is not None:
             await self._settle(
                 interaction_id,
@@ -326,7 +352,7 @@ class InteractionGateway:
     ) -> InteractionResolution:
         row = await self._database.fetchone(
             """
-            SELECT kind, expires_at, state, payload, form_schema,
+            SELECT kind, expires_at, state, content_key, request_hash,
                    runtime_generation, owner_fence_token
             FROM pending_interactions
             WHERE interaction_id = ? AND sdk_session_id = ?
@@ -335,17 +361,35 @@ class InteractionGateway:
         )
         if row is None:
             return "invalid"
+        if row["state"] != "pending":
+            self._discard_interaction_content(interaction_id)
+            return "expired"
         if (
-            row["state"] != "pending"
-            or float(row["expires_at"]) <= time.time()
-            or int(row["runtime_generation"]) != self._scope.runtime_generation
+            int(row["runtime_generation"]) != self._scope.runtime_generation
             or int(row["owner_fence_token"]) != self._scope.owner_fence_token
         ):
+            return "expired"
+        if float(row["expires_at"]) <= time.time():
+            kind = cast(InteractionKind, str(row["kind"]))
+            fallback = interaction_fallback(kind)
+            await self._settle(
+                interaction_id,
+                response=fallback,
+                persisted_response=_safe_response(kind, fallback),
+                display_response="Request timed out.",
+                state="expired",
+            )
             return "expired"
         future = self._futures.get(interaction_id)
         if future is None or future.done():
             return "expired"
-        payload = json.loads(str(row["payload"]))
+        payload = self._content_store.get(
+            row["content_key"],
+            expected_hash=row["request_hash"],
+        )
+        if not isinstance(payload, dict):
+            await self._expire_content_unavailable(interaction_id)
+            return "expired"
         kind = cast(InteractionKind, str(row["kind"]))
         response: InteractionResponse
         persisted_response: InteractionResponse
@@ -356,8 +400,8 @@ class InteractionGateway:
                 response = {"action": action}
                 persisted_response = response
                 display_response = f"Form {action}led." if action == "cancel" else "Form declined."
-            elif form_content is not None and row["form_schema"] is not None:
-                form = ElicitationForm.from_dict(json.loads(str(row["form_schema"])))
+            elif form_content is not None and isinstance(payload.get("form"), Mapping):
+                form = ElicitationForm.from_dict(cast(Mapping[str, Any], payload["form"]))
                 try:
                     validated = form.validate(form_content)
                 except InteractionValidationError:
@@ -435,6 +479,48 @@ class InteractionGateway:
         )
         return "resolved" if claimed else "expired"
 
+    async def _expire_content_unavailable(self, interaction_id: str) -> None:
+        now = time.time()
+        changed = await self._database.execute_count(
+            """
+            UPDATE pending_interactions
+            SET state = 'content_unavailable', updated_at = ?
+            WHERE interaction_id = ? AND sdk_session_id = ?
+              AND runtime_generation = ? AND owner_fence_token = ?
+              AND state = 'pending'
+            """,
+            (
+                now,
+                interaction_id,
+                self._scope.sdk_session_id,
+                self._scope.runtime_generation,
+                self._scope.owner_fence_token,
+            ),
+        )
+        if changed:
+            await self._database.execute(
+                """
+                UPDATE liveness_leases
+                SET state = 'released', refreshed_at = ?, released_at = ?
+                WHERE sdk_session_id = ? AND lease_id = ? AND state = 'active'
+                """,
+                (
+                    now,
+                    now,
+                    self._scope.sdk_session_id,
+                    f"interaction:{interaction_id}",
+                ),
+            )
+        future = self._futures.get(interaction_id)
+        if future is not None and not future.done():
+            row = await self._database.fetchone(
+                "SELECT kind FROM pending_interactions WHERE interaction_id = ?",
+                (interaction_id,),
+            )
+            kind = "user_input" if row is None else str(row["kind"])
+            future.set_result(interaction_fallback(kind))
+        self._discard_interaction_content(interaction_id)
+
     async def cancel_pending(self, *, reason: str) -> int:
         rows = await self._database.fetchall(
             """
@@ -472,10 +558,10 @@ class InteractionGateway:
         state: Literal["resolved", "expired"],
     ) -> tuple[bool, InteractionResponse]:
         future = self._futures.get(interaction_id)
-        encoded_response = json.dumps(
-            persisted_response,
-            ensure_ascii=False,
-            sort_keys=True,
+        response_key = opaque_content_key(
+            "interaction-response",
+            self._scope.sdk_session_id,
+            interaction_id,
         )
         target_mode = interaction_target_mode(response) if state == "resolved" else None
         now = time.time()
@@ -485,73 +571,95 @@ class InteractionGateway:
                 f"copilotd:{self._scope.sdk_session_id}:interaction:{interaction_id}",
             )
         )
-        expiry_predicate = "AND expires_at > ?" if state == "resolved" else ""
-        parameters: tuple[Any, ...] = (
-            state,
-            encoded_response,
-            target_mode,
-            response_attempt_id,
-            now,
-            interaction_id,
-            self._scope.sdk_session_id,
-            self._scope.runtime_generation,
-            self._scope.owner_fence_token,
-        )
-        if state == "resolved":
-            parameters = (*parameters, now)
-        async with self._database.transaction() as connection:
-            cursor = await connection.execute(
-                f"""
-                UPDATE pending_interactions
-                SET state = ?, response = ?, target_mode = ?,
-                    response_attempt_id = ?, updated_at = ?
-                WHERE interaction_id = ? AND sdk_session_id = ?
-                  AND runtime_generation = ? AND owner_fence_token = ?
-                  AND state = 'pending' {expiry_predicate}
-                """,
-                parameters,
-            )
-            claimed = cursor.rowcount == 1
-            await cursor.close()
-            if claimed:
-                await connection.execute(
+        with self._content_store.transaction():
+            async with self._database.transaction() as connection:
+                current_cursor = await connection.execute(
                     """
-                    UPDATE liveness_leases
-                    SET state = 'released', refreshed_at = ?, released_at = ?
-                    WHERE sdk_session_id = ? AND lease_id = ?
-                      AND runtime_generation = ? AND owner_fence_token = ?
-                      AND state = 'active'
+                    SELECT kind, state, expires_at, response_hash,
+                           runtime_generation, owner_fence_token
+                    FROM pending_interactions
+                    WHERE interaction_id = ? AND sdk_session_id = ?
                     """,
-                    (
-                        now,
-                        now,
-                        self._scope.sdk_session_id,
-                        f"interaction:{interaction_id}",
-                        self._scope.runtime_generation,
-                        self._scope.owner_fence_token,
-                    ),
+                    (interaction_id, self._scope.sdk_session_id),
                 )
-            row_cursor = await connection.execute(
-                """
-                SELECT kind, response FROM pending_interactions
-                WHERE interaction_id = ? AND sdk_session_id = ?
-                """,
-                (interaction_id, self._scope.sdk_session_id),
-            )
-            row = await row_cursor.fetchone()
-            await row_cursor.close()
+                current = await current_cursor.fetchone()
+                await current_cursor.close()
+                claimed = bool(
+                    current is not None
+                    and current["state"] == "pending"
+                    and int(current["runtime_generation"]) == self._scope.runtime_generation
+                    and int(current["owner_fence_token"]) == self._scope.owner_fence_token
+                    and (state != "resolved" or float(current["expires_at"]) > now)
+                )
+                if claimed:
+                    response_ref = self._content_store.put(
+                        persisted_response,
+                        key=response_key,
+                    )
+                    cursor = await connection.execute(
+                        """
+                        UPDATE pending_interactions
+                        SET state = ?, response = NULL, response_hash = ?, target_mode = ?,
+                            response_attempt_id = ?, updated_at = ?
+                        WHERE interaction_id = ? AND sdk_session_id = ?
+                          AND runtime_generation = ? AND owner_fence_token = ?
+                          AND state = 'pending'
+                        """,
+                        (
+                            state,
+                            response_ref.sha256,
+                            target_mode,
+                            response_attempt_id,
+                            now,
+                            interaction_id,
+                            self._scope.sdk_session_id,
+                            self._scope.runtime_generation,
+                            self._scope.owner_fence_token,
+                        ),
+                    )
+                    if cursor.rowcount != 1:
+                        await cursor.close()
+                        raise RuntimeError("interaction settlement claim changed in transaction")
+                    await cursor.close()
+                    await connection.execute(
+                        """
+                        UPDATE liveness_leases
+                        SET state = 'released', refreshed_at = ?, released_at = ?
+                        WHERE sdk_session_id = ? AND lease_id = ?
+                          AND runtime_generation = ? AND owner_fence_token = ?
+                          AND state = 'active'
+                        """,
+                        (
+                            now,
+                            now,
+                            self._scope.sdk_session_id,
+                            f"interaction:{interaction_id}",
+                            self._scope.runtime_generation,
+                            self._scope.owner_fence_token,
+                        ),
+                    )
+                row_cursor = await connection.execute(
+                    """
+                    SELECT kind, response_hash, state FROM pending_interactions
+                    WHERE interaction_id = ? AND sdk_session_id = ?
+                    """,
+                    (interaction_id, self._scope.sdk_session_id),
+                )
+                row = await row_cursor.fetchone()
+                await row_cursor.close()
 
         settled_response = response
         kind = "interaction"
         if row is not None:
             kind = str(row["kind"])
         if not claimed:
+            recovered = self._content_store.get(
+                response_key,
+                expected_hash=None if row is None else row["response_hash"],
+            )
             settled_response = (
-                cast(
-                    InteractionResponse,
-                    json.loads(str(row["response"])),
-                )
-                if row is not None and row["response"] is not None
+                cast(InteractionResponse, recovered)
+                if recovered is not None
                 else _unclaimed_interaction_fallback(kind)
             )
         if claimed:
@@ -575,7 +683,19 @@ class InteractionGateway:
                 future.set_result(response)
         elif future is not None and not future.done():
             future.set_result(settled_response)
+        if claimed or (row is not None and str(row["state"]) != "pending"):
+            self._discard_interaction_content(interaction_id)
         return claimed, settled_response
+
+    def _discard_interaction_content(self, interaction_id: str) -> None:
+        for scope in ("interaction-request", "interaction-response"):
+            self._content_store.delete(
+                opaque_content_key(
+                    scope,
+                    self._scope.sdk_session_id,
+                    interaction_id,
+                )
+            )
 
 
 def interaction_target_mode(response: Any) -> str | None:

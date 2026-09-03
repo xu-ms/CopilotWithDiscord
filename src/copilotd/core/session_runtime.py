@@ -9,7 +9,6 @@ import time
 import uuid
 from collections.abc import Awaitable, Callable, Mapping
 from enum import StrEnum
-from pathlib import Path
 from typing import Any, Literal, Protocol, TypeVar, cast
 
 from copilotd.core.attachments import (
@@ -30,7 +29,6 @@ from copilotd.core.commands import (
     CDInputError,
     CDSessionStateError,
     ModelReasoningSummaryAdapter,
-    TaskActionAdapter,
 )
 from copilotd.core.event_adapter import InvalidSdkEvent, validate_sdk_event_identity
 from copilotd.core.extensions import (
@@ -66,7 +64,6 @@ from copilotd.core.native import (
     NativeRemoteMode,
     NativeTaskAction,
     RemotePreflightController,
-    TaskDeckAdapter,
     json_payload,
     stable_hash,
 )
@@ -75,6 +72,12 @@ from copilotd.core.protocol import ProtocolResponseRepository
 from copilotd.core.reducer import EventReducerWorker, JournalReducer
 from copilotd.core.session_config import SessionLaunchOptions
 from copilotd.core.task_registry import TaskRegistry
+from copilotd.core.volatile_content import (
+    MissingVolatileContentError,
+    VolatileContentStore,
+    opaque_content_key,
+)
+from copilotd.render.outbox import recover_reaction_outbox
 from copilotd.sdk.bridge import (
     EventLogBatch,
     ManagedAwarePermissionHandler,
@@ -91,6 +94,7 @@ from copilotd.storage.leases import (
     OwnerLease,
     OwnerLeaseStore,
 )
+from copilotd.storage.state_only import state_only_json
 
 AgentMode = Literal["interactive", "plan", "autopilot", "shell"]
 DeliveryMode = Literal["enqueue", "immediate"]
@@ -385,6 +389,10 @@ class SessionOwnerConflict(RuntimeError):
     pass
 
 
+class SessionLeaseRenewalFailed(RuntimeError):
+    pass
+
+
 class SessionNotReady(RuntimeError):
     pass
 
@@ -418,20 +426,23 @@ class SessionRuntime:
         ingress_capacity: int = 4096,
         reducer_batch_size: int = 64,
         owner_renew_seconds: float = OWNER_LEASE_RENEW_SECONDS,
+        owner_renew_retry_attempts: int = 3,
         queue_poll_seconds: float = 1,
         attachment_resolver: AttachmentResolver | None = None,
         interaction_timeout_seconds: float = 15 * 60,
         sdk_operation_timeout_seconds: float = 30,
         abort_evidence_timeout_seconds: float = 15,
         shutdown_timeout_seconds: float = 5,
+        shutdown_settle_seconds: float = 0.25,
+        event_replay_max_pages: int = 20,
         capabilities: CapabilityManifest | None = None,
         task_registry: TaskRegistry | None = None,
         send_frame_max_bytes: int = 7 * 1024 * 1024,
         model_summary_adapter: ModelReasoningSummaryAdapter | None = None,
-        task_action_adapter: TaskActionAdapter | None = None,
         extension_configs: ExtensionConfigRepository | None = None,
         oauth_authorizer: OAuthAuthorizer | None = None,
-        managed_session_state_root: Path | None = None,
+        content_store: VolatileContentStore | None = None,
+        capture_tool_acceptance_evidence: bool = False,
     ) -> None:
         self._database = database
         self._bridge = bridge
@@ -442,22 +453,28 @@ class SessionRuntime:
         self._ingress_capacity = ingress_capacity
         self._reducer_batch_size = reducer_batch_size
         self._owner_renew_seconds = owner_renew_seconds
+        if owner_renew_retry_attempts < 1:
+            raise ValueError("owner renewal retry attempts must be positive")
+        self._owner_renew_retry_attempts = owner_renew_retry_attempts
         self._queue_poll_seconds = queue_poll_seconds
         self._attachment_resolver = attachment_resolver
         self._interaction_timeout_seconds = interaction_timeout_seconds
         self._sdk_operation_timeout_seconds = sdk_operation_timeout_seconds
         self._abort_evidence_timeout_seconds = abort_evidence_timeout_seconds
         self._shutdown_timeout_seconds = shutdown_timeout_seconds
+        self._shutdown_settle_seconds = shutdown_settle_seconds
+        if event_replay_max_pages < 1:
+            raise ValueError("event replay page budget must be positive")
+        self._event_replay_max_pages = event_replay_max_pages
         self._capabilities = capabilities
         self._send_frame_max_bytes = send_frame_max_bytes
         self._model_summary_adapter = model_summary_adapter
-        self._task_action_adapter = task_action_adapter
         self._native_manifest = NativeManifestController(database, capabilities)
-        self._taskdeck = TaskDeckAdapter(database)
         self._remote_preflight = RemotePreflightController(bridge)
         self._extension_configs = extension_configs
         self._oauth_authorizer = oauth_authorizer
-        self._managed_session_state_root = managed_session_state_root
+        self._content_store = content_store or database.content_store
+        self._capture_tool_acceptance_evidence = capture_tool_acceptance_evidence
         self.state = RuntimeState.DETACHED
         self._lease: OwnerLease | None = None
         self._handle: SessionHandle | None = None
@@ -488,7 +505,10 @@ class SessionRuntime:
         self._hook_audit: SessionHookAudit | None = None
         self._permission_handler: ManagedAwarePermissionHandler | None = None
         self._extension_snapshot: ExtensionConfigSnapshot | None = None
-        self._protocol_responses = ProtocolResponseRepository(database)
+        self._protocol_responses = ProtocolResponseRepository(
+            database,
+            content_store=self._content_store,
+        )
         self._deferred_protocol_events: list[Any] = []
         self._protocol_tasks: set[asyncio.Task[Any]] = set()
         self._lifecycle_lock = asyncio.Lock()
@@ -504,6 +524,9 @@ class SessionRuntime:
         self._handle_terminal = False
         self._superseded_shutdown_event_ids: set[str] = set()
         self._shutdown_finalize_task: asyncio.Task[None] | None = None
+        self._pending_shutdown_event_id: str | None = None
+        self._shutdown_superseded_waiters: dict[str, asyncio.Event] = {}
+        self._state_before_shutdown: RuntimeState | None = None
 
     @property
     def handle(self) -> SessionHandle | None:
@@ -547,6 +570,8 @@ class SessionRuntime:
         prompt: str,
         *,
         idempotency_key: str,
+        discord_message_id: str | None = None,
+        discord_channel_id: str | None = None,
         attachments: list[Any] | None = None,
         attachment_manifest_id: str | None = None,
         discord_source_channel_id: str | None = None,
@@ -564,12 +589,19 @@ class SessionRuntime:
             )
         )
         prompt_hash = hashlib.sha256(prompt.encode()).hexdigest()
+        prompt_content_key = opaque_content_key(
+            "submission-prompt",
+            self.binding.sdk_session_id,
+            submission_id,
+        )
         async with self._admission_lock:
             if not self._accepting_sends:
                 raise SessionNotReady("session is not accepting new messages")
+            published_new_prompt = False
             snapshot = await self._database.fetchone(
                 """
-                SELECT q.prompt, q.attachment_manifest_id,
+                SELECT q.prompt_content_key, q.attachment_manifest_id,
+                       q.discord_message_id, q.discord_channel_id,
                        q.requested_mode_snapshot,
                        q.requested_model_config_snapshot,
                        q.requested_agent_snapshot,
@@ -584,94 +616,125 @@ class SessionRuntime:
                 """,
                 (submission_id, self.binding.thread_id),
             )
-            if snapshot is None:
-                if mode == "immediate":
-                    await self._assert_dispatchable()
-                else:
-                    await self._assert_intake_allowed(requested_origin=origin)
-                effective_agent_mode = agent_mode or self.binding.desired_mode
-                if effective_agent_mode not in {
-                    "interactive",
-                    "plan",
-                    "autopilot",
-                    "shell",
-                }:
-                    raise SessionNotReady(f"unsupported message mode: {effective_agent_mode}")
-                model_row = await self._database.fetchone(
-                    """
-                    SELECT desired_model_config, desired_agent,
-                           desired_project_config_version
-                    FROM session_bindings WHERE thread_id = ?
-                    """,
-                    (self.binding.thread_id,),
-                )
-                if model_row is None:
-                    raise SessionNotReady("session execution configuration is unavailable")
-                await self._require_inbox().commit_internal(
-                    {
-                        "type": "copilotd.submission.queued",
-                        "data": {
-                            "submission_id": submission_id,
-                            "thread_id": self.binding.thread_id,
-                            "origin": origin,
-                            "prompt": prompt,
-                            "prompt_hash": prompt_hash,
-                            "correlation_id": idempotency_key,
-                            "attachment_manifest_id": attachment_manifest_id,
-                            "attachment_count": len(attachments or []),
-                            "discord_source_channel_id": discord_source_channel_id,
-                            "discord_source_message_id": discord_source_message_id,
-                            "requested_mode": effective_agent_mode,
-                            "requested_model_config": json.loads(model_row["desired_model_config"]),
-                            "requested_agent": model_row["desired_agent"],
-                            "requested_session_config_version": model_row[
-                                "desired_project_config_version"
-                            ],
-                            "requested_delivery": mode,
-                            "created_at": time.time(),
+            try:
+                if snapshot is None:
+                    if mode == "immediate":
+                        await self._assert_dispatchable()
+                    else:
+                        await self._assert_intake_allowed(requested_origin=origin)
+                    effective_agent_mode = agent_mode or self.binding.desired_mode
+                    if effective_agent_mode not in {
+                        "interactive",
+                        "plan",
+                        "autopilot",
+                        "shell",
+                    }:
+                        raise SessionNotReady(f"unsupported message mode: {effective_agent_mode}")
+                    model_row = await self._database.fetchone(
+                        """
+                        SELECT desired_model_config, desired_agent,
+                               desired_project_config_version
+                        FROM session_bindings WHERE thread_id = ?
+                        """,
+                        (self.binding.thread_id,),
+                    )
+                    if model_row is None:
+                        raise SessionNotReady("session execution configuration is unavailable")
+                    self._content_store.put(prompt, key=prompt_content_key)
+                    published_new_prompt = True
+                    await self._require_inbox().commit_internal(
+                        {
+                            "type": "copilotd.submission.queued",
+                            "data": {
+                                "submission_id": submission_id,
+                                "thread_id": self.binding.thread_id,
+                                "origin": origin,
+                                "prompt": prompt,
+                                "prompt_content_key": prompt_content_key,
+                                "prompt_hash": prompt_hash,
+                                "correlation_id": idempotency_key,
+                                "discord_message_id": discord_message_id,
+                                "discord_channel_id": discord_channel_id,
+                                "attachment_manifest_id": attachment_manifest_id,
+                                "attachment_count": len(attachments or []),
+                                "discord_source_channel_id": discord_source_channel_id,
+                                "discord_source_message_id": discord_source_message_id,
+                                "requested_mode": effective_agent_mode,
+                                "requested_model_config": json.loads(
+                                    model_row["desired_model_config"]
+                                ),
+                                "requested_agent": model_row["desired_agent"],
+                                "requested_session_config_version": model_row[
+                                    "desired_project_config_version"
+                                ],
+                                "requested_delivery": mode,
+                                "created_at": time.time(),
+                            },
                         },
-                    },
-                    internal_event_id=f"submission:{submission_id}:queued",
-                )
-                snapshot = await self._database.fetchone(
-                    """
-                    SELECT q.prompt, q.attachment_manifest_id,
-                           q.requested_mode_snapshot,
-                           q.requested_model_config_snapshot,
-                           q.requested_agent_snapshot,
-                           q.requested_session_config_version,
-                           q.dispatch_attempt,
-                           s.prompt_hash, s.requested_delivery, s.origin,
-                           s.attachment_count, s.discord_source_channel_id,
-                           s.discord_source_message_id
-                    FROM message_queue q
-                    JOIN submissions s ON s.submission_id = q.id
-                    WHERE q.id = ? AND q.thread_id = ?
-                    """,
-                    (submission_id, self.binding.thread_id),
-                )
-            if snapshot is None:
-                raise SessionNotReady("submission admission was rejected by lifecycle fencing")
-            if (
-                str(snapshot["prompt_hash"]) != prompt_hash
-                or snapshot["attachment_manifest_id"] != attachment_manifest_id
-                or (
-                    agent_mode is not None
-                    and str(snapshot["requested_mode_snapshot"]) != agent_mode
-                )
-                or str(snapshot["requested_delivery"]) != mode
-                or str(snapshot["origin"]) != origin
-                or snapshot["discord_source_channel_id"] != discord_source_channel_id
-                or snapshot["discord_source_message_id"] != discord_source_message_id
-                or (
-                    attachments is not None
-                    and len(attachments) != int(snapshot["attachment_count"])
-                )
-            ):
-                raise ValueError("idempotency key was reused with a different immutable submission")
-            self._volatile_attachments.setdefault(submission_id, attachments)
-            self._active_send_admissions += 1
-            self._send_admissions_drained.clear()
+                        internal_event_id=f"submission:{submission_id}:queued",
+                    )
+                    snapshot = await self._database.fetchone(
+                        """
+                        SELECT q.prompt_content_key, q.attachment_manifest_id,
+                               q.discord_message_id, q.discord_channel_id,
+                               q.requested_mode_snapshot,
+                               q.requested_model_config_snapshot,
+                               q.requested_agent_snapshot,
+                               q.requested_session_config_version,
+                               q.dispatch_attempt,
+                               s.prompt_hash, s.requested_delivery, s.origin,
+                               s.attachment_count, s.discord_source_channel_id,
+                               s.discord_source_message_id
+                        FROM message_queue q
+                        JOIN submissions s ON s.submission_id = q.id
+                        WHERE q.id = ? AND q.thread_id = ?
+                        """,
+                        (submission_id, self.binding.thread_id),
+                    )
+                if snapshot is None:
+                    raise SessionNotReady("submission admission was rejected by lifecycle fencing")
+                persisted_content_key = str(snapshot["prompt_content_key"] or prompt_content_key)
+                if (
+                    str(snapshot["prompt_hash"]) != prompt_hash
+                    or snapshot["discord_message_id"] != discord_message_id
+                    or snapshot["discord_channel_id"] != discord_channel_id
+                    or snapshot["attachment_manifest_id"] != attachment_manifest_id
+                    or (
+                        agent_mode is not None
+                        and str(snapshot["requested_mode_snapshot"]) != agent_mode
+                    )
+                    or str(snapshot["requested_delivery"]) != mode
+                    or str(snapshot["origin"]) != origin
+                    or snapshot["discord_source_channel_id"] != discord_source_channel_id
+                    or snapshot["discord_source_message_id"] != discord_source_message_id
+                    or (
+                        attachments is not None
+                        and len(attachments) != int(snapshot["attachment_count"])
+                    )
+                ):
+                    raise ValueError(
+                        "idempotency key was reused with a different immutable submission"
+                    )
+                self._content_store.put(prompt, key=persisted_content_key)
+                self._volatile_attachments.setdefault(submission_id, attachments)
+                self._active_send_admissions += 1
+                self._send_admissions_drained.clear()
+            except BaseException:
+                if published_new_prompt:
+                    lookup = asyncio.create_task(
+                        self._database.fetchone(
+                            "SELECT 1 FROM message_queue WHERE id = ?",
+                            (submission_id,),
+                        )
+                    )
+                    while not lookup.done():
+                        try:
+                            await asyncio.shield(lookup)
+                        except asyncio.CancelledError:
+                            continue
+                    if lookup.result() is None:
+                        self._content_store.delete(prompt_content_key)
+                raise
 
         try:
             if mode == "immediate":
@@ -688,6 +751,7 @@ class SessionRuntime:
                     if current is None:
                         raise SessionNotReady("immediate submission disappeared")
                     if current["accepted_message_id"] is not None:
+                        self._discard_submission_content(submission_id)
                         return str(current["accepted_message_id"])
                     if current["state"] in {"submitted_unknown", "outcome_unknown"}:
                         raise OperationAmbiguous("immediate submission outcome is already unknown")
@@ -703,7 +767,7 @@ class SessionRuntime:
                     return await self._dispatch_submission(
                         submission_id=submission_id,
                         idempotency_key=operation_key,
-                        prompt=str(snapshot["prompt"]),
+                        prompt=prompt,
                         prompt_hash=str(snapshot["prompt_hash"]),
                         attachment_manifest_id=snapshot["attachment_manifest_id"],
                         attachments=attachments,
@@ -752,6 +816,7 @@ class SessionRuntime:
                 (submission_id,),
             )
             if accepted is not None and accepted["accepted_message_id"] is not None:
+                self._discard_submission_content(submission_id)
                 return str(accepted["accepted_message_id"])
             return submission_id
 
@@ -792,7 +857,23 @@ class SessionRuntime:
             row = await self._database.fetchone(
                 """
                 SELECT q.*, s.prompt_hash, s.requested_delivery,
-                       s.attachment_count, s.origin
+                       s.attachment_count, s.origin,
+                       EXISTS (
+                           SELECT 1
+                           FROM schedule_runs AS run
+                           JOIN schedules AS schedule
+                             ON schedule.id = run.schedule_id
+                           WHERE run.run_id = q.schedule_run_id
+                             AND s.origin = 'app_schedule'
+                             AND run.status IN (
+                                 'claimed', 'submitting', 'retry_wait'
+                             )
+                             AND run.send_started_at IS NULL
+                             AND run.accepted_message_id IS NULL
+                             AND schedule.state != 'deleted'
+                             AND schedule.source_channel_id IS NOT NULL
+                             AND schedule.source_message_id IS NOT NULL
+                       ) AS schedule_source_recoverable
                 FROM message_queue AS q
                 JOIN submissions AS s ON s.submission_id = q.id
                 WHERE q.thread_id = ? AND q.state = 'local_queued'
@@ -903,11 +984,20 @@ class SessionRuntime:
                     "blocked_attachment_manifest_missing",
                 )
                 raise SessionNotReady("attachments require a durable manifest")
+            prompt = self._content_store.get(
+                None if row["prompt_content_key"] is None else str(row["prompt_content_key"]),
+                expected_hash=str(row["prompt_hash"]),
+            )
+            if not isinstance(prompt, str):
+                if bool(row["schedule_source_recoverable"]):
+                    return None
+                await self._mark_queue_content_unavailable(str(row["id"]))
+                return None
             try:
                 message_id = await self._dispatch_submission(
                     submission_id=str(row["id"]),
                     idempotency_key=(f"queue:{row['id']}:{int(row['dispatch_attempt'])}"),
-                    prompt=str(row["prompt"]),
+                    prompt=prompt,
                     prompt_hash=str(row["prompt_hash"]),
                     attachment_manifest_id=(None if manifest_id is None else str(manifest_id)),
                     attachments=attachments,
@@ -1058,7 +1148,7 @@ class SessionRuntime:
                 },
                 internal_event_id=f"submission:{submission_id}:accepted",
             )
-            self._volatile_attachments.pop(submission_id, None)
+            self._discard_submission_content(submission_id)
             return str(message_id)
 
         try:
@@ -1092,7 +1182,6 @@ class SessionRuntime:
                 f"submission {submission_id} was requeued before SDK send"
             ) from error
         except OperationRejected:
-            self._volatile_attachments.pop(submission_id, None)
             await inbox.commit_internal(
                 {
                     "type": "copilotd.submission.rejected",
@@ -1100,6 +1189,7 @@ class SessionRuntime:
                 },
                 internal_event_id=f"submission:{submission_id}:rejected",
             )
+            self._discard_submission_content(submission_id)
             raise
         except OperationAmbiguous:
             await inbox.commit_internal(
@@ -1109,6 +1199,7 @@ class SessionRuntime:
                 },
                 internal_event_id=f"submission:{submission_id}:acceptance-unknown",
             )
+            self._discard_submission_content(submission_id)
             raise
 
         await inbox.commit_internal(
@@ -1121,8 +1212,18 @@ class SessionRuntime:
             },
             internal_event_id=f"submission:{submission_id}:accepted",
         )
-        self._volatile_attachments.pop(submission_id, None)
+        self._discard_submission_content(submission_id)
         return str(message_id)
+
+    def _discard_submission_content(self, submission_id: str) -> None:
+        self._content_store.delete(
+            opaque_content_key(
+                "submission-prompt",
+                self.binding.sdk_session_id,
+                submission_id,
+            )
+        )
+        self._volatile_attachments.pop(submission_id, None)
 
     async def _resolve_attachments_for_send(
         self,
@@ -1215,6 +1316,67 @@ class SessionRuntime:
                 "data": {"submission_id": submission_id, "state": state},
             },
             internal_event_id=f"queue:{submission_id}:{state}",
+        )
+
+    async def _mark_queue_content_unavailable(self, submission_id: str) -> None:
+        now = time.time()
+        async with self._database.transaction() as connection:
+            await connection.execute(
+                """
+                UPDATE message_queue
+                SET state = 'content_unavailable', updated_at = ?
+                WHERE id = ? AND state NOT IN (
+                    'cancelled', 'submitted', 'failed', 'content_unavailable'
+                )
+                """,
+                (now, submission_id),
+            )
+            await connection.execute(
+                """
+                UPDATE submissions
+                SET state = 'rejected', completion_basis = 'content_unavailable',
+                    terminal_at = COALESCE(terminal_at, ?)
+                WHERE submission_id = ? AND state = 'local_queued'
+                """,
+                (now, submission_id),
+            )
+            await connection.execute(
+                """
+                UPDATE liveness_leases
+                SET state = 'released', refreshed_at = ?, released_at = ?
+                WHERE sdk_session_id = ? AND kind = 'submission'
+                  AND source_id = ? AND state = 'active'
+                """,
+                (now, now, self.binding.sdk_session_id, submission_id),
+            )
+            await connection.execute(
+                """
+                UPDATE submission_reactions
+                SET desired_state = 'failed', resume_state = 'content_unavailable',
+                    terminal = 1, revision = revision + 1,
+                    last_error = 'content_unavailable', updated_at = ?
+                WHERE submission_id = ?
+                """,
+                (now, submission_id),
+            )
+            await connection.execute(
+                """
+                UPDATE schedule_runs
+                SET status = 'failed', error_category = 'storage',
+                    error_code = 'content_unavailable', error_detail = NULL,
+                    terminal_at = COALESCE(terminal_at, ?), updated_at = ?
+                WHERE result_submission_id = ?
+                  AND status NOT IN (
+                    'semantic_complete', 'blocked', 'failed', 'outcome_unknown',
+                    'cancelled', 'target_unknown', 'dispatch_unknown'
+                  )
+                """,
+                (now, now, submission_id),
+            )
+        await recover_reaction_outbox(
+            self._database,
+            now=now,
+            content_store=self._content_store,
         )
 
     async def _requeue_pre_send_without_reducer(
@@ -2239,10 +2401,20 @@ class SessionRuntime:
         loop = self._loop
         if raw_type == "session.resume" and parent_id is not None:
             self._superseded_shutdown_event_ids.add(parent_id)
-        if (
-            raw_type == "session.shutdown"
-            and event_id not in self._superseded_shutdown_event_ids
-        ):
+            if parent_id == self._pending_shutdown_event_id:
+                self._handle_terminal = False
+                if self.state == RuntimeState.TERMINAL:
+                    self.state = self._state_before_shutdown or RuntimeState.RECOVERY_UNKNOWN
+                    self._accepting_sends = self.state == RuntimeState.READY
+                if loop is not None:
+                    loop.call_soon_threadsafe(
+                        self._signal_shutdown_superseded,
+                        parent_id,
+                    )
+        if raw_type == "session.shutdown" and event_id not in self._superseded_shutdown_event_ids:
+            self._pending_shutdown_event_id = event_id
+            self._shutdown_superseded_waiters[event_id] = asyncio.Event()
+            self._state_before_shutdown = self.state
             self._handle_terminal = True
             self._accepting_sends = False
             if self.state != RuntimeState.CLOSING:
@@ -2324,8 +2496,15 @@ class SessionRuntime:
         ):
             loop.call_soon_threadsafe(self._schedule_protocol_response, event)
 
+    def _signal_shutdown_superseded(self, shutdown_event_id: str) -> None:
+        if self._pending_shutdown_event_id != shutdown_event_id:
+            return
+        waiter = self._shutdown_superseded_waiters.get(shutdown_event_id)
+        if waiter is not None:
+            waiter.set()
+
     def _schedule_shutdown_finalization(self) -> None:
-        if self.state == RuntimeState.CLOSING:
+        if self.state in {RuntimeState.CLOSING, RuntimeState.CLOSED}:
             return
         self._shutdown_finalize_task = self._tasks.create(
             self._finalize_handle_shutdown(),
@@ -2336,34 +2515,90 @@ class SessionRuntime:
         )
 
     async def _finalize_handle_shutdown(self) -> None:
-        async with self._lifecycle_lock:
-            inbox = self._inbox
-            if inbox is not None:
-                await inbox.join()
-            current = await self._bindings.by_thread(self.binding.thread_id)
-            if current is None:
+        shutdown_event_id = self._pending_shutdown_event_id
+        if shutdown_event_id is None:
+            return
+        waiter = self._shutdown_superseded_waiters.setdefault(
+            shutdown_event_id,
+            asyncio.Event(),
+        )
+        try:
+            try:
+                async with asyncio.timeout(self._shutdown_settle_seconds):
+                    await waiter.wait()
+            except TimeoutError:
+                pass
+            async with self._lifecycle_lock:
+                inbox = self._inbox
+                if inbox is not None:
+                    await inbox.join()
+                if await self._shutdown_was_superseded(shutdown_event_id):
+                    current = await self._bindings.by_thread(self.binding.thread_id)
+                    if current is not None:
+                        self.binding = current
+                    if self._pending_shutdown_event_id != shutdown_event_id:
+                        return
+                    self._handle_terminal = False
+                    if self.state == RuntimeState.TERMINAL:
+                        self.state = self._state_before_shutdown or RuntimeState.RECOVERY_UNKNOWN
+                    async with self._admission_lock:
+                        self._accepting_sends = self.state == RuntimeState.READY
+                    self._pending_shutdown_event_id = None
+                    self._state_before_shutdown = None
+                    return
+                current = await self._bindings.by_thread(self.binding.thread_id)
+                if current is None:
+                    await self._stop_components(release_owner=True)
+                    return
+                if self._inbox is not None and self._reducer is not None:
+                    await self._force_active_unknown()
+                    await self._inbox.join()
+                current = await self._bindings.by_thread(self.binding.thread_id)
+                if (
+                    current is not None
+                    and current.runtime_generation == self.binding.runtime_generation
+                    and current.owner_fence_token == self.binding.owner_fence_token
+                    and current.attachment_state
+                    in {
+                        AttachmentState.CREATING,
+                        AttachmentState.RESUMING,
+                        AttachmentState.ATTACHED,
+                        AttachmentState.DISCONNECTING,
+                        AttachmentState.TERMINAL,
+                    }
+                ):
+                    self.binding = await self._bindings.mark_recovery_unknown(current)
                 await self._stop_components(release_owner=True)
-                return
-            if self._inbox is not None and self._reducer is not None:
-                await self._force_active_unknown()
-                await self._inbox.join()
-            current = await self._bindings.by_thread(self.binding.thread_id)
+                self.state = RuntimeState.RECOVERY_UNKNOWN
+                if self._pending_shutdown_event_id == shutdown_event_id:
+                    self._pending_shutdown_event_id = None
+                    self._state_before_shutdown = None
+        finally:
+            self._shutdown_superseded_waiters.pop(shutdown_event_id, None)
             if (
-                current is not None
-                and current.runtime_generation == self.binding.runtime_generation
-                and current.owner_fence_token == self.binding.owner_fence_token
-                and current.attachment_state
-                in {
-                    AttachmentState.CREATING,
-                    AttachmentState.RESUMING,
-                    AttachmentState.ATTACHED,
-                    AttachmentState.DISCONNECTING,
-                    AttachmentState.TERMINAL,
-                }
+                self._pending_shutdown_event_id is not None
+                and self._pending_shutdown_event_id != shutdown_event_id
+                and self.state not in {RuntimeState.CLOSING, RuntimeState.CLOSED}
             ):
-                self.binding = await self._bindings.mark_recovery_unknown(current)
-            await self._stop_components(release_owner=True)
-            self.state = RuntimeState.RECOVERY_UNKNOWN
+                self._schedule_shutdown_finalization()
+
+    async def _shutdown_was_superseded(self, shutdown_event_id: str) -> bool:
+        if shutdown_event_id in self._superseded_shutdown_event_ids:
+            return True
+        resumed = await self._database.fetchone(
+            """
+            SELECT 1 FROM event_journal
+            WHERE sdk_session_id = ? AND generation = ?
+              AND raw_type = 'session.resume' AND parent_id = ?
+            LIMIT 1
+            """,
+            (
+                self.binding.sdk_session_id,
+                self.binding.runtime_generation,
+                shutdown_event_id,
+            ),
+        )
+        return resumed is not None or shutdown_event_id in self._superseded_shutdown_event_ids
 
     def _schedule_protocol_response(self, event: Any) -> None:
         if self._handle is None:
@@ -2611,6 +2846,7 @@ class SessionRuntime:
                 idempotency_key=f"mode:{idempotency_key}",
                 input_payload={"mode": mode},
                 operation=dispatch,
+                retain_result_for_replay=True,
             )
         except OperationRejected:
             await inbox.commit_internal(
@@ -2759,6 +2995,7 @@ class SessionRuntime:
                 idempotency_key=f"model:{idempotency_key}",
                 input_payload=target,
                 operation=dispatch,
+                retain_result_for_replay=True,
             )
         except OperationRejected:
             await inbox.commit_internal(
@@ -3027,16 +3264,25 @@ class SessionRuntime:
         self._require_capability("commands_result_select_subcommand")
         row = await self._database.fetchone(
             """
-            SELECT command_name, result_json
+            SELECT invocation_id, command_name, result_hash
             FROM runtime_command_invocations
             WHERE sdk_session_id = ? AND selection_token = ?
               AND state = 'confirmed' AND result_kind = 'select-subcommand'
             """,
             (self.binding.sdk_session_id, selection_token),
         )
-        if row is None or row["result_json"] is None:
+        if row is None or row["result_hash"] is None:
             raise NativeCapabilityError("native command selection is stale or invalid")
-        previous = json.loads(row["result_json"])
+        previous = self._content_store.get(
+            opaque_content_key(
+                "native-command-result",
+                self.binding.sdk_session_id,
+                row["invocation_id"],
+            ),
+            expected_hash=str(row["result_hash"]),
+        )
+        if not isinstance(previous, dict):
+            raise NativeCapabilityError("native command selection content is unavailable")
         options = {
             str(option["name"])
             for option in previous.get("options", [])
@@ -3056,13 +3302,21 @@ class SessionRuntime:
                 self.binding.sdk_session_id,
                 command,
             )
-        return await self._invoke_command_operation(
+        result = await self._invoke_command_operation(
             command,
             selection,
             idempotency_key=idempotency_key,
             require_manifest=True,
             require_quiet=True,
         )
+        self._content_store.delete(
+            opaque_content_key(
+                "native-command-result",
+                self.binding.sdk_session_id,
+                row["invocation_id"],
+            )
+        )
+        return result
 
     async def _invoke_command_operation(
         self,
@@ -3154,6 +3408,7 @@ class SessionRuntime:
                         "input_hash": input_hash,
                     },
                     operation=dispatch,
+                    retain_result_for_replay=True,
                 ),
             )
         except OperationRejected:
@@ -3281,7 +3536,7 @@ class SessionRuntime:
                     },
                 ),
             )
-            if "answer" not in result:
+            if not isinstance(result, dict) or "answer" not in result:
                 raise NativeCapabilityError(
                     "ephemeral query already completed; its answer was not retained"
                 )
@@ -3395,6 +3650,7 @@ class SessionRuntime:
                     idempotency_key=operation_key,
                     input_payload={"focus_hash": stable_hash(focus)},
                     operation=dispatch,
+                    retain_result_for_replay=True,
                 ),
             )
         except OperationRejected:
@@ -3544,6 +3800,7 @@ class SessionRuntime:
                     idempotency_key=operation_key,
                     input_payload={"prompt_hash": stable_hash(prompt)},
                     operation=dispatch,
+                    retain_result_for_replay=True,
                 ),
             )
         except OperationRejected:
@@ -3741,30 +3998,6 @@ class SessionRuntime:
                 source="snapshot",
                 internal_event_id=f"task-action:{action_id}:snapshot",
             )
-            if selected == NativeTaskAction.SHOW and task_id is not None:
-                card = await self._taskdeck.task(
-                    self.binding.sdk_session_id,
-                    task_id,
-                )
-                if card is not None:
-                    panel_id = str(
-                        uuid.uuid5(
-                            uuid.NAMESPACE_URL,
-                            f"copilotd:{self.binding.sdk_session_id}:taskdeck",
-                        )
-                    )[:16]
-                    await self._require_inbox().commit_internal(
-                        {
-                            "type": "copilotd.taskdeck.view_changed",
-                            "data": {
-                                "panel_id": panel_id,
-                                "selected_card_token": card.card_token,
-                                "page": 0,
-                                "expanded": True,
-                            },
-                        },
-                        internal_event_id=f"task-action:{action_id}:focus",
-                    )
             return {"action": selected.value, "result": action_result, "tasks": tasks}
 
         failure_state: Literal["rejected", "unknown"] | None = None
@@ -3776,6 +4009,7 @@ class SessionRuntime:
                     idempotency_key=operation_key,
                     input_payload=input_payload,
                     operation=dispatch,
+                    retain_result_for_replay=True,
                 ),
             )
         except OperationRejected:
@@ -3809,20 +4043,6 @@ class SessionRuntime:
             },
             internal_event_id=f"task-action:{action_id}:confirmed",
         )
-        cards = await self._taskdeck.cards(self.binding.sdk_session_id)
-        result["taskdeck"] = [
-            {
-                "card_token": card.card_token,
-                "task_id": card.task_id,
-                "agent_id": card.agent_id,
-                "kind": card.kind,
-                "title": card.title,
-                "state": card.state,
-                "progress_summary": card.progress_summary,
-                "terminal_at": card.terminal_at,
-            }
-            for card in cards
-        ]
         return result
 
     async def _assert_task_action_allowed(self, action: NativeTaskAction) -> None:
@@ -3991,6 +4211,7 @@ class SessionRuntime:
                 idempotency_key=operation_key,
                 input_payload={"target": target},
                 operation=dispatch,
+                retain_result_for_replay=True,
             )
         except OperationRejected:
             failure_state = "rejected"
@@ -4053,7 +4274,23 @@ class SessionRuntime:
             """,
             parameters,
         )
-        return [dict(row) for row in rows]
+        schedules: list[dict[str, Any]] = []
+        for row in rows:
+            item = dict(row)
+            volatile = self._content_store.get(
+                opaque_content_key(
+                    "runtime-schedule",
+                    self.binding.sdk_session_id,
+                    item["runtime_schedule_id"],
+                )
+            )
+            if isinstance(volatile, dict):
+                item["display_prompt"] = volatile.get("display_prompt")
+            else:
+                item["display_prompt"] = None
+            item["invocation_input"] = ""
+            schedules.append(item)
+        return schedules
 
     async def create_runtime_schedule(
         self,
@@ -4079,7 +4316,7 @@ class SessionRuntime:
         async with self._native_schedule_lock:
             existing = await self._database.fetchone(
                 """
-                SELECT state, runtime_schedule_id, input_hash, baseline_json,
+                SELECT state, runtime_schedule_id, input_hash, baseline_hash,
                        builtin_name
                 FROM runtime_schedule_actions
                 WHERE action_id = ? AND sdk_session_id = ?
@@ -4111,7 +4348,6 @@ class SessionRuntime:
                     internal_event_id=f"schedule-action:{action_id}:pending",
                 )
             else:
-                before = set(json.loads(existing["baseline_json"] or "[]"))
                 if existing["runtime_schedule_id"] is not None:
                     schedules = await self.runtime_schedules(kind=kind)
                     confirmed = next(
@@ -4125,6 +4361,17 @@ class SessionRuntime:
                     )
                     if confirmed is not None:
                         return confirmed
+                baseline = self._content_store.get(
+                    opaque_content_key(
+                        "runtime-schedule-action-baseline",
+                        self.binding.sdk_session_id,
+                        action_id,
+                    ),
+                    expected_hash=existing["baseline_hash"],
+                )
+                if not isinstance(baseline, list):
+                    raise OperationAmbiguous("schedule creation baseline content is unavailable")
+                before = {str(item) for item in baseline}
 
             async def find_created() -> list[dict[str, Any]]:
                 deadline = asyncio.get_running_loop().time() + 10
@@ -4297,6 +4544,7 @@ class SessionRuntime:
                 idempotency_key=operation_key,
                 input_payload={"kind": kind, "schedule_id": schedule_id},
                 operation=dispatch,
+                retain_result_for_replay=True,
             )
         except OperationRejected:
             failure_state = "rejected"
@@ -4517,6 +4765,7 @@ class SessionRuntime:
                     idempotency_key=operation_key,
                     input_payload={"target": target.value},
                     operation=dispatch,
+                    retain_result_for_replay=True,
                 ),
             )
         except OperationRejected:
@@ -4658,7 +4907,8 @@ class SessionRuntime:
     async def queue_items(self) -> list[dict[str, Any]]:
         rows = await self._database.fetchall(
             """
-            SELECT q.id, q.prompt, q.position, q.state, q.created_at,
+            SELECT q.id, q.prompt_content_key, q.prompt_hash,
+                   q.position, q.state, q.created_at,
                    q.schedule_run_id, q.replaces_id, s.origin,
                    s.runtime_schedule_id
             FROM message_queue AS q
@@ -4669,7 +4919,16 @@ class SessionRuntime:
             """,
             (self.binding.thread_id,),
         )
-        return [dict(row) for row in rows]
+        items: list[dict[str, Any]] = []
+        for row in rows:
+            item = dict(row)
+            prompt = self._content_store.get(
+                item.pop("prompt_content_key", None),
+                expected_hash=item.get("prompt_hash"),
+            )
+            item["prompt"] = prompt if isinstance(prompt, str) else "[content unavailable]"
+            items.append(item)
+        return items
 
     async def dispatch_queued_once(self) -> tuple[str, str] | None:
         return await self._dispatch_next_queued()
@@ -4770,27 +5029,58 @@ class SessionRuntime:
                     f"{submission_id}:{idempotency_key}",
                 )
             )
-            replacement_prompt = str(row["prompt"]) if prompt is None else prompt
-            await self._require_inbox().commit_internal(
-                {
-                    "type": "copilotd.queue.replaced",
-                    "data": {
-                        "old_submission_id": submission_id,
-                        "new_submission_id": replacement_id,
-                        "prompt": replacement_prompt,
-                        "prompt_hash": hashlib.sha256(replacement_prompt.encode()).hexdigest(),
-                        "allowed_states": sorted(allowed_states),
-                        "requested_mode": str(binding["desired_mode"]),
-                        "requested_model_config": json.loads(str(binding["desired_model_config"])),
-                        "requested_agent": str(binding["desired_agent"]),
-                        "requested_session_config_version": int(
-                            binding["desired_project_config_version"]
-                        ),
-                        "created_at": time.time(),
-                    },
-                },
-                internal_event_id=f"queue:{replacement_id}:replaced",
+            if prompt is None:
+                recovered_prompt = self._content_store.get(
+                    row["prompt_content_key"],
+                    expected_hash=str(row["prompt_hash"]),
+                )
+                if not isinstance(recovered_prompt, str):
+                    await self._mark_queue_content_unavailable(submission_id)
+                    raise MissingVolatileContentError(str(row["prompt_content_key"] or ""))
+                replacement_prompt = recovered_prompt
+            else:
+                replacement_prompt = prompt
+            replacement_content_key = opaque_content_key(
+                "submission-prompt",
+                self.binding.sdk_session_id,
+                replacement_id,
             )
+            self._content_store.put(
+                replacement_prompt,
+                key=replacement_content_key,
+            )
+            try:
+                await self._require_inbox().commit_internal(
+                    {
+                        "type": "copilotd.queue.replaced",
+                        "data": {
+                            "old_submission_id": submission_id,
+                            "new_submission_id": replacement_id,
+                            "prompt": replacement_prompt,
+                            "prompt_content_key": replacement_content_key,
+                            "prompt_hash": hashlib.sha256(replacement_prompt.encode()).hexdigest(),
+                            "allowed_states": sorted(allowed_states),
+                            "requested_mode": str(binding["desired_mode"]),
+                            "requested_model_config": json.loads(
+                                str(binding["desired_model_config"])
+                            ),
+                            "requested_agent": str(binding["desired_agent"]),
+                            "requested_session_config_version": int(
+                                binding["desired_project_config_version"]
+                            ),
+                            "created_at": time.time(),
+                        },
+                    },
+                    internal_event_id=f"queue:{replacement_id}:replaced",
+                )
+            except BaseException:
+                replacement = await self._database.fetchone(
+                    "SELECT 1 FROM message_queue WHERE id = ?",
+                    (replacement_id,),
+                )
+                if replacement is None:
+                    self._content_store.delete(replacement_content_key)
+                raise
             replacement = await self._database.fetchone(
                 "SELECT id FROM message_queue WHERE id = ?",
                 (replacement_id,),
@@ -4841,244 +5131,6 @@ class SessionRuntime:
                 "owner fence, runtime generation, or mutation headroom "
                 "changed before queue resubmission"
             )
-
-    async def update_taskdeck_view(
-        self,
-        *,
-        panel_id: str,
-        expected_revision: int,
-        action: Literal["select", "toggle", "previous", "next"],
-        card_token: str | None,
-        message_id: str,
-        interaction_id: str,
-    ) -> Literal["updated", "stale", "invalid"]:
-        mapping = await self._database.fetchone(
-            """
-            SELECT discord_message_id FROM render_messages
-            WHERE session_id = ? AND logical_key = 'taskdeck'
-            """,
-            (self.binding.sdk_session_id,),
-        )
-        if mapping is None or str(mapping["discord_message_id"]) != message_id:
-            return "invalid"
-        cards = await self._database.fetchall(
-            """
-            SELECT card_token, revision FROM task_card_projections
-            WHERE sdk_session_id = ? AND panel_id = ?
-            ORDER BY
-              CASE WHEN terminal_at IS NULL THEN 0 ELSE 1 END,
-              first_seen_at, card_key
-            """,
-            (self.binding.sdk_session_id, panel_id),
-        )
-        if not cards:
-            return "invalid"
-        revision = sum(int(card["revision"]) for card in cards)
-        if revision != expected_revision:
-            return "stale"
-        state = await self._database.fetchone(
-            """
-            SELECT selected_card_token, page, expanded
-            FROM taskdeck_panel_state WHERE sdk_session_id = ? AND panel_id = ?
-            """,
-            (self.binding.sdk_session_id, panel_id),
-        )
-        tokens = [str(card["card_token"]) for card in cards]
-        selected = (
-            tokens[0]
-            if state is None or state["selected_card_token"] not in tokens
-            else str(state["selected_card_token"])
-        )
-        page_count = max(1, (len(tokens) + 7) // 8)
-        page = 0 if state is None else min(max(int(state["page"]), 0), page_count - 1)
-        expanded = bool(state is not None and state["expanded"])
-        if action == "select":
-            if card_token not in tokens:
-                return "invalid"
-            selected = str(card_token)
-            page = tokens.index(selected) // 8
-            expanded = False
-        elif action == "toggle":
-            expanded = not expanded
-        elif action == "previous":
-            page = max(0, page - 1)
-            selected = tokens[page * 8]
-            expanded = False
-        elif action == "next":
-            page = min(page_count - 1, page + 1)
-            selected = tokens[page * 8]
-            expanded = False
-        await self._require_inbox().commit_internal(
-            {
-                "type": "copilotd.taskdeck.view_changed",
-                "data": {
-                    "panel_id": panel_id,
-                    "selected_card_token": selected,
-                    "page": page,
-                    "expanded": expanded,
-                },
-            },
-            internal_event_id=f"taskdeck-view:{interaction_id}",
-        )
-        return "updated"
-
-    async def perform_taskdeck_action(
-        self,
-        *,
-        panel_id: str,
-        card_token: str,
-        expected_revision: int,
-        action: Literal["cancel", "promote", "message", "remove", "download"],
-        message_id: str,
-        interaction_id: str,
-        message: str | None = None,
-    ) -> dict[str, Any]:
-        mapping = await self._database.fetchone(
-            """
-            SELECT discord_message_id FROM render_messages
-            WHERE session_id = ? AND logical_key = 'taskdeck'
-            """,
-            (self.binding.sdk_session_id,),
-        )
-        if mapping is None or str(mapping["discord_message_id"]) != message_id:
-            return {"status": "invalid"}
-        cards = await self._database.fetchall(
-            """
-            SELECT card_token, task_id, agent_id, kind, state, can_promote,
-                   detail_artifact, revision
-            FROM task_card_projections
-            WHERE sdk_session_id = ? AND panel_id = ?
-            ORDER BY first_seen_at, card_key
-            """,
-            (self.binding.sdk_session_id, panel_id),
-        )
-        if not cards:
-            return {"status": "invalid"}
-        revision = sum(int(card["revision"]) for card in cards)
-        if revision != expected_revision:
-            await self.refresh_taskdeck(interaction_id=f"{interaction_id}:stale")
-            return {"status": "stale"}
-        card = next(
-            (candidate for candidate in cards if str(candidate["card_token"]) == card_token),
-            None,
-        )
-        if card is None:
-            return {"status": "invalid"}
-        state = str(card["state"])
-        task_id = None if card["task_id"] is None else str(card["task_id"])
-        if action == "download":
-            artifact = card["detail_artifact"]
-            if artifact is None:
-                return {"status": "invalid"}
-            return {
-                "status": "download",
-                "filename": f"task-{card_token}-detail.md",
-                "content": str(artifact),
-            }
-        if self._task_action_adapter is None:
-            raise CDCapabilityError("native task actions are not available")
-        if task_id is None:
-            raise CDCapabilityError("this TaskDeck card has no addressable task ID")
-        operation_key = f"task-action:{interaction_id}:{action}:{task_id}"
-
-        async def dispatch() -> Mapping[str, Any]:
-            await self._assert_owned_handle()
-            if action == "cancel":
-                return await self._task_action_adapter.cancel_task(
-                    session_id=self.binding.sdk_session_id,
-                    task_id=task_id,
-                )
-            if action == "promote":
-                return await self._task_action_adapter.promote_task(
-                    session_id=self.binding.sdk_session_id,
-                    task_id=task_id,
-                )
-            if action == "message":
-                return await self._task_action_adapter.message_task(
-                    session_id=self.binding.sdk_session_id,
-                    task_id=task_id,
-                    message=normalized_message,
-                )
-            return await self._task_action_adapter.remove_task(
-                session_id=self.binding.sdk_session_id,
-                task_id=task_id,
-            )
-
-        normalized_message = ""
-        if action == "cancel":
-            if state not in {"running", "idle"}:
-                raise CDSessionStateError("only running or idle tasks can be cancelled")
-        elif action == "promote":
-            if state not in {"running", "idle"} or not bool(card["can_promote"]):
-                raise CDSessionStateError("this task cannot be promoted")
-        elif action == "message":
-            if str(card["kind"]) != "agent" or state not in {"running", "idle"}:
-                raise CDSessionStateError("only active agent tasks accept messages")
-            normalized_message = "" if message is None else message.strip()
-            if not normalized_message:
-                raise CDInputError("task message cannot be empty")
-        else:
-            if state not in {"completed", "failed", "cancelled"}:
-                raise CDSessionStateError("only terminal tasks can be removed")
-        if not await self._is_current_owner():
-            raise OperationAmbiguous(f"owner fence lost before task action {operation_key}")
-        result = await self._require_mailbox().submit(
-            kind=f"task_{action}",
-            idempotency_key=operation_key,
-            input_payload={
-                "action": action,
-                "task_id": task_id,
-                "message": normalized_message or None,
-            },
-            operation=dispatch,
-        )
-        if action == "remove":
-            await self._database.execute(
-                """
-                DELETE FROM task_card_projections
-                WHERE sdk_session_id = ? AND panel_id = ? AND card_token = ?
-                """,
-                (self.binding.sdk_session_id, panel_id, card_token),
-            )
-        await self.refresh_taskdeck(interaction_id=interaction_id)
-        return {"status": "updated", "result": dict(result or {})}
-
-    async def refresh_taskdeck(self, *, interaction_id: str) -> None:
-        state = await self._database.fetchone(
-            """
-            SELECT panel_id, selected_card_token, page, expanded
-            FROM taskdeck_panel_state WHERE sdk_session_id = ?
-            """,
-            (self.binding.sdk_session_id,),
-        )
-        if state is None:
-            cards = await self._database.fetchone(
-                """
-                SELECT panel_id, card_token FROM task_card_projections
-                WHERE sdk_session_id = ?
-                ORDER BY first_seen_at, card_key LIMIT 1
-                """,
-                (self.binding.sdk_session_id,),
-            )
-            if cards is None:
-                return
-            data = {
-                "panel_id": str(cards["panel_id"]),
-                "selected_card_token": str(cards["card_token"]),
-                "page": 0,
-                "expanded": False,
-            }
-        else:
-            data = {
-                "panel_id": str(state["panel_id"]),
-                "selected_card_token": state["selected_card_token"],
-                "page": int(state["page"]),
-                "expanded": bool(state["expanded"]),
-            }
-        await self._require_inbox().commit_internal(
-            {"type": "copilotd.taskdeck.view_changed", "data": data},
-            internal_event_id=f"taskdeck-refresh:{interaction_id}",
-        )
 
     async def _cancel_queued(
         self,
@@ -5498,6 +5550,7 @@ class SessionRuntime:
             idempotency_key=idempotency_key,
             input_payload=input_payload,
             operation=operation,
+            retain_result_for_replay=True,
         )
 
     def _supports_capability(self, capability: str) -> bool:
@@ -6356,6 +6409,9 @@ class SessionRuntime:
     def _start_components(self) -> None:
         self._loop = asyncio.get_running_loop()
         self._superseded_shutdown_event_ids.clear()
+        self._pending_shutdown_event_id = None
+        self._shutdown_superseded_waiters.clear()
+        self._state_before_shutdown = None
         fence_token = self._require_fence_token()
         self._inbox = ReducerInbox(
             sdk_session_id=self.binding.sdk_session_id,
@@ -6374,6 +6430,7 @@ class SessionRuntime:
                 thread_id=self.binding.thread_id,
             ),
             timeout_seconds=self._interaction_timeout_seconds,
+            content_store=self._content_store,
         )
         snapshot = self._extension_snapshot
         if snapshot is None:
@@ -6415,8 +6472,9 @@ class SessionRuntime:
             inbox=self._inbox,
             reducer=JournalReducer(
                 self._database,
-                managed_session_state_root=self._managed_session_state_root,
                 require_binding_fence=True,
+                content_store=self._content_store,
+                capture_tool_acceptance_evidence=(self._capture_tool_acceptance_evidence),
             ),
             batch_size=self._reducer_batch_size,
             fence_validator=validate,
@@ -6437,9 +6495,9 @@ class SessionRuntime:
         handle: SessionHandle,
         *,
         initialize: bool,
-    ) -> None:
+    ) -> bool:
         if self._capabilities is None or not self._capabilities.supports("event_log"):
-            return
+            return True
         cursor_state = await self._database.fetchone(
             """
             SELECT event_cursor, event_cursor_epoch, event_predecessor_id
@@ -6451,80 +6509,148 @@ class SessionRuntime:
         cursor_epoch = 0 if cursor_state is None else int(cursor_state["event_cursor_epoch"])
         predecessor_id = None if cursor_state is None else cursor_state["event_predecessor_id"]
         if initialize:
-            tail = await self._bridge.tail_event_log(handle)
+            tail = await self._sdk_call(
+                self._bridge.tail_event_log(handle),
+                timeout_seconds=min(10, self._sdk_operation_timeout_seconds),
+            )
             await self._advance_event_cursor(
                 tail,
                 cursor_status="tail",
                 cursor_epoch=cursor_epoch,
                 last_event_id=predecessor_id,
             )
-            return
+            await self._settle_checkpoint_replay()
+            return True
 
         seen_ids: set[str] = set()
         if predecessor_id is not None:
             seen_ids.add(str(predecessor_id))
-        while True:
-            previous_cursor = cursor
-            batch = await self._bridge.read_event_log(
-                handle,
-                cursor=None if cursor is None else str(cursor),
-                max_events=500,
-                wait_ms=0,
-                include_ephemeral=False,
-            )
-            if batch.cursor_status == "expired":
-                cursor_epoch += 1
-                await self._record_recovery_incident(
-                    "event_cursor_expired_rebase",
-                    {
-                        "previous_cursor": cursor,
-                        "rebased_cursor": batch.cursor,
-                        "cursor_epoch": cursor_epoch,
-                    },
-                )
-            for recovered in batch.events:
-                parent_id = (
-                    None
-                    if getattr(recovered, "parent_id", None) is None
-                    else str(recovered.parent_id)
-                )
-                if parent_id is not None and parent_id not in seen_ids:
-                    known = await self._database.fetchone(
-                        """
-                        SELECT 1 FROM event_journal
-                        WHERE sdk_session_id = ? AND event_id = ?
-                        """,
-                        (self.binding.sdk_session_id, parent_id),
+        deadline = time.monotonic() + self._sdk_operation_timeout_seconds
+        total_pages_read = 0
+        try:
+            while True:
+                if self._handle is not handle or not await self._is_current_owner():
+                    self.state = RuntimeState.FENCED
+                    raise FenceLost(
+                        f"owner fence lost during event replay for {self.binding.sdk_session_id}"
                     )
-                    if known is None:
+                pages_read = 0
+                while pages_read < self._event_replay_max_pages:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise TimeoutError("event-log replay exceeded attachment deadline")
+                    previous_cursor = cursor
+                    batch = await self._sdk_call(
+                        self._bridge.read_event_log(
+                            handle,
+                            cursor=None if cursor is None else str(cursor),
+                            max_events=500,
+                            wait_ms=0,
+                            include_ephemeral=False,
+                        ),
+                        timeout_seconds=max(
+                            0.001,
+                            min(
+                                10,
+                                self._sdk_operation_timeout_seconds,
+                                remaining,
+                            ),
+                        ),
+                    )
+                    pages_read += 1
+                    total_pages_read += 1
+                    if batch.cursor_status == "expired":
+                        cursor_epoch += 1
                         await self._record_recovery_incident(
-                            "event_predecessor_gap",
+                            "event_cursor_expired_rebase",
                             {
-                                "event_id": str(recovered.id),
-                                "parent_id": parent_id,
-                                "classification": "filtered_or_retained_gap",
+                                "previous_cursor": cursor,
+                                "rebased_cursor": batch.cursor,
                                 "cursor_epoch": cursor_epoch,
                             },
                         )
-                await self._require_inbox().commit_recovered_sdk(recovered)
-                seen_ids.add(str(recovered.id))
-                predecessor_id = str(recovered.id)
-            cursor = batch.cursor
-            await self._advance_event_cursor(
-                cursor,
-                cursor_status=batch.cursor_status,
-                cursor_epoch=cursor_epoch,
-                last_event_id=predecessor_id,
-            )
-            if not batch.has_more:
-                return
-            if cursor == previous_cursor:
+                    for recovered in batch.events:
+                        parent_id = (
+                            None
+                            if getattr(recovered, "parent_id", None) is None
+                            else str(recovered.parent_id)
+                        )
+                        if parent_id is not None and parent_id not in seen_ids:
+                            known = await self._database.fetchone(
+                                """
+                                SELECT 1 FROM event_journal
+                                WHERE sdk_session_id = ? AND event_id = ?
+                                """,
+                                (self.binding.sdk_session_id, parent_id),
+                            )
+                            if known is None:
+                                await self._record_recovery_incident(
+                                    "event_predecessor_gap",
+                                    {
+                                        "event_id": str(recovered.id),
+                                        "parent_id": parent_id,
+                                        "classification": "filtered_or_retained_gap",
+                                        "cursor_epoch": cursor_epoch,
+                                    },
+                                )
+                        await self._require_inbox().commit_recovered_sdk(recovered)
+                        seen_ids.add(str(recovered.id))
+                        predecessor_id = str(recovered.id)
+                    cursor = batch.cursor
+                    await self._advance_event_cursor(
+                        cursor,
+                        cursor_status=batch.cursor_status,
+                        cursor_epoch=cursor_epoch,
+                        last_event_id=predecessor_id,
+                    )
+                    if not batch.has_more:
+                        await self._settle_checkpoint_replay()
+                        return True
+                    if cursor == previous_cursor:
+                        await self._record_recovery_incident(
+                            "event_cursor_stalled",
+                            {"cursor": cursor, "cursor_epoch": cursor_epoch},
+                        )
+                        raise RuntimeError(
+                            "event-log cursor did not advance while has_more was true"
+                        )
+                    await asyncio.sleep(0)
+                await self._require_inbox().join()
                 await self._record_recovery_incident(
-                    "event_cursor_stalled",
-                    {"cursor": cursor, "cursor_epoch": cursor_epoch},
+                    "event_replay_chunk_continued",
+                    {
+                        "cursor": cursor,
+                        "cursor_epoch": cursor_epoch,
+                        "page_budget": self._event_replay_max_pages,
+                        "total_pages_read": total_pages_read,
+                        "has_more": True,
+                    },
                 )
-                raise RuntimeError("event-log cursor did not advance while has_more was true")
-            await asyncio.sleep(0)
+                await asyncio.sleep(0)
+        except TimeoutError:
+            await self._record_recovery_incident(
+                "event_replay_timeout",
+                {
+                    "cursor": cursor,
+                    "cursor_epoch": cursor_epoch,
+                    "page_budget": self._event_replay_max_pages,
+                    "total_pages_read": total_pages_read,
+                    "has_more": True,
+                },
+            )
+            raise
+
+    async def _settle_checkpoint_replay(self) -> None:
+        await self._database.execute(
+            """
+            UPDATE service_restart_intents
+            SET state = 'settled', outcome = 'replayed', updated_at = ?
+            WHERE sdk_session_id = ? AND kind = 'checkpoint_replay'
+              AND state IN ('requested', 'claimed')
+              AND outcome IN ('replay_required', 'replay_pending')
+            """,
+            (time.time(), self.binding.sdk_session_id),
+        )
 
     async def _advance_event_cursor(
         self,
@@ -6621,10 +6747,7 @@ class SessionRuntime:
                     time.time(),
                     self.binding.runtime_generation,
                     self.binding.sdk_session_id,
-                    json.dumps(
-                        {"error_type": type(error).__name__, "message": str(error)},
-                        sort_keys=True,
-                    ),
+                    state_only_json({"error_type": type(error).__name__, "message": str(error)}),
                 ),
             )
             raise
@@ -6797,13 +6920,96 @@ class SessionRuntime:
                 return
             try:
                 self._lease = await self._owner_leases.renew(lease)
-            except Exception:
-                self.state = RuntimeState.FENCED
-                if self._mailbox is not None:
-                    self._mailbox.freeze()
-                if self._inbox is not None:
-                    self._inbox.close_sdk()
-                raise
+            except FenceLost as error:
+                await self._fence_after_renewal_failure(error)
+                raise SessionLeaseRenewalFailed(
+                    f"owner lease was lost for {self.binding.sdk_session_id}"
+                ) from error
+            except Exception as first_error:
+                renewed = False
+                delay = max(0.01, min(1.0, self._owner_renew_seconds / 3))
+                for attempt in range(self._owner_renew_retry_attempts):
+                    remaining = lease.expires_at - time.time()
+                    if remaining <= delay:
+                        break
+                    try:
+                        await asyncio.wait_for(
+                            self._renewal_stop.wait(),
+                            timeout=min(delay * (2**attempt), remaining),
+                        )
+                    except TimeoutError:
+                        pass
+                    if self._renewal_stop.is_set():
+                        return
+                    try:
+                        self._lease = await self._owner_leases.renew(lease)
+                    except FenceLost as error:
+                        await self._fence_after_renewal_failure(error)
+                        raise SessionLeaseRenewalFailed(
+                            f"owner lease was lost for {self.binding.sdk_session_id}"
+                        ) from error
+                    except Exception:
+                        continue
+                    renewed = True
+                    break
+                if not renewed:
+                    await self._fence_after_renewal_failure(first_error)
+                    raise SessionLeaseRenewalFailed(
+                        f"owner lease renewal failed for {self.binding.sdk_session_id}"
+                    ) from first_error
+
+    async def _fence_after_renewal_failure(self, error: Exception) -> None:
+        self.state = RuntimeState.FENCED
+        self._accepting_sends = False
+        if self._mailbox is not None:
+            self._mailbox.freeze()
+        if self._inbox is not None:
+            self._inbox.close_sdk()
+        try:
+            current = await self._bindings.by_thread(self.binding.thread_id)
+            if (
+                current is not None
+                and current.runtime_generation == self.binding.runtime_generation
+                and current.owner_fence_token == self.binding.owner_fence_token
+                and current.attachment_state
+                in {
+                    AttachmentState.CREATING,
+                    AttachmentState.RESUMING,
+                    AttachmentState.ATTACHED,
+                    AttachmentState.DISCONNECTING,
+                    AttachmentState.TERMINAL,
+                }
+            ):
+                self.binding = await self._bindings.mark_recovery_unknown(current)
+        except Exception:
+            _LOGGER.exception(
+                "owner renewal failure could not mark session recovery unknown for %s",
+                self.binding.sdk_session_id,
+            )
+        try:
+            await self._database.execute(
+                """
+                INSERT INTO runtime_incidents(
+                    timestamp, runtime_generation, session_id, kind, detail
+                ) VALUES (?, ?, ?, 'owner_renewal_failed', ?)
+                """,
+                (
+                    time.time(),
+                    self.binding.runtime_generation,
+                    self.binding.sdk_session_id,
+                    state_only_json(
+                        {
+                            "error_type": type(error).__name__,
+                            "message": str(error),
+                        }
+                    ),
+                ),
+            )
+        except Exception:
+            _LOGGER.exception(
+                "owner renewal failure incident could not be persisted for %s",
+                self.binding.sdk_session_id,
+            )
 
     async def _assert_dispatchable(self) -> None:
         if self.state != RuntimeState.READY:

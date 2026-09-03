@@ -16,6 +16,7 @@ from typing import Protocol
 from aiosqlite import Row
 
 from copilotd.core.bindings import (
+    AttachmentState,
     BindingIntent,
     SessionBinding,
     SessionBindingRepository,
@@ -37,12 +38,19 @@ from copilotd.core.session_runtime import (
     RuntimeState,
     SessionAttachRejected,
     SessionAttachUnknown,
+    SessionOwnerConflict,
     SessionRuntime,
 )
 from copilotd.storage.database import Database
-from copilotd.storage.leases import OwnerConflict
+from copilotd.storage.leases import OWNER_LEASE_TTL_SECONDS, OwnerConflict
 
 RuntimeFactory = Callable[[SessionBinding], SessionRuntime]
+_RETRYABLE_ATTACH_ERRORS = (
+    OwnerConflict,
+    SessionOwnerConflict,
+    SessionAttachUnknown,
+    TimeoutError,
+)
 _creation_admitted: ContextVar[bool] = ContextVar(
     "copilotd_creation_admitted",
     default=False,
@@ -361,7 +369,8 @@ class SessionRegistry:
         bindings: SessionBindingRepository,
         runtime_factory: RuntimeFactory,
         *,
-        eager_retry_delays: tuple[float, ...] = (1, 2, 5, 10, 15, 15, 15),
+        owner_lease_ttl_seconds: float = OWNER_LEASE_TTL_SECONDS,
+        eager_retry_delays: tuple[float, ...] | None = None,
     ) -> None:
         self._bindings = bindings
         self._runtime_factory = runtime_factory
@@ -378,7 +387,12 @@ class SessionRegistry:
         self._transition_lock = asyncio.Lock()
         self._transitions: dict[str, _AttachmentTransition] = {}
         self._transition_cleanup_tasks: set[asyncio.Task[None]] = set()
-        self._eager_retry_delays = eager_retry_delays
+        self._protected_recovery_lock = asyncio.Lock()
+        self._eager_retry_delays = (
+            _lease_retry_delays(owner_lease_ttl_seconds)
+            if eager_retry_delays is None
+            else eager_retry_delays
+        )
         self._eager_retry_tasks: dict[str, asyncio.Task[None]] = {}
 
     def for_thread(self, thread_id: str) -> SessionRuntime | None:
@@ -452,7 +466,7 @@ class SessionRegistry:
         if current is None:
             raise RuntimeError("session binding disappeared before attach")
         binding = current
-        if binding.binding_intent == BindingIntent.CLOSED and not reactivate:
+        if _requires_explicit_reactivation(binding) and not reactivate:
             raise ClosedSessionRequiresReactivation("closed session requires an explicit resume")
         runtime = self.for_thread(binding.thread_id)
         if (
@@ -551,16 +565,24 @@ class SessionRegistry:
             if current is None:
                 raise RuntimeError("session binding disappeared during attach transition")
             binding = current
-            if (
-                binding.binding_intent == BindingIntent.CLOSED
-                and not transition.reactivate_requested
-            ):
+            if _requires_explicit_reactivation(binding) and not transition.reactivate_requested:
                 raise ClosedSessionRequiresReactivation(
                     "closed session requires an explicit resume"
                 )
-            runtime = self.for_thread(binding.thread_id)
+            runtime = self._runtimes.get(binding.thread_id)
+            if runtime is not None and runtime.state == RuntimeState.TERMINAL:
+                settlement = getattr(runtime, "_shutdown_finalize_task", None)
+                if settlement is not None:
+                    try:
+                        await asyncio.shield(settlement)
+                    except Exception:
+                        pass
+                runtime = self._runtimes.get(binding.thread_id)
+                if runtime is not None and runtime.state == RuntimeState.READY:
+                    return runtime
             if runtime is None or runtime.state in {
                 RuntimeState.CLOSED,
+                RuntimeState.DEGRADED,
                 RuntimeState.FENCED,
                 RuntimeState.RECOVERY_UNKNOWN,
                 RuntimeState.TERMINAL,
@@ -572,36 +594,162 @@ class SessionRegistry:
                 raise RuntimeError(f"session attach settled in {runtime.state}")
             return runtime
 
-    async def eager_resume(self) -> dict[str, str]:
+    async def eager_resume(
+        self,
+        *,
+        protected_only: bool = False,
+        max_bindings: int | None = None,
+        concurrency: int = 1,
+        attach_timeout_seconds: float | None = None,
+    ) -> dict[str, str]:
+        if concurrency < 1:
+            raise ValueError("eager resume concurrency must be positive")
         failures: dict[str, str] = {}
-        for binding in await self._bindings.eager_bindings():
-            try:
-                async with self._admit():
-                    runtime = self._runtime_factory(binding)
-                    self._register_admitted(runtime)
-                    try:
-                        await runtime.attach_resume()
-                    except Exception as error:
-                        failures[binding.thread_id] = str(error)
-                        self._runtimes.pop(binding.thread_id, None)
-                        try:
-                            await runtime.shutdown()
-                        except Exception as cleanup_error:
-                            failures[binding.thread_id] = (
-                                f"{error}; cleanup failed: {cleanup_error}"
-                            )
-                        if isinstance(error, OwnerConflict):
-                            self._schedule_eager_retry(binding.thread_id)
-            except SessionRegistryNotAccepting:
-                break
+        semaphore = asyncio.Semaphore(concurrency)
+
+        async def resume(binding: SessionBinding) -> None:
+            async with semaphore:
+                await self._eager_resume_one(
+                    binding,
+                    failures,
+                    attach_timeout_seconds=attach_timeout_seconds,
+                )
+
+        bindings = await self._bindings.eager_bindings(
+            protected_only=protected_only,
+            limit=max_bindings,
+        )
+        await asyncio.gather(*(resume(binding) for binding in bindings))
         return failures
 
-    def _schedule_eager_retry(self, thread_id: str) -> None:
+    async def recover_protected_bindings(
+        self,
+        *,
+        page_size: int,
+        concurrency: int,
+        attach_timeout_seconds: float | None,
+    ) -> dict[str, str]:
+        if page_size < 1:
+            raise ValueError("protected recovery page size must be positive")
+        if concurrency < 1:
+            raise ValueError("protected recovery concurrency must be positive")
+        failures: dict[str, str] = {}
+        async with self._protected_recovery_lock:
+            starting_cursor = await self._bindings.protected_recovery_cursor()
+            after_thread_id = starting_cursor
+            through_thread_id: str | None = None
+            wrapped = starting_cursor is None
+            while True:
+                bindings = await self._bindings.eager_bindings(
+                    protected_only=True,
+                    limit=page_size,
+                    after_thread_id=after_thread_id,
+                    through_thread_id=through_thread_id,
+                )
+                if not bindings:
+                    if not wrapped:
+                        wrapped = True
+                        after_thread_id = None
+                        through_thread_id = starting_cursor
+                        continue
+                    await self._bindings.set_protected_recovery_cursor(None)
+                    return failures
+                for start in range(0, len(bindings), concurrency):
+                    group = bindings[start : start + concurrency]
+                    await asyncio.gather(
+                        *(
+                            self._eager_resume_one(
+                                binding,
+                                failures,
+                                attach_timeout_seconds=attach_timeout_seconds,
+                            )
+                            for binding in group
+                        )
+                    )
+                    after_thread_id = group[-1].thread_id
+                    await self._bindings.set_protected_recovery_cursor(after_thread_id)
+
+    async def _eager_resume_one(
+        self,
+        binding: SessionBinding,
+        failures: dict[str, str],
+        *,
+        attach_timeout_seconds: float | None,
+    ) -> None:
+        try:
+            if attach_timeout_seconds is None:
+                await self.ensure_attached(binding)
+            else:
+                async with asyncio.timeout(attach_timeout_seconds):
+                    await self.ensure_attached(binding)
+        except SessionRegistryNotAccepting:
+            return
+        except asyncio.CancelledError:
+            raise
+        except Exception as error:
+            failures[binding.thread_id] = str(error)
+            if isinstance(error, _RETRYABLE_ATTACH_ERRORS):
+                self._schedule_eager_retry(
+                    binding.thread_id,
+                    attach_timeout_seconds=attach_timeout_seconds,
+                )
+
+    async def quarantine_failure(
+        self,
+        sdk_session_id: str,
+        *,
+        runtime_generation: int | None = None,
+    ) -> None:
+        async with self._mutation_lock:
+            match = next(
+                (
+                    (thread_id, runtime)
+                    for thread_id, runtime in self._runtimes.items()
+                    if runtime.binding.sdk_session_id == sdk_session_id
+                    and (
+                        runtime_generation is None
+                        or runtime.binding.runtime_generation == runtime_generation
+                    )
+                ),
+                None,
+            )
+            if match is None:
+                return
+            thread_id, runtime = match
+            self._runtimes.pop(thread_id, None)
+        try:
+            await runtime.shutdown(emergency=True)
+        except Exception:
+            current = await self._bindings.by_thread(thread_id)
+            if current is None or current.attachment_state != AttachmentState.RECOVERY_UNKNOWN:
+                raise
+        finally:
+            if self._accepting:
+                self._schedule_eager_retry(thread_id)
+
+    async def quarantine_all(self) -> None:
+        async with self._mutation_lock:
+            runtimes = list(self._runtimes.values())
+            self._runtimes.clear()
+        await asyncio.gather(
+            *(runtime.shutdown(emergency=True) for runtime in runtimes),
+            return_exceptions=True,
+        )
+
+    def _schedule_eager_retry(
+        self,
+        thread_id: str,
+        *,
+        attach_timeout_seconds: float | None = None,
+    ) -> None:
         existing = self._eager_retry_tasks.get(thread_id)
         if existing is not None and not existing.done():
             return
         task = asyncio.create_task(
-            self._retry_eager_resume(thread_id),
+            self._retry_eager_resume(
+                thread_id,
+                attach_timeout_seconds=attach_timeout_seconds,
+            ),
             name=f"session-eager-retry:{thread_id}",
         )
         self._eager_retry_tasks[thread_id] = task
@@ -615,18 +763,52 @@ class SessionRegistry:
         if not task.cancelled():
             task.exception()
 
-    async def _retry_eager_resume(self, thread_id: str) -> None:
+    async def _retry_eager_resume(
+        self,
+        thread_id: str,
+        *,
+        attach_timeout_seconds: float | None,
+    ) -> None:
         for delay in self._eager_retry_delays:
             await asyncio.sleep(delay)
             if not self._accepting:
                 return
             binding = await self._bindings.by_thread(thread_id)
-            if binding is None or binding.binding_intent != BindingIntent.ACTIVE:
+            if not _eligible_for_automatic_resume(binding):
                 return
+            assert binding is not None
             try:
-                await self.ensure_attached(binding)
-            except OwnerConflict:
+                if attach_timeout_seconds is None:
+                    await self.ensure_attached(binding)
+                else:
+                    async with asyncio.timeout(attach_timeout_seconds):
+                        await self.ensure_attached(binding)
+            except _RETRYABLE_ATTACH_ERRORS:
                 continue
+            except SessionRegistryNotAccepting:
+                return
+            except Exception:
+                return
+            return
+        while self._accepting:
+            binding = await self._bindings.by_thread(thread_id)
+            if not _eligible_for_automatic_resume(binding):
+                return
+            assert binding is not None
+            expires_at = await self._bindings.owner_lease_expiration(binding.sdk_session_id)
+            if expires_at is None or expires_at <= time.time():
+                return
+            await asyncio.sleep(max(0.1, expires_at - time.time() + 0.01))
+            try:
+                if attach_timeout_seconds is None:
+                    await self.ensure_attached(binding)
+                else:
+                    async with asyncio.timeout(attach_timeout_seconds):
+                        await self.ensure_attached(binding)
+            except (OwnerConflict, SessionOwnerConflict):
+                continue
+            except (SessionAttachUnknown, TimeoutError):
+                return
             except SessionRegistryNotAccepting:
                 return
             except Exception:
@@ -636,6 +818,19 @@ class SessionRegistry:
     async def _cancel_eager_retries(self) -> None:
         tasks = list(self._eager_retry_tasks.values())
         self._eager_retry_tasks.clear()
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+
+    async def _cancel_attachment_transitions(self) -> None:
+        async with self._transition_lock:
+            tasks = [
+                transition.task
+                for transition in self._transitions.values()
+                if transition.task is not None and not transition.task.done()
+            ]
+            self._transitions.clear()
         for task in tasks:
             task.cancel()
         if tasks:
@@ -725,6 +920,7 @@ class SessionRegistry:
     ) -> None:
         await self._cancel_eager_retries()
         await self.close_admission()
+        await self._cancel_attachment_transitions()
         async with self._mutation_lock:
             runtimes = list(self._runtimes.values())
             self._runtimes.clear()
@@ -1050,4 +1246,30 @@ def _project_snapshot_json(project: ProjectSnapshot) -> str:
         ensure_ascii=False,
         sort_keys=True,
         separators=(",", ":"),
+    )
+
+
+def _lease_retry_delays(ttl_seconds: float) -> tuple[float, ...]:
+    if ttl_seconds <= 0:
+        raise ValueError("owner lease TTL must be positive")
+    fractions = (1 / 12, 1 / 6, 1 / 4, 1 / 3)
+    delays = tuple(max(0.1, ttl_seconds * fraction) for fraction in fractions)
+    after_expiry = max(0.1, ttl_seconds - sum(delays) + 0.1)
+    return (*delays, after_expiry)
+
+
+def _requires_explicit_reactivation(binding: SessionBinding) -> bool:
+    return (
+        binding.binding_intent == BindingIntent.CLOSED
+        and binding.attachment_reason != "scheduler_run"
+    )
+
+
+def _eligible_for_automatic_resume(binding: SessionBinding | None) -> bool:
+    return binding is not None and (
+        binding.binding_intent == BindingIntent.ACTIVE
+        or (
+            binding.binding_intent == BindingIntent.CLOSED
+            and binding.attachment_reason == "scheduler_run"
+        )
     )

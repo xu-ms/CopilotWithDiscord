@@ -1,10 +1,10 @@
 import asyncio
 import time
-from types import SimpleNamespace
 from typing import Any
 
 import pytest
 
+from copilotd.discord_http_limiter import DiscordHttpRedirectBlocked
 from copilotd.discord_requests import (
     DiscordBackpressure,
     DiscordCoordinatorConfig,
@@ -26,6 +26,7 @@ def _request(
     coalesce: str | None = None,
     terminal: bool = False,
     deadline: float | None = None,
+    min_interval: float = 0.0,
 ) -> DiscordRequest:
     return DiscordRequest(
         operation=operation,
@@ -36,14 +37,13 @@ def _request(
         coalesce_key=coalesce,
         terminal=terminal,
         deadline=deadline,
+        min_interval_seconds=min_interval,
     )
 
 
 @pytest.mark.asyncio
 async def test_deadline_priority_overtakes_background_without_reordering_target() -> None:
-    coordinator = DiscordRequestCoordinator(
-        DiscordCoordinatorConfig(requests_per_second=1000, route_requests_per_second=1000)
-    )
+    coordinator = DiscordRequestCoordinator(DiscordCoordinatorConfig(max_concurrency=1))
     entered = asyncio.Event()
     release = asyncio.Event()
     seen: list[str] = []
@@ -101,10 +101,38 @@ async def test_deadline_priority_overtakes_background_without_reordering_target(
 
 
 @pytest.mark.asyncio
-async def test_coalescing_keeps_latest_terminal_and_never_downgrades() -> None:
-    coordinator = DiscordRequestCoordinator(
-        DiscordCoordinatorConfig(requests_per_second=1000, route_requests_per_second=1000)
+async def test_redirect_blocked_fails_one_command_without_stopping_coordinator() -> None:
+    coordinator = DiscordRequestCoordinator()
+
+    async def blocked_command() -> None:
+        raise DiscordHttpRedirectBlocked()
+
+    with pytest.raises(DiscordBackpressure):
+        await coordinator.execute(
+            _request(
+                blocked_command,
+                operation=DiscordOperation.COMMAND_SYNC,
+                route="commands.sync",
+                target="application:commands",
+            )
+        )
+    assert (
+        await coordinator.execute(
+            _request(
+                lambda: _value("next"),
+                operation=DiscordOperation.COMMAND_SYNC,
+                route="commands.sync",
+                target="application:commands",
+            )
+        )
+        == "next"
     )
+    await coordinator.close()
+
+
+@pytest.mark.asyncio
+async def test_coalescing_keeps_latest_terminal_and_never_downgrades() -> None:
+    coordinator = DiscordRequestCoordinator(DiscordCoordinatorConfig(max_concurrency=1))
     entered = asyncio.Event()
     release = asyncio.Event()
     seen: list[str] = []
@@ -164,103 +192,29 @@ async def test_coalescing_keeps_latest_terminal_and_never_downgrades() -> None:
     assert snapshot["dropped"] == 1
 
 
-class _RateLimited(Exception):
-    def __init__(self, retry_after: float, *, global_: bool = False) -> None:
-        self.status = 429
-        self.retry_after = retry_after
-        self.global_ = global_
-        self.response = SimpleNamespace(headers={})
-
-
-class _HttpError(Exception):
-    def __init__(self, status: int) -> None:
-        self.status = status
-        self.response = SimpleNamespace(headers={})
-
-
 @pytest.mark.asyncio
-async def test_route_429_does_not_block_other_route_or_consume_transient_budget() -> None:
-    coordinator = DiscordRequestCoordinator(
-        DiscordCoordinatorConfig(
-            requests_per_second=1000,
-            route_requests_per_second=1000,
-            transient_attempts=1,
-        )
-    )
+async def test_logical_callback_is_invoked_once_when_it_raises() -> None:
+    coordinator = DiscordRequestCoordinator()
     attempts = 0
-    order: list[str] = []
 
-    async def limited() -> str:
+    async def failing() -> None:
         nonlocal attempts
         attempts += 1
-        if attempts == 1:
-            raise _RateLimited(0.03)
-        order.append("limited")
-        return "limited"
+        raise OSError("discord.py owns transport retries")
 
-    limited_task = asyncio.create_task(
-        coordinator.execute(_request(limited, route="reactions", target="message:1"))
-    )
-    await asyncio.sleep(0.005)
-    other = await coordinator.execute(
-        _request(lambda: _record(order, "other"), route="messages", target="channel:2")
-    )
-    limited_result = await limited_task
-    snapshot = coordinator.snapshot()
+    with pytest.raises(OSError):
+        await coordinator.execute(_request(failing))
+    metrics = coordinator.snapshot()
     await coordinator.close()
 
-    assert other == "other"
-    assert limited_result == "limited"
-    assert order == ["other", "limited"]
-    assert attempts == 2
-    assert snapshot["rate_limited_429"] == 1
-
-
-@pytest.mark.asyncio
-async def test_global_429_blocks_every_priority_until_retry_after() -> None:
-    coordinator = DiscordRequestCoordinator(
-        DiscordCoordinatorConfig(requests_per_second=1000, route_requests_per_second=1000)
-    )
-    attempts = 0
-    started = time.monotonic()
-    sent_at: list[float] = []
-
-    async def limited() -> None:
-        nonlocal attempts
-        attempts += 1
-        if attempts == 1:
-            raise _RateLimited(0.03, global_=True)
-        sent_at.append(time.monotonic())
-
-    limited_task = asyncio.create_task(
-        coordinator.execute(_request(limited, route="messages", target="channel:1"))
-    )
-    await asyncio.sleep(0.005)
-    critical_task = asyncio.create_task(
-        coordinator.execute(
-            _request(
-                lambda: _timestamp(sent_at),
-                route="interactions",
-                target="interaction:1",
-                priority=DiscordPriority.DEADLINE_CRITICAL,
-                deadline=time.monotonic() + 1,
-            )
-        )
-    )
-    await asyncio.gather(limited_task, critical_task)
-    await coordinator.close()
-
-    assert min(sent_at) - started >= 0.025
+    assert attempts == 1
+    assert metrics["logical_failures"] == 1
 
 
 @pytest.mark.asyncio
 async def test_bounded_queue_coalesces_background_and_backpressures_foreground() -> None:
     coordinator = DiscordRequestCoordinator(
-        DiscordCoordinatorConfig(
-            requests_per_second=1000,
-            route_requests_per_second=1000,
-            queue_limit=1,
-        )
+        DiscordCoordinatorConfig(queue_limit=1, max_concurrency=1)
     )
     entered = asyncio.Event()
     release = asyncio.Event()
@@ -303,69 +257,100 @@ async def test_bounded_queue_coalesces_background_and_backpressures_foreground()
 
 
 @pytest.mark.asyncio
-async def test_process_token_bucket_shapes_burst_rate() -> None:
-    coordinator = DiscordRequestCoordinator(
-        DiscordCoordinatorConfig(
-            requests_per_second=40,
-            burst=1,
-            route_requests_per_second=1000,
-            route_burst=10,
-        )
+async def test_blocked_route_does_not_head_of_line_block_interaction_ack() -> None:
+    coordinator = DiscordRequestCoordinator()
+    route_entered = asyncio.Event()
+    release_route = asyncio.Event()
+
+    async def blocked_route() -> None:
+        route_entered.set()
+        await release_route.wait()
+
+    normal = asyncio.create_task(
+        coordinator.execute(_request(blocked_route, target="channel:normal"))
     )
+    await route_entered.wait()
+    started = time.monotonic()
+    acknowledged = await asyncio.wait_for(
+        coordinator.execute(
+            _request(
+                lambda: _value("acknowledged"),
+                operation=DiscordOperation.INTERACTION_DEFER,
+                target="interaction:deadline",
+                priority=DiscordPriority.DEADLINE_CRITICAL,
+                deadline=time.monotonic() + 0.1,
+            )
+        ),
+        timeout=0.1,
+    )
+
+    assert acknowledged == "acknowledged"
+    assert time.monotonic() - started < 0.1
+    release_route.set()
+    await normal
+    await coordinator.close()
+
+
+@pytest.mark.asyncio
+async def test_close_cancels_and_settles_active_callbacks() -> None:
+    coordinator = DiscordRequestCoordinator()
+    entered = asyncio.Event()
+    settled = asyncio.Event()
+
+    async def blocked() -> None:
+        entered.set()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            settled.set()
+
+    request = asyncio.create_task(coordinator.execute(_request(blocked, target="channel:active")))
+    await entered.wait()
+    await coordinator.close()
+
+    with pytest.raises(DiscordBackpressure):
+        await request
+    assert settled.is_set()
+    assert coordinator.snapshot()["active_operations"] == 0
+
+
+@pytest.mark.asyncio
+async def test_target_minimum_interval_is_preserved() -> None:
+    coordinator = DiscordRequestCoordinator()
     sent_at: list[float] = []
     await asyncio.gather(
         coordinator.execute(
-            _request(lambda: _timestamp(sent_at), target="channel:1", route="send")
+            _request(
+                lambda: _timestamp(sent_at),
+                target="message:1",
+                route="edit",
+                min_interval=0.03,
+            )
         ),
         coordinator.execute(
-            _request(lambda: _timestamp(sent_at), target="channel:2", route="send")
+            _request(
+                lambda: _timestamp(sent_at),
+                target="message:1",
+                route="edit",
+                min_interval=0.03,
+            )
         ),
     )
     await coordinator.close()
 
-    assert sent_at[1] - sent_at[0] >= 0.02
+    assert sent_at[1] - sent_at[0] >= 0.025
 
 
 @pytest.mark.asyncio
-async def test_5xx_retries_are_bounded_and_permanent_4xx_are_observable() -> None:
-    coordinator = DiscordRequestCoordinator(
-        DiscordCoordinatorConfig(
-            requests_per_second=1000,
-            route_requests_per_second=1000,
-            transient_attempts=3,
-            retry_backoff_base_seconds=0.001,
+async def test_interaction_fails_when_target_cadence_misses_deadline() -> None:
+    coordinator = DiscordRequestCoordinator()
+    await coordinator.execute(
+        _request(
+            lambda: _value("first"),
+            target="interaction:late",
+            min_interval=0.05,
         )
     )
-    attempts = 0
-
-    async def eventually_succeeds() -> str:
-        nonlocal attempts
-        attempts += 1
-        if attempts < 3:
-            raise _HttpError(503)
-        return "ok"
-
-    assert await coordinator.execute(_request(eventually_succeeds)) == "ok"
-    with pytest.raises(_HttpError):
-        await coordinator.execute(_request(lambda: _raise_http(403), target="channel:forbidden"))
-    metrics = coordinator.snapshot()
-    await coordinator.close()
-
-    assert attempts == 3
-    assert metrics["permanent_failures"] == 1
-
-
-@pytest.mark.asyncio
-async def test_interaction_fails_fast_when_limiter_cannot_meet_deadline() -> None:
-    coordinator = DiscordRequestCoordinator(
-        DiscordCoordinatorConfig(
-            requests_per_second=1,
-            burst=1,
-            route_requests_per_second=1000,
-            route_burst=10,
-        )
-    )
-    await coordinator.execute(_request(lambda: _value("first"), target="channel:first"))
     with pytest.raises(DiscordDeadlineExceeded):
         await coordinator.execute(
             _request(
@@ -373,15 +358,11 @@ async def test_interaction_fails_fast_when_limiter_cannot_meet_deadline() -> Non
                 target="interaction:late",
                 priority=DiscordPriority.DEADLINE_CRITICAL,
                 deadline=time.monotonic() + 0.01,
+                min_interval=0.05,
             )
         )
     assert coordinator.snapshot()["deadline_misses"] == 1
     await coordinator.close()
-
-
-async def _record(values: list[str], value: str) -> str:
-    values.append(value)
-    return value
 
 
 async def _timestamp(values: list[float]) -> None:
@@ -390,7 +371,3 @@ async def _timestamp(values: list[float]) -> None:
 
 async def _value(value: Any) -> Any:
     return value
-
-
-async def _raise_http(status: int) -> None:
-    raise _HttpError(status)

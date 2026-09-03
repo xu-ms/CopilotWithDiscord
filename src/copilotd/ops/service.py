@@ -52,6 +52,28 @@ _WINDOWS_RUNTIME_TASK = "copilotD Runtime"
 _WINDOWS_BOT_TASK = "copilotD Bot"
 _WINDOWS_WATCHDOG_TASK = "copilotD Watchdog"
 _TASK_NAMESPACE = "http://schemas.microsoft.com/windows/2004/02/mit/task"
+_LIFECYCLE_SERVICE_ENVIRONMENT_FIELDS = (
+    (
+        "owner_lease_renew_retry_attempts",
+        "COPILOTD_OWNER_LEASE_RENEW_RETRY_ATTEMPTS",
+    ),
+    ("startup_recovery_concurrency", "COPILOTD_STARTUP_RECOVERY_CONCURRENCY"),
+    ("startup_recovery_limit", "COPILOTD_STARTUP_RECOVERY_LIMIT"),
+    ("startup_attach_timeout_seconds", "COPILOTD_STARTUP_ATTACH_TIMEOUT_SECONDS"),
+    (
+        "startup_recovery_total_timeout_seconds",
+        "COPILOTD_STARTUP_RECOVERY_TOTAL_TIMEOUT_SECONDS",
+    ),
+    ("event_replay_max_pages", "COPILOTD_EVENT_REPLAY_MAX_PAGES"),
+    (
+        "runtime_health_failure_threshold",
+        "COPILOTD_RUNTIME_HEALTH_FAILURE_THRESHOLD",
+    ),
+    (
+        "runtime_health_backoff_max_seconds",
+        "COPILOTD_RUNTIME_HEALTH_BACKOFF_MAX_SECONDS",
+    ),
+)
 
 _INFLIGHT_SUBMISSION_STATES = {
     "submitting",
@@ -207,6 +229,7 @@ class ServiceStatus:
     definition_drift: tuple[str, ...]
     last_resume_at: str | None
     wake_suppression_until: str | None
+    lifecycle_settings: dict[str, int | float]
 
 
 @dataclass(frozen=True, slots=True)
@@ -734,11 +757,7 @@ class SqliteRestartCoordinator:
         connection.execute(
             """
             UPDATE pending_interactions
-            SET state = 'expired', updated_at = ?,
-                response = COALESCE(
-                  response,
-                  'Cancelled after restart admission violation.'
-                )
+            SET state = 'expired', updated_at = ?, response = NULL
             WHERE state = 'pending'
             """,
             (now,),
@@ -1186,7 +1205,7 @@ class SqliteRestartCoordinator:
                 """
                 UPDATE pending_interactions
                 SET state = 'expired',
-                    response = COALESCE(response, 'Cancelled by forced service restart.'),
+                    response = NULL,
                     updated_at = ?
                 WHERE state = 'pending'
                 """,
@@ -2645,6 +2664,7 @@ if ($remaining.Count -ne 0 -or $remainingTracked.Count -ne 0) {
             wake_suppression_until=(
                 None if heartbeat is None else heartbeat.wake_suppression_until
             ),
+            lifecycle_settings=self._lifecycle_service_settings(),
         )
 
     def restart(
@@ -3692,7 +3712,15 @@ if ($remaining.Count -ne 0 -or $remainingTracked.Count -ne 0) {
             environment["COPILOTD_DISCORD_GUILD_ID"] = str(self.settings.discord_guild_id)
         if self.settings.runtime_uri is not None:
             environment["COPILOTD_RUNTIME_URI"] = self.settings.runtime_uri
+        for field, environment_name in _LIFECYCLE_SERVICE_ENVIRONMENT_FIELDS:
+            environment[environment_name] = str(getattr(self.settings, field))
         return environment
+
+    def _lifecycle_service_settings(self) -> dict[str, int | float]:
+        return {
+            field: getattr(self.settings, field)
+            for field, _environment_name in _LIFECYCLE_SERVICE_ENVIRONMENT_FIELDS
+        }
 
     def _process_started_at(self, pid: int) -> float | None:
         if self._process_start_provider is not None:
@@ -3799,6 +3827,7 @@ if ($remaining.Count -ne 0 -or $remainingTracked.Count -ne 0) {
                         "log_level": self.settings.log_level,
                         "sdk_log_level": self.settings.sdk_log_level,
                         "runtime_uri": self.settings.runtime_uri,
+                        **self._lifecycle_service_settings(),
                     },
                 },
                 ensure_ascii=False,

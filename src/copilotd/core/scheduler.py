@@ -5,7 +5,8 @@ import hashlib
 import json
 import time
 import uuid
-from collections.abc import Awaitable, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from enum import StrEnum
 from typing import Any, Protocol
@@ -14,12 +15,32 @@ from aiosqlite import Connection, Row
 
 from copilotd.core.schedule_time import ParsedSchedule, parse_schedule, planned_key
 from copilotd.core.task_registry import TaskRegistry
+from copilotd.core.volatile_content import (
+    VolatileContentStore,
+    opaque_content_key,
+)
 from copilotd.storage.database import Database
+from copilotd.storage.state_only import (
+    payload_sha256,
+    render_payload_receipt,
+    state_only_json,
+)
 
 SCHEDULE_LEASE_SECONDS = 60.0
 SCHEDULE_RENEW_SECONDS = 20.0
 SCHEDULE_RETRY_DELAYS = (5.0, 30.0, 120.0, 600.0, 1_800.0)
 SCHEDULE_MAX_ATTEMPTS = 6
+_SOURCE_CONTENT_ERROR_CODES = {
+    "content_unavailable",
+    "queued_source_hash_mismatch",
+    "source_access_denied",
+    "source_channel_invalid",
+    "source_content_empty",
+    "source_content_unavailable",
+    "source_deleted",
+    "source_hash_mismatch",
+    "source_resolver_unavailable",
+}
 
 
 class ScheduleKind(StrEnum):
@@ -31,6 +52,7 @@ class ScheduleState(StrEnum):
     ENABLED = "enabled"
     DISABLED = "disabled"
     DELETED = "deleted"
+    NEEDS_RECREATE = "needs_recreate"
 
 
 class MisfirePolicy(StrEnum):
@@ -136,6 +158,11 @@ class ScheduleDefinition:
     updated_at: float
     name: str | None = None
     created_by: str | None = None
+    source_channel_id: str | None = None
+    source_message_id: str | None = None
+    prompt_hash: str | None = None
+    target_snapshot_hash: str | None = None
+    thread_name: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -234,9 +261,28 @@ class SystemClock:
         await asyncio.sleep(seconds)
 
 
+SchedulePromptResolver = Callable[[str, str], Awaitable[str]]
+
+
 class SchedulerRepository:
-    def __init__(self, database: Database) -> None:
+    def __init__(
+        self,
+        database: Database,
+        *,
+        content_store: VolatileContentStore | None = None,
+        prompt_resolver: SchedulePromptResolver | None = None,
+    ) -> None:
         self._database = database
+        self._content_store = content_store or database.content_store
+        self._prompt_resolver = prompt_resolver
+
+    @asynccontextmanager
+    async def coupled_transaction(self) -> AsyncIterator[Connection]:
+        async with _volatile_database_transaction(
+            self._content_store,
+            self._database,
+        ) as connection:
+            yield connection
 
     async def create(
         self,
@@ -256,11 +302,39 @@ class SchedulerRepository:
         now: float | None = None,
         schedule_id: str | None = None,
         connection: Connection | None = None,
+        source_channel_id: str | None = None,
+        source_message_id: str | None = None,
+        prompt_hash: str | None = None,
     ) -> ScheduleDefinition:
         timestamp = time.time() if now is None else now
         parsed = parse_schedule(expression, timezone, anchor_utc=timestamp)
         next_run = parsed.next_after(timestamp)
         identifier = str(uuid.uuid4()) if schedule_id is None else schedule_id
+        thread_name = _schedule_thread_name(kind, payload.get("thread_name"))
+        prompt_value = payload.get("text")
+        prompt_text: str | None = None
+        if prompt_value is not None:
+            prompt_text = str(prompt_value)
+            prompt_digest = hashlib.sha256(prompt_text.encode()).hexdigest()
+            if prompt_hash is None:
+                prompt_hash = prompt_digest
+            elif prompt_hash != prompt_digest:
+                raise ScheduleConflict("schedule prompt hash does not match live content")
+        if source_channel_id is None:
+            candidate = payload.get("source_channel_id")
+            source_channel_id = None if candidate is None else str(candidate)
+        if source_message_id is None:
+            candidate = payload.get("source_message_id")
+            source_message_id = None if candidate is None else str(candidate)
+        persisted_payload = {
+            key: value
+            for key, value in payload.items()
+            if key in {"source_kind"} and value is not None
+        }
+        durable_target = _durable_schedule_target(kind, target_snapshot)
+        target_snapshot_hash = (
+            payload_sha256(durable_target) if kind == ScheduleKind.NEW_SESSION else None
+        )
 
         async def insert(active_connection: Connection) -> None:
             await _require_scheduler_admission(
@@ -273,9 +347,11 @@ class SchedulerRepository:
                     id, project_id, thread_id, channel_id, kind, expression,
                     normalized_expression, timezone, payload, target_snapshot,
                     misfire_policy, state, next_run_at_utc, name, created_by,
-                    misfire_grace_seconds, created_at, updated_at
+                    misfire_grace_seconds, created_at, updated_at,
+                    source_channel_id, source_message_id, prompt_hash,
+                    target_snapshot_hash, thread_name
                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'enabled',
-                          ?, ?, ?, ?, ?, ?)
+                          ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     identifier,
@@ -286,8 +362,11 @@ class SchedulerRepository:
                     parsed.source,
                     parsed.normalized,
                     parsed.timezone,
-                    _canonical_json(payload),
-                    _canonical_json(target_snapshot),
+                    state_only_json(persisted_payload),
+                    state_only_json(
+                        durable_target,
+                        preserve_application_configuration=True,
+                    ),
                     misfire_policy.value,
                     next_run,
                     name,
@@ -295,14 +374,25 @@ class SchedulerRepository:
                     misfire_grace_seconds,
                     timestamp,
                     timestamp,
+                    source_channel_id,
+                    source_message_id,
+                    prompt_hash,
+                    target_snapshot_hash,
+                    thread_name,
                 ),
             )
 
-        if connection is None:
-            async with self._database.transaction() as active_connection:
-                await insert(active_connection)
-        else:
-            await insert(connection)
+        with self._content_store.transaction():
+            if prompt_text is not None:
+                self._content_store.put(
+                    prompt_text,
+                    key=opaque_content_key("schedule-prompt", identifier),
+                )
+            if connection is None:
+                async with self._database.transaction() as active_connection:
+                    await insert(active_connection)
+            else:
+                await insert(connection)
         return await self.require(identifier)
 
     async def require(self, schedule_id: str) -> ScheduleDefinition:
@@ -373,7 +463,7 @@ class SchedulerRepository:
             """
             UPDATE schedules
             SET state = ?, version = version + 1, updated_at = ?
-            WHERE id = ? AND state != 'deleted'
+            WHERE id = ? AND state NOT IN ('deleted', 'needs_recreate')
             """,
             (target.value, timestamp, schedule_id),
         )
@@ -391,34 +481,34 @@ class SchedulerRepository:
             )
             if row is None:
                 raise ScheduleNotFound(f"schedule does not exist: {schedule_id}")
-            if row["state"] == ScheduleState.DELETED.value:
-                return
-            active = await _fetchone(
-                connection,
-                """
-                SELECT run_id, status FROM schedule_runs
-                WHERE schedule_id = ? AND status NOT IN (
-                    'semantic_complete', 'blocked', 'failed', 'outcome_unknown',
-                    'cancelled', 'target_unknown', 'dispatch_unknown'
+            if row["state"] != ScheduleState.DELETED.value:
+                active = await _fetchone(
+                    connection,
+                    """
+                    SELECT run_id, status FROM schedule_runs
+                    WHERE schedule_id = ? AND status NOT IN (
+                        'semantic_complete', 'blocked', 'failed', 'outcome_unknown',
+                        'cancelled', 'target_unknown', 'dispatch_unknown'
+                    )
+                    LIMIT 1
+                    """,
+                    (schedule_id,),
                 )
-                LIMIT 1
-                """,
-                (schedule_id,),
-            )
-            if active is not None:
-                raise ScheduleConflict(
-                    f"schedule has nonterminal run {active['run_id']} ({active['status']})"
+                if active is not None:
+                    raise ScheduleConflict(
+                        f"schedule has nonterminal run {active['run_id']} ({active['status']})"
+                    )
+                await connection.execute(
+                    """
+                    UPDATE schedules
+                    SET state = 'deleted', deleted_at = ?, planner_owner = NULL,
+                        planner_lease_expires_at = NULL, version = version + 1,
+                        updated_at = ?
+                    WHERE id = ?
+                    """,
+                    (timestamp, timestamp, schedule_id),
                 )
-            await connection.execute(
-                """
-                UPDATE schedules
-                SET state = 'deleted', deleted_at = ?, planner_owner = NULL,
-                    planner_lease_expires_at = NULL, version = version + 1,
-                    updated_at = ?
-                WHERE id = ?
-                """,
-                (timestamp, timestamp, schedule_id),
-            )
+        self._content_store.delete(opaque_content_key("schedule-prompt", schedule_id))
 
     async def run_now(
         self,
@@ -429,8 +519,11 @@ class SchedulerRepository:
     ) -> ScheduleRun:
         timestamp = time.time() if now is None else now
         definition = await self.require(schedule_id)
-        if definition.state == ScheduleState.DELETED:
-            raise ScheduleConflict("deleted schedules cannot be run")
+        if definition.state in {
+            ScheduleState.DELETED,
+            ScheduleState.NEEDS_RECREATE,
+        }:
+            raise ScheduleConflict("unavailable schedules cannot be run")
         key = f"manual:{manual_id or uuid.uuid4()}"
         run_id = _run_id(schedule_id, key)
         async with self._database.transaction() as connection:
@@ -446,8 +539,11 @@ class SchedulerRepository:
                 "SELECT state, project_id FROM schedules WHERE id = ?",
                 (schedule_id,),
             )
-            if current is None or current["state"] == ScheduleState.DELETED.value:
-                raise ScheduleConflict("deleted schedules cannot be run")
+            if current is None or current["state"] in {
+                ScheduleState.DELETED.value,
+                ScheduleState.NEEDS_RECREATE.value,
+            }:
+                raise ScheduleConflict("unavailable schedules cannot be run")
             await _require_scheduler_admission(
                 connection,
                 project_id=current["project_id"],
@@ -860,10 +956,18 @@ class SchedulerRepository:
             requested_model = {}
         requested_agent = str(execution.get("agent", "default"))
         requested_config_version = int(execution.get("session_config_version", 1))
-        prompt = str(definition.payload.get("text", ""))
+        prompt = await self._resolve_schedule_prompt(definition)
         prompt_hash = hashlib.sha256(prompt.encode()).hexdigest()
+        prompt_content_key = opaque_content_key(
+            "submission-prompt",
+            target.sdk_session_id,
+            submission_id,
+        )
 
-        async with self._database.transaction() as connection:
+        async with _volatile_database_transaction(
+            self._content_store,
+            self._database,
+        ) as connection:
             scheduler = await _fetchone(
                 connection,
                 "SELECT worker_state FROM scheduler_state WHERE singleton = 1",
@@ -881,12 +985,25 @@ class SchedulerRepository:
             existing = await _fetchone(
                 connection,
                 """
-                SELECT id FROM message_queue
+                SELECT id, prompt_content_key, prompt_hash
+                FROM message_queue
                 WHERE schedule_run_id = ? AND state NOT IN ('cancelled', 'submitted', 'failed')
                 """,
                 (run.run_id,),
             )
             if existing is not None:
+                if existing["prompt_content_key"] is not None:
+                    if (
+                        existing["prompt_hash"] is not None
+                        and str(existing["prompt_hash"]) != prompt_hash
+                    ):
+                        raise ScheduleConflict(
+                            "queued schedule prompt hash conflicts with live content"
+                        )
+                    self._content_store.put(
+                        prompt,
+                        key=str(existing["prompt_content_key"]),
+                    )
                 await connection.execute(
                     """
                     UPDATE schedule_runs
@@ -952,6 +1069,7 @@ class SchedulerRepository:
                 (target.thread_id,),
             )
             assert position_row is not None
+            prompt_ref = self._content_store.put(prompt, key=prompt_content_key)
             await connection.execute(
                 """
                 INSERT INTO submissions(
@@ -980,16 +1098,19 @@ class SchedulerRepository:
                 """
                 INSERT INTO message_queue(
                     id, thread_id, schedule_run_id, prompt,
+                    prompt_content_key, prompt_hash,
                     requested_mode_snapshot, requested_model_config_snapshot,
                     requested_agent_snapshot, requested_session_config_version,
                     position, state, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'local_queued', ?, ?)
+                ) VALUES (?, ?, ?, '', ?, ?, ?, ?, ?, ?, ?,
+                          'local_queued', ?, ?)
                 """,
                 (
                     submission_id,
                     target.thread_id,
                     run.run_id,
-                    prompt,
+                    prompt_ref.key,
+                    prompt_ref.sha256,
                     requested_mode,
                     _canonical_json(requested_model),
                     requested_agent,
@@ -1069,6 +1190,336 @@ class SchedulerRepository:
             )
         return submission_id
 
+    async def _resolve_schedule_prompt(self, definition: ScheduleDefinition) -> str:
+        if definition.source_channel_id and definition.source_message_id:
+            if self._prompt_resolver is None:
+                raise SchedulerDispatchError(
+                    "schedule source resolver unavailable",
+                    category=SchedulerErrorCategory.DISCORD,
+                    code="source_resolver_unavailable",
+                    blocked=True,
+                )
+            try:
+                prompt = await self._prompt_resolver(
+                    definition.source_channel_id,
+                    definition.source_message_id,
+                )
+            except SchedulerDispatchError:
+                raise
+            except Exception as error:
+                status = getattr(error, "status", None)
+                if status == 404:
+                    raise SchedulerDispatchError(
+                        "schedule source message was deleted",
+                        category=SchedulerErrorCategory.INPUT,
+                        code="source_deleted",
+                    ) from error
+                if status in {401, 403}:
+                    raise SchedulerDispatchError(
+                        "schedule source content is inaccessible",
+                        category=SchedulerErrorCategory.DISCORD,
+                        code="source_access_denied",
+                        blocked=True,
+                    ) from error
+                raise SchedulerDispatchError(
+                    "schedule source content unavailable",
+                    category=SchedulerErrorCategory.DISCORD,
+                    code="source_content_unavailable",
+                    retryable=True,
+                ) from error
+            digest = hashlib.sha256(prompt.encode()).hexdigest()
+            if definition.prompt_hash is not None and digest != definition.prompt_hash:
+                raise SchedulerDispatchError(
+                    "schedule source content changed",
+                    category=SchedulerErrorCategory.INPUT,
+                    code="source_hash_mismatch",
+                    blocked=True,
+                )
+            self._content_store.put(
+                prompt,
+                key=opaque_content_key("schedule-prompt", definition.id),
+            )
+            return prompt
+        prompt = self._content_store.get(
+            opaque_content_key("schedule-prompt", definition.id),
+            expected_hash=definition.prompt_hash,
+        )
+        if isinstance(prompt, str):
+            return prompt
+        raise SchedulerDispatchError(
+            "schedule source content unavailable",
+            category=SchedulerErrorCategory.INPUT,
+            code="content_unavailable",
+            blocked=True,
+        )
+
+    async def rehydrate_queued_prompt(
+        self,
+        definition: ScheduleDefinition,
+        run: ScheduleRun,
+    ) -> bool:
+        prompt = await self._resolve_schedule_prompt(definition)
+        prompt_hash = hashlib.sha256(prompt.encode()).hexdigest()
+        async with _volatile_database_transaction(
+            self._content_store,
+            self._database,
+        ) as connection:
+            row = await _fetchone(
+                connection,
+                """
+                SELECT queue.id, queue.prompt_content_key,
+                       queue.prompt_hash AS queue_prompt_hash,
+                       submission.prompt_hash AS submission_prompt_hash,
+                       submission.sdk_session_id
+                FROM message_queue AS queue
+                JOIN submissions AS submission ON submission.submission_id = queue.id
+                WHERE queue.schedule_run_id = ?
+                  AND queue.state = 'local_queued'
+                  AND submission.state = 'local_queued'
+                  AND submission.origin = 'app_schedule'
+                ORDER BY queue.created_at DESC
+                LIMIT 1
+                """,
+                (run.run_id,),
+            )
+            if row is None:
+                return False
+            for persisted_hash in (
+                row["queue_prompt_hash"],
+                row["submission_prompt_hash"],
+            ):
+                if persisted_hash is not None and str(persisted_hash) != prompt_hash:
+                    raise SchedulerDispatchError(
+                        "queued schedule prompt hash conflicts with its durable source",
+                        category=SchedulerErrorCategory.INPUT,
+                        code="queued_source_hash_mismatch",
+                        blocked=True,
+                    )
+            prompt_key = (
+                str(row["prompt_content_key"])
+                if row["prompt_content_key"] is not None
+                else opaque_content_key(
+                    "submission-prompt",
+                    row["sdk_session_id"],
+                    row["id"],
+                )
+            )
+            prompt_ref = self._content_store.put(prompt, key=prompt_key)
+            await connection.execute(
+                """
+                UPDATE message_queue
+                SET prompt_content_key = ?, prompt_hash = ?, updated_at = ?
+                WHERE id = ? AND state = 'local_queued'
+                """,
+                (prompt_ref.key, prompt_ref.sha256, time.time(), row["id"]),
+            )
+            await connection.execute(
+                """
+                UPDATE submissions SET prompt_hash = ?
+                WHERE submission_id = ? AND state = 'local_queued'
+                """,
+                (prompt_ref.sha256, row["id"]),
+            )
+        return True
+
+    async def rehydrate_source_backed_queues(self, *, now: float | None = None) -> int:
+        timestamp = time.time() if now is None else now
+        rows = await self._database.fetchall(
+            """
+            SELECT DISTINCT run.run_id
+            FROM schedule_runs AS run
+            JOIN schedules AS schedule ON schedule.id = run.schedule_id
+            JOIN message_queue AS queue ON queue.schedule_run_id = run.run_id
+            JOIN submissions AS submission ON submission.submission_id = queue.id
+            WHERE run.status IN ('claimed', 'submitting')
+              AND (
+                  run.lease_owner IS NULL
+                  OR COALESCE(run.lease_expires_at, 0) <= ?
+              )
+              AND run.send_started_at IS NULL
+              AND run.accepted_message_id IS NULL
+              AND schedule.state != 'deleted'
+              AND schedule.source_channel_id IS NOT NULL
+              AND schedule.source_message_id IS NOT NULL
+              AND queue.state = 'local_queued'
+              AND submission.state = 'local_queued'
+              AND submission.origin = 'app_schedule'
+            ORDER BY run.created_at, run.run_id
+            """,
+            (timestamp,),
+        )
+        restored = 0
+        for row in rows:
+            run = await self.get_run(str(row["run_id"]))
+            definition = await self.require(run.schedule_id)
+            try:
+                restored += int(await self.rehydrate_queued_prompt(definition, run))
+            except SchedulerDispatchError as error:
+                await self.transition_queued_submission_error(
+                    run,
+                    error,
+                    now=timestamp,
+                    content_unavailable=True,
+                )
+        return restored
+
+    async def transition_queued_submission_error(
+        self,
+        run: ScheduleRun,
+        error: SchedulerDispatchError,
+        *,
+        now: float,
+        owner_id: str | None = None,
+        content_unavailable: bool = False,
+    ) -> ScheduleRunState | None:
+        async with self._database.transaction() as connection:
+            row = await _fetchone(
+                connection,
+                "SELECT * FROM schedule_runs WHERE run_id = ?",
+                (run.run_id,),
+            )
+            if row is None:
+                raise ScheduleNotFound(f"schedule run does not exist: {run.run_id}")
+            current = _row_to_run(row)
+            if current.status.terminal:
+                return current.status
+            if owner_id is not None:
+                if current.lease_owner != owner_id or current.fence_token != run.fence_token:
+                    raise ScheduleConflict(
+                        "schedule run fence was lost before queue error transition"
+                    )
+            elif (
+                current.lease_owner is not None
+                and current.lease_expires_at is not None
+                and current.lease_expires_at > now
+            ):
+                return None
+            if current.send_started_at is not None:
+                raise ScheduleConflict("queued submission crossed its dispatch boundary")
+
+            if error.target_unknown:
+                state = ScheduleRunState.TARGET_UNKNOWN
+            elif error.dispatch_unknown:
+                state = ScheduleRunState.DISPATCH_UNKNOWN
+            elif error.blocked:
+                state = ScheduleRunState.BLOCKED
+            elif not error.retryable or current.attempt >= SCHEDULE_MAX_ATTEMPTS:
+                state = ScheduleRunState.FAILED
+            else:
+                state = ScheduleRunState.RETRY_WAIT
+
+            if state == ScheduleRunState.RETRY_WAIT:
+                delay = SCHEDULE_RETRY_DELAYS[
+                    min(max(current.attempt, 1) - 1, len(SCHEDULE_RETRY_DELAYS) - 1)
+                ]
+                cursor = await connection.execute(
+                    """
+                    UPDATE schedule_runs
+                    SET status = 'retry_wait', retry_at = ?,
+                        error_category = ?, error_code = ?, error_detail = NULL,
+                        lease_owner = NULL, lease_expires_at = NULL,
+                        last_progress_at = ?, updated_at = ?
+                    WHERE run_id = ? AND fence_token = ?
+                      AND status IN ('claimed', 'submitting', 'retry_wait')
+                      AND send_started_at IS NULL
+                    """,
+                    (
+                        now + delay,
+                        error.category.value,
+                        error.code,
+                        now,
+                        now,
+                        current.run_id,
+                        current.fence_token,
+                    ),
+                )
+                changed = cursor.rowcount
+                await cursor.close()
+                if changed != 1:
+                    raise ScheduleConflict("queued submission cannot enter retry wait")
+                await connection.execute(
+                    """
+                    UPDATE schedule_run_attempts
+                    SET state = 'retry_wait', error_category = ?, error_code = ?,
+                        settled_at = ?
+                    WHERE run_id = ? AND attempt = ?
+                    """,
+                    (
+                        error.category.value,
+                        error.code,
+                        now,
+                        current.run_id,
+                        current.attempt,
+                    ),
+                )
+                return state
+
+            await self._finalize_in_transaction(
+                connection,
+                current.run_id,
+                state,
+                completion_basis=None,
+                error_category=error.category.value,
+                error_code=error.code,
+                detail=str(error),
+                now=now,
+                expected_owner_id=owner_id,
+                expected_fence_token=current.fence_token if owner_id is not None else None,
+            )
+            queue_state = "content_unavailable" if content_unavailable else "failed"
+            completion_basis = "content_unavailable" if content_unavailable else error.code
+            await connection.execute(
+                """
+                UPDATE message_queue
+                SET state = ?, updated_at = ?
+                WHERE schedule_run_id = ?
+                  AND state NOT IN ('submitted', 'cancelled', 'failed',
+                                    'content_unavailable')
+                """,
+                (queue_state, now, current.run_id),
+            )
+            await connection.execute(
+                """
+                UPDATE submissions
+                SET state = 'rejected', completion_basis = ?,
+                    terminal_at = COALESCE(terminal_at, ?)
+                WHERE submission_id IN (
+                    SELECT id FROM message_queue WHERE schedule_run_id = ?
+                ) AND state = 'local_queued'
+                """,
+                (completion_basis, now, current.run_id),
+            )
+            reaction_error = "content_unavailable" if content_unavailable else error.code
+            await connection.execute(
+                """
+                UPDATE submission_reactions
+                SET desired_state = 'failed', resume_state = ?,
+                    terminal = 1, revision = revision + 1,
+                    last_error = ?, updated_at = ?
+                WHERE submission_id IN (
+                    SELECT id FROM message_queue WHERE schedule_run_id = ?
+                )
+                """,
+                (
+                    reaction_error,
+                    reaction_error,
+                    now,
+                    current.run_id,
+                ),
+            )
+            await connection.execute(
+                """
+                UPDATE liveness_leases
+                SET state = 'released', refreshed_at = ?, released_at = ?
+                WHERE kind = 'submission' AND state = 'active'
+                  AND source_id IN (
+                      SELECT id FROM message_queue WHERE schedule_run_id = ?
+                  )
+                """,
+                (now, now, current.run_id),
+            )
+            return state
+
     async def retry_or_fail(
         self,
         run: ScheduleRun,
@@ -1105,7 +1556,7 @@ class SchedulerRepository:
             """
             UPDATE schedule_runs
             SET status = 'retry_wait', retry_at = ?,
-                error_category = ?, error_code = ?, error_detail = ?,
+                error_category = ?, error_code = ?, error_detail = NULL,
                 lease_owner = NULL, lease_expires_at = NULL,
                 last_progress_at = ?, updated_at = ?
             WHERE run_id = ? AND lease_owner = ? AND fence_token = ?
@@ -1115,7 +1566,6 @@ class SchedulerRepository:
                 now + delay,
                 error.category.value,
                 error.code,
-                str(error),
                 now,
                 now,
                 run.run_id,
@@ -1242,15 +1692,38 @@ class SchedulerRepository:
             error_code=error_code,
             detail=detail,
         )
+        render_payload = {
+            "content": content,
+            "finalized": True,
+            "schedule_run": {
+                "run_id": run_id,
+                "schedule_id": str(row["schedule_id"]),
+                "status": status.value,
+                "completion_basis": completion_basis,
+                "error_code": error_code,
+            },
+            "render_destination": render_session,
+        }
+        render_ref = self._content_store.put(
+            render_payload,
+            key=opaque_content_key("render-outbox", render_id),
+        )
+        persisted_render = render_payload_receipt(render_payload, render_ref)
         await connection.execute(
             """
             INSERT INTO render_outbox(
                 id, session_id, logical_seq, lane, coalesce_key,
                 idempotency_key, payload, state, attempts,
-                next_attempt_at, created_at, updated_at
-            ) VALUES (?, ?, ?, 'schedule', ?, ?, ?, 'pending', 0, ?, ?, ?)
+                next_attempt_at, created_at, updated_at,
+                content_key, content_hash, render_kind, finalized
+            ) VALUES (?, ?, ?, 'schedule', ?, ?, ?, 'pending', 0, ?, ?, ?,
+                     ?, ?, 'schedule', 1)
             ON CONFLICT(idempotency_key) DO UPDATE SET
                 payload = excluded.payload,
+                content_key = excluded.content_key,
+                content_hash = excluded.content_hash,
+                render_kind = excluded.render_kind,
+                finalized = excluded.finalized,
                 payload_revision = render_outbox.payload_revision + 1,
                 state = CASE
                     WHEN render_outbox.state = 'sending' THEN 'sending'
@@ -1268,23 +1741,12 @@ class SchedulerRepository:
                 int(logical_row["logical_seq"]),
                 f"schedule-run:{run_id}",
                 f"schedule-run:{run_id}:final",
-                _canonical_json(
-                    {
-                        "content": content,
-                        "finalized": True,
-                        "schedule_run": {
-                            "run_id": run_id,
-                            "schedule_id": str(row["schedule_id"]),
-                            "status": status.value,
-                            "completion_basis": completion_basis,
-                            "error_code": error_code,
-                        },
-                        "render_destination": render_session,
-                    }
-                ),
+                persisted_render,
                 now,
                 now,
                 now,
+                render_ref.key,
+                render_ref.sha256,
             ),
         )
         await connection.execute(
@@ -1303,7 +1765,7 @@ class SchedulerRepository:
             """
             UPDATE schedule_runs
             SET status = ?, completion_basis = ?, error_category = ?,
-                error_code = ?, error_detail = ?, render_intent_id = ?,
+                error_code = ?, error_detail = NULL, render_intent_id = ?,
                 lease_owner = NULL, lease_expires_at = NULL,
                 terminal_at = COALESCE(terminal_at, ?),
                 cancelled_at = CASE WHEN ? = 'cancelled' THEN ? ELSE cancelled_at END,
@@ -1315,7 +1777,6 @@ class SchedulerRepository:
                 completion_basis,
                 error_category,
                 error_code,
-                detail,
                 render_id,
                 now,
                 status.value,
@@ -1558,7 +2019,7 @@ class SchedulerRepository:
                 str(uuid.uuid4()),
                 run.schedule_id,
                 run_id,
-                _canonical_json(
+                state_only_json(
                     {
                         "error_type": type(error).__name__,
                         "message": str(error)[:500],
@@ -1570,6 +2031,36 @@ class SchedulerRepository:
 
     async def recover(self, *, now: float | None = None) -> dict[str, int]:
         now = time.time() if now is None else now
+        definitions = await self._database.fetchall(
+            """
+            SELECT id, source_channel_id, source_message_id, prompt_hash
+            FROM schedules WHERE state IN ('enabled', 'disabled')
+            """
+        )
+        unavailable_ids = [
+            str(row["id"])
+            for row in definitions
+            if (
+                (row["source_channel_id"] is None or row["source_message_id"] is None)
+                and self._content_store.get(
+                    opaque_content_key("schedule-prompt", row["id"]),
+                    expected_hash=row["prompt_hash"],
+                )
+                is None
+            )
+        ]
+        if unavailable_ids:
+            placeholders = ", ".join("?" for _ in unavailable_ids)
+            await self._database.execute(
+                f"""
+                UPDATE schedules
+                SET state = 'needs_recreate', updated_at = ?
+                WHERE id IN ({placeholders})
+                """,
+                (now, *unavailable_ids),
+            )
+            for schedule_id in unavailable_ids:
+                self._content_store.delete(opaque_content_key("schedule-prompt", schedule_id))
         counts: dict[str, int] = {}
         async with self._database.transaction() as connection:
             legacy_definitions = await _fetchall(
@@ -1628,7 +2119,12 @@ class SchedulerRepository:
                 connection,
                 """
                 UPDATE schedule_runs
-                SET status = 'submitting', lease_owner = NULL, lease_expires_at = NULL,
+                SET status = CASE
+                        WHEN status = 'retry_wait' AND COALESCE(retry_at, 0) > ?
+                        THEN 'retry_wait'
+                        ELSE 'submitting'
+                    END,
+                    lease_owner = NULL, lease_expires_at = NULL,
                     result_submission_id = COALESCE(
                         result_submission_id,
                         (
@@ -1668,7 +2164,7 @@ class SchedulerRepository:
                         AND state NOT IN ('cancelled', 'failed')
                   )
                 """,
-                (now, now, now),
+                (now, now, now, now),
             )
             counts["dispatch_unknown"] = await _update_count(
                 connection,
@@ -1862,13 +2358,40 @@ class SchedulerRepository:
                     error_code=f"startup_{status.value}",
                     now=now,
                 )
+        rehydrated = await self.rehydrate_source_backed_queues(now=now)
+        if rehydrated:
+            counts["rehydrated_queued_prompts"] = rehydrated
         return counts
 
-    async def closed_queued_runs_for_redrive(self) -> list[ScheduleRun]:
+    async def queued_runs_for_redrive(self, *, now: float) -> list[ScheduleRun]:
+        await self._database.execute(
+            """
+            UPDATE schedule_runs
+            SET status = 'submitting', lease_owner = NULL, lease_expires_at = NULL,
+                last_progress_at = ?, updated_at = ?
+            WHERE status IN ('claimed', 'submitting')
+              AND lease_owner IS NOT NULL
+              AND COALESCE(lease_expires_at, 0) <= ?
+              AND send_started_at IS NULL
+              AND EXISTS (
+                  SELECT 1 FROM message_queue AS queue
+                  JOIN submissions AS submission
+                    ON submission.submission_id = queue.id
+                  WHERE queue.schedule_run_id = schedule_runs.run_id
+                    AND queue.state = 'local_queued'
+                    AND submission.state = 'local_queued'
+                    AND submission.origin = 'app_schedule'
+              )
+            """,
+            (now, now, now),
+        )
         rows = await self._database.fetchall(
             """
-            SELECT DISTINCT run.*
+            SELECT run.*, queue.prompt_content_key, queue.prompt_hash,
+                   binding.binding_intent,
+                   schedule.source_channel_id, schedule.source_message_id
             FROM schedule_runs AS run
+            JOIN schedules AS schedule ON schedule.id = run.schedule_id
             JOIN message_queue AS queue
               ON queue.schedule_run_id = run.run_id
             JOIN submissions AS submission
@@ -1877,15 +2400,42 @@ class SchedulerRepository:
               ON binding.thread_id = queue.thread_id
              AND binding.sdk_session_id = submission.sdk_session_id
             WHERE run.status = 'submitting'
+              AND (
+                  run.lease_owner IS NULL
+                  OR COALESCE(run.lease_expires_at, 0) <= ?
+              )
               AND run.send_started_at IS NULL
               AND queue.state = 'local_queued'
               AND submission.state = 'local_queued'
               AND submission.origin = 'app_schedule'
-              AND binding.binding_intent = 'closed'
+              AND binding.binding_intent IN ('active', 'closed')
+              AND (
+                  binding.binding_intent = 'active'
+                  OR binding.attachment_state = 'attached'
+                  OR NOT EXISTS (
+                      SELECT 1 FROM session_owner_leases AS owner
+                      WHERE owner.sdk_session_id = submission.sdk_session_id
+                        AND owner.expires_at > ?
+                  )
+              )
             ORDER BY run.created_at, run.run_id
-            """
+            """,
+            (now, now),
         )
-        return [_row_to_run(row) for row in rows]
+        return [
+            _row_to_run(row)
+            for row in rows
+            if str(row["binding_intent"]) == "closed"
+            or (
+                row["source_channel_id"] is not None
+                and row["source_message_id"] is not None
+                and self._content_store.get(
+                    row["prompt_content_key"],
+                    expected_hash=row["prompt_hash"],
+                )
+                is None
+            )
+        ]
 
     async def status(self, *, now: float | None = None) -> SchedulerStatus:
         timestamp = time.time() if now is None else now
@@ -2305,7 +2855,7 @@ class SchedulerWorker:
         await self._repository.mark_tick(self._owner_id, now=now)
         await self._repository.plan_due(self._owner_id, now=now, limit=dispatch_limit)
         await self._repository.reconcile_submissions(now=now)
-        await self._redrive_closed_queues()
+        await self._redrive_queued_submissions()
         await self._release_temporary_targets()
         dispatched = 0
         while dispatched < dispatch_limit:
@@ -2321,19 +2871,44 @@ class SchedulerWorker:
         await self._release_temporary_targets()
         return dispatched
 
-    async def _redrive_closed_queues(self) -> None:
-        for run in await self._repository.closed_queued_runs_for_redrive():
+    async def _redrive_queued_submissions(self) -> None:
+        now = self._clock.now()
+        for run in await self._repository.queued_runs_for_redrive(now=now):
             try:
                 definition = await self._repository.require(run.schedule_id)
+                if definition.source_channel_id and definition.source_message_id:
+                    try:
+                        await self._repository.rehydrate_queued_prompt(definition, run)
+                    except SchedulerDispatchError as error:
+                        await self._repository.transition_queued_submission_error(
+                            run,
+                            error,
+                            now=self._clock.now(),
+                            content_unavailable=True,
+                        )
+                        continue
                 target = await self._adapter.reconcile_target(definition, run)
                 if target is None and definition.kind == ScheduleKind.MESSAGE:
                     target = await self._adapter.prepare_message_target(definition, run)
                 if target is not None:
                     await self._adapter.queue_ready(target, run.run_id)
-            except Exception:
-                # The durable local queue remains authoritative. A later tick retries
-                # after stale startup owner leases or runtime attachment failures clear.
-                continue
+            except SchedulerDispatchError as error:
+                await self._repository.transition_queued_submission_error(
+                    run,
+                    error,
+                    now=self._clock.now(),
+                )
+            except Exception as error:
+                await self._repository.transition_queued_submission_error(
+                    run,
+                    SchedulerDispatchError(
+                        str(error),
+                        category=SchedulerErrorCategory.RUNTIME,
+                        code=type(error).__name__,
+                        retryable=True,
+                    ),
+                    now=self._clock.now(),
+                )
 
     async def _dispatch(self, run: ScheduleRun) -> None:
         definition = await self._repository.require(run.schedule_id)
@@ -2384,12 +2959,25 @@ class SchedulerWorker:
         except SchedulerDispatchError as error:
             if queued:
                 return
-            await self._repository.retry_or_fail(
-                run,
-                self._owner_id,
-                error,
-                now=self._clock.now(),
-            )
+            if (
+                definition.source_channel_id is not None
+                and definition.source_message_id is not None
+                and error.code in _SOURCE_CONTENT_ERROR_CODES
+            ):
+                await self._repository.transition_queued_submission_error(
+                    run,
+                    error,
+                    now=self._clock.now(),
+                    owner_id=self._owner_id,
+                    content_unavailable=True,
+                )
+            else:
+                await self._repository.retry_or_fail(
+                    run,
+                    self._owner_id,
+                    error,
+                    now=self._clock.now(),
+                )
         except Exception as error:
             if queued:
                 return
@@ -2536,6 +3124,17 @@ def _row_to_definition(row: Row) -> ScheduleDefinition:
         updated_at=float(row["updated_at"]),
         name=None if row["name"] is None else str(row["name"]),
         created_by=None if row["created_by"] is None else str(row["created_by"]),
+        source_channel_id=(
+            None if row["source_channel_id"] is None else str(row["source_channel_id"])
+        ),
+        source_message_id=(
+            None if row["source_message_id"] is None else str(row["source_message_id"])
+        ),
+        prompt_hash=None if row["prompt_hash"] is None else str(row["prompt_hash"]),
+        target_snapshot_hash=(
+            None if row["target_snapshot_hash"] is None else str(row["target_snapshot_hash"])
+        ),
+        thread_name=None if row["thread_name"] is None else str(row["thread_name"]),
     )
 
 
@@ -2603,6 +3202,42 @@ def _canonical_json(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
 
 
+def _durable_schedule_target(
+    kind: ScheduleKind,
+    target_snapshot: dict[str, Any],
+) -> dict[str, Any]:
+    allowed = (
+        {"project", "project_config", "execution_config"}
+        if kind == ScheduleKind.NEW_SESSION
+        else {
+            "thread_id",
+            "sdk_session_id",
+            "project_id",
+            "project_source",
+            "cwd_snapshot",
+            "project_snapshot",
+            "session_config",
+            "execution_config",
+        }
+    )
+    durable = {key: value for key, value in target_snapshot.items() if key in allowed}
+    return json.loads(_canonical_json(durable))
+
+
+def _schedule_thread_name(kind: ScheduleKind, value: Any) -> str | None:
+    if kind != ScheduleKind.NEW_SESSION or value is None:
+        return None
+    name = str(value)
+    if (
+        not name
+        or name != name.strip()
+        or len(name) > 100
+        or any(character in name for character in "\r\n\0")
+    ):
+        raise ScheduleConflict("scheduled thread name must be 1-100 trimmed characters")
+    return name
+
+
 def _terminal_content(
     run_id: str,
     status: ScheduleRunState,
@@ -2618,6 +3253,16 @@ def _terminal_content(
     if detail:
         content += f" {detail}"
     return content
+
+
+@asynccontextmanager
+async def _volatile_database_transaction(
+    content_store: VolatileContentStore,
+    database: Database,
+) -> AsyncIterator[Connection]:
+    with content_store.transaction():
+        async with database.transaction() as connection:
+            yield connection
 
 
 def _schedule_render_destination(row: Row) -> str:
@@ -2675,7 +3320,7 @@ async def _record_scheduler_event(
     detail: dict[str, Any],
     now: float,
 ) -> None:
-    identity = _canonical_json(
+    identity = state_only_json(
         {
             "event_type": event_type,
             "schedule_id": schedule_id,
@@ -2701,7 +3346,7 @@ async def _record_scheduler_event(
             event_type,
             owner_id,
             fence_token,
-            _canonical_json(detail),
+            state_only_json(detail),
             now,
         ),
     )

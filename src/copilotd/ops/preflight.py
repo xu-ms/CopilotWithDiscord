@@ -1,11 +1,9 @@
 from __future__ import annotations
 
 import asyncio
-import json
+import inspect
 import os
 import platform
-import urllib.error
-import urllib.request
 from collections.abc import Awaitable, Callable
 from dataclasses import asdict, dataclass
 from importlib.metadata import PackageNotFoundError, version
@@ -13,6 +11,14 @@ from typing import Any
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from copilotd.config import Settings
+from copilotd.discord_http_limiter import (
+    DISCORD_INVALID_REQUEST_LIMIT,
+    DISCORD_INVALID_REQUEST_WINDOW_SECONDS,
+    DISCORD_REST_GLOBAL_LIMIT,
+    DISCORD_REST_GLOBAL_WINDOW_SECONDS,
+    DiscordHttpRateLimiter,
+    probe_discord_identity,
+)
 from copilotd.ops.contracts import (
     EXPECTED_RUNTIME_VERSION,
     EXPECTED_SDK_VERSION,
@@ -74,8 +80,15 @@ class SetupPreflight:
         self._settings = settings
         self._discord_probe = discord_probe or self._default_discord_probe
         self._copilot_probe = copilot_probe or self._default_copilot_probe
+        self._discord_limiter = DiscordHttpRateLimiter()
 
     async def run(self) -> PreflightReport:
+        try:
+            return await self._run()
+        finally:
+            await self._discord_limiter.close()
+
+    async def _run(self) -> PreflightReport:
         checks: list[PreflightCheck] = []
         discord_identity: dict[str, Any] | None = None
         copilot_runtime: dict[str, Any] | None = None
@@ -101,13 +114,14 @@ class SetupPreflight:
         )
         checks.append(
             PreflightCheck(
-                "discord_request_coordinator",
+                "discord_http_limiter",
                 True,
                 (
-                    f"rate={self._settings.discord_requests_per_second:g}/s "
-                    f"burst={self._settings.discord_request_burst} "
-                    f"route={self._settings.discord_route_requests_per_second:g}/s "
-                    f"route_burst={self._settings.discord_route_burst} "
+                    f"physical_global={DISCORD_REST_GLOBAL_LIMIT}/"
+                    f"{DISCORD_REST_GLOBAL_WINDOW_SECONDS:g}s "
+                    f"invalid_guard={DISCORD_INVALID_REQUEST_LIMIT}/"
+                    f"{DISCORD_INVALID_REQUEST_WINDOW_SECONDS:g}s "
+                    "dynamic_routes=80% "
                     f"queue_limit={self._settings.discord_request_queue_limit} "
                     f"interaction_deadline="
                     f"{self._settings.discord_interaction_deadline_seconds:g}s"
@@ -198,26 +212,8 @@ class SetupPreflight:
             copilot_runtime=copilot_runtime,
         )
 
-    @staticmethod
-    def _default_discord_probe(token: str) -> dict[str, Any]:
-        request = urllib.request.Request(
-            "https://discord.com/api/v10/users/@me",
-            headers={
-                "Authorization": f"Bot {token}",
-                "User-Agent": "copilotd-setup/0.1",
-            },
-        )
-        try:
-            with urllib.request.urlopen(request, timeout=15) as response:
-                if response.status != 200:
-                    raise RuntimeError(f"Discord returned HTTP {response.status}")
-                payload = json.loads(response.read().decode("utf-8"))
-        except urllib.error.HTTPError as error:
-            raise RuntimeError(f"Discord token rejected with HTTP {error.code}") from error
-        return {
-            "id": str(payload["id"]),
-            "username": str(payload.get("username", payload["id"])),
-        }
+    async def _default_discord_probe(self, token: str) -> dict[str, Any]:
+        return await probe_discord_identity(token, limiter=self._discord_limiter)
 
     async def _default_copilot_probe(self) -> dict[str, Any]:
         bridge = CopilotBridge(self._settings)
@@ -234,7 +230,8 @@ class SetupPreflight:
 async def _call_probe(probe: Callable[..., Any], *arguments: object) -> Any:
     if asyncio.iscoroutinefunction(probe):
         return await probe(*arguments)
-    return await asyncio.to_thread(probe, *arguments)
+    result = await asyncio.to_thread(probe, *arguments)
+    return await result if inspect.isawaitable(result) else result
 
 
 def _package_version(name: str) -> str:

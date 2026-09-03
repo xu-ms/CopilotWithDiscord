@@ -41,16 +41,18 @@ async def test_preflight_validates_discord_runtime_directories_and_tzdata(
             "model_count": 2,
         }
 
-    report = await SetupPreflight(
+    preflight = SetupPreflight(
         _settings(tmp_path),
         discord_probe=discord_probe,
         copilot_probe=copilot_probe,
-    ).run()
+    )
+    report = await preflight.run()
 
     assert report.ok is True
     assert seen_tokens == ["super-secret-value"]
     assert report.discord_identity == {"id": "123", "username": "copilotd-test"}
     assert "super-secret-value" not in str(report.as_dict())
+    assert preflight._discord_limiter.snapshot()["closed"] is True
 
 
 @pytest.mark.asyncio

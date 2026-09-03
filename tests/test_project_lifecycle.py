@@ -97,7 +97,10 @@ async def test_old_session_keeps_typed_config_snapshot_after_project_mutations(
     assert after.plugin_dirs == ()
     assert not after.custom_agents[0].enabled
     assert before.snapshot_hash != after.snapshot_hash
-    assert json.loads(persisted_intent["session_config_snapshot_json"]) == before.to_dict()
+    persisted_snapshot = json.loads(persisted_intent["session_config_snapshot_json"])
+    assert persisted_snapshot == before.to_dict()
+    assert "Review this change." in persisted_intent["session_config_snapshot_json"]
+    assert persisted_snapshot["variables"][0]["value"] == "first"
     assert persisted_binding is not None
     assert persisted_binding.session_config_snapshot_json == before.canonical_json()
     assert binding.cwd_snapshot == repo
@@ -192,6 +195,8 @@ async def test_new_session_schedule_keeps_project_snapshot_after_future_changes(
             timezone=None,
             created_by="user",
             now=0,
+            source_channel_id="channel-1",
+            source_message_id="source-new-session",
         )
         await projects.set_variable(project.project_id, "VALUE", "after")
         current = await projects.config_snapshot_by_id(project.project_id)
@@ -231,6 +236,8 @@ async def test_legacy_message_schedule_requires_real_channel_timezone_and_valid_
                 text="scheduled",
                 timezone=None,
                 created_by="user",
+                source_channel_id="channel-1",
+                source_message_id="source-missing-channel",
             )
         definition = await commands.create_message(
             thread_id="legacy-thread",
@@ -239,6 +246,8 @@ async def test_legacy_message_schedule_requires_real_channel_timezone_and_valid_
             timezone=None,
             created_by="user",
             channel_id="channel-1",
+            source_channel_id="channel-1",
+            source_message_id="source-valid",
         )
         await database.execute(
             """
@@ -254,6 +263,8 @@ async def test_legacy_message_schedule_requires_real_channel_timezone_and_valid_
                 timezone="UTC",
                 created_by="user",
                 channel_id="channel-1",
+                source_channel_id="channel-1",
+                source_message_id="source-invalid",
             )
 
     assert definition.timezone == "Asia/Shanghai"
@@ -296,6 +307,8 @@ async def test_message_binding_validation_and_schedule_insert_share_transaction(
                 text="atomic",
                 timezone="UTC",
                 created_by="user",
+                source_channel_id="channel-1",
+                source_message_id="source-atomic",
             )
         )
         await insertion_entered.wait()

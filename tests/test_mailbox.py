@@ -14,6 +14,7 @@ from copilotd.core.mailbox import (
     OperationStore,
 )
 from copilotd.core.reducer import EventReducerWorker, JournalReducer
+from copilotd.core.volatile_content import VolatileContentStore
 from copilotd.storage.database import Database
 
 
@@ -71,6 +72,7 @@ async def test_mailbox_serializes_and_deduplicates_operations(tmp_path: Path) ->
                 idempotency_key="message-1",
                 input_payload={"prompt": "one"},
                 operation=lambda: operation("accepted-1"),
+                retain_result_for_replay=True,
             ),
             mailbox.submit(
                 kind="send",
@@ -90,6 +92,7 @@ async def test_mailbox_serializes_and_deduplicates_operations(tmp_path: Path) ->
             idempotency_key="message-1",
             input_payload={"prompt": "one"},
             operation=lambda: operation("must-not-run"),
+            retain_result_for_replay=True,
         )
         await mailbox.stop()
         await reducer.stop()
@@ -107,6 +110,47 @@ async def test_mailbox_serializes_and_deduplicates_operations(tmp_path: Path) ->
     assert calls == 2
     assert peak_active == 1
     assert [row["state"] for row in rows] == ["confirmed", "confirmed"]
+    assert rows[0]["result_ref"] is not None
+    assert rows[1]["result_ref"] is None
+
+
+@pytest.mark.asyncio
+async def test_repeated_confirmed_operations_reclaim_bounded_results(tmp_path: Path) -> None:
+    async with Database(tmp_path / "bounded-operation-results.sqlite3") as database:
+        database.content_store = VolatileContentStore(max_items=2, max_bytes=1024 * 1024)
+
+        async def validate() -> bool:
+            return True
+
+        mailbox, reducer = _start_mailbox(database, validate)
+        for index in range(32):
+
+            async def operation(index: int = index) -> dict[str, int]:
+                return {"index": index}
+
+            result = await mailbox.submit(
+                kind="query",
+                idempotency_key=f"bounded-{index}",
+                input_payload={"index": index},
+                operation=operation,
+            )
+            assert result == {"index": index}
+            assert database.content_store.item_count == 0
+        rows = await database.fetchall(
+            "SELECT result_ref FROM session_operations WHERE kind = 'query'"
+        )
+        replay = await mailbox.submit(
+            kind="query",
+            idempotency_key="bounded-0",
+            input_payload={"index": 0},
+            operation=lambda: asyncio.sleep(0, result={"unexpected": True}),
+        )
+        await mailbox.stop()
+        await reducer.stop()
+
+    assert len(rows) == 32
+    assert all(row["result_ref"] is None for row in rows)
+    assert replay is None
 
 
 @pytest.mark.asyncio
@@ -320,7 +364,7 @@ async def test_cancelled_waiter_does_not_cache_raw_ephemeral_result(
             operation=operation,
         )
 
-        assert replay == {"answer_hash": "hash:14"}
+        assert replay is None
         assert calls == 1
         assert "ask" not in mailbox._futures
         await mailbox.stop()

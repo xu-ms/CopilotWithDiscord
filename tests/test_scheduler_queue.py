@@ -149,7 +149,7 @@ async def test_schedule_queue_replacement_transfers_nonterminal_slot_atomically(
                 requested_mode_snapshot, requested_model_config_snapshot,
                 requested_agent_snapshot, requested_session_config_version,
                 position, state, created_at, updated_at
-            ) VALUES ('old', 'thread-1', ?, 'old prompt', 'plan', '{}',
+            ) VALUES ('old', 'thread-1', ?, '', 'plan', '{}',
                       'default', 1, 1, ?, 1, 1)
             """,
             (run.run_id, old_state),
@@ -229,14 +229,14 @@ async def test_schedule_queue_replacement_transfers_nonterminal_slot_atomically(
         {
             "id": "old",
             "schedule_run_id": None,
-            "prompt": "old prompt",
+            "prompt": "",
             "state": "cancelled",
             "replaces_id": None,
         },
         {
             "id": "new",
             "schedule_run_id": run.run_id,
-            "prompt": replacement_prompt,
+            "prompt": "",
             "state": "local_queued",
             "replaces_id": "old",
         },
@@ -298,7 +298,7 @@ async def test_shutdown_unknown_does_not_terminalize_unsent_schedule_queue(
                 requested_mode_snapshot, requested_model_config_snapshot,
                 requested_agent_snapshot, requested_session_config_version,
                 position, state, created_at, updated_at
-            ) VALUES ('unsent', 'thread-1', ?, 'queued', 'interactive', '{}',
+            ) VALUES ('unsent', 'thread-1', ?, '', 'interactive', '{}',
                       'default', 1, 1, 'local_queued', 1, 1)
             """,
             (run.run_id,),
@@ -386,7 +386,7 @@ async def test_observed_user_event_prevents_dispatch_unknown_after_send_timeout(
                 requested_mode_snapshot, requested_model_config_snapshot,
                 requested_agent_snapshot, requested_session_config_version,
                 position, state, created_at, updated_at
-            ) VALUES ('observed', 'thread-1', ?, 'observed', 'interactive', '{}',
+            ) VALUES ('observed', 'thread-1', ?, '', 'interactive', '{}',
                       'default', 1, 1, 'submitting', 1, 1)
             """,
             (run.run_id,),
@@ -475,7 +475,7 @@ async def test_pre_send_readiness_loss_requeues_without_dispatch_unknown(
                 requested_mode_snapshot, requested_model_config_snapshot,
                 requested_agent_snapshot, requested_session_config_version,
                 position, state, created_at, updated_at
-            ) VALUES ('deferred', 'thread-1', ?, 'deferred', 'interactive', '{}',
+            ) VALUES ('deferred', 'thread-1', ?, '', 'interactive', '{}',
                       'default', 1, 1, 'submitting', 1, 1)
             """,
             (run.run_id,),

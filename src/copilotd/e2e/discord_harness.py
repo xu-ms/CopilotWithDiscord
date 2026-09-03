@@ -31,8 +31,8 @@ from copilotd.discord_app import (
     _discord_files,
     _discord_render_plan,
     _render_view,
-    _taskdeck_view,
 )
+from copilotd.discord_http_limiter import append_trace_callbacks
 from copilotd.discord_requests import DiscordOperation, DiscordPriority
 from copilotd.ops.surface import redact_sensitive_text
 from copilotd.render.outbox import RenderOutboxDispatcher
@@ -783,9 +783,6 @@ class DiscordRealHarness:
 
         image_path = root / "local-image.png"
         Image.new("RGB", (8, 8), "purple").save(image_path)
-        image_snapshot = root / "durable-local-image.png"
-        image_snapshot.write_bytes(image_path.read_bytes())
-        image_snapshot_bytes = image_snapshot.read_bytes()
         markdown = (
             "Paragraph before.\n\n"
             "- list item\n"
@@ -799,16 +796,6 @@ class DiscordRealHarness:
                 "type": "assistant.message",
                 "content": markdown,
                 "finalized": True,
-                "trusted_local_images": True,
-                "trusted_local_image_paths": [str(image_path)],
-                "trusted_local_image_artifacts": [
-                    {
-                        "source_path": str(image_path),
-                        "snapshot_path": str(image_snapshot),
-                        "byte_size": len(image_snapshot_bytes),
-                        "sha256": _hash_bytes(image_snapshot_bytes),
-                    }
-                ],
             },
             allowed_roots=(root,),
             max_bytes=7 * 1024 * 1024,
@@ -893,69 +880,6 @@ class DiscordRealHarness:
                 transport="real Discord files",
                 detail="12 files delivered as ordered 10+2 batches",
                 discord_ids=[str(first_files.id), str(second_files.id)],
-            )
-        )
-
-        task_payload = {
-            "type": "taskdeck",
-            "content": "**TaskDeck** — 1 item(s)",
-            "finalized": False,
-            "cards": [
-                {
-                    "card_token": "e2ecard",
-                    "title": "E2E task",
-                    "state": "running",
-                    "kind": "agent",
-                    "elapsed": "12s",
-                    "progress_summary": "Rendering the complete Discord message gallery.",
-                    "detail_artifact": None,
-                    "dependencies": ["gallery-seed"],
-                    "artifact_links": ["taskdeck-preview.md"],
-                }
-            ],
-            "taskdeck": {
-                "panel_id": "e2epanel",
-                "revision": 1,
-                "page": 0,
-                "page_count": 1,
-                "selected_card_token": "e2ecard",
-                "expanded": False,
-                "actions": ["download"],
-                "options": [{"label": "E2E task", "value": "e2ecard", "state": "running"}],
-            },
-        }
-        task_plan = await _discord_render_plan(task_payload)
-        task_batch = task_plan.batches[0]
-        task_message = await thread.send(
-            task_batch.content or "\u200b",
-            files=_discord_files(list(task_batch.assets)),
-            embeds=_discord_embeds(tuple(getattr(task_batch, "embeds", ()))),
-            view=_taskdeck_view(task_payload),
-            silent=True,
-        )
-        self._created_messages.append(task_message)
-        fetched_task = await thread.fetch_message(task_message.id)
-        self._stable_ids["taskdeck_message_id"] = str(task_message.id)
-        if not fetched_task.embeds:
-            raise DiscordE2EError("TaskDeck embeds were not serialized by Discord")
-        if not fetched_task.components:
-            raise DiscordE2EError("TaskDeck components were not serialized by Discord")
-        self.evidence.features.append(
-            FeatureEvidence(
-                feature="TaskDeck embeds",
-                status="passed",
-                transport="real Discord embed serialization",
-                detail=f"{len(fetched_task.embeds)} embed card(s)",
-                discord_ids=[str(task_message.id)],
-            )
-        )
-        self.evidence.features.append(
-            FeatureEvidence(
-                feature="TaskDeck components",
-                status="passed",
-                transport="real Discord component serialization",
-                detail=f"{len(fetched_task.components)} component row(s)",
-                discord_ids=[str(task_message.id)],
             )
         )
 
@@ -1355,10 +1279,6 @@ class DiscordRealHarness:
                 "seed_message_id",
                 "${SEED_MESSAGE_ID}",
             ),
-            "taskdeck_message_id": self._stable_ids.get(
-                "taskdeck_message_id",
-                "${TASKDECK_MESSAGE_ID}",
-            ),
         }
         inbound_marker = f"E2E-INBOUND::{self._run_id}"
         self.evidence.features.append(
@@ -1419,47 +1339,16 @@ class DiscordRealHarness:
         self.evidence.features.extend(
             [
                 FeatureEvidence(
-                    feature="TaskDeck component interactions",
-                    status="pending_human_driver",
-                    transport="Discord desktop Appium + real component gateway",
-                    detail="Select, expand, download, and refresh the same durable TaskDeck.",
-                    stable_identifiers={
-                        **base_identifiers,
-                        "select_custom_id_prefix": "cdtd:",
-                        "expected_card_label": "E2E task",
-                    },
-                    ui_actions=[
-                        _appium_click(thread_name),
-                        _appium_click("E2E task"),
-                        _appium_click("Expand"),
-                        _appium_click("Download"),
-                    ],
-                    assertions=[
-                        "All component custom_id values begin with cdtd: and are under 100 chars.",
-                        "Expand edits taskdeck_message_id in place; thread count is unchanged.",
-                        "Download returns an ephemeral detail attachment.",
-                        "A stale revision refreshes controls and does not repeat mutation.",
-                    ],
-                ),
-                FeatureEvidence(
                     feature="modal submissions",
                     status="pending_human_driver",
                     transport="Discord desktop Appium + real modal gateway",
-                    detail="Submit TaskDeck Message and Copilot freeform response modals.",
+                    detail="Submit a Copilot freeform response modal.",
                     stable_identifiers={
                         **base_identifiers,
-                        "task_modal_title": "Message Copilot task",
                         "input_modal_title": "Respond to Copilot",
                         "component_custom_id_prefix": "cdi:",
-                        "modal_marker": f"E2E-MODAL::{self._run_id}",
                     },
                     ui_actions=[
-                        _appium_click("Message"),
-                        _appium_send_keys(
-                            "Message",
-                            f"E2E-MODAL::{self._run_id}",
-                        ),
-                        _appium_click("Submit"),
                         _appium_click("Write a response"),
                         _appium_send_keys(
                             "Response",
@@ -1468,8 +1357,7 @@ class DiscordRealHarness:
                         _appium_click("Submit"),
                     ],
                     assertions=[
-                        "Each modal interaction is acknowledged before DB/runtime work.",
-                        "Task adapter receives exactly one modal_marker for the selected task.",
+                        "The modal interaction is acknowledged before DB/runtime work.",
                         "Pending Copilot interaction transitions once to resolved.",
                     ],
                 ),
@@ -1586,8 +1474,6 @@ class DiscordRealHarness:
         )
         marker_prefix = "DRY-RUN-PIPELINE" if self._dry_run else "PRODUCTION-PIPELINE"
         marker = f"{marker_prefix}::{self._run_id}"
-        exact_artifact = ("artifact-" + self._run_id).encode() * 4000
-        exact_text = exact_artifact.decode()
         events = [
             AdaptedEvent(
                 sdk_session_id=session_id,
@@ -1621,7 +1507,7 @@ class DiscordRealHarness:
                         "toolCallId": "e2e-production-tool",
                         "toolName": "e2e tool",
                         "success": True,
-                        "result": {"detailedContent": exact_text},
+                        "result": {"state": "completed"},
                     },
                 },
                 reducer_hash="e2e-production-tool",
@@ -1650,10 +1536,7 @@ class DiscordRealHarness:
                 message_id="e2e-production-message",
             ),
         ]
-        reducer = JournalReducer(
-            bot.database,
-            artifact_root=root / "artifacts",
-        )
+        reducer = JournalReducer(bot.database)
         if await reducer.persist(events) != 3:
             raise DiscordE2EError("production reducer did not persist all probe events")
         await bot.database.execute(
@@ -1692,38 +1575,32 @@ class DiscordRealHarness:
             )
         expected_rows = await bot.database.fetchall(
             """
-            SELECT lane, payload FROM render_outbox
+            SELECT lane, content_key, content_hash FROM render_outbox
             WHERE session_id = ?
             ORDER BY logical_seq, created_at
             """,
             (session_id,),
         )
-        expected_intent_count = 1
+        expected_intent_count = 2
         if len(expected_rows) != expected_intent_count:
             raise DiscordE2EError(
-                "production reducer probe did not create exactly one turn render intent"
+                "production reducer probe did not create distinct tool and assistant intents"
             )
         lanes = {str(row["lane"]) for row in expected_rows}
-        if lanes != {"assistant_final"}:
+        if lanes != {"assistant_final", "tool"}:
             raise DiscordE2EError(
                 f"production reducer probe emitted unexpected lanes: {sorted(lanes)}"
             )
-        known_payloads = [json.loads(str(row["payload"])) for row in expected_rows]
+        known_payloads = [
+            bot.database.content_store.require(
+                str(row["content_key"]),
+                expected_hash=str(row["content_hash"]),
+            )
+            for row in expected_rows
+        ]
         if sum(payload.get("content") == marker for payload in known_payloads) != 1:
             raise DiscordE2EError(
                 "production reducer probe did not preserve the known marker intent"
-            )
-        expected_artifact_sha256 = _hash_bytes(exact_artifact)
-        spill = await bot.database.fetchone(
-            """
-            SELECT sha256 FROM tool_spill_artifacts
-            WHERE session_id = ? AND tool_call_id = 'e2e-production-tool'
-            """,
-            (session_id,),
-        )
-        if spill is None or str(spill["sha256"]) != expected_artifact_sha256:
-            raise DiscordE2EError(
-                "production reducer probe did not retain the exact durable tool spill"
             )
         expected_contents: list[str] = []
         expected_filenames: list[str] = []
@@ -1747,7 +1624,9 @@ class DiscordRealHarness:
         dispatcher = RenderOutboxDispatcher(bot.database, transport)
         delivered_count = await dispatcher.drain(deadline_seconds=30)
         if delivered_count != expected_intent_count:
-            raise DiscordE2EError("production outbox probe did not deliver exactly one turn intent")
+            raise DiscordE2EError(
+                "production outbox probe did not deliver tool and assistant intents"
+            )
         pending = await bot.database.fetchone(
             """
             SELECT COUNT(*) AS count FROM render_outbox
@@ -1770,7 +1649,9 @@ class DiscordRealHarness:
             (session_id,),
         )
         if len(rows) != expected_intent_count:
-            raise DiscordE2EError("production outbox probe did not map exactly one Discord message")
+            raise DiscordE2EError(
+                "production outbox probe did not map distinct tool and assistant messages"
+            )
         messages = [await thread.fetch_message(int(row["discord_message_id"])) for row in rows]
         if not self._dry_run:
             visible_text = [_discord_message_visible_text(message) for message in messages]
@@ -1784,9 +1665,7 @@ class DiscordRealHarness:
                     "production Discord history did not preserve the planned content/embed mix"
                 )
             if any(message.attachments for message in messages):
-                raise DiscordE2EError(
-                    "production Discord history exposed an internal tool artifact"
-                )
+                raise DiscordE2EError("production Discord history exposed an unexpected attachment")
         evidence = await self.record_ordered_delivery_probe(
             messages,
             expected_contents=expected_contents,
@@ -1808,7 +1687,7 @@ class DiscordRealHarness:
                 f"render_message_count={len(rows)}",
                 f"rich_embed_message_count={sum(bool(message.embeds) for message in messages)}",
                 f"known_marker={marker}",
-                f"durable_internal_artifact_sha256={expected_artifact_sha256}",
+                "durable_internal_artifact_count=0",
                 "discord_internal_artifact_count=0",
                 "delivery_path=JournalReducer->RenderOutboxDispatcher",
             ]
@@ -2067,7 +1946,10 @@ def _wire_discord_http_trace(
     if http is None:
         raise DiscordE2EError("Discord bot HTTP client is unavailable before start")
     http.connector = connector
-    http.http_trace = trace
+    mandatory_trace = getattr(http, "http_trace", None)
+    if mandatory_trace is None:
+        raise DiscordE2EError("mandatory Discord HTTP limiter trace is unavailable")
+    append_trace_callbacks(mandatory_trace, trace)
 
 
 def _asset_bytes(asset: Any) -> bytes:

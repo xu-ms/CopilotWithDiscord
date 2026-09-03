@@ -12,7 +12,7 @@ from copilotd.storage.database import Database
 
 
 @pytest.mark.asyncio
-async def test_compatibility_patches_create_render_stream_key_and_attachment_tables(
+async def test_compatibility_patches_keep_render_streams_in_memory_only(
     tmp_path: Path,
 ) -> None:
     async with Database(tmp_path / "schema.sqlite3") as database:
@@ -30,19 +30,7 @@ async def test_compatibility_patches_create_render_stream_key_and_attachment_tab
             "PRAGMA index_info(render_attachment_batches_idempotency_idx)"
         )
 
-    assert [row["name"] for row in render_columns] == [
-        "session_id",
-        "message_id",
-        "agent_id",
-        "content",
-        "finalized",
-        "updated_at",
-    ]
-    assert [row["name"] for row in render_columns if int(row["pk"]) > 0] == [
-        "session_id",
-        "message_id",
-        "agent_id",
-    ]
+    assert render_columns == []
     assert [row["name"] for row in render_tables] == [
         "render_attachment_batches",
         "render_attachment_checkpoints",
@@ -52,7 +40,7 @@ async def test_compatibility_patches_create_render_stream_key_and_attachment_tab
 
 
 @pytest.mark.asyncio
-async def test_render_stream_compatibility_patch_preserves_existing_rows(
+async def test_state_only_migration_deletes_legacy_render_stream_rows(
     tmp_path: Path,
 ) -> None:
     database_path = tmp_path / "legacy.sqlite3"
@@ -85,19 +73,11 @@ async def test_render_stream_compatibility_patch_preserves_existing_rows(
     async with Database(database_path) as database:
         await database.apply_compatibility_patches()
         row = await database.fetchone(
-            "SELECT session_id, message_id, agent_id, content, finalized, updated_at "
-            "FROM render_streams"
+            "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'render_streams'"
         )
         schema_rows = await database.fetchall(
             "SELECT version FROM schema_migrations ORDER BY version"
         )
 
-    assert dict(row) == {
-        "session_id": "session-1",
-        "message_id": "message-1",
-        "agent_id": "",
-        "content": "hello",
-        "finalized": 1,
-        "updated_at": 123.0,
-    }
+    assert row is None
     assert [item["version"] for item in schema_rows] == list(EXPECTED_MIGRATION_VERSIONS)

@@ -18,6 +18,45 @@ from copilotd.render.markdown import MarkdownSpan, split_table_row
 
 _DELIMITER = re.compile(r"^(:)?-{3,}:?$")
 _NON_SCALAR_MARKDOWN = re.compile(r"[*_`<>\n]")
+_ZERO_WIDTH_CHARACTERS = frozenset({"\u200d", "\ufe0e", "\ufe0f"})
+_BASE_FONT_CANDIDATES = (
+    Path("/System/Library/Fonts/Supplemental/Arial Unicode.ttf"),
+    Path("/Library/Fonts/Arial Unicode.ttf"),
+    Path("C:/Windows/Fonts/arial.ttf"),
+    Path("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"),
+)
+_CODE_FONT_CANDIDATES = (
+    Path("/System/Library/Fonts/Menlo.ttc"),
+    Path("/System/Library/Fonts/Supplemental/Menlo.ttc"),
+    Path("/System/Library/Fonts/SFNSMono.ttf"),
+    Path("C:/Windows/Fonts/consola.ttf"),
+    Path("/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf"),
+)
+_CJK_FONT_CANDIDATES = (
+    Path("/System/Library/Fonts/PingFang.ttc"),
+    Path("/System/Library/Fonts/Hiragino Sans GB.ttc"),
+    Path("/System/Library/Fonts/STHeiti Light.ttc"),
+    Path("/System/Library/Fonts/STHeiti Medium.ttc"),
+    Path("/System/Library/Fonts/Supplemental/Arial Unicode.ttf"),
+    Path("/Library/Fonts/Arial Unicode.ttf"),
+    Path("C:/Windows/Fonts/msyh.ttc"),
+    Path("C:/Windows/Fonts/msyhbd.ttc"),
+    Path("C:/Windows/Fonts/simsun.ttc"),
+    Path("C:/Windows/Fonts/simhei.ttf"),
+    Path("C:/Windows/Fonts/arialuni.ttf"),
+    Path("/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc"),
+    Path("/usr/share/fonts/opentype/noto/NotoSansCJKsc-Regular.otf"),
+    Path("/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc"),
+    Path("/usr/share/fonts/truetype/wqy/wqy-zenhei.ttc"),
+)
+_EMOJI_FONT_CANDIDATES = (
+    Path("/System/Library/Fonts/Apple Color Emoji.ttc"),
+    Path("C:/Windows/Fonts/seguiemj.ttf"),
+    Path("/usr/share/fonts/truetype/noto/NotoEmoji-Regular.ttf"),
+    Path("/usr/share/fonts/opentype/noto/NotoEmoji-Regular.ttf"),
+    Path("/usr/share/fonts/truetype/noto/NotoColorEmoji.ttf"),
+    Path("/usr/share/fonts/opentype/noto/NotoColorEmoji.ttf"),
+)
 
 
 class TableAlignment(StrEnum):
@@ -296,7 +335,16 @@ def _align_display(value: str, width: int, alignment: TableAlignment) -> str:
 
 def _display_width(value: str) -> int:
     return sum(
-        2 if unicodedata.east_asian_width(character) in {"W", "F"} else 1 for character in value
+        0
+        if (
+            character in _ZERO_WIDTH_CHARACTERS
+            or unicodedata.combining(character)
+            or _is_emoji_modifier(character)
+        )
+        else 2
+        if unicodedata.east_asian_width(character) in {"W", "F"}
+        else 1
+        for character in value
     )
 
 
@@ -358,6 +406,7 @@ def _render_png_pages(table: ParsedTable, source_hash: str) -> tuple[tuple[Table
         draw = ImageDraw.Draw(image)
         y = 0
         _draw_row(
+            image,
             draw,
             wrapped_header,
             table.alignments,
@@ -375,6 +424,7 @@ def _render_png_pages(table: ParsedTable, source_hash: str) -> tuple[tuple[Table
             zip(page_rows, page_heights, strict=True), start=start
         ):
             _draw_row(
+                image,
                 draw,
                 wrapped,
                 table.alignments,
@@ -428,13 +478,13 @@ def _wrap_cell_text(value: str, max_width: int, resolver: _FontResolver) -> list
                 raw_pieces.append((is_code, token))
                 current_width += token_width
                 continue
-            for char in token:
-                char_width = _measure_inline_text(char, resolver, code=is_code)
-                if current_width and current_width + char_width > max_width:
+            for cluster in _text_clusters(token):
+                cluster_width = _measure_inline_text(cluster, resolver, code=is_code)
+                if current_width and current_width + cluster_width > max_width:
                     raw_pieces.append((False, "\n"))
                     current_width = 0
-                raw_pieces.append((is_code, char))
-                current_width += char_width
+                raw_pieces.append((is_code, cluster))
+                current_width += cluster_width
     lines: list[list[tuple[bool, str]]] = [[]]
     for is_code, token in raw_pieces:
         if token == "\n":
@@ -469,6 +519,7 @@ def _tokenize_inline(value: str) -> list[tuple[bool, str]]:
 
 
 def _draw_row(
+    image: Image.Image,
     draw: ImageDraw.ImageDraw,
     wrapped: tuple[tuple[tuple[bool, str], ...], ...],
     alignments: tuple[TableAlignment, ...],
@@ -510,6 +561,7 @@ def _draw_row(
                         outline="#d7dfeb",
                     )
                 _draw_inline_text(
+                    image,
                     draw,
                     cursor_x,
                     y + padding_y + line_index * line_height,
@@ -522,10 +574,11 @@ def _draw_row(
 
 
 def _measure_inline_text(value: str, resolver: _FontResolver, *, code: bool) -> int:
-    return sum(resolver.glyph_width(character, code=code) for character in value)
+    return resolver.text_width(value, code=code)
 
 
 def _draw_inline_text(
+    image: Image.Image,
     draw: ImageDraw.ImageDraw,
     x: float,
     y: float,
@@ -535,95 +588,241 @@ def _draw_inline_text(
     code: bool,
 ) -> None:
     cursor = x
-    for character in value:
-        font = resolver.font_for(character, code=code)
+    for cluster in _text_clusters(value):
+        if all(character in _ZERO_WIDTH_CHARACTERS for character in cluster):
+            continue
+        font = resolver.font_for(cluster, code=code)
         try:
-            draw.text((cursor, y), character, fill="#172033", font=font)
-        except Exception:
+            resolver.draw_text(image, draw, cursor, y, cluster, font=font)
+        except (OSError, UnicodeError, ValueError):
             draw.text((cursor, y), "?", fill="#172033", font=resolver._base_font)
-        cursor += resolver.glyph_width(character, code=code)
+        cursor += resolver.text_width(cluster, code=code)
+
+
+def _text_clusters(value: str) -> tuple[str, ...]:
+    clusters: list[str] = []
+    for character in value:
+        if not clusters:
+            clusters.append(character)
+            continue
+        if (
+            character in _ZERO_WIDTH_CHARACTERS
+            or unicodedata.combining(character)
+            or _is_emoji_modifier(character)
+            or clusters[-1].endswith("\u200d")
+        ):
+            clusters[-1] += character
+        else:
+            clusters.append(character)
+    return tuple(unicodedata.normalize("NFC", cluster) for cluster in clusters)
 
 
 class _FontResolver:
     def __init__(self, *, scale: int) -> None:
-        self._base_font = self._load_font(
-            (
-                Path("/System/Library/Fonts/Supplemental/Arial Unicode.ttf"),
-                Path("/System/Library/Fonts/PingFang.ttc"),
-                Path("C:/Windows/Fonts/arial.ttf"),
-                Path("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"),
+        self._base_font = self._load_font(_BASE_FONT_CANDIDATES, 14 * scale)
+        self._code_font = self._load_font(_CODE_FONT_CANDIDATES, 13 * scale)
+        cjk = self._load_optional_font(_CJK_FONT_CANDIDATES, 14 * scale)
+        self._cjk_font = None if cjk is None else cjk[0]
+        emoji_target_size = 14 * scale
+        emoji = self._load_optional_font(
+            _EMOJI_FONT_CANDIDATES,
+            emoji_target_size,
+            alternate_sizes=(
+                16 * scale,
+                10 * scale,
+                20 * scale,
+                32 * scale,
+                109,
             ),
-            14 * scale,
         )
-        self._code_font = self._load_font(
-            (
-                Path("/System/Library/Fonts/Supplemental/Menlo.ttc"),
-                Path("C:/Windows/Fonts/consola.ttf"),
-                Path("/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf"),
-            ),
-            13 * scale,
-        )
-        self._cjk_font = self._load_font(
-            (
-                Path("/System/Library/Fonts/PingFang.ttc"),
-                Path("C:/Windows/Fonts/msyh.ttc"),
-                Path("/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc"),
-                Path("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"),
-            ),
-            14 * scale,
-        )
-        self._emoji_font = self._load_font(
-            (
-                Path("/System/Library/Fonts/Apple Color Emoji.ttc"),
-                Path("C:/Windows/Fonts/seguiemj.ttf"),
-                Path("/usr/share/fonts/truetype/noto/NotoColorEmoji.ttf"),
-                Path("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"),
-            ),
-            14 * scale,
+        self._emoji_font = None if emoji is None else emoji[0]
+        self._emoji_render_scale = 1.0 if emoji is None else emoji_target_size / emoji[1]
+        self._font_cache: dict[tuple[bool, str], ImageFont.ImageFont] = {}
+        self._support_cache: dict[tuple[int, str], bool] = {}
+        text_line_height = max(
+            self._line_height(font)
+            for font in (self._base_font, self._code_font, self._cjk_font)
+            if font is not None
         )
         self.line_height = max(
-            self._line_height(font)
-            for font in (self._base_font, self._code_font, self._cjk_font, self._emoji_font)
+            text_line_height,
+            emoji_target_size + 4 if self._emoji_font is not None else 0,
         )
 
-    def font_for(self, character: str, *, code: bool) -> ImageFont.ImageFont:
-        if code:
-            return (
-                self._code_font if not _needs_fallback(character) else self._fallback_for(character)
-            )
-        if _is_emoji(character):
-            return self._emoji_font
-        if _is_cjk(character):
-            return self._cjk_font
-        return self._base_font if not _needs_fallback(character) else self._fallback_for(character)
+    def font_for(self, text: str, *, code: bool) -> ImageFont.ImageFont:
+        key = (code, text)
+        cached = self._font_cache.get(key)
+        if cached is not None:
+            return cached
+        font = self._fallback_for(text, code=code)
+        self._font_cache[key] = font
+        return font
 
     def glyph_width(self, character: str, *, code: bool) -> int:
-        for font in (self.font_for(character, code=code), self._base_font, self._code_font):
-            try:
-                left, _, right, _ = font.getbbox(character or " ")
-            except Exception:
-                continue
-            width = right - left
-            if width > 0:
-                return width
-        return 1
+        return self.text_width(character, code=code)
 
-    def _fallback_for(self, character: str) -> ImageFont.ImageFont:
-        for font in (self._emoji_font, self._cjk_font, self._code_font, self._base_font):
-            if _font_supports(font, character):
+    def text_width(self, value: str, *, code: bool) -> int:
+        total = 0
+        for cluster in _text_clusters(value):
+            if all(character in _ZERO_WIDTH_CHARACTERS for character in cluster):
+                continue
+            font = self.font_for(cluster, code=code)
+            rendered = self._renderable_text(cluster, font)
+            if not rendered:
+                continue
+            try:
+                width = font.getlength(rendered)
+            except (OSError, UnicodeError, ValueError):
+                left, _, right, _ = font.getbbox(rendered or " ")
+                width = right - left
+            if font is self._emoji_font:
+                width = round(width * self._emoji_render_scale)
+            if width > 0:
+                total += round(width)
+        return total
+
+    def draw_text(
+        self,
+        image: Image.Image,
+        draw: ImageDraw.ImageDraw,
+        x: float,
+        y: float,
+        text: str,
+        *,
+        font: ImageFont.ImageFont,
+    ) -> None:
+        rendered = self._renderable_text(text, font)
+        if not rendered:
+            return
+        if font is not self._emoji_font or self._emoji_render_scale == 1.0:
+            draw.text(
+                (x, y),
+                rendered,
+                fill="#172033",
+                font=font,
+                embedded_color=font is self._emoji_font,
+            )
+            return
+        left, top, right, bottom = font.getbbox(rendered)
+        source_width = max(right - left, 1)
+        source_height = max(bottom - top, 1)
+        glyph = Image.new("RGBA", (source_width, source_height), (0, 0, 0, 0))
+        ImageDraw.Draw(glyph).text(
+            (-left, -top),
+            rendered,
+            fill="#172033",
+            font=font,
+            embedded_color=True,
+        )
+        target_size = (
+            max(round(source_width * self._emoji_render_scale), 1),
+            max(round(source_height * self._emoji_render_scale), 1),
+        )
+        glyph = glyph.resize(target_size, Image.Resampling.LANCZOS)
+        image.paste(
+            glyph,
+            (
+                round(x + left * self._emoji_render_scale),
+                round(y + top * self._emoji_render_scale),
+            ),
+            glyph,
+        )
+
+    def _fallback_for(self, text: str, *, code: bool) -> ImageFont.ImageFont:
+        characters = [character for character in text if character not in _ZERO_WIDTH_CHARACTERS]
+        if "\ufe0e" in text:
+            candidates = (
+                self._code_font if code else self._base_font,
+                self._base_font,
+                self._code_font,
+                self._cjk_font,
+            )
+        elif "\ufe0f" in text:
+            candidates = (
+                self._emoji_font,
+                self._cjk_font,
+                self._code_font if code else self._base_font,
+                self._base_font,
+                self._code_font,
+            )
+        elif any(unicodedata.combining(character) for character in characters):
+            candidates = (
+                self._base_font,
+                self._cjk_font,
+                self._code_font,
+                self._emoji_font,
+            )
+        elif any(_is_emoji(character) for character in characters):
+            candidates = (
+                self._emoji_font,
+                self._cjk_font,
+                self._code_font if code else self._base_font,
+                self._base_font,
+                self._code_font,
+            )
+        elif any(_is_cjk(character) for character in characters):
+            candidates = (
+                self._code_font if code else self._cjk_font,
+                self._cjk_font,
+                self._base_font,
+                self._emoji_font,
+                self._code_font,
+            )
+        else:
+            candidates = (
+                self._code_font if code else self._base_font,
+                self._base_font,
+                self._code_font,
+                self._cjk_font,
+                self._emoji_font,
+            )
+        seen: set[int] = set()
+        for font in candidates:
+            if font is None or id(font) in seen:
+                continue
+            seen.add(id(font))
+            if all(self._supports(font, character) for character in characters):
                 return font
-        return self._base_font
+        codepoints = "+".join(f"U+{ord(character):04X}" for character in characters)
+        raise OSError(f"no installed table font supports {codepoints or 'empty text'}")
+
+    def _renderable_text(self, text: str, font: ImageFont.ImageFont) -> str:
+        if font is self._emoji_font:
+            return text.replace("\ufe0e", "")
+        return "".join(character for character in text if character not in _ZERO_WIDTH_CHARACTERS)
+
+    def _supports(self, font: ImageFont.ImageFont, character: str) -> bool:
+        cache_key = (id(font), character)
+        supported = self._support_cache.get(cache_key)
+        if supported is None:
+            supported = _font_supports(font, character)
+            self._support_cache[cache_key] = supported
+        return supported
 
     @staticmethod
     def _load_font(candidates: tuple[Path, ...], size: int) -> ImageFont.ImageFont:
+        loaded = _FontResolver._load_optional_font(candidates, size)
+        return loaded[0] if loaded is not None else ImageFont.load_default()
+
+    @staticmethod
+    def _load_optional_font(
+        candidates: tuple[Path, ...],
+        size: int,
+        *,
+        alternate_sizes: tuple[int, ...] = (),
+    ) -> tuple[ImageFont.ImageFont, int] | None:
         for candidate in candidates:
             if not candidate.is_file():
                 continue
-            try:
-                return ImageFont.truetype(str(candidate), size=size)
-            except Exception:
-                continue
-        return ImageFont.load_default()
+            for candidate_size in (size, *alternate_sizes):
+                try:
+                    return (
+                        ImageFont.truetype(str(candidate), size=candidate_size),
+                        candidate_size,
+                    )
+                except (OSError, ValueError):
+                    continue
+        return None
 
     @staticmethod
     def _line_height(font: ImageFont.ImageFont) -> int:
@@ -632,15 +831,16 @@ class _FontResolver:
 
 
 def _font_supports(font: ImageFont.ImageFont, character: str) -> bool:
+    if character.isspace():
+        return True
     try:
-        left, top, right, bottom = font.getbbox(character or " ")
-    except Exception:
+        glyph = font.getmask(character)
+        missing = font.getmask("\U0010ffff")
+    except (OSError, UnicodeError, ValueError):
         return False
-    return (right - left) > 0 and (bottom - top) > 0
-
-
-def _needs_fallback(character: str) -> bool:
-    return _is_cjk(character) or _is_emoji(character)
+    if glyph.getbbox() is None:
+        return False
+    return glyph.size != missing.size or bytes(glyph) != bytes(missing)
 
 
 def _is_cjk(character: str) -> bool:
@@ -649,7 +849,11 @@ def _is_cjk(character: str) -> bool:
 
 def _is_emoji(character: str) -> bool:
     codepoint = ord(character)
-    return 0x1F000 <= codepoint <= 0x1FAFF
+    return 0x2600 <= codepoint <= 0x27BF or 0x1F000 <= codepoint <= 0x1FAFF
+
+
+def _is_emoji_modifier(character: str) -> bool:
+    return 0x1F3FB <= ord(character) <= 0x1F3FF
 
 
 def _is_scalar_table(table: ParsedTable) -> bool:

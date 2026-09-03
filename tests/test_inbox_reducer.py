@@ -1,7 +1,6 @@
 import asyncio
 import hashlib
 import json
-import os
 import threading
 from dataclasses import replace
 from datetime import UTC, datetime
@@ -19,7 +18,6 @@ from copilot.session_events import (
     SubagentCompletedData,
     SubagentStartedData,
 )
-from PIL import Image
 
 from copilotd.config import Settings
 from copilotd.core.bindings import SessionBindingRepository
@@ -35,23 +33,12 @@ from copilotd.core.reducer import (
     EventReducerWorker,
     JournalReducer,
     RenderPlanner,
-    _diff_render_payload,
-    _diff_stats,
 )
 from copilotd.core.scheduler import SchedulerRepository, ScheduleRunState
-from copilotd.discord_app import _discord_render_plan
+from copilotd.core.volatile_content import CommittedCancellation, opaque_content_key
 from copilotd.ops.heartbeat import HeartbeatWriter
 from copilotd.sdk.capabilities import CapabilityRegistry
 from copilotd.storage.database import Database
-
-
-def _read_text_file(path: Path) -> str:
-    return path.read_text()
-
-
-def _sha256_file(path: Path) -> str:
-    with path.open("rb") as file:
-        return hashlib.file_digest(file, "sha256").hexdigest()
 
 
 def _message_delta(event_id: UUID | None = None, *, content: str = "hello") -> SessionEvent:
@@ -125,6 +112,234 @@ async def _insert_projection_binding(database: Database, session_id: str) -> Non
         """,
         (session_id,),
     )
+
+
+@pytest.mark.asyncio
+async def test_shutdown_settlement_is_reversed_by_later_linked_resume(
+    tmp_path: Path,
+) -> None:
+    session_id = "session-shutdown-order"
+    async with Database(tmp_path / "shutdown-order.sqlite3") as database:
+        await _insert_projection_binding(database, session_id)
+        reducer = JournalReducer(database, require_binding_fence=True)
+        shutdown = _adapted(
+            "session.shutdown",
+            {"shutdownType": "routine"},
+            1,
+            session_id=session_id,
+        )
+        resume = replace(
+            _adapted(
+                "session.resume",
+                {"eventCount": 1},
+                2,
+                session_id=session_id,
+            ),
+            parent_id=shutdown.event_id,
+        )
+
+        await reducer.persist([shutdown])
+        interrupted = await database.fetchone(
+            """
+            SELECT attachment_state FROM session_bindings
+            WHERE sdk_session_id = ?
+            """,
+            (session_id,),
+        )
+        await reducer.persist([resume])
+        settled = await database.fetchone(
+            """
+            SELECT attachment_state, permission_posture FROM session_bindings
+            WHERE sdk_session_id = ?
+            """,
+            (session_id,),
+        )
+        shutdown_render = await database.fetchone(
+            """
+            SELECT state, payload, payload_revision FROM render_outbox
+            WHERE idempotency_key = ?
+            """,
+            (f"event:{session_id}:{shutdown.event_id}:status",),
+        )
+
+    assert interrupted["attachment_state"] == "recovery_unknown"
+    assert dict(settled) == {
+        "attachment_state": "attached",
+        "permission_posture": "verified_allow_all",
+    }
+    assert shutdown_render["state"] == "pending"
+    assert shutdown_render["payload_revision"] == 2
+    assert json.loads(str(shutdown_render["payload"]))["render_kind"] == "session.resume"
+
+
+@pytest.mark.parametrize("shutdown_render_state", ["pending", "sending", "blocked", "sent"])
+@pytest.mark.asyncio
+async def test_linked_resume_recovers_only_its_submission_shutdown_failure(
+    tmp_path: Path,
+    shutdown_render_state: str,
+) -> None:
+    session_id = "session-submission-shutdown"
+    async with Database(tmp_path / "submission-shutdown.sqlite3") as database:
+        await _insert_projection_binding(database, session_id)
+        async with database.transaction() as connection:
+            await connection.executemany(
+                """
+                INSERT INTO submissions(
+                    submission_id, sdk_session_id, origin, state,
+                    discord_source_channel_id, discord_source_message_id,
+                    created_at, observed_at, terminal_at
+                ) VALUES (?, ?, 'app_message', ?, 'channel-1', ?, 1, 1, ?)
+                """,
+                (
+                    ("active-submission", session_id, "observed_active", "message-active", None),
+                    ("other-submission", session_id, "semantic_blocked", "message-other", 2),
+                ),
+            )
+            await connection.executemany(
+                """
+                INSERT INTO submission_reactions(
+                    submission_id, sdk_session_id, source_channel_id, source_message_id,
+                    desired_state, delivered_state, revision, delivered_revision,
+                    runtime_generation, owner_fence_token, terminal, created_at, updated_at
+                ) VALUES (?, ?, 'channel-1', ?, ?, ?, 1, 1, 1, 7, ?, 1, 1)
+                """,
+                (
+                    (
+                        "active-submission",
+                        session_id,
+                        "message-active",
+                        "action",
+                        "action",
+                        0,
+                    ),
+                    (
+                        "other-submission",
+                        session_id,
+                        "message-other",
+                        "failed",
+                        "failed",
+                        1,
+                    ),
+                ),
+            )
+        await database.execute(
+            """
+            INSERT INTO render_outbox(
+                id, session_id, logical_seq, lane, coalesce_key,
+                idempotency_key, payload, state, attempts,
+                next_attempt_at, created_at, updated_at
+            ) VALUES (
+                'other-failure', ?, 0, 'status', 'failure:turn:other-submission',
+                'render-family:other-failure',
+                '{"schema":1,"render_kind":"model.call_failure",'
+                || '"submission_id":"other-submission","finalized":true}',
+                'pending', 0, 0, 1, 1
+            )
+            """,
+            (session_id,),
+        )
+        reducer = JournalReducer(database, require_binding_fence=True)
+        shutdown = _adapted(
+            "session.shutdown",
+            {"shutdownType": "routine"},
+            1,
+            session_id=session_id,
+        )
+        resume = replace(
+            _adapted(
+                "session.resume",
+                {"eventCount": 1},
+                2,
+                session_id=session_id,
+            ),
+            parent_id=shutdown.event_id,
+        )
+
+        assert await reducer.persist([shutdown]) == 1
+        shutdown_failure = await database.fetchone(
+            """
+            SELECT id, state, payload, content_key, content_hash FROM render_outbox
+            WHERE idempotency_key = ?
+            """,
+            (f"render-family:{session_id}:failure:turn:active-submission",),
+        )
+        failed_reaction = await database.fetchone(
+            """
+            SELECT desired_state, resume_state, terminal
+            FROM submission_reactions WHERE submission_id = 'active-submission'
+            """
+        )
+        await database.execute(
+            """
+            UPDATE render_outbox
+            SET state = ?, last_error = CASE
+                    WHEN ? = 'blocked' THEN 'render_delivery_error'
+                    ELSE last_error
+                END
+            WHERE id = ?
+            """,
+            (shutdown_render_state, shutdown_render_state, shutdown_failure["id"]),
+        )
+        assert await reducer.persist([resume]) == 1
+        settled_failure = await database.fetchone(
+            """
+            SELECT state, payload, content_key, content_hash,
+                   payload_revision, last_error
+            FROM render_outbox WHERE id = ?
+            """,
+            (shutdown_failure["id"],),
+        )
+        other_failure = await database.fetchone(
+            "SELECT state FROM render_outbox WHERE id = 'other-failure'"
+        )
+        reactions = await database.fetchall(
+            """
+            SELECT submission_id, desired_state, resume_state, terminal
+            FROM submission_reactions ORDER BY submission_id
+            """
+        )
+        reaction_outbox = await database.fetchone(
+            """
+            SELECT payload FROM render_outbox
+            WHERE idempotency_key = 'reaction:active-submission'
+            """
+        )
+
+    shutdown_payload = json.loads(str(shutdown_failure["payload"]))
+    shutdown_resume_state = json.loads(str(failed_reaction["resume_state"]))
+    assert shutdown_failure["state"] == "pending"
+    assert shutdown_payload["shutdown_event_id"] == shutdown.event_id
+    assert shutdown_resume_state["event_id"] == shutdown.event_id
+    assert settled_failure["state"] == (
+        "sending" if shutdown_render_state == "sending" else "pending"
+    )
+    assert settled_failure["payload_revision"] == 2
+    assert settled_failure["last_error"] is None
+    recovered_payload = database.content_store.require(
+        str(settled_failure["content_key"]),
+        expected_hash=str(settled_failure["content_hash"]),
+    )
+    assert recovered_payload["type"] == "session.resume"
+    assert recovered_payload["status"]["title"] == "Session resumed"
+    assert recovered_payload["shutdown_event_id"] == shutdown.event_id
+    assert recovered_payload["shutdown_generation"] == 1
+    assert recovered_payload["finalized"] is True
+    assert dict(other_failure) == {"state": "pending"}
+    assert [dict(row) for row in reactions] == [
+        {
+            "submission_id": "active-submission",
+            "desired_state": "action",
+            "resume_state": None,
+            "terminal": 0,
+        },
+        {
+            "submission_id": "other-submission",
+            "desired_state": "failed",
+            "resume_state": None,
+            "terminal": 1,
+        },
+    ]
+    assert json.loads(str(reaction_outbox["payload"]))["state"] == "action"
 
 
 @pytest.mark.parametrize("event_type", list(SessionEventType))
@@ -460,7 +675,7 @@ async def test_invalid_sdk_event_ids_become_durable_incidents(
     assert len(incidents) == 1
     assert incidents[0]["kind"] == expected_kind
     assert incidents[0]["last_inbox_seq"] == 1
-    assert "SDK event event_id" in json.loads(incidents[0]["detail"])["reason"]
+    assert json.loads(incidents[0]["detail"])["reason"].startswith("sha256:")
     assert sdk_rows == []
 
 
@@ -544,17 +759,23 @@ async def test_reducer_atomically_journals_deduplicates_and_creates_outbox(
 @pytest.mark.asyncio
 async def test_journal_and_outbox_rollback_together(tmp_path: Path) -> None:
     class FailingPlanner:
+        def __init__(self) -> None:
+            self.fail_once = True
+            self.delegate = RenderPlanner()
+
         def plan(
             self,
-            _event: object,
+            event: AdaptedEvent,
             *,
-            payload_override: object = None,
-        ) -> list[object]:
-            del payload_override
-            raise RuntimeError("render planning failed")
+            payload_override: dict[str, Any] | None = None,
+        ) -> list[Any]:
+            if self.fail_once:
+                self.fail_once = False
+                raise RuntimeError("render planning failed")
+            return self.delegate.plan(event, payload_override=payload_override)
 
     async with Database(tmp_path / "atomic.sqlite3") as database:
-        reducer = JournalReducer(database, planner=FailingPlanner())  # type: ignore[arg-type]
+        reducer = JournalReducer(database, planner=FailingPlanner())
         envelope = InboxEnvelope(
             sdk_session_id="session-1",
             generation=1,
@@ -570,12 +791,87 @@ async def test_journal_and_outbox_rollback_together(tmp_path: Path) -> None:
             await reducer.persist([EventAdapter().adapt(envelope)])
 
         count = await database.fetchone("SELECT COUNT(*) FROM event_journal")
+        stream_key = opaque_content_key(
+            "assistant-stream",
+            "session-1",
+            "message-1",
+            "",
+        )
+        assert count[0] == 0
+        assert database.content_store.get(stream_key) is None
 
-    assert count[0] == 0
+        assert await reducer.persist([EventAdapter().adapt(envelope)]) == 1
+        stream = database.content_store.require(stream_key)
+        row = await database.fetchone("SELECT content_key, content_hash FROM render_outbox")
+        payload = database.content_store.require(
+            str(row["content_key"]),
+            expected_hash=str(row["content_hash"]),
+        )
+
+    assert stream == {"content": "hello", "finalized": False}
+    assert payload["content"] == "hello"
 
 
 @pytest.mark.asyncio
-async def test_reducer_materializes_full_stream_content_for_each_outbox_edit(
+@pytest.mark.parametrize("commit_succeeds", [True, False])
+async def test_reducer_cancellation_waits_for_coupled_commit_or_rollback(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    commit_succeeds: bool,
+) -> None:
+    async with Database(tmp_path / f"cancel-atomic-{commit_succeeds}.sqlite3") as database:
+        reducer = JournalReducer(database)
+        envelope = InboxEnvelope(
+            sdk_session_id="session-cancel",
+            generation=1,
+            fence_token=1,
+            inbox_seq=1,
+            source="sdk",
+            payload=_message_delta(content="commit-delay"),
+            received_at=datetime.now(UTC).timestamp(),
+            sdk_receive_seq=1,
+        )
+        event = EventAdapter().adapt(envelope)
+        commit_started = asyncio.Event()
+        finish_commit = asyncio.Event()
+        original_commit = database.connection.commit
+
+        async def delayed_commit() -> None:
+            commit_started.set()
+            await finish_commit.wait()
+            if not commit_succeeds:
+                raise RuntimeError("injected commit failure")
+            await original_commit()
+
+        monkeypatch.setattr(database.connection, "commit", delayed_commit)
+        persistence = asyncio.create_task(reducer.persist([event]))
+        await commit_started.wait()
+        persistence.cancel()
+        await asyncio.sleep(0)
+        assert not persistence.done()
+
+        finish_commit.set()
+        expected_error = CommittedCancellation if commit_succeeds else RuntimeError
+        with pytest.raises(expected_error):
+            await persistence
+
+        journal = await database.fetchone("SELECT COUNT(*) FROM event_journal")
+        outbox = await database.fetchone("SELECT COUNT(*) FROM render_outbox")
+        stream_key = opaque_content_key(
+            "assistant-stream",
+            "session-cancel",
+            "message-1",
+            "",
+        )
+
+    expected = int(commit_succeeds)
+    assert journal[0] == expected
+    assert outbox[0] == expected
+    assert (database.content_store.get(stream_key) is not None) is commit_succeeds
+
+
+@pytest.mark.asyncio
+async def test_reducer_coalesces_full_stream_content_in_durable_message_family(
     tmp_path: Path,
 ) -> None:
     async with Database(tmp_path / "stream.sqlite3") as database:
@@ -602,15 +898,27 @@ async def test_reducer_materializes_full_stream_content_for_each_outbox_edit(
         ]
 
         assert await JournalReducer(database).persist(adapted) == 3
-        rows = await database.fetchall("SELECT payload FROM render_outbox ORDER BY logical_seq")
-        stream = await database.fetchone(
-            "SELECT content, finalized FROM render_streams WHERE message_id = 'message-1'"
+        rows = await database.fetchall(
+            """
+            SELECT content_key, content_hash, payload_revision
+            FROM render_outbox ORDER BY logical_seq
+            """
+        )
+        stream = database.content_store.require(
+            opaque_content_key("assistant-stream", "session-1", "message-1", "")
         )
 
-    payloads = [json.loads(row["payload"]) for row in rows]
-    assert [payload["content"] for payload in payloads] == ["hel", "hello", "hello!"]
-    assert [payload["finalized"] for payload in payloads] == [False, False, True]
-    assert dict(stream) == {"content": "hello!", "finalized": 1}
+    payloads = [
+        database.content_store.require(
+            str(row["content_key"]),
+            expected_hash=str(row["content_hash"]),
+        )
+        for row in rows
+    ]
+    assert [payload["content"] for payload in payloads] == ["hello!"]
+    assert [payload["finalized"] for payload in payloads] == [True]
+    assert rows[0]["payload_revision"] == 3
+    assert stream == {"content": "hello!", "finalized": True}
 
 
 @pytest.mark.asyncio
@@ -669,7 +977,10 @@ async def test_reducer_materializes_status_and_keeps_usage_in_footer_projection(
     async with Database(tmp_path / "status-render.sqlite3") as database:
         assert await JournalReducer(database).persist(adapted) == 6
         rows = await database.fetchall(
-            "SELECT lane, payload FROM render_outbox ORDER BY logical_seq"
+            """
+            SELECT lane, content_key, content_hash
+            FROM render_outbox ORDER BY logical_seq
+            """
         )
         usage = await database.fetchone(
             """
@@ -678,8 +989,17 @@ async def test_reducer_materializes_status_and_keeps_usage_in_footer_projection(
             """
         )
 
-    payloads = [(row["lane"], json.loads(row["payload"])) for row in rows]
-    assert len(payloads) == 5
+    payloads = [
+        (
+            row["lane"],
+            database.content_store.require(
+                str(row["content_key"]),
+                expected_hash=str(row["content_hash"]),
+            ),
+        )
+        for row in rows
+    ]
+    assert len(payloads) == 4
     assert payloads[0][0] == "status"
     assert "Context is nearly full." in payloads[0][1]["content"]
     assert payloads[0][1]["status"] == {
@@ -693,18 +1013,15 @@ async def test_reducer_materializes_status_and_keeps_usage_in_footer_projection(
         "premium_requests": 1.0,
     }
     assert payloads[1][0] == "status"
-    assert "raw chain-of-thought is hidden" in payloads[1][1]["content"]
-    assert "private chain of thought" not in payloads[1][1]["content"]
+    assert "`modified` `src/copilotd/app.py`" in payloads[1][1]["content"]
     assert payloads[2][0] == "status"
-    assert "`modified` `src/copilotd/app.py`" in payloads[2][1]["content"]
+    assert payloads[2][1]["status"]["outcome"] == "blocked"
     assert payloads[3][0] == "status"
-    assert payloads[3][1]["status"]["outcome"] == "blocked"
-    assert payloads[4][0] == "status"
-    assert payloads[4][1]["status"]["outcome"] == "completed"
+    assert payloads[3][1]["status"]["outcome"] == "completed"
 
 
 @pytest.mark.asyncio
-async def test_reasoning_delta_is_safe_status_and_streaming_delta_is_suppressed(
+async def test_reasoning_and_transport_only_deltas_are_suppressed(
     tmp_path: Path,
 ) -> None:
     planner = RenderPlanner()
@@ -719,12 +1036,7 @@ async def test_reasoning_delta_is_safe_status_and_streaming_delta_is_suppressed(
         2,
     )
 
-    intents = planner.plan(reasoning)
-
-    assert len(intents) == 1
-    assert intents[0].lane == "status"
-    assert intents[0].coalesce_key == "intent"
-    assert not intents[0].finalized
+    assert planner.plan(reasoning) == []
     assert planner.plan(streaming) == []
 
     async with Database(tmp_path / "reasoning-render.sqlite3") as database:
@@ -733,928 +1045,7 @@ async def test_reasoning_delta_is_safe_status_and_streaming_delta_is_suppressed(
             "SELECT lane, coalesce_key, payload FROM render_outbox ORDER BY logical_seq"
         )
 
-    assert len(rows) == 1
-    payload = json.loads(rows[0]["payload"])
-    assert rows[0]["lane"] == "status"
-    assert rows[0]["coalesce_key"] == "intent"
-    assert "Copilot is thinking" in payload["content"]
-    assert "private step-by-step chain" not in payload["content"]
-    assert "transport-only bytes" not in payload["content"]
-
-
-@pytest.mark.asyncio
-async def test_sdk_workspace_event_authorizes_matching_local_image_path(
-    tmp_path: Path,
-) -> None:
-    cwd = tmp_path / "workspace"
-    image_path = cwd / "artifacts" / "chart.png"
-    image_path.parent.mkdir(parents=True)
-    Image.new("RGB", (4, 4), "green").save(image_path)
-    original_bytes = image_path.read_bytes()
-    events = [
-        AdaptedEvent(
-            sdk_session_id="session-trusted-image",
-            generation=1,
-            fence_token=1,
-            inbox_seq=1,
-            source="internal",
-            raw_type="session.workspace_file_changed",
-            raw_payload={
-                "data": {
-                    "operation": "created",
-                    "path": "artifacts/unverified.png",
-                }
-            },
-            reducer_hash="unverified-workspace-image",
-            persistence_class="internal",
-            received_at=1,
-            internal_event_id="unverified-workspace-image",
-        ),
-        AdaptedEvent(
-            sdk_session_id="session-trusted-image",
-            generation=1,
-            fence_token=1,
-            inbox_seq=2,
-            source="sdk",
-            raw_type="session.workspace_file_changed",
-            raw_payload={
-                "data": {
-                    "operation": "created",
-                    "path": "artifacts/chart.png",
-                }
-            },
-            reducer_hash="workspace-image",
-            persistence_class="durable",
-            received_at=2,
-            event_id="workspace-image",
-        ),
-        AdaptedEvent(
-            sdk_session_id="session-trusted-image",
-            generation=1,
-            fence_token=1,
-            inbox_seq=3,
-            source="sdk",
-            raw_type="assistant.message",
-            raw_payload={
-                "data": {
-                    "messageId": "trusted-image-message",
-                    "content": "![chart](artifacts/chart.png)",
-                }
-            },
-            reducer_hash="assistant-image",
-            persistence_class="durable",
-            received_at=3,
-            event_id="assistant-image",
-            message_id="trusted-image-message",
-        ),
-    ]
-    async with Database(tmp_path / "trusted-image.sqlite3") as database:
-        await SessionBindingRepository(database).create(
-            thread_id="thread-trusted-image",
-            sdk_session_id="session-trusted-image",
-            cwd_snapshot=cwd,
-            project_source="explicit",
-        )
-        assert await JournalReducer(database).persist(events) == 3
-        row = await database.fetchone(
-            """
-            SELECT payload FROM render_outbox
-            WHERE lane = 'assistant_final'
-            """
-        )
-
-    payload = json.loads(row["payload"])
-    assert payload["trusted_local_images"] is True
-    assert payload["trusted_local_image_paths"] == ["artifacts/chart.png"]
-    artifacts = payload["trusted_local_image_artifacts"]
-    assert len(artifacts) == 1
-    snapshot_path = Path(artifacts[0]["snapshot_path"])
-    assert await asyncio.to_thread(snapshot_path.read_bytes) == original_bytes
-    assert artifacts[0]["byte_size"] == len(original_bytes)
-    assert artifacts[0]["sha256"] == hashlib.sha256(original_bytes).hexdigest()
-
-    Image.new("RGB", (4, 4), "red").save(image_path)
-    first_render = await _discord_render_plan(payload, allowed_roots=(cwd,))
-    second_render = await _discord_render_plan(payload, allowed_roots=(cwd,))
-    assert [asset.content for batch in first_render.batches for asset in batch.assets] == [
-        original_bytes
-    ]
-    assert [asset.content for batch in second_render.batches for asset in batch.assets] == [
-        original_bytes
-    ]
-
-
-@pytest.mark.asyncio
-async def test_current_copilot_session_image_is_snapshotted_without_cross_session_access(
-    tmp_path: Path,
-) -> None:
-    session_id = "session-managed-image"
-    session_state = tmp_path / ".copilot" / "session-state"
-    cwd = session_state
-    managed_files = session_state / session_id / "files"
-    managed_files.mkdir(parents=True)
-    image_path = managed_files / "report.png"
-    Image.new("RGB", (4, 4), "green").save(image_path)
-    original_bytes = image_path.read_bytes()
-
-    cross_session = session_state / "other-session" / "files" / "private.png"
-    cross_session.parent.mkdir(parents=True)
-    Image.new("RGB", (4, 4), "red").save(cross_session)
-    arbitrary = tmp_path / "arbitrary.png"
-    Image.new("RGB", (4, 4), "blue").save(arbitrary)
-    escaped = managed_files / "escaped.png"
-    escaped.symlink_to(arbitrary)
-    unsupported = managed_files / "notes.txt"
-    unsupported.write_text("not an image")
-    fifo = managed_files / "blocked.png"
-    os.mkfifo(fifo)
-
-    references = [image_path, cross_session, arbitrary, escaped, unsupported, fifo]
-    events = [
-        _adapted(
-            "session.workspace_file_changed",
-            {"operation": "created", "path": str(path)},
-            index,
-            session_id=session_id,
-        )
-        for index, path in enumerate(references, start=1)
-    ]
-    events.append(
-        replace(
-            _adapted(
-                "assistant.message",
-                {
-                    "messageId": "managed-image-message",
-                    "content": "\n".join(
-                        f"![image-{index}]({path})"
-                        for index, path in enumerate(references, start=1)
-                    ),
-                },
-                len(events) + 1,
-                session_id=session_id,
-            ),
-            message_id="managed-image-message",
-        )
-    )
-
-    async with Database(tmp_path / "managed-image.sqlite3") as database:
-        await SessionBindingRepository(database).create(
-            thread_id="thread-managed-image",
-            sdk_session_id=session_id,
-            cwd_snapshot=cwd,
-            project_source="explicit",
-        )
-        reducer = JournalReducer(
-            database,
-            managed_session_state_root=session_state,
-        )
-        assert await reducer.persist(events) == len(events)
-        row = await database.fetchone(
-            "SELECT payload FROM render_outbox WHERE lane = 'assistant_final'"
-        )
-
-    payload = json.loads(row["payload"])
-    assert payload["trusted_local_image_paths"] == [str(path) for path in references]
-    assert len(payload["trusted_local_image_artifacts"]) == 1
-    artifact = payload["trusted_local_image_artifacts"][0]
-    assert artifact["source_path"] == str(image_path)
-    assert artifact["byte_size"] == len(original_bytes)
-    assert artifact["sha256"] == hashlib.sha256(original_bytes).hexdigest()
-
-    Image.new("RGB", (4, 4), "yellow").save(image_path)
-    plan = await _discord_render_plan(payload, allowed_roots=(cwd,))
-    assets = [asset for batch in plan.batches for asset in batch.assets]
-    visible = "\n".join(batch.content for batch in plan.batches)
-
-    assert [(asset.filename, asset.content) for asset in assets] == [("report.png", original_bytes)]
-    assert all(str(path) not in visible for path in references)
-    assert "**Image:** image-1" in visible
-    assert "unsupported file type" in visible
-    assert "does not point to a file" in visible
-
-
-@pytest.mark.asyncio
-async def test_long_tool_results_stay_in_journal_without_discord_artifacts(
-    tmp_path: Path,
-) -> None:
-    outputs = [
-        ("short", "x" * 7999, "content", True),
-        ("fallback", "y" * 8000, "content", True),
-        ("detailed", "z" * 12000, "detailedContent", True),
-        ("failure", "e" * 8000, "error", False),
-    ]
-    adapted = []
-    for index, (tool_id, content, source, success) in enumerate(outputs, start=1):
-        result: dict[str, str] | None = None
-        error: dict[str, str] | None = None
-        if success:
-            result = {source: content}
-        else:
-            error = {"message": content}
-        adapted.append(
-            EventAdapter().adapt(
-                InboxEnvelope(
-                    sdk_session_id="session-tool-artifact",
-                    generation=1,
-                    fence_token=1,
-                    inbox_seq=index,
-                    source="internal",
-                    payload={
-                        "type": "tool.execution_complete",
-                        "data": {
-                            "toolCallId": tool_id,
-                            "success": success,
-                            "result": result,
-                            "error": error,
-                        },
-                    },
-                    received_at=100 + index,
-                    internal_event_id=f"tool-{tool_id}",
-                )
-            )
-        )
-
-    async with Database(tmp_path / "tool-artifact.sqlite3") as database:
-        assert await JournalReducer(database).persist(adapted) == 4
-        rows = await database.fetchall(
-            """
-            SELECT raw_payload FROM event_journal
-            WHERE raw_type = 'tool.execution_complete' ORDER BY inbox_seq
-            """
-        )
-        outbox = await database.fetchone("SELECT COUNT(*) FROM render_outbox")
-
-    payloads = [json.loads(row["raw_payload"]) for row in rows]
-    assert len(payloads) == 4
-    assert payloads[1]["data"]["result"]["content"] == "y" * 8000
-    assert payloads[2]["data"]["result"]["detailedContent"] == "z" * 12000
-    assert payloads[3]["data"]["error"]["message"] == "e" * 8000
-    assert outbox[0] == 0
-
-
-@pytest.mark.asyncio
-async def test_partial_tool_spill_and_fenced_diff_are_attached_losslessly(
-    tmp_path: Path,
-) -> None:
-    events = [
-        {
-            "type": "tool.execution_progress",
-            "data": {
-                "toolCallId": "partial-short",
-                "output": "a" * (64 * 1024 - 1),
-            },
-        },
-        {
-            "type": "tool.execution_progress",
-            "data": {
-                "toolCallId": "partial-spill",
-                "output": "b" * (64 * 1024),
-            },
-        },
-        {
-            "type": "tool.execution_complete",
-            "data": {
-                "toolCallId": "diff-fence",
-                "toolName": "git diff",
-                "success": True,
-                "result": {"patch": "+```python\n+print('safe')\n+```"},
-            },
-        },
-    ]
-    adapted = [
-        EventAdapter().adapt(
-            InboxEnvelope(
-                sdk_session_id="session-tool-spill",
-                generation=1,
-                fence_token=1,
-                inbox_seq=index,
-                source="internal",
-                payload=event,
-                received_at=100 + index,
-                internal_event_id=f"spill-{index}",
-            )
-        )
-        for index, event in enumerate(events, start=1)
-    ]
-    async with Database(tmp_path / "tool-spill.sqlite3") as database:
-        assert await JournalReducer(database).persist(adapted) == 3
-        artifact_rows = await database.fetchall(
-            "SELECT payload FROM render_outbox WHERE lane = 'artifact'"
-        )
-        diff_row = await database.fetchone("SELECT payload FROM render_outbox WHERE lane = 'diff'")
-        spill = await database.fetchone(
-            """
-            SELECT streams.content, streams.spilled, artifacts.local_path,
-                   artifacts.byte_size
-            FROM tool_output_streams AS streams
-            JOIN tool_spill_artifacts AS artifacts
-              ON artifacts.session_id = streams.session_id
-             AND artifacts.tool_call_id = streams.tool_call_id
-            WHERE streams.tool_call_id = 'partial-spill'
-            """
-        )
-
-    assert artifact_rows == []
-    assert diff_row is None
-    assert await asyncio.to_thread(
-        _read_text_file,
-        Path(spill["local_path"]),
-    ) == "b" * (64 * 1024)
-    assert spill["byte_size"] == 64 * 1024
-    assert spill["content"] == ""
-    assert spill["spilled"] == 1
-
-
-def test_structured_diff_enforces_render_byte_cap() -> None:
-    patch = "x" * (8 * 1024 * 1024 + 1)
-    event = AdaptedEvent(
-        sdk_session_id="session-large-diff",
-        generation=1,
-        fence_token=1,
-        inbox_seq=1,
-        source="internal",
-        raw_type="tool.execution_complete",
-        raw_payload={
-            "data": {
-                "toolCallId": "large-diff",
-                "success": True,
-                "result": {"patch": patch},
-            }
-        },
-        reducer_hash="large-diff",
-        persistence_class="internal",
-        received_at=1,
-        internal_event_id="large-diff",
-    )
-
-    payload = _diff_render_payload(event)
-
-    assert payload is not None
-    assert payload["oversized"] is True
-    assert payload["byte_count"] == len(patch)
-    assert payload["attachments"] == []
-    assert len(payload["content"]) < 300
-
-
-def test_diff_named_tool_cannot_trigger_implicit_local_or_content_diff() -> None:
-    event = AdaptedEvent(
-        sdk_session_id="session-untrusted-diff",
-        generation=1,
-        fence_token=1,
-        inbox_seq=1,
-        source="internal",
-        raw_type="tool.execution_complete",
-        raw_payload={
-            "data": {
-                "toolCallId": "untrusted-diff",
-                "toolName": "diff secrets helper",
-                "success": True,
-                "result": {"detailedContent": "not a structured diff"},
-            }
-        },
-        reducer_hash="untrusted-diff",
-        persistence_class="internal",
-        received_at=1,
-        internal_event_id="untrusted-diff",
-    )
-
-    assert _diff_render_payload(event) is None
-
-
-@pytest.mark.asyncio
-async def test_structured_diff_suppresses_duplicate_generic_tool_artifact(
-    tmp_path: Path,
-) -> None:
-    patch = "+" + ("diff-line\n" * 1000)
-    event = EventAdapter().adapt(
-        InboxEnvelope(
-            sdk_session_id="session-diff-dedup",
-            generation=1,
-            fence_token=1,
-            inbox_seq=1,
-            source="internal",
-            payload={
-                "type": "tool.execution_complete",
-                "data": {
-                    "toolCallId": "diff-dedup",
-                    "toolName": "git diff",
-                    "success": True,
-                    "result": {
-                        "patch": patch,
-                        "detailedContent": patch,
-                    },
-                },
-            },
-            received_at=1,
-            internal_event_id="diff-dedup",
-        )
-    )
-    async with Database(tmp_path / "diff-dedup.sqlite3") as database:
-        assert await JournalReducer(database).persist([event]) == 1
-        lanes = await database.fetchall("SELECT lane FROM render_outbox ORDER BY lane")
-
-    assert [row["lane"] for row in lanes] == []
-
-
-@pytest.mark.asyncio
-async def test_tool_spill_uses_durable_cumulative_stream(tmp_path: Path) -> None:
-    chunks = ("a" * (70 * 1024), "b" * (10 * 1024))
-    adapted = [
-        EventAdapter().adapt(
-            InboxEnvelope(
-                sdk_session_id="session-cumulative-tool",
-                generation=1,
-                fence_token=1,
-                inbox_seq=index,
-                source="internal",
-                payload={
-                    "type": "tool.execution_progress",
-                    "data": {
-                        "toolCallId": "cumulative-tool",
-                        "outputDelta": chunk,
-                    },
-                },
-                received_at=100 + index,
-                internal_event_id=f"cumulative-{index}",
-            )
-        )
-        for index, chunk in enumerate(chunks, start=1)
-    ]
-    adapted.append(
-        EventAdapter().adapt(
-            InboxEnvelope(
-                sdk_session_id="session-cumulative-tool",
-                generation=1,
-                fence_token=1,
-                inbox_seq=3,
-                source="internal",
-                payload={
-                    "type": "tool.execution_progress",
-                    "data": {
-                        "toolCallId": "cumulative-tool",
-                        "progressMessage": "human status only",
-                    },
-                },
-                received_at=103,
-                internal_event_id="cumulative-status",
-            )
-        )
-    )
-    adapted.append(
-        EventAdapter().adapt(
-            InboxEnvelope(
-                sdk_session_id="session-cumulative-tool",
-                generation=1,
-                fence_token=1,
-                inbox_seq=4,
-                source="internal",
-                payload={
-                    "type": "tool.execution_complete",
-                    "data": {
-                        "toolCallId": "cumulative-tool",
-                        "success": True,
-                        "result": {"detailedContent": "FINAL-RESULT"},
-                    },
-                },
-                received_at=104,
-                internal_event_id="cumulative-complete",
-            )
-        )
-    )
-    adapted.append(
-        EventAdapter().adapt(
-            InboxEnvelope(
-                sdk_session_id="session-cumulative-tool",
-                generation=1,
-                fence_token=1,
-                inbox_seq=5,
-                source="internal",
-                payload={
-                    "type": "tool.execution_progress",
-                    "data": {
-                        "toolCallId": "cumulative-tool",
-                        "outputDelta": "LATE-PROGRESS",
-                    },
-                },
-                received_at=105,
-                internal_event_id="cumulative-late-progress",
-            )
-        )
-    )
-    async with Database(tmp_path / "cumulative-tool.sqlite3") as database:
-        assert await JournalReducer(database).persist(adapted) == 5
-        rows = await database.fetchall(
-            """
-            SELECT coalesce_key, payload FROM render_outbox
-            WHERE lane = 'artifact' ORDER BY logical_seq
-            """
-        )
-        stream = await database.fetchone(
-            """
-            SELECT content, spilled, artifact_emitted, finalized
-            FROM tool_output_streams
-            WHERE session_id = 'session-cumulative-tool'
-              AND tool_call_id = 'cumulative-tool'
-            """
-        )
-        artifact = await database.fetchone(
-            """
-            SELECT local_path FROM tool_spill_artifacts
-            WHERE session_id = 'session-cumulative-tool'
-              AND tool_call_id = 'cumulative-tool'
-            """
-        )
-
     assert rows == []
-    final_content = await asyncio.to_thread(
-        _read_text_file,
-        Path(artifact["local_path"]),
-    )
-    assert final_content.startswith("".join(chunks))
-    assert final_content.endswith("FINAL-RESULT")
-    assert "LATE-PROGRESS" not in final_content
-    assert stream["content"] == ""
-    assert "human status only" not in final_content
-    assert stream["spilled"] == 1
-    assert stream["artifact_emitted"] == 1
-    assert stream["finalized"] == 1
-
-
-@pytest.mark.asyncio
-async def test_failed_cumulative_tool_spill_stays_durable_and_hidden(tmp_path: Path) -> None:
-    events = [
-        _adapted(
-            "tool.execution_progress",
-            {"toolCallId": "failed-spill", "output": "x" * (64 * 1024)},
-            1,
-            session_id="session-failed-spill",
-        ),
-        _adapted(
-            "tool.execution_complete",
-            {
-                "toolCallId": "failed-spill",
-                "success": False,
-                "error": {"message": "tool failed"},
-            },
-            2,
-            session_id="session-failed-spill",
-        ),
-    ]
-
-    async with Database(tmp_path / "failed-spill.sqlite3") as database:
-        assert await JournalReducer(database).persist(events) == 2
-        row = await database.fetchone(
-            """
-            SELECT local_path, finalized FROM tool_spill_artifacts
-            WHERE session_id = 'session-failed-spill'
-              AND tool_call_id = 'failed-spill'
-            """
-        )
-        outbox = await database.fetchone("SELECT COUNT(*) FROM render_outbox")
-
-    content = await asyncio.to_thread(Path(row["local_path"]).read_text, encoding="utf-8")
-    assert row["finalized"] == 1
-    assert content.startswith("x" * 100)
-    assert content.endswith("tool failed")
-    assert outbox[0] == 0
-
-
-def test_diff_stats_parse_hunks_without_dropping_plus_or_minus_prefixed_content() -> None:
-    patch = "\n".join(
-        [
-            "--- /dev/null",
-            "+++ b/new-file.txt",
-            "@@ -1,3 +1,3 @@",
-            "+++counter",
-            "+normal",
-            "+++ new",
-            "---flag",
-            "-removed",
-            "--- old",
-        ]
-    )
-
-    assert _diff_stats(patch) == {"files": 1, "additions": 3, "deletions": 3}
-
-
-def test_diff_stats_distinguish_multiple_file_headers_from_hunk_content() -> None:
-    patch = "\n".join(
-        [
-            "--- a/one.txt",
-            "+++ b/one.txt",
-            "@@ -1 +1 @@",
-            "--- old",
-            "+++ new",
-            "--- a/two.txt",
-            "+++ b/two.txt",
-            "@@ -1 +1 @@",
-            "-old",
-            "+new",
-        ]
-    )
-
-    assert _diff_stats(patch) == {"files": 2, "additions": 2, "deletions": 2}
-    assert _diff_stats("@@ -1 +1 @@\n-old\n+new") == {
-        "additions": 1,
-        "deletions": 1,
-    }
-
-
-@pytest.mark.asyncio
-async def test_spill_progress_grows_durable_file_without_outbox_delivery(
-    tmp_path: Path,
-) -> None:
-    def progress(index: int, chunk: str) -> AdaptedEvent:
-        return EventAdapter().adapt(
-            InboxEnvelope(
-                sdk_session_id="session-spill-retry",
-                generation=1,
-                fence_token=1,
-                inbox_seq=index,
-                source="internal",
-                payload={
-                    "type": "tool.execution_progress",
-                    "data": {
-                        "toolCallId": "spill-retry",
-                        "outputDelta": chunk,
-                    },
-                },
-                received_at=100 + index,
-                internal_event_id=f"spill-retry-{index}",
-            )
-        )
-
-    async with Database(tmp_path / "spill-retry.sqlite3") as database:
-        reducer = JournalReducer(database)
-        assert await reducer.persist([progress(1, "a" * (70 * 1024))]) == 1
-        assert await reducer.persist([progress(2, "b")]) == 1
-        row = await database.fetchone(
-            """
-            SELECT local_path, byte_size FROM tool_spill_artifacts
-            WHERE session_id = 'session-spill-retry'
-              AND tool_call_id = 'spill-retry'
-            """
-        )
-        outbox = await database.fetchone("SELECT COUNT(*) FROM render_outbox")
-
-    assert row["byte_size"] == 70 * 1024 + 1
-    spill_content = await asyncio.to_thread(
-        Path(row["local_path"]).read_text,
-        encoding="utf-8",
-    )
-    assert spill_content.endswith("b")
-    assert outbox[0] == 0
-
-
-@pytest.mark.asyncio
-async def test_canonical_tool_completion_does_not_duplicate_spilled_stream(
-    tmp_path: Path,
-) -> None:
-    canonical = "canonical-" * (70 * 1024 // len("canonical-") + 1)
-    events = [
-        {
-            "type": "tool.execution_progress",
-            "data": {
-                "toolCallId": "canonical-spill",
-                "outputDelta": canonical,
-            },
-        },
-        {
-            "type": "tool.execution_complete",
-            "data": {
-                "toolCallId": "canonical-spill",
-                "success": True,
-                "result": {"detailedContent": canonical},
-            },
-        },
-    ]
-    adapted = [
-        EventAdapter().adapt(
-            InboxEnvelope(
-                sdk_session_id="session-canonical-spill",
-                generation=1,
-                fence_token=1,
-                inbox_seq=index,
-                source="internal",
-                payload=event,
-                received_at=100 + index,
-                internal_event_id=f"canonical-spill-{index}",
-            )
-        )
-        for index, event in enumerate(events, start=1)
-    ]
-
-    async with Database(tmp_path / "canonical-spill.sqlite3") as database:
-        assert await JournalReducer(database).persist(adapted) == 2
-        artifact = await database.fetchone(
-            """
-            SELECT local_path, byte_size, sha256 FROM tool_spill_artifacts
-            WHERE session_id = 'session-canonical-spill'
-              AND tool_call_id = 'canonical-spill'
-            """
-        )
-
-    artifact_path = Path(str(artifact["local_path"]))
-    content = await asyncio.to_thread(artifact_path.read_text, encoding="utf-8")
-    assert content == canonical
-    assert artifact["byte_size"] == len(canonical.encode())
-    assert artifact["sha256"] == hashlib.sha256(canonical.encode()).hexdigest()
-
-
-@pytest.mark.timeout(60)
-@pytest.mark.asyncio
-async def test_completion_only_100mib_spills_without_large_outbox_payload(
-    tmp_path: Path,
-) -> None:
-    completion = "q" * (100 * 1024 * 1024)
-    event = EventAdapter().adapt(
-        InboxEnvelope(
-            sdk_session_id="session-completion-only",
-            generation=1,
-            fence_token=1,
-            inbox_seq=1,
-            source="internal",
-            payload={
-                "type": "tool.execution_complete",
-                "data": {
-                    "toolCallId": "completion-only",
-                    "success": True,
-                    "result": {"detailedContent": completion},
-                },
-            },
-            received_at=100,
-            internal_event_id="completion-only",
-        )
-    )
-    database_path = tmp_path / "completion-only.sqlite3"
-    async with Database(database_path) as database:
-        assert await JournalReducer(database).persist([event]) == 1
-        artifact = await database.fetchone(
-            """
-            SELECT local_path, byte_size, sha256, finalized
-            FROM tool_spill_artifacts
-            WHERE session_id = 'session-completion-only'
-              AND tool_call_id = 'completion-only'
-            """
-        )
-        outbox = await database.fetchone("SELECT COUNT(*) FROM render_outbox")
-        stream = await database.fetchone(
-            """
-            SELECT content, spilled, finalized FROM tool_output_streams
-            WHERE session_id = 'session-completion-only'
-            """
-        )
-
-    artifact_path = Path(str(artifact["local_path"]))
-    artifact_size = await asyncio.to_thread(lambda: artifact_path.stat().st_size)
-    artifact_digest = await asyncio.to_thread(_sha256_file, artifact_path)
-    assert artifact_size == len(completion)
-    assert artifact["byte_size"] == len(completion)
-    assert artifact["sha256"] == artifact_digest
-    assert artifact["finalized"] == 1
-    assert outbox[0] == 0
-    assert dict(stream) == {"content": "", "spilled": 1, "finalized": 1}
-    assert database_path.stat().st_size < 160 * 1024 * 1024
-
-
-@pytest.mark.asyncio
-async def test_tool_spill_preserves_full_structured_completion_error(
-    tmp_path: Path,
-) -> None:
-    events = [
-        {
-            "type": "tool.execution_progress",
-            "data": {
-                "toolCallId": "error-spill",
-                "outputDelta": "x" * (70 * 1024),
-            },
-        },
-        {
-            "type": "tool.execution_complete",
-            "data": {
-                "toolCallId": "error-spill",
-                "success": False,
-                "error": {
-                    "message": "ENOENT",
-                    "path": "/tmp/missing",
-                    "errno": 2,
-                },
-            },
-        },
-    ]
-    adapted = [
-        EventAdapter().adapt(
-            InboxEnvelope(
-                sdk_session_id="session-error-spill",
-                generation=1,
-                fence_token=1,
-                inbox_seq=index,
-                source="internal",
-                payload=event,
-                received_at=100 + index,
-                internal_event_id=f"error-spill-{index}",
-            )
-        )
-        for index, event in enumerate(events, start=1)
-    ]
-    async with Database(tmp_path / "error-spill.sqlite3") as database:
-        assert await JournalReducer(database).persist(adapted) == 2
-        artifact = await database.fetchone(
-            """
-            SELECT local_path FROM tool_spill_artifacts
-            WHERE session_id = 'session-error-spill'
-              AND tool_call_id = 'error-spill'
-            """
-        )
-        outbox = await database.fetchone("SELECT COUNT(*) FROM render_outbox")
-
-    final_content = await asyncio.to_thread(
-        _read_text_file,
-        Path(artifact["local_path"]),
-    )
-    assert final_content.startswith("x" * 100)
-    assert '"message": "ENOENT"' in final_content
-    assert '"path": "/tmp/missing"' in final_content
-    assert '"errno": 2' in final_content
-    assert outbox[0] == 0
-
-
-@pytest.mark.timeout(60)
-@pytest.mark.asyncio
-async def test_tool_spill_100x1mib_has_linear_database_growth(
-    tmp_path: Path,
-) -> None:
-    chunk = "z" * (1024 * 1024)
-    adapted = [
-        EventAdapter().adapt(
-            InboxEnvelope(
-                sdk_session_id="session-stress-spill",
-                generation=1,
-                fence_token=1,
-                inbox_seq=index,
-                source="internal",
-                payload={
-                    "type": "tool.execution_progress",
-                    "data": {
-                        "toolCallId": "stress-spill",
-                        "outputDelta": chunk,
-                    },
-                },
-                received_at=100 + index,
-                internal_event_id=f"stress-spill-{index}",
-            )
-        )
-        for index in range(1, 101)
-    ]
-    adapted.append(
-        EventAdapter().adapt(
-            InboxEnvelope(
-                sdk_session_id="session-stress-spill",
-                generation=1,
-                fence_token=1,
-                inbox_seq=101,
-                source="internal",
-                payload={
-                    "type": "tool.execution_complete",
-                    "data": {
-                        "toolCallId": "stress-spill",
-                        "success": True,
-                        "result": {"detailedContent": "STRESS-DONE"},
-                    },
-                },
-                received_at=201,
-                internal_event_id="stress-spill-complete",
-            )
-        )
-    )
-    database_path = tmp_path / "stress-spill.sqlite3"
-    async with Database(database_path) as database:
-        assert await JournalReducer(database).persist(adapted) == 101
-        artifact = await database.fetchone(
-            """
-            SELECT local_path, byte_size, sha256, finalized
-            FROM tool_spill_artifacts
-            WHERE session_id = 'session-stress-spill'
-              AND tool_call_id = 'stress-spill'
-            """
-        )
-        outbox = await database.fetchone("SELECT COUNT(*) AS count FROM render_outbox")
-        stream = await database.fetchone(
-            """
-            SELECT content, finalized FROM tool_output_streams
-            WHERE session_id = 'session-stress-spill'
-            """
-        )
-
-    artifact_path = Path(artifact["local_path"])
-    artifact_digest = await asyncio.to_thread(_sha256_file, artifact_path)
-    assert artifact["finalized"] == 1
-    assert artifact["sha256"] == artifact_digest
-    assert artifact["byte_size"] >= 100 * 1024 * 1024
-    assert outbox["count"] == 0
-    assert stream["content"] == ""
-    assert stream["finalized"] == 1
-    assert database_path.stat().st_size < 300 * 1024 * 1024
 
 
 @pytest.mark.asyncio
@@ -1723,11 +1114,7 @@ async def test_correlated_idle_keeps_metrics_durable_without_footer_message(
             (session_id,),
         )
 
-    assert row["lane"] == "assistant_stream"
-    payload = json.loads(row["payload"])
-    assert payload["content"] == "Copilot is working…"
-    assert payload["turn_render_key"] == "turn:submission-footer"
-    assert "gpt-footer" not in payload["content"]
+    assert row is None
 
 
 @pytest.mark.asyncio
@@ -2158,7 +1545,7 @@ async def test_session_idle_is_the_supported_agent_loop_observation(
 
 
 @pytest.mark.asyncio
-async def test_subagent_output_stays_durable_without_discord_taskdeck(tmp_path: Path) -> None:
+async def test_subagent_lifecycle_stays_durable_without_discord_render(tmp_path: Path) -> None:
     started = SessionEvent(
         data=SubagentStartedData(
             agent_description="Investigate the parser",
@@ -2198,7 +1585,7 @@ async def test_subagent_output_stays_durable_without_discord_taskdeck(tmp_path: 
     adapted = [
         adapter.adapt(
             InboxEnvelope(
-                sdk_session_id="session-taskdeck",
+                sdk_session_id="session-subagent",
                 generation=1,
                 fence_token=9,
                 inbox_seq=index,
@@ -2211,202 +1598,21 @@ async def test_subagent_output_stays_durable_without_discord_taskdeck(tmp_path: 
         for index, event in enumerate((started, detail, completed), start=1)
     ]
 
-    async with Database(tmp_path / "taskdeck.sqlite3") as database:
+    async with Database(tmp_path / "subagent-lifecycle.sqlite3") as database:
         assert await JournalReducer(database).persist(adapted) == 3
-        cards = await database.fetchall(
-            "SELECT kind, title, state, progress_summary FROM task_card_projections"
-        )
         outbox = await database.fetchall(
             "SELECT lane, coalesce_key, payload FROM render_outbox ORDER BY logical_seq"
         )
         lease = await database.fetchone(
-            "SELECT state FROM liveness_leases WHERE sdk_session_id = 'session-taskdeck'"
+            "SELECT state FROM liveness_leases WHERE sdk_session_id = 'session-subagent'"
+        )
+        journal = await database.fetchone(
+            "SELECT COUNT(*) FROM event_journal WHERE sdk_session_id = 'session-subagent'"
         )
 
-    assert [dict(card) for card in cards] == [
-        {
-            "kind": "agent",
-            "title": "Parser investigator",
-            "state": "completed",
-            "progress_summary": "42 tokens, 2 tool calls",
-        }
-    ]
     assert outbox == []
     assert lease["state"] == "released"
-
-
-@pytest.mark.asyncio
-async def test_terminal_tool_event_keeps_projection_without_taskdeck_delivery(
-    tmp_path: Path,
-) -> None:
-    event = _adapted(
-        "tool.execution_complete",
-        {
-            "toolCallId": "terminal-only-tool",
-            "success": True,
-            "result": {"detailedContent": "done"},
-        },
-        1,
-        source="internal",
-        session_id="session-terminal-tool",
-    )
-
-    async with Database(tmp_path / "terminal-tool.sqlite3") as database:
-        await _insert_projection_binding(database, "session-terminal-tool")
-        assert await JournalReducer(database).persist([event]) == 1
-        card = await database.fetchone(
-            """
-            SELECT title, state FROM task_card_projections
-            WHERE sdk_session_id = 'session-terminal-tool'
-            """
-        )
-        outbox = await database.fetchone(
-            """
-            SELECT payload FROM render_outbox
-            WHERE session_id = 'session-terminal-tool' AND lane = 'taskdeck'
-            """
-        )
-
-    assert dict(card) == {"title": "Copilot tool", "state": "completed"}
-    assert outbox is None
-
-
-@pytest.mark.asyncio
-async def test_agent_deltas_assemble_before_taskdeck_projection(tmp_path: Path) -> None:
-    started = SessionEvent(
-        data=SubagentStartedData(
-            agent_description="Stream a result",
-            agent_display_name="Streaming agent",
-            agent_name="stream-agent",
-            tool_call_id="tool-agent-stream",
-        ),
-        id=uuid4(),
-        timestamp=datetime.now(UTC),
-        type=SessionEventType.SUBAGENT_STARTED,
-        agent_id="agent-stream",
-    )
-    deltas = [
-        SessionEvent(
-            data=AssistantMessageDeltaData(
-                delta_content=content,
-                message_id="agent-stream-message",
-            ),
-            id=uuid4(),
-            timestamp=datetime.now(UTC),
-            type=SessionEventType.ASSISTANT_MESSAGE_DELTA,
-            agent_id="agent-stream",
-        )
-        for content in ("hel", "lo")
-    ]
-    adapter = EventAdapter()
-    adapted = [
-        adapter.adapt(
-            InboxEnvelope(
-                sdk_session_id="session-agent-stream",
-                generation=1,
-                fence_token=1,
-                inbox_seq=index,
-                source="sdk",
-                payload=event,
-                received_at=100 + index,
-                sdk_receive_seq=index,
-            )
-        )
-        for index, event in enumerate((started, *deltas), start=1)
-    ]
-
-    async with Database(tmp_path / "agent-stream.sqlite3") as database:
-        assert await JournalReducer(database).persist(adapted) == 3
-        stream = await database.fetchone(
-            """
-            SELECT content, finalized FROM render_streams
-            WHERE session_id = 'session-agent-stream'
-              AND message_id = 'agent-stream-message'
-              AND agent_id = 'agent-stream'
-            """
-        )
-        card = await database.fetchone(
-            """
-            SELECT progress_summary FROM task_card_projections
-            WHERE sdk_session_id = 'session-agent-stream'
-            """
-        )
-
-    assert dict(stream) == {"content": "hello", "finalized": 0}
-    assert card["progress_summary"] == "hello"
-
-
-@pytest.mark.asyncio
-async def test_taskdeck_view_change_updates_projection_without_discord_delivery(
-    tmp_path: Path,
-) -> None:
-    started = SessionEvent(
-        data=SubagentStartedData(
-            agent_description="Investigate the parser",
-            agent_display_name="Parser investigator",
-            agent_name="parser-agent",
-            tool_call_id="tool-agent-1",
-        ),
-        id=uuid4(),
-        timestamp=datetime.now(UTC),
-        type=SessionEventType.SUBAGENT_STARTED,
-        agent_id="agent-1",
-    )
-    adapter = EventAdapter()
-    adapted_started = adapter.adapt(
-        InboxEnvelope(
-            sdk_session_id="session-taskdeck-view",
-            generation=1,
-            fence_token=9,
-            inbox_seq=1,
-            source="sdk",
-            payload=started,
-            received_at=100,
-            sdk_receive_seq=1,
-        )
-    )
-
-    async with Database(tmp_path / "taskdeck-view.sqlite3") as database:
-        reducer = JournalReducer(database)
-        assert await reducer.persist([adapted_started]) == 1
-        initial = await database.fetchone(
-            """
-            SELECT panel_id, selected_card_token
-            FROM taskdeck_panel_state
-            WHERE sdk_session_id = 'session-taskdeck-view'
-            """
-        )
-        changed = adapter.adapt(
-            InboxEnvelope(
-                sdk_session_id="session-taskdeck-view",
-                generation=1,
-                fence_token=9,
-                inbox_seq=2,
-                source="internal",
-                payload={
-                    "type": "copilotd.taskdeck.view_changed",
-                    "data": {
-                        "panel_id": initial["panel_id"],
-                        "selected_card_token": initial["selected_card_token"],
-                        "page": 0,
-                        "expanded": True,
-                    },
-                },
-                received_at=101,
-                internal_event_id="taskdeck-view:interaction-1",
-            )
-        )
-        assert await reducer.persist([changed]) == 1
-        expanded = await database.fetchone(
-            """
-            SELECT expanded FROM taskdeck_panel_state
-            WHERE sdk_session_id = 'session-taskdeck-view'
-            """
-        )
-        outbox = await database.fetchone("SELECT COUNT(*) FROM render_outbox")
-
-    assert expanded["expanded"] == 1
-    assert outbox[0] == 0
+    assert journal[0] == 3
 
 
 @pytest.mark.asyncio
@@ -2834,7 +2040,7 @@ async def test_exact_runtime_schedule_event_bypasses_app_correlation_and_settles
             INSERT INTO runtime_schedules(
                 sdk_session_id, runtime_schedule_id, builtin_name,
                 invocation_input, recurrence, next_run_at, state, updated_at
-            ) VALUES (?, 'native-once', 'after', 'once', NULL, 100,
+            ) VALUES (?, 'native-once', 'after', '', NULL, 100,
                       'active', 1)
             """,
             (session_id,),
@@ -4119,9 +3325,6 @@ async def test_snapshot_epochs_suppress_stale_negative_and_keep_terminal_monoton
     async with Database(tmp_path / "snapshot-order.sqlite3") as database:
         await _insert_projection_binding(database, session_id)
         assert await JournalReducer(database).persist(events) == len(events)
-        card = await database.fetchone(
-            "SELECT state, terminal_at FROM task_card_projections WHERE task_id = 'task-1'"
-        )
         observation = await database.fetchone(
             """
             SELECT observed_state, terminal_evidence
@@ -4143,8 +3346,6 @@ async def test_snapshot_epochs_suppress_stale_negative_and_keep_terminal_monoton
             """
         )
 
-    assert card["state"] == "completed"
-    assert card["terminal_at"] is not None
     assert dict(observation) == {
         "observed_state": "completed",
         "terminal_evidence": "task_snapshot",

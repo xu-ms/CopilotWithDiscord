@@ -15,7 +15,7 @@ from typing import Any
 import pytest
 from pydantic import SecretStr
 
-from copilotd.config import Settings
+from copilotd.config import Settings, load_settings
 from copilotd.ops.contracts import EXPECTED_MIGRATION_VERSIONS
 from copilotd.ops.heartbeat import HeartbeatSnapshot, HeartbeatWriter, read_heartbeat
 from copilotd.ops.service import (
@@ -376,6 +376,59 @@ def test_macos_plists_are_deterministic_secure_and_route_logs(tmp_path: Path) ->
         settings.service_secrets_path
     )
     assert bot["EnvironmentVariables"]["COPILOTD_MANAGED_SERVICE"] == "1"
+
+
+def test_managed_service_lifecycle_settings_round_trip(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    custom = {
+        "owner_lease_renew_retry_attempts": 7,
+        "startup_recovery_concurrency": 9,
+        "startup_recovery_limit": 77,
+        "startup_attach_timeout_seconds": 12.5,
+        "startup_recovery_total_timeout_seconds": 98.5,
+        "event_replay_max_pages": 11,
+        "runtime_health_failure_threshold": 6,
+        "runtime_health_backoff_max_seconds": 42.5,
+    }
+    environment_names = {
+        "owner_lease_renew_retry_attempts": "COPILOTD_OWNER_LEASE_RENEW_RETRY_ATTEMPTS",
+        "startup_recovery_concurrency": "COPILOTD_STARTUP_RECOVERY_CONCURRENCY",
+        "startup_recovery_limit": "COPILOTD_STARTUP_RECOVERY_LIMIT",
+        "startup_attach_timeout_seconds": "COPILOTD_STARTUP_ATTACH_TIMEOUT_SECONDS",
+        "startup_recovery_total_timeout_seconds": (
+            "COPILOTD_STARTUP_RECOVERY_TOTAL_TIMEOUT_SECONDS"
+        ),
+        "event_replay_max_pages": "COPILOTD_EVENT_REPLAY_MAX_PAGES",
+        "runtime_health_failure_threshold": "COPILOTD_RUNTIME_HEALTH_FAILURE_THRESHOLD",
+        "runtime_health_backoff_max_seconds": ("COPILOTD_RUNTIME_HEALTH_BACKOFF_MAX_SECONDS"),
+    }
+    settings = _settings(tmp_path).model_copy(update=custom)
+    runner = FakeRunner()
+    manager = _manager(settings, runner)
+    definition = plistlib.loads(manager.macos_plists()["com.github.copilotd.bot.plist"])
+    environment = definition["EnvironmentVariables"]
+
+    assert {
+        field: environment[environment_name]
+        for field, environment_name in environment_names.items()
+    } == {field: str(value) for field, value in custom.items()}
+
+    manager.install()
+    persisted = json.loads(settings.service_state_path.read_text(encoding="utf-8"))
+    assert {field: persisted["settings"][field] for field in custom} == custom
+    assert manager.status().lifecycle_settings == custom
+
+    monkeypatch.setenv("COPILOTD_DATA_DIR", str(settings.data_dir))
+    monkeypatch.setenv("COPILOTD_CACHE_DIR", str(settings.cache_dir))
+    monkeypatch.setenv("COPILOTD_LOG_DIR", str(settings.log_dir))
+    monkeypatch.setenv("COPILOTD_RESOLVED_HOME", str(settings.resolved_home))
+    for environment_name in environment_names.values():
+        monkeypatch.delenv(environment_name, raising=False)
+    reloaded = load_settings()
+
+    assert {field: getattr(reloaded, field) for field in custom} == custom
 
 
 def test_sidecar_topology_adds_runtime_definitions(tmp_path: Path) -> None:
@@ -1061,7 +1114,7 @@ async def test_heartbeat_uses_only_current_generation_fence_and_real_metrics(
             INSERT INTO runtime_schedules(
                 sdk_session_id, runtime_schedule_id, builtin_name,
                 invocation_input, state, updated_at
-            ) VALUES ('session-1', 'schedule-1', 'after', '{}', 'unknown', 0)
+            ) VALUES ('session-1', 'schedule-1', 'after', '', 'unknown', 0)
             """
         )
         writer = HeartbeatWriter(
@@ -1309,7 +1362,7 @@ async def test_watchdog_uses_full_durable_restart_blocker_snapshot(
                 id, thread_id, prompt, requested_mode_snapshot,
                 requested_model_config_snapshot, requested_session_config_version,
                 position, state, created_at, updated_at
-            ) VALUES ('queued-1', 'thread-1', 'pending', 'interactive',
+            ) VALUES ('queued-1', 'thread-1', '', 'interactive',
                       '{}', 1, 1, 'local_queued', 0, 0)
             """
         )
@@ -1446,11 +1499,11 @@ async def test_sidecar_runtime_loss_marks_inflight_outcome_unknown_without_bot_k
                 requested_model_config_snapshot, requested_session_config_version,
                 position, state, created_at, updated_at
             ) VALUES
-              ('submission-1', 'thread-1', 'in flight', 'interactive',
+              ('submission-1', 'thread-1', '', 'interactive',
                '{}', 1, 1, 'submitting', 0, 0),
-              ('queued-1', 'thread-1', 'queued', 'interactive',
+              ('queued-1', 'thread-1', '', 'interactive',
                '{}', 1, 2, 'local_queued', 0, 0),
-              ('ambiguous-1', 'thread-1', 'ambiguous', 'interactive',
+              ('ambiguous-1', 'thread-1', '', 'interactive',
                '{}', 1, 3, 'local_queued', 0, 0)
             """
         )
@@ -2126,7 +2179,7 @@ async def test_restart_fails_closed_and_force_marks_ambiguous_work_unknown(
             INSERT INTO runtime_schedules(
                 sdk_session_id, runtime_schedule_id, builtin_name,
                 invocation_input, state, updated_at
-            ) VALUES ('session-1', 'schedule-1', 'after', '{}', 'active', 0)
+            ) VALUES ('session-1', 'schedule-1', 'after', '', 'active', 0)
             """
         )
     manager.install()

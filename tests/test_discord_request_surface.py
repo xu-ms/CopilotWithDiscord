@@ -1,45 +1,51 @@
 import ast
 from pathlib import Path
 
+from copilotd.config import Settings
+from copilotd.discord_app import CopilotDiscordBot
 
-def test_production_discord_rest_awaits_only_the_request_coordinator() -> None:
-    source_path = Path("src/copilotd/discord_app.py")
-    tree = ast.parse(source_path.read_text(encoding="utf-8"))
-    rest_operations = {
-        "add_reaction",
-        "create_thread",
-        "defer",
-        "delete",
-        "edit",
-        "fetch_channel",
-        "fetch_message",
-        "pin",
-        "remove_reaction",
-        "reply",
-        "send",
-        "send_message",
-        "send_modal",
-        "sync",
-    }
-    violations: list[tuple[int, str]] = []
-    non_discord_receivers = {
-        "runtime",
-        "responder",
-        "self._require_deletions()",
-        "self._require_scheduler_commands()",
-    }
-    for node in ast.walk(tree):
-        if not isinstance(node, ast.Await) or not isinstance(node.value, ast.Call):
-            continue
-        function = node.value.func
-        if isinstance(function, ast.Attribute) and function.attr in rest_operations:
-            receiver = ast.unparse(function.value)
-            if (
-                receiver in non_discord_receivers
-                or "_interaction_runtime" in receiver
-                or receiver.startswith("DiscordInteractionResponder(")
-            ):
+
+def test_direct_discord_calls_are_covered_by_authoritative_http_trace(tmp_path: Path) -> None:
+    bot = CopilotDiscordBot(Settings(data_dir=tmp_path))
+
+    assert bot.http.http_trace is not None
+    assert bot.http.http_trace._copilotd_discord_http_limiter is bot.discord_http_limiter
+    assert bot.http.http_trace.on_request_start
+    assert bot.http.http_trace.on_request_end
+    assert bot.http.http_trace.on_request_exception
+
+
+def test_no_discord_api_urllib_or_unlimited_aiohttp_transport_exists() -> None:
+    violations: list[str] = []
+    for source_path in Path("src").rglob("*.py"):
+        source = source_path.read_text(encoding="utf-8")
+        tree = ast.parse(source)
+        imports_urllib_request = any(
+            (
+                isinstance(node, ast.Import)
+                and any(alias.name == "urllib.request" for alias in node.names)
+            )
+            or (
+                isinstance(node, ast.ImportFrom)
+                and node.module == "urllib"
+                and any(alias.name == "request" for alias in node.names)
+            )
+            for node in ast.walk(tree)
+        )
+        has_discord_api_url = "discord.com/api" in source or "discordapp.com/api" in source
+        if imports_urllib_request and has_discord_api_url:
+            violations.append(f"{source_path}: Discord API urllib transport")
+
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
                 continue
-            violations.append((node.lineno, function.attr))
+            if ast.unparse(node.func) != "aiohttp.ClientSession":
+                continue
+            trace_keyword = next(
+                (keyword for keyword in node.keywords if keyword.arg == "trace_configs"),
+                None,
+            )
+            if source_path.name != "discord_http_limiter.py" or trace_keyword is None:
+                violations.append(f"{source_path}:{node.lineno}: unlimited aiohttp session")
 
     assert violations == []

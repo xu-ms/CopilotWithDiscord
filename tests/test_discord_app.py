@@ -9,22 +9,24 @@ from unittest.mock import AsyncMock
 import discord
 import pytest
 from discord.ext import commands
-from PIL import Image
 
 from copilotd.config import Settings
 from copilotd.core.bindings import BindingIntent, SessionBindingRepository
-from copilotd.core.commands import CDConflictError, UnknownInteractionError
+from copilotd.core.commands import (
+    CDConflictError,
+    CommandInvocation,
+    UnknownInteractionError,
+)
 from copilotd.core.task_registry import TaskFailure
 from copilotd.discord_app import (
     CopilotDiscordBot,
     DiscordInteractionResponder,
+    DiscordThreadGateway,
     _discord_render,
     _discord_render_plan,
     _prepare_discord_assets,
     _render_delivery_error,
     _render_view,
-    _safe_stream_content,
-    _taskdeck_view,
 )
 from copilotd.render.outbox import (
     RenderPermanentError,
@@ -237,8 +239,69 @@ async def test_every_registered_slash_command_routes_through_its_exact_shared_pa
 
 
 @pytest.mark.asyncio
+async def test_scheduled_new_session_name_is_never_derived_from_prompt(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sentinel = "PROMPT-MUST-NOT-BECOME-THREAD-NAME-83f6"
+    captured: list[dict[str, Any]] = []
+
+    class SchedulerCommands:
+        async def create_new_session(self, **kwargs: Any) -> Any:
+            captured.append(kwargs)
+            return SimpleNamespace(id="schedule-1", next_run_at_utc=1)
+
+    bot = CopilotDiscordBot(Settings(data_dir=tmp_path))
+    bot._register_application_commands()
+    monkeypatch.setattr(bot, "_require_scheduler_commands", lambda: SchedulerCommands())
+
+    async def create_source(_interaction: Any, text: str) -> tuple[str, str]:
+        assert text == sentinel
+        return "source-channel", "source-message"
+
+    async def run_command(
+        _interaction: Any,
+        _name: str,
+        operation: Any,
+    ) -> None:
+        await operation(CommandInvocation(name="schedule new-session"))
+
+    monkeypatch.setattr(bot, "_create_schedule_source", create_source)
+    monkeypatch.setattr(bot, "_run_command", run_command)
+    schedule = bot.tree.get_command("schedule")
+    assert isinstance(schedule, discord.app_commands.Group)
+    command = schedule.get_command("new-session")
+    assert command is not None
+    interaction = SimpleNamespace(
+        id=1,
+        channel=object(),
+        channel_id=123,
+        user=SimpleNamespace(id=456),
+    )
+
+    await command.callback(
+        interaction,
+        when="at:2030-01-01T00:00:00Z",
+        text=sentinel,
+    )
+    await command.callback(
+        interaction,
+        when="at:2030-01-01T00:00:00Z",
+        text=sentinel,
+        thread_name="Explicit bounded schedule name",
+    )
+
+    assert [call["thread_name"] for call in captured] == [
+        "Scheduled Copilot session",
+        "Explicit bounded schedule name",
+    ]
+    assert all(sentinel not in call["thread_name"] for call in captured)
+
+
+@pytest.mark.asyncio
 async def test_ready_attachment_orphan_is_resubmitted_after_gateway_recovery(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     bot = CopilotDiscordBot(Settings(data_dir=tmp_path))
     await bot.database.open()
@@ -278,6 +341,16 @@ async def test_ready_attachment_orphan_is_resubmitted_after_gateway_recovery(
             return runtime
 
     bot.sessions = Sessions()  # type: ignore[assignment]
+
+    class SourceChannel:
+        async def fetch_message(self, message_id: int) -> Any:
+            assert message_id == 200
+            return SimpleNamespace(
+                content="recover this message",
+                attachments=[_DiscordAttachmentFixture()],
+            )
+
+    monkeypatch.setattr(bot, "get_channel", lambda channel_id: SourceChannel())
     prepared = await bot.attachment_service.prepare(
         source_kind="discord-message",
         source_id="message-ready-orphan",
@@ -297,6 +370,60 @@ async def test_ready_attachment_orphan_is_resubmitted_after_gateway_recovery(
     assert sent[0]["idempotency_key"] == "discord-message:200"
     assert sent[0]["attachment_manifest_id"] == prepared.manifest_id
     assert await bot.attachment_service.pending_recoveries() == ()
+    await bot.database.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("origin", "source_content", "expected_code"),
+    [
+        ("discord_message", "edited message", "source_hash_mismatch"),
+        ("context_menu_ask", "original message", "content_unavailable"),
+    ],
+)
+async def test_attachment_recovery_never_substitutes_a_different_prompt(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    origin: str,
+    source_content: str,
+    expected_code: str,
+) -> None:
+    bot = CopilotDiscordBot(Settings(data_dir=tmp_path))
+    await bot.database.open()
+
+    class SourceChannel:
+        async def fetch_message(self, _message_id: int) -> Any:
+            return SimpleNamespace(
+                content=source_content,
+                attachments=[_DiscordAttachmentFixture()],
+            )
+
+    monkeypatch.setattr(bot, "get_channel", lambda _channel_id: SourceChannel())
+    prepared = await bot.attachment_service.prepare(
+        source_kind=origin,
+        source_id=f"source-{origin}",
+        session_id=f"session-{origin}",
+        attachments=[_DiscordAttachmentFixture()],
+        source_channel_id="100",
+        source_message_id="200",
+        recovery_prompt="original message",
+        recovery_idempotency_key=f"recovery:{origin}",
+        recovery_origin=origin,
+    )
+    assert prepared is not None
+
+    await bot._recover_attachment_manifests()
+    manifest = await bot.database.fetchone(
+        "SELECT state, error_code, recovery_prompt_hash FROM attachment_manifests WHERE id = ?",
+        (prepared.manifest_id,),
+    )
+
+    assert manifest is not None
+    assert dict(manifest) == {
+        "state": "failed",
+        "error_code": expected_code,
+        "recovery_prompt_hash": hashlib.sha256(b"original message").hexdigest(),
+    }
     await bot.database.close()
 
 
@@ -631,12 +758,14 @@ async def test_bot_teardown_is_idempotent(tmp_path: Path) -> None:
     bot = CopilotDiscordBot(Settings(data_dir=tmp_path))
     bot.bridge.stop = AsyncMock()
     bot.database.close = AsyncMock()
+    bot.discord_http_limiter.close = AsyncMock()
 
     await bot.close()
     await bot.close()
 
     bot.bridge.stop.assert_awaited_once()
     bot.database.close.assert_awaited_once()
+    bot.discord_http_limiter.close.assert_awaited_once()
 
 
 @pytest.mark.asyncio
@@ -669,6 +798,7 @@ async def test_shutdown_closes_gateway_and_registry_then_drains_admitted_handler
     monkeypatch.setattr(commands.Bot, "close", gateway_close)
     bot = CopilotDiscordBot(Settings(data_dir=tmp_path))
     bot.sessions = FakeSessions()
+    bot.discord_http_limiter.close = AsyncMock(side_effect=lambda: order.append("limiter_closed"))
     bot.bridge.stop = AsyncMock(side_effect=lambda: order.append("bridge_stopped"))
     bot.database.close = AsyncMock(side_effect=lambda: order.append("database_closed"))
     monkeypatch.setattr(bot, "_on_message_admitted", admitted_handler)
@@ -678,7 +808,7 @@ async def test_shutdown_closes_gateway_and_registry_then_drains_admitted_handler
     closing = asyncio.create_task(bot.close())
     await admission_closed.wait()
     assert not closing.done()
-    assert order[:2] == ["gateway_closed", "registry_closed"]
+    assert order[:3] == ["limiter_closed", "gateway_closed", "registry_closed"]
 
     release_handler.set()
     await handler
@@ -790,6 +920,7 @@ async def test_real_prompt_types_submit_once_without_thread_starter_duplicate(
     binding = SimpleNamespace(binding_intent=BindingIntent.ACTIVE, sdk_session_id="session-1")
     runtime = SimpleNamespace(binding=binding, send=AsyncMock())
     bot = CopilotDiscordBot(Settings(data_dir=tmp_path))
+    bot._queue_message_admission_reaction = AsyncMock()
     bot.bindings = SimpleNamespace(by_thread=AsyncMock(return_value=binding))
     bot.sessions = SimpleNamespace(ensure_attached=AsyncMock(return_value=runtime))
     bot.attachment_service.prepare = AsyncMock(return_value=None)
@@ -835,6 +966,7 @@ async def test_attachment_only_thread_message_persists_explicit_reaction_source(
     prepared = SimpleNamespace(manifest_id="manifest-1")
     sdk_attachment = object()
     bot = CopilotDiscordBot(Settings(_env_file=None, data_dir=tmp_path))
+    bot._queue_message_admission_reaction = AsyncMock()
     bot.bindings = SimpleNamespace(by_thread=AsyncMock(return_value=binding))
     bot.sessions = SimpleNamespace(ensure_attached=AsyncMock(return_value=runtime))
     bot.attachment_service.prepare = AsyncMock(return_value=prepared)
@@ -882,6 +1014,7 @@ async def test_first_channel_message_persists_original_message_reaction_source(
     )
     runtime = SimpleNamespace(binding=binding, send=AsyncMock())
     bot = CopilotDiscordBot(Settings(_env_file=None, data_dir=tmp_path))
+    bot._queue_message_admission_reaction = AsyncMock()
     bot.projects = SimpleNamespace(channel_settings=AsyncMock(return_value=("text", False, 1)))
     bot.creation = SimpleNamespace(create_from_source=AsyncMock(return_value=runtime))
     bot.attachment_service.prepare = AsyncMock(return_value=None)
@@ -994,15 +1127,21 @@ async def test_fatal_diagnostic_failure_still_runs_teardown(tmp_path: Path) -> N
     bot.database.close.assert_awaited_once()
 
 
-def test_streaming_table_is_held_before_discord_edit() -> None:
+@pytest.mark.asyncio
+async def test_streaming_table_remains_lossless_discord_text() -> None:
     content = "before\n\n| A | B |\n| --- | --- |\n| 1 | partial"
 
-    rendered = _safe_stream_content(content)
+    plan = await _discord_render_plan(
+        {
+            "type": "assistant.message_delta",
+            "content": content,
+            "finalized": False,
+        }
+    )
+    rendered = "".join(batch.content for batch in plan.batches)
 
-    assert "before" in rendered
-    assert "rendering table" in rendered
-    assert "| A | B |" not in rendered
-    assert "partial" not in rendered
+    assert rendered == content
+    assert all(batch.embeds == () for batch in plan.batches)
 
 
 @pytest.mark.asyncio
@@ -1048,20 +1187,20 @@ async def test_discord_render_preserves_explicit_text_artifact() -> None:
 
 
 @pytest.mark.asyncio
-async def test_discord_render_materializes_verified_artifact_reference(
+async def test_discord_render_materializes_verified_attachment_reference(
     tmp_path: Path,
 ) -> None:
-    artifact = tmp_path / "spill.txt"
-    content = b"append-only spill"
+    artifact = tmp_path / "delivery.txt"
+    content = b"explicit attachment"
     artifact.write_bytes(content)
 
     rendered, assets = await _discord_render(
         {
-            "content": "Tool spill attached.",
+            "content": "Attachment ready.",
             "finalized": True,
             "attachments": [
                 {
-                    "filename": "spill.txt",
+                    "filename": "delivery.txt",
                     "media_type": "text/plain",
                     "path": str(artifact),
                     "byte_size": len(content),
@@ -1071,38 +1210,8 @@ async def test_discord_render_materializes_verified_artifact_reference(
         }
     )
 
-    assert rendered == "Tool spill attached."
+    assert rendered == "Attachment ready."
     assert assets[0].content == content
-
-
-@pytest.mark.asyncio
-async def test_local_image_warning_flood_stays_within_discord_limit(
-    tmp_path: Path,
-) -> None:
-    content = "\n".join(f"![missing-{index}](missing-{index}.png)" for index in range(80))
-
-    plan = await _discord_render_plan(
-        {
-            "content": content,
-            "finalized": True,
-            "trusted_local_images": True,
-            "trusted_local_image_paths": [f"missing-{index}.png" for index in range(80)],
-            "trusted_local_image_artifacts": [
-                {
-                    "source_path": f"missing-{index}.png",
-                    "snapshot_path": str(tmp_path / f"snapshot-{index}.png"),
-                    "byte_size": 0,
-                    "sha256": hashlib.sha256(b"").hexdigest(),
-                }
-                for index in range(80)
-            ],
-        },
-        allowed_roots=(tmp_path,),
-    )
-
-    assert len(plan.batches) > 1
-    assert all(len(batch.content) <= 1850 for batch in plan.batches)
-    assert any("image path" in batch.content for batch in plan.batches)
 
 
 @pytest.mark.asyncio
@@ -1113,46 +1222,10 @@ async def test_assistant_markdown_cannot_dereference_local_image_without_trust(
     await asyncio.to_thread(local.write_bytes, b"local private bytes")
     source = f"Do not upload ![private]({local.name})"
 
-    plan = await _discord_render_plan(
-        {"content": source, "finalized": True},
-        allowed_roots=(tmp_path,),
-    )
+    plan = await _discord_render_plan({"content": source, "finalized": True})
 
     assert all(not batch.assets for batch in plan.batches)
     assert "![private]" in plan.batches[0].content
-
-
-@pytest.mark.asyncio
-async def test_verified_relative_assistant_image_is_uploaded(
-    tmp_path: Path,
-) -> None:
-    local = tmp_path / "artifacts" / "chart.png"
-    local.parent.mkdir()
-    Image.new("RGB", (4, 4), "green").save(local)
-    snapshot = tmp_path / "snapshot.png"
-    snapshot.write_bytes(local.read_bytes())
-    snapshot_content = snapshot.read_bytes()
-
-    plan = await _discord_render_plan(
-        {
-            "content": "Result: ![chart](artifacts/chart.png)",
-            "finalized": True,
-            "trusted_local_images": True,
-            "trusted_local_image_paths": ["artifacts/chart.png"],
-            "trusted_local_image_artifacts": [
-                {
-                    "source_path": "artifacts/chart.png",
-                    "snapshot_path": str(snapshot),
-                    "byte_size": len(snapshot_content),
-                    "sha256": hashlib.sha256(snapshot_content).hexdigest(),
-                }
-            ],
-        },
-        allowed_roots=(tmp_path,),
-    )
-
-    assert [asset.filename for batch in plan.batches for asset in batch.assets] == ["chart.png"]
-    assert all("![chart]" not in batch.content for batch in plan.batches)
 
 
 @pytest.mark.asyncio
@@ -1302,58 +1375,6 @@ async def test_usage_and_turn_summary_render_as_compact_subtext() -> None:
         "-# ✅ 🧠 gpt-test │ 📥 1,200 │ 📤 340 │ ⏱ 1m 5s │ 🧩 50/100 │ ✨ 1.5"
     )
     assert footer.batches[0].embeds == ()
-
-
-@pytest.mark.asyncio
-async def test_internal_diff_and_tool_artifacts_are_not_discord_renderable() -> None:
-    image = TableAsset(
-        filename="table-preview.png",
-        media_type="image/png",
-        content=b"png",
-    )
-    with pytest.raises(RenderPermanentError, match="internal tool diagnostics"):
-        await _discord_render_plan(
-            {
-                "type": "diff",
-                "content": "raw patch",
-                "attachments": [
-                    {
-                        "filename": image.filename,
-                        "media_type": image.media_type,
-                        "content": image.content,
-                    }
-                ],
-                "finalized": True,
-            }
-        )
-    with pytest.raises(RenderPermanentError, match="internal tool diagnostics"):
-        await _discord_render_plan(
-            {
-                "type": "tool_output_artifact",
-                "content": "raw detailedContent",
-                "attachments": [
-                    {
-                        "filename": "tool-output.txt",
-                        "media_type": "text/plain",
-                        "content": "exact",
-                    }
-                ],
-                "finalized": True,
-            }
-        )
-
-
-@pytest.mark.asyncio
-async def test_legacy_tool_diagnostics_remain_blocked_from_discord() -> None:
-    for payload_type in ("diff", "tool_output_artifact"):
-        with pytest.raises(RenderPermanentError):
-            await _discord_render_plan(
-                {
-                    "type": payload_type,
-                    "content": "Traceback and raw tool logs",
-                    "finalized": True,
-                }
-            )
 
 
 @pytest.mark.asyncio
@@ -1611,108 +1632,6 @@ async def test_reaction_transport_adds_new_state_before_removing_previous_bot_st
     assert calls[2:] == [("remove", "🧠", bot_user)]
 
 
-def test_taskdeck_view_uses_short_in_place_controls() -> None:
-    view = _taskdeck_view(
-        {
-            "taskdeck": {
-                "panel_id": "panel-token",
-                "revision": 12,
-                "page": 0,
-                "page_count": 2,
-                "selected_card_token": "card-a",
-                "expanded": False,
-                "options": [{"label": "Worker A", "value": "card-a", "state": "running"}],
-            }
-        }
-    )
-
-    assert view is not None
-    custom_ids = [item.custom_id for item in view.children]
-    assert custom_ids == [
-        "cdtd:panel-token:12:select",
-        "cdtd:panel-token:12:toggle",
-        "cdtd:panel-token:12:prev",
-        "cdtd:panel-token:12:next",
-    ]
-    assert all(len(custom_id) < 100 for custom_id in custom_ids)
-
-
-def test_taskdeck_view_normalizes_empty_option_text() -> None:
-    view = _taskdeck_view(
-        {
-            "taskdeck": {
-                "panel_id": "panel-token",
-                "revision": 1,
-                "page": 0,
-                "page_count": 1,
-                "selected_card_token": "card-a",
-                "expanded": False,
-                "options": [{"label": "", "value": "card-a", "state": ""}],
-            }
-        }
-    )
-
-    assert view is not None
-    select = view.children[0]
-    assert select.options[0].label == "Untitled task"
-    assert select.options[0].description == "unknown"
-
-
-@pytest.mark.asyncio
-async def test_taskdeck_render_plan_uses_bounded_embeds_and_preserves_them_across_assets() -> None:
-    cards = [
-        {
-            "card_token": f"card-{index}",
-            "title": f"Worker {index}",
-            "state": "running" if index == 0 else "idle",
-            "kind": "agent",
-            "elapsed": f"{index + 1}s",
-            "progress_summary": f"Progress {index}",
-            "detail_artifact": "full detail" if index == 0 else None,
-            "dependencies": ["setup"] if index == 0 else [],
-            "artifact_links": ["artifact.md"] if index == 0 else [],
-        }
-        for index in range(10)
-    ]
-    plan = await _discord_render_plan(
-        {
-            "type": "taskdeck",
-            "content": "**TaskDeck** — 10 item(s)",
-            "cards": cards,
-            "attachments": [
-                {
-                    "filename": f"artifact-{index}.txt",
-                    "media_type": "text/plain",
-                    "content": str(index),
-                }
-                for index in range(11)
-            ],
-            "finalized": False,
-            "taskdeck": {
-                "page": 0,
-                "selected_card_token": "card-0",
-                "expanded": True,
-            },
-        }
-    )
-
-    assert len(plan.batches) == 2
-    assert len(plan.batches[0].embeds) == 8
-    assert plan.batches[1].embeds == ()
-    assert [field["name"] for field in plan.batches[0].embeds[0]["fields"]] == [
-        "State",
-        "Type",
-        "Elapsed",
-        "Dependencies",
-        "Artifacts",
-    ]
-    assert plan.batches[0].embeds[0]["footer"]["text"] == "Selected · expanded"
-    assert "Full detail is attached" in plan.batches[0].embeds[0]["description"]
-    assert sum(len(discord.Embed.from_dict(item)) for item in plan.batches[0].embeds) <= 6000
-    assert len(plan.batches[0].assets) == 10
-    assert len(plan.batches[1].assets) == 1
-
-
 def test_interaction_view_uses_bounded_buttons_and_freeform_modal_button() -> None:
     interaction_id = "4ed74879-92fb-47c5-9ee9-81dde5079ab1"
     view = _render_view(
@@ -1793,7 +1712,7 @@ def test_elicitation_view_exposes_bounded_form_decline_and_cancel_controls() -> 
 
 
 @pytest.mark.asyncio
-async def test_critical_task_failure_closes_gateway_and_persists_incident(
+async def test_session_task_failure_quarantines_one_session_without_closing_gateway(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1806,6 +1725,20 @@ async def test_critical_task_failure_closes_gateway_and_persists_incident(
             gateway_closed.set()
 
         monkeypatch.setattr(commands.Bot, "close", fake_base_close)
+        quarantined = asyncio.Event()
+
+        class Sessions:
+            async def quarantine_failure(
+                self,
+                sdk_session_id: str,
+                *,
+                runtime_generation: int | None,
+            ) -> None:
+                assert sdk_session_id == "session-1"
+                assert runtime_generation == 4
+                quarantined.set()
+
+        bot.sessions = Sessions()  # type: ignore[assignment]
         supervisor = asyncio.create_task(bot._task_failure_loop())
 
         async def fail() -> None:
@@ -1818,8 +1751,8 @@ async def test_critical_task_failure_closes_gateway_and_persists_incident(
             session_id="session-1",
             runtime_generation=4,
         )
-        await asyncio.wait_for(gateway_closed.wait(), timeout=1)
-        await supervisor
+        await asyncio.wait_for(quarantined.wait(), timeout=1)
+        await asyncio.sleep(0)
         async with Database(bot.settings.database_path) as database:
             incident = await database.fetchone(
                 """
@@ -1828,12 +1761,15 @@ async def test_critical_task_failure_closes_gateway_and_persists_incident(
                 """
             )
 
-        assert isinstance(bot._fatal_worker_error, RuntimeError)
-        assert bot.heartbeat.runtime_state == "down"
-        assert bot.heartbeat.gateway_state == "down"
+        assert bot._fatal_worker_error is None
+        assert not gateway_closed.is_set()
+        assert not supervisor.done()
         assert incident["runtime_generation"] == 4
         assert incident["kind"] == "background_task_failed"
         assert "event-reducer" in incident["detail"]
+        supervisor.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await supervisor
     finally:
         await bot.database.close()
 
@@ -1873,7 +1809,7 @@ async def test_runtime_health_loop_marks_unexpected_runtime_loss_and_recovery(
                 break
             await asyncio.sleep(0.005)
         assert calls >= 2
-        assert bot.heartbeat.runtime_state == "down"
+        assert bot.heartbeat.runtime_state == "reconnecting"
         recover.set()
         for _ in range(100):
             if bot.heartbeat.runtime_state == "ready":
@@ -1884,3 +1820,246 @@ async def test_runtime_health_loop_marks_unexpected_runtime_loss_and_recovery(
         task.cancel()
         with pytest.raises(asyncio.CancelledError):
             await task
+
+
+@pytest.mark.asyncio
+async def test_repeated_health_failures_recover_bundled_runtime_with_backoff(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    bot = CopilotDiscordBot(
+        Settings(
+            _env_file=None,
+            data_dir=tmp_path / "data",
+            cache_dir=tmp_path / "cache",
+            log_dir=tmp_path / "logs",
+            heartbeat_interval_seconds=0.01,
+            runtime_health_failure_threshold=2,
+            runtime_health_backoff_max_seconds=0.02,
+        )
+    )
+    calls = 0
+    recovered = asyncio.Event()
+    block = asyncio.Event()
+
+    async def healthcheck() -> None:
+        nonlocal calls
+        calls += 1
+        if calls <= 2:
+            raise ConnectionError("bundled runtime unavailable")
+        await block.wait()
+
+    async def recover() -> None:
+        recovered.set()
+
+    monkeypatch.setattr(bot.bridge, "healthcheck", healthcheck)
+    monkeypatch.setattr(bot, "_recover_bundled_runtime", recover)
+    task = asyncio.create_task(bot._runtime_health_loop())
+    try:
+        await asyncio.wait_for(recovered.wait(), timeout=1)
+        for _ in range(100):
+            if bot.heartbeat.runtime_state == "ready":
+                break
+            await asyncio.sleep(0.005)
+
+        assert calls == 2
+        assert bot.heartbeat.runtime_state == "ready"
+    finally:
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+
+@pytest.mark.asyncio
+async def test_attachment_recovery_retries_on_gateway_resume_and_maintenance(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    bot = CopilotDiscordBot(Settings(_env_file=None, data_dir=tmp_path))
+    calls = 0
+    retried = asyncio.Event()
+
+    async def recover() -> None:
+        nonlocal calls
+        calls += 1
+        if calls >= 2:
+            retried.set()
+
+    monkeypatch.setattr(bot, "_recover_attachment_manifests", recover)
+    bot.attachment_service.release_unreferenced = AsyncMock(return_value=0)
+    bot.attachment_service.garbage_collect = AsyncMock(return_value=0)
+
+    await bot.on_resumed()
+    assert bot._attachment_recovery_task is not None
+    await bot._attachment_recovery_task
+
+    maintenance = asyncio.create_task(bot._attachment_maintenance_loop())
+    try:
+        await asyncio.wait_for(retried.wait(), timeout=1)
+    finally:
+        maintenance.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await maintenance
+
+    assert calls >= 2
+
+
+@pytest.mark.asyncio
+async def test_existing_thread_attach_error_is_reported_to_user(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FakeThread:
+        def __init__(self, thread_id: int) -> None:
+            self.id = thread_id
+
+    binding = SimpleNamespace(
+        binding_intent=BindingIntent.ACTIVE,
+        sdk_session_id="session-1",
+    )
+    bot = CopilotDiscordBot(Settings(_env_file=None, data_dir=tmp_path))
+    bot.bindings = SimpleNamespace(by_thread=AsyncMock(return_value=binding))
+    await bot.database.open()
+
+    async def fail_after_admission(_binding: object) -> None:
+        admitted = await bot.database.fetchone(
+            "SELECT reaction_state FROM render_outbox WHERE lane = 'admission_reaction'"
+        )
+        assert admitted["reaction_state"] == "accepted"
+        raise RuntimeError("owner handoff pending")
+
+    bot.sessions = SimpleNamespace(ensure_attached=AsyncMock(side_effect=fail_after_admission))
+    replies: list[str] = []
+
+    async def reply(_message: object, content: str) -> None:
+        replies.append(content)
+
+    monkeypatch.setattr(discord, "Thread", FakeThread)
+    monkeypatch.setattr(bot, "_is_restart_draining", AsyncMock(return_value=False))
+    monkeypatch.setattr(bot, "_reply_message", reply)
+    message = SimpleNamespace(
+        id=73,
+        type=discord.MessageType.default,
+        author=SimpleNamespace(bot=False),
+        guild=object(),
+        channel=FakeThread(10),
+        content="hello",
+        attachments=[],
+    )
+
+    await bot._on_message_admitted(message)
+    admission = await bot.database.fetchone(
+        """
+        SELECT reaction_state, payload_revision, state
+        FROM render_outbox WHERE lane = 'admission_reaction'
+        """
+    )
+    await bot.database.close()
+
+    assert replies == ["copilotD could not attach or submit this message: `owner handoff pending`"]
+    assert admission["state"] == "pending"
+    assert admission["payload_revision"] == 2
+    assert admission["reaction_state"] == "failed"
+
+
+@pytest.mark.asyncio
+async def test_new_session_creation_failure_updates_durable_admission_reaction(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FakeThread:
+        pass
+
+    class FakeChannel:
+        id = 20
+
+    bot = CopilotDiscordBot(Settings(_env_file=None, data_dir=tmp_path))
+    await bot.database.open()
+    bot.projects = SimpleNamespace(channel_settings=AsyncMock(return_value=("text", False, 1)))
+
+    async def fail_after_admission(**_kwargs: Any) -> None:
+        admitted = await bot.database.fetchone(
+            "SELECT reaction_state FROM render_outbox WHERE lane = 'admission_reaction'"
+        )
+        assert admitted["reaction_state"] == "accepted"
+        raise RuntimeError("creation failed")
+
+    bot.creation = SimpleNamespace(create_from_source=AsyncMock(side_effect=fail_after_admission))
+    replies: list[str] = []
+
+    async def reply(_message: object, content: str) -> None:
+        replies.append(content)
+
+    monkeypatch.setattr(discord, "Thread", FakeThread)
+    monkeypatch.setattr(bot, "_is_restart_draining", AsyncMock(return_value=False))
+    monkeypatch.setattr(bot, "_reply_message", reply)
+    message = SimpleNamespace(
+        id=74,
+        type=discord.MessageType.default,
+        author=SimpleNamespace(bot=False),
+        guild=object(),
+        channel=FakeChannel(),
+        content="create",
+        attachments=[],
+        mentions=[],
+    )
+
+    await bot._on_message_admitted(message)
+    admission = await bot.database.fetchone(
+        """
+        SELECT reaction_state, payload_revision, state
+        FROM render_outbox WHERE lane = 'admission_reaction'
+        """
+    )
+    await bot.database.close()
+
+    assert replies == ["copilotD could not create the session: `creation failed`"]
+    assert admission["state"] == "pending"
+    assert admission["payload_revision"] == 2
+    assert admission["reaction_state"] == "failed"
+
+
+@pytest.mark.asyncio
+async def test_thread_recovery_discovers_archived_creation_token(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    token = "12345678abcdef"
+    archived = SimpleNamespace(id=44, name=f"Recovered [cd:{token[:8]}]")
+
+    class FakeTextChannel:
+        def __init__(self) -> None:
+            self.threads: list[object] = []
+
+        async def fetch_message(self, _message_id: int) -> object:
+            return SimpleNamespace(thread=None)
+
+        def archived_threads(self, *, limit: int | None):
+            assert limit is None
+
+            async def items():
+                for index in range(100):
+                    yield SimpleNamespace(id=index, name=f"Older thread {index}")
+                yield archived
+
+            return items()
+
+    channel = FakeTextChannel()
+
+    class Bot:
+        def get_channel(self, _channel_id: int) -> object:
+            return channel
+
+        async def _discord_request(self, _operation: object, callback, **_kwargs):
+            return await callback()
+
+    monkeypatch.setattr(discord, "TextChannel", FakeTextChannel)
+    gateway = DiscordThreadGateway(Bot())  # type: ignore[arg-type]
+
+    result = await gateway.find_thread(
+        channel_id="10",
+        source_id="20",
+        creation_token=token,
+    )
+
+    assert result is not None
+    assert result.thread_id == "44"

@@ -16,6 +16,18 @@ from copilotd.config import (
 )
 
 
+def test_discord_physical_rate_limits_are_not_runtime_configuration() -> None:
+    removed_fields = {
+        "discord_requests_per_second",
+        "discord_request_burst",
+        "discord_route_requests_per_second",
+        "discord_route_burst",
+        "discord_request_transient_attempts",
+    }
+
+    assert removed_fields.isdisjoint(Settings.model_fields)
+
+
 def _create_sqlite(path: Path, value: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     connection = sqlite3.connect(path)
@@ -1097,8 +1109,6 @@ def test_insecure_service_secret_is_rejected(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    if os.name != "posix":
-        pytest.skip("POSIX mode bits are not available")
     secret = tmp_path / "secrets.json"
     secret.write_text(
         json.dumps({"schema_version": 1, "discord_token": "secret"}),

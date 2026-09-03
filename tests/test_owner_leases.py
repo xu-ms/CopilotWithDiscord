@@ -136,7 +136,7 @@ async def test_takeover_atomically_orphans_all_old_generation_domain_state(
             INSERT INTO runtime_schedules(
                 sdk_session_id, runtime_schedule_id, builtin_name,
                 invocation_input, state, updated_at
-            ) VALUES ('session-1', 'schedule-1', 'after', '10s work',
+            ) VALUES ('session-1', 'schedule-1', 'after', '',
                       'active', 101)
             """
         )
@@ -275,11 +275,11 @@ async def test_takeover_replay_reconciles_persisted_acceptance_without_duplicate
                 requested_model_config_snapshot, requested_session_config_version,
                 position, state, created_at, updated_at
             ) VALUES (
-                'submission-replay', 'thread-replay', ?, 'interactive',
+                'submission-replay', 'thread-replay', '', 'interactive',
                 '{}', 1, 1, 'submitted', 101, 105
             )
             """,
-            (prompt,),
+            (),
         )
         await database.execute(
             """

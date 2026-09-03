@@ -3,6 +3,7 @@ from pathlib import Path
 
 import pytest
 
+from copilotd.core.bindings import SessionBindingRepository
 from copilotd.core.recovery import StartupRecoveryInventory
 from copilotd.core.scheduler import ScheduleKind, SchedulerRepository
 from copilotd.storage.database import Database
@@ -98,6 +99,40 @@ async def test_startup_inventory_settles_only_expired_owner_work_before_ready(
     assert creation["state"] == "unknown"
     assert run["status"] == "completed"
     assert json.loads(run["detail"])["run_id"] == report.run_id
+
+
+@pytest.mark.asyncio
+async def test_startup_recovers_active_terminal_binding_without_owner_row(
+    tmp_path: Path,
+) -> None:
+    async with Database(tmp_path / "startup-terminal-recovery.sqlite3") as database:
+        await database.execute(
+            """
+            INSERT INTO session_bindings(
+                thread_id, project_source, cwd_snapshot, sdk_session_id,
+                binding_intent, attachment_state, runtime_generation,
+                owner_fence_token, created_at, updated_at
+            ) VALUES (
+                'thread-terminal-crash', 'home', '/workspace', 'session-terminal-crash',
+                'active', 'terminal', 3, 9, 1, 1
+            )
+            """
+        )
+        await StartupRecoveryInventory(database).run(now=200)
+        binding = await database.fetchone(
+            """
+            SELECT binding_intent, attachment_state, attachment_reason
+            FROM session_bindings WHERE thread_id = 'thread-terminal-crash'
+            """
+        )
+        eager = await SessionBindingRepository(database).eager_bindings()
+
+    assert dict(binding) == {
+        "binding_intent": "active",
+        "attachment_state": "recovery_unknown",
+        "attachment_reason": "startup_terminal_recovery",
+    }
+    assert [item.thread_id for item in eager] == ["thread-terminal-crash"]
 
 
 @pytest.mark.asyncio
@@ -339,7 +374,7 @@ async def test_startup_recovery_preserves_pending_config_and_marks_runtime_unkno
         "runtime_model_config": None,
         "model_reconciliation_state": "unknown",
     }
-    assert request["response_state"] == "unknown"
+    assert request["response_state"] == "content_unavailable"
     assert dict(attempt) == {
         "state": "unknown",
         "error_code": "startup_recovery",

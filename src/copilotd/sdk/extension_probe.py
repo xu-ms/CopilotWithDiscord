@@ -30,9 +30,14 @@ from copilotd.core.extensions import (
 from copilotd.core.projects import ProjectRegistry
 from copilotd.core.session_runtime import SessionRuntime
 from copilotd.core.task_registry import TaskRegistry
+from copilotd.core.volatile_content import (
+    VolatileContentStore,
+    tool_event_evidence_key,
+)
 from copilotd.sdk.bridge import CopilotBridge, ManagedAwarePermissionHandler
 from copilotd.storage.database import Database
 from copilotd.storage.leases import OwnerLeaseStore
+from copilotd.storage.state_only import payload_sha256
 
 
 class LiveAcceptanceAuthError(RuntimeError):
@@ -774,6 +779,7 @@ class ExtensionAcceptanceProbe:
                 owner_id="extension-acceptance",
                 binding=binding,
                 extension_configs=configs,
+                capture_tool_acceptance_evidence=True,
             )
             await runtime.attach_create()
             await runtime.send(
@@ -842,7 +848,7 @@ class ExtensionAcceptanceProbe:
             )
             tool_events = await database.fetchall(
                 """
-                SELECT raw_type, tool_call_id, raw_payload
+                SELECT raw_type, tool_call_id
                 FROM event_journal
                 WHERE sdk_session_id = ?
                   AND generation = ?
@@ -855,7 +861,12 @@ class ExtensionAcceptanceProbe:
                 (session_id, runtime.binding.runtime_generation),
             )
             tool_evidence = _correlate_mcp_tool_evidence(
-                tool_events,
+                _load_volatile_tool_evidence(
+                    database.content_store,
+                    tool_events,
+                    session_id=session_id,
+                    generation=runtime.binding.runtime_generation,
+                ),
                 server_name="second",
                 tool_name="echo",
                 marker="REATTACH_TOOL_OK",
@@ -1099,7 +1110,7 @@ def _protocol_response_evidence(
 
 
 def _correlate_mcp_tool_evidence(
-    rows: list[Any],
+    evidence: list[dict[str, Any]],
     *,
     server_name: str,
     tool_name: str,
@@ -1107,36 +1118,25 @@ def _correlate_mcp_tool_evidence(
 ) -> dict[str, Any]:
     starts: dict[str, list[dict[str, Any]]] = {}
     completions: dict[str, list[dict[str, Any]]] = {}
-    for row in rows:
-        tool_call_id = row["tool_call_id"]
-        if tool_call_id is None:
+    for item in evidence:
+        tool_call_id = item.get("tool_call_id")
+        if not isinstance(tool_call_id, str) or not tool_call_id:
             continue
-        try:
-            payload = json.loads(str(row["raw_payload"]))
-        except json.JSONDecodeError:
-            continue
-        data = payload.get("data", {})
-        if not isinstance(data, dict):
-            continue
-        if str(data.get("toolCallId") or "") != str(tool_call_id):
-            continue
-        if row["raw_type"] == "tool.execution_start":
-            starts.setdefault(str(tool_call_id), []).append(data)
-        elif row["raw_type"] == "tool.execution_complete":
-            completions.setdefault(str(tool_call_id), []).append(data)
+        if item.get("kind") == "tool.execution_start":
+            starts.setdefault(tool_call_id, []).append(item)
+        elif item.get("kind") == "tool.execution_complete":
+            completions.setdefault(tool_call_id, []).append(item)
+    expected_arguments_hash = payload_sha256({"text": marker})
+    expected_result_hash = hashlib.sha256(marker.encode("utf-8")).hexdigest()
     matching_ids: list[str] = []
     for tool_call_id, start_events in starts.items():
         if len(start_events) != 1:
             continue
         start = start_events[0]
-        observed_server = start.get("mcpServerName")
-        observed_tool = start.get("mcpToolName")
-        arguments = start.get("arguments")
         if (
-            observed_server == server_name
-            and observed_tool == tool_name
-            and isinstance(arguments, dict)
-            and arguments.get("text") == marker
+            start.get("server_name") == server_name
+            and start.get("tool_name") == tool_name
+            and start.get("arguments_hash") == expected_arguments_hash
         ):
             matching_ids.append(tool_call_id)
     completed_ids = [
@@ -1144,11 +1144,7 @@ def _correlate_mcp_tool_evidence(
         for tool_call_id in matching_ids
         if len(completions.get(tool_call_id, [])) == 1
         and completions[tool_call_id][0].get("success") is True
-        and marker
-        in json.dumps(
-            completions[tool_call_id][0].get("result"),
-            sort_keys=True,
-        )
+        and expected_result_hash in completions[tool_call_id][0].get("result_text_hashes", ())
     ]
     return {
         "correlated": len(matching_ids) == 1 and completed_ids == matching_ids,
@@ -1159,6 +1155,35 @@ def _correlate_mcp_tool_evidence(
         "tool": tool_name,
         "result_marker_matched": bool(completed_ids),
     }
+
+
+def _load_volatile_tool_evidence(
+    store: VolatileContentStore,
+    rows: list[Any],
+    *,
+    session_id: str,
+    generation: int,
+) -> list[dict[str, Any]]:
+    evidence: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for row in rows:
+        tool_call_id = row["tool_call_id"]
+        if tool_call_id is None:
+            continue
+        key = tool_event_evidence_key(
+            session_id,
+            generation,
+            str(tool_call_id),
+            str(row["raw_type"]),
+        )
+        if key in seen:
+            continue
+        seen.add(key)
+        values = store.get(key)
+        if isinstance(values, list):
+            evidence.extend(item for item in values if isinstance(item, dict))
+        store.delete(key)
+    return evidence
 
 
 async def _wait_runtime_idle(

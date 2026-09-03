@@ -109,7 +109,7 @@ class ApplicationSchedulerAdapter:
                 source_kind="schedule",
                 source_id=run.run_id,
                 prompt="",
-                thread_name=str(definition.payload.get("thread_name", "Scheduled session")),
+                thread_name=definition.thread_name or "Scheduled Copilot session",
                 send_initial_prompt=False,
                 project_snapshot=project,
                 config_snapshot=config,

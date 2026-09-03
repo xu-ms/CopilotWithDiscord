@@ -142,24 +142,26 @@ class Settings(BaseSettings):
     service_handoff_token: SecretStr | None = None
     owner_lease_ttl_seconds: int = int(OWNER_LEASE_TTL_SECONDS)
     owner_lease_renew_seconds: int = int(OWNER_LEASE_RENEW_SECONDS)
+    owner_lease_renew_retry_attempts: int = 3
     ingress_capacity: int = 4096
     reducer_batch_size: int = 64
+    startup_recovery_concurrency: int = 4
+    startup_recovery_limit: int = 64
+    startup_attach_timeout_seconds: float = 30
+    startup_recovery_total_timeout_seconds: float = 60
+    event_replay_max_pages: int = 20
+    runtime_health_failure_threshold: int = 3
+    runtime_health_backoff_max_seconds: float = 60
     interaction_timeout_seconds: float = 15 * 60
     attachment_file_max_bytes: int = 25 * 1024 * 1024
     attachment_message_max_bytes: int = 100 * 1024 * 1024
     attachment_blob_max_bytes: int = 7 * 1024 * 1024
     attachment_runtime_frame_max_bytes: int = 7 * 1024 * 1024
     discord_upload_max_bytes: int = 7 * 1024 * 1024
-    discord_requests_per_second: float = 20.0
-    discord_request_burst: int = 10
-    discord_route_requests_per_second: float = 5.0
-    discord_route_burst: int = 5
     discord_request_queue_limit: int = 512
     discord_interaction_deadline_seconds: float = 2.5
     discord_stream_edit_interval_seconds: float = 1.0
-    discord_taskdeck_edit_interval_seconds: float = 4.0
     discord_reaction_interval_seconds: float = 0.25
-    discord_request_transient_attempts: int = 3
     heartbeat_interval_seconds: float = 30
     heartbeat_stale_seconds: float = 120
     gateway_down_restart_seconds: float = 600
@@ -185,6 +187,19 @@ class Settings(BaseSettings):
     def validate_lease_renew(cls, value: int) -> int:
         if value < 1:
             raise ValueError("owner lease renew interval must be positive")
+        return value
+
+    @field_validator(
+        "owner_lease_renew_retry_attempts",
+        "startup_recovery_concurrency",
+        "startup_recovery_limit",
+        "event_replay_max_pages",
+        "runtime_health_failure_threshold",
+    )
+    @classmethod
+    def validate_positive_count(cls, value: int) -> int:
+        if value < 1:
+            raise ValueError("runtime lifecycle counts must be positive")
         return value
 
     @model_validator(mode="after")
@@ -214,11 +229,11 @@ class Settings(BaseSettings):
         "restart_drain_timeout_seconds",
         "service_startup_grace_seconds",
         "interaction_timeout_seconds",
-        "discord_requests_per_second",
-        "discord_route_requests_per_second",
+        "startup_attach_timeout_seconds",
+        "startup_recovery_total_timeout_seconds",
+        "runtime_health_backoff_max_seconds",
         "discord_interaction_deadline_seconds",
         "discord_stream_edit_interval_seconds",
-        "discord_taskdeck_edit_interval_seconds",
         "discord_reaction_interval_seconds",
     )
     @classmethod
@@ -235,10 +250,7 @@ class Settings(BaseSettings):
         "attachment_blob_max_bytes",
         "attachment_runtime_frame_max_bytes",
         "discord_upload_max_bytes",
-        "discord_request_burst",
-        "discord_route_burst",
         "discord_request_queue_limit",
-        "discord_request_transient_attempts",
     )
     @classmethod
     def validate_positive(cls, value: int) -> int:
@@ -802,6 +814,16 @@ def _apply_persisted_service_settings(settings: Settings) -> Settings:
         "log_level": "COPILOTD_LOG_LEVEL",
         "sdk_log_level": "COPILOTD_SDK_LOG_LEVEL",
         "runtime_uri": "COPILOTD_RUNTIME_URI",
+        "owner_lease_renew_retry_attempts": ("COPILOTD_OWNER_LEASE_RENEW_RETRY_ATTEMPTS"),
+        "startup_recovery_concurrency": "COPILOTD_STARTUP_RECOVERY_CONCURRENCY",
+        "startup_recovery_limit": "COPILOTD_STARTUP_RECOVERY_LIMIT",
+        "startup_attach_timeout_seconds": ("COPILOTD_STARTUP_ATTACH_TIMEOUT_SECONDS"),
+        "startup_recovery_total_timeout_seconds": (
+            "COPILOTD_STARTUP_RECOVERY_TOTAL_TIMEOUT_SECONDS"
+        ),
+        "event_replay_max_pages": "COPILOTD_EVENT_REPLAY_MAX_PAGES",
+        "runtime_health_failure_threshold": ("COPILOTD_RUNTIME_HEALTH_FAILURE_THRESHOLD"),
+        "runtime_health_backoff_max_seconds": ("COPILOTD_RUNTIME_HEALTH_BACKOFF_MAX_SECONDS"),
     }
     updates = {
         field: persisted[field]

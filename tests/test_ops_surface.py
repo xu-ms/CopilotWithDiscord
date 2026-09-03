@@ -216,7 +216,7 @@ async def test_ops_surface_redacts_diagnostics_log_tail_and_event_dump(
                 "demo",
                 1,
                 "test",
-                json_blob,
+                "{}",
                 "",
                 "",
                 0,
@@ -237,10 +237,10 @@ async def test_ops_surface_redacts_diagnostics_log_tail_and_event_dump(
                 3,
                 "session-1",
                 "crash",
-                "Authorization = Digest incident-secret",
+                None,
                 7,
                 9,
-                "detail",
+                "{}",
             ),
         )
         await database.execute(
@@ -258,12 +258,12 @@ async def test_ops_surface_redacts_diagnostics_log_tail_and_event_dump(
                 "sdk",
                 "durable",
                 "message",
-                'authorization={"value":{"nested":"parent-secret"}}',
-                'client_secret="agent-secret"',
-                f"{_cookie()} = message-secret",
-                f"{_aws_secret()} = turn-secret",
+                "parent-id",
+                "agent-id",
+                "message-id",
+                "turn-id",
                 "hash",
-                json_blob,
+                '{"payload_state":"discarded","schema":1}',
                 now,
             ),
         )
@@ -277,12 +277,8 @@ async def test_ops_surface_redacts_diagnostics_log_tail_and_event_dump(
     assert health["database"] == "ok"
     assert health["pending_outbox"] == 0
     assert diagnostics["bindings"][0]["owner_fence_token"] == "[redacted]"
-    assert diagnostics["capabilities"][0]["probe_detail"] == (
-        '{"credentials":"[redacted]","secret":"[redacted]","secret_count":7,'
-        '"credential_type":"basic","has_secret":false,"nonsecret":"keep",'
-        '"public_metadata":"show"}'
-    )
-    assert diagnostics["incidents"][0]["stderr_tail"] == "Authorization = [redacted]"
+    assert diagnostics["capabilities"][0]["probe_detail"] == "{}"
+    assert diagnostics["incidents"][0]["stderr_tail"] is None
     assert "cred-secret" not in logs["files"]["copilotd.log"]
     assert "secret-secret" not in logs["files"]["copilotd.log"]
     assert "hook-secret" not in logs["files"]["copilotd.log"]
@@ -308,8 +304,8 @@ async def test_ops_surface_redacts_diagnostics_log_tail_and_event_dump(
     assert "nonsecret=keep-me" in logs["files"]["copilotd.log"]
     assert 'public_metadata="visible"' in logs["files"]["copilotd.log"]
     assert "safe text" in logs["files"]["boot.log"]
-    assert events["events"][0]["parent_id"] == "authorization=[redacted]"
-    assert events["events"][0]["agent_id"] == 'client_secret="[redacted]"'
-    assert events["events"][0]["message_id"] == "Cookie = [redacted]"
-    assert events["events"][0]["turn_id"] == f"{_aws_secret()} = [redacted]"
+    assert events["events"][0]["parent_id"] == "parent-id"
+    assert events["events"][0]["agent_id"] == "agent-id"
+    assert events["events"][0]["message_id"] == "message-id"
+    assert events["events"][0]["turn_id"] == "turn-id"
     assert events["events"][0]["raw_type"] == "message"

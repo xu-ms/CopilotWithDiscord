@@ -5,7 +5,12 @@ from uuid import uuid4
 import pytest
 
 from copilotd.core.bindings import SessionBindingRepository
-from copilotd.core.projects import ProjectPathError, ProjectRegistry, ProjectSource
+from copilotd.core.projects import (
+    ProjectConflictError,
+    ProjectPathError,
+    ProjectRegistry,
+    ProjectSource,
+)
 from copilotd.storage.database import Database
 
 
@@ -107,3 +112,47 @@ async def test_channel_settings_are_independent_from_project_binding(tmp_path: P
         settings = await projects.channel_settings("channel-1")
 
     assert settings == ("forum", True, 3)
+
+
+@pytest.mark.asyncio
+async def test_stale_custom_agent_update_cannot_change_persisted_configuration(
+    tmp_path: Path,
+) -> None:
+    home = tmp_path / "home"
+    repo = tmp_path / "repo"
+    await asyncio.to_thread(home.mkdir)
+    await asyncio.to_thread(repo.mkdir)
+    path = tmp_path / "agent-version.sqlite3"
+
+    async with Database(path) as database:
+        projects = ProjectRegistry(database, resolved_home=home)
+        await projects.initialize()
+        project = await projects.bind("channel-agent", repo)
+        accepted = await projects.set_custom_agent(
+            "channel-agent",
+            name="reviewer",
+            description="accepted description",
+            prompt="accepted prompt",
+            tools=("read",),
+            expected_version=project.config_version,
+        )
+        with pytest.raises(ProjectConflictError, match="expected"):
+            await projects.set_custom_agent(
+                "channel-agent",
+                name="reviewer",
+                description="stale description",
+                prompt="stale prompt",
+                tools=("write",),
+                expected_version=project.config_version,
+            )
+        assert accepted.project_config_version == project.config_version + 1
+
+    async with Database(path) as database:
+        projects = ProjectRegistry(database, resolved_home=home)
+        await projects.initialize()
+        agents = await projects.list_custom_agents("channel-agent")
+
+    assert len(agents) == 1
+    assert agents[0].description == "accepted description"
+    assert agents[0].prompt == "accepted prompt"
+    assert agents[0].tools == ("read",)

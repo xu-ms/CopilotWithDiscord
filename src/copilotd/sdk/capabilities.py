@@ -12,6 +12,7 @@ from copilot.session_events import SessionEventType
 
 from copilotd.config import Settings
 from copilotd.storage.database import Database
+from copilotd.storage.state_only import state_only_json
 
 CAPABILITY_SCHEMA_VERSION = 2
 PINNED_SDK_VERSION = "1.0.8"
@@ -610,7 +611,7 @@ class CapabilityRegistry:
                             else "unsupported"
                         ),
                         evidence.evidence_kind,
-                        json.dumps(evidence.detail, ensure_ascii=False, sort_keys=True),
+                        state_only_json(evidence.detail),
                         str(manifest.fixture_path),
                         manifest.fixture_sha256,
                         manifest.generated_event_count,

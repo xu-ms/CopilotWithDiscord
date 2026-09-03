@@ -7,6 +7,10 @@ from dataclasses import asdict, dataclass
 
 from aiosqlite import Connection
 
+from copilotd.core.volatile_content import (
+    VolatileContentStore,
+    opaque_content_key,
+)
 from copilotd.storage.database import Database
 
 
@@ -31,13 +35,73 @@ class RecoveryInventoryReport:
 
 
 class StartupRecoveryInventory:
-    def __init__(self, database: Database) -> None:
+    def __init__(
+        self,
+        database: Database,
+        *,
+        content_store: VolatileContentStore | None = None,
+    ) -> None:
         self._database = database
+        self._content_store = content_store or database.content_store
 
     async def run(self, *, now: float | None = None) -> RecoveryInventoryReport:
         timestamp = time.time() if now is None else now
         run_id = str(uuid.uuid4())
         counts: dict[str, int] = {}
+        queued = await self._database.fetchall(
+            """
+            SELECT queue.id, queue.prompt_content_key, queue.prompt_hash,
+                   EXISTS (
+                       SELECT 1
+                       FROM submissions AS submission
+                       JOIN schedule_runs AS run
+                         ON run.run_id = queue.schedule_run_id
+                       JOIN schedules AS schedule
+                         ON schedule.id = run.schedule_id
+                       WHERE submission.submission_id = queue.id
+                         AND submission.origin = 'app_schedule'
+                         AND submission.state = 'local_queued'
+                         AND run.status IN ('claimed', 'submitting', 'retry_wait')
+                         AND run.send_started_at IS NULL
+                         AND run.accepted_message_id IS NULL
+                         AND schedule.state != 'deleted'
+                         AND schedule.source_channel_id IS NOT NULL
+                         AND schedule.source_message_id IS NOT NULL
+                   ) AS source_recoverable
+            FROM message_queue AS queue
+            WHERE queue.state IN (
+                'local_queued', 'blocked_config_unknown',
+                'blocked_remote_transition', 'blocked_mode_drift',
+                'blocked_model_drift', 'blocked_agent_drift',
+                'blocked_session_config_drift'
+            )
+            """
+        )
+        unavailable_submissions = [
+            str(row["id"])
+            for row in queued
+            if self._content_store.get(
+                row["prompt_content_key"],
+                expected_hash=row["prompt_hash"],
+            )
+            is None
+            and not bool(row["source_recoverable"])
+        ]
+        interactions = await self._database.fetchall(
+            """
+            SELECT interaction_id, sdk_session_id, content_key, request_hash
+            FROM pending_interactions WHERE state = 'pending'
+            """
+        )
+        unavailable_interactions = [
+            str(row["interaction_id"])
+            for row in interactions
+            if self._content_store.get(
+                row["content_key"],
+                expected_hash=row["request_hash"],
+            )
+            is None
+        ]
         async with self._database.transaction() as connection:
             await connection.execute(
                 """
@@ -46,6 +110,74 @@ class StartupRecoveryInventory:
                 ) VALUES (?, ?, 'running', '{}')
                 """,
                 (run_id, timestamp),
+            )
+            if unavailable_submissions:
+                placeholders = ", ".join("?" for _ in unavailable_submissions)
+                await connection.execute(
+                    f"""
+                    UPDATE message_queue
+                    SET state = 'content_unavailable', updated_at = ?
+                    WHERE id IN ({placeholders})
+                    """,
+                    (timestamp, *unavailable_submissions),
+                )
+                await connection.execute(
+                    f"""
+                    UPDATE submissions
+                    SET state = 'rejected',
+                        completion_basis = 'content_unavailable',
+                        terminal_at = COALESCE(terminal_at, ?)
+                    WHERE submission_id IN ({placeholders})
+                      AND state = 'local_queued'
+                    """,
+                    (timestamp, *unavailable_submissions),
+                )
+                await connection.execute(
+                    f"""
+                    UPDATE submission_reactions
+                    SET desired_state = 'failed',
+                        resume_state = 'content_unavailable',
+                        terminal = 1, revision = revision + 1,
+                        last_error = 'content_unavailable', updated_at = ?
+                    WHERE submission_id IN ({placeholders})
+                    """,
+                    (timestamp, *unavailable_submissions),
+                )
+                await connection.execute(
+                    f"""
+                    UPDATE liveness_leases
+                    SET state = 'released', refreshed_at = ?, released_at = ?
+                    WHERE kind = 'submission'
+                      AND source_id IN ({placeholders}) AND state = 'active'
+                    """,
+                    (timestamp, timestamp, *unavailable_submissions),
+                )
+            if unavailable_interactions:
+                placeholders = ", ".join("?" for _ in unavailable_interactions)
+                await connection.execute(
+                    f"""
+                    UPDATE pending_interactions
+                    SET state = 'content_unavailable', updated_at = ?
+                    WHERE interaction_id IN ({placeholders}) AND state = 'pending'
+                    """,
+                    (timestamp, *unavailable_interactions),
+                )
+                await connection.execute(
+                    f"""
+                    UPDATE liveness_leases
+                    SET state = 'released', refreshed_at = ?, released_at = ?
+                    WHERE kind = 'interaction'
+                      AND source_id IN ({placeholders}) AND state = 'active'
+                    """,
+                    (timestamp, timestamp, *unavailable_interactions),
+                )
+            await connection.execute(
+                """
+                UPDATE protocol_requests
+                SET response_state = 'content_unavailable', updated_at = ?
+                WHERE response_state IN ('pending', 'responding')
+                """,
+                (timestamp,),
             )
             cursor = await connection.execute(
                 """
@@ -57,6 +189,33 @@ class StartupRecoveryInventory:
             expired = [str(row["sdk_session_id"]) for row in await cursor.fetchall()]
             await cursor.close()
             counts["expired_owner_sessions"] = len(expired)
+            await connection.execute(
+                """
+                UPDATE session_bindings
+                SET attachment_state = 'recovery_unknown',
+                    attachment_reason = COALESCE(
+                        attachment_reason,
+                        'startup_terminal_recovery'
+                    ),
+                    permission_posture = 'unknown',
+                    permission_verified_at = NULL,
+                    updated_at = ?, row_version = row_version + 1
+                WHERE binding_intent = 'active'
+                  AND attachment_state = 'terminal'
+                """,
+                (timestamp,),
+            )
+            await connection.execute(
+                """
+                UPDATE service_restart_intents
+                SET state = 'claimed', outcome = 'replay_pending',
+                    updated_at = ?
+                WHERE kind = 'checkpoint_replay'
+                  AND state IN ('requested', 'claimed')
+                  AND outcome IN ('replay_required', 'replay_pending')
+                """,
+                (timestamp,),
+            )
 
             counts["unknown_operations"] = await _update_count(
                 connection,
@@ -203,7 +362,8 @@ class StartupRecoveryInventory:
                         updated_at = ?, row_version = row_version + 1
                     WHERE sdk_session_id IN ({placeholders})
                       AND attachment_state IN (
-                          'creating', 'resuming', 'attached', 'disconnecting'
+                          'creating', 'resuming', 'attached', 'disconnecting',
+                          'terminal'
                       )
                     """,
                     (timestamp, *expired),
@@ -238,6 +398,8 @@ class StartupRecoveryInventory:
                 ):
                     counts[key] = 0
                 counts["stale_runtime_projections"] = 0
+            counts["unknown_submissions"] += len(unavailable_submissions)
+            counts["expired_interactions"] += len(unavailable_interactions)
 
             counts["unknown_creation_intents"] = await _update_count(
                 connection,
@@ -350,6 +512,24 @@ class StartupRecoveryInventory:
                     json.dumps(asdict(report), sort_keys=True),
                     run_id,
                 ),
+            )
+        unavailable_submission_set = set(unavailable_submissions)
+        for row in queued:
+            if str(row["id"]) in unavailable_submission_set and row["prompt_content_key"]:
+                self._content_store.delete(str(row["prompt_content_key"]))
+        unavailable_interaction_set = set(unavailable_interactions)
+        for row in interactions:
+            interaction_id = str(row["interaction_id"])
+            if interaction_id not in unavailable_interaction_set:
+                continue
+            if row["content_key"]:
+                self._content_store.delete(str(row["content_key"]))
+            self._content_store.delete(
+                opaque_content_key(
+                    "interaction-response",
+                    str(row["sdk_session_id"]),
+                    interaction_id,
+                )
             )
         return report
 

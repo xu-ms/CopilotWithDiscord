@@ -770,7 +770,6 @@ async def test_compact_fleet_and_task_surface_are_durable_and_idempotent(
         assert listed["tasks"]
         assert shown["result"]["progress"]["latestIntent"] == "progress:task-agent"
         assert progressed["result"]["progress"]["latestIntent"] == "progress:task-agent"
-        assert shown["taskdeck"]
         assert bridge.task_messages == [("task-agent", "status please")]
         assert bridge.task_promotions == ["task-agent"]
         assert bridge.task_cancels == ["task-agent", "task-agent-2"]
@@ -875,9 +874,17 @@ async def test_agent_schedule_and_remote_transitions_reconcile_projections(
         listing = await runtime.list_agents()
         assert "mcpServers" not in listing["agents"][0]["metadata"]
         assert "path" not in listing["agents"][0]["metadata"]
-        stored_agent = await database.fetchone("SELECT metadata_json FROM runtime_agent_manifest")
+        stored_agent = await database.fetchone(
+            """
+            SELECT metadata_json, display_name, description
+            FROM runtime_agent_manifest WHERE agent_name = 'reviewer'
+            """
+        )
         assert "secret-token" not in stored_agent["metadata_json"]
         assert "/private/agent.md" not in stored_agent["metadata_json"]
+        assert stored_agent["display_name"] == "Reviewer"
+        assert stored_agent["description"] == "Reviews changes"
+        assert json.loads(stored_agent["metadata_json"])["description"] == ("Reviews changes")
         assert (
             await runtime.select_agent(
                 "reviewer",
@@ -1087,13 +1094,17 @@ async def test_commands_changed_refreshes_generation_and_removes_missing_builtin
 
         rows = await database.fetchall(
             """
-            SELECT command_name, state, manifest_generation
+            SELECT command_name, description, state, manifest_generation
             FROM runtime_command_manifest ORDER BY command_name
             """
         )
         states = {row["command_name"]: row["state"] for row in rows}
         assert states["review"] == "available"
         assert states["research"] == "unavailable"
+        assert (
+            next(row["description"] for row in rows if row["command_name"] == "review")
+            == "review builtin"
+        )
         assert max(int(row["manifest_generation"]) for row in rows) >= 2
 
 

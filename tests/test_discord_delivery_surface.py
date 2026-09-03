@@ -12,6 +12,7 @@ from copilotd.discord_app import (
     DiscordRenderBatch,
     DiscordRenderPlan,
     RenderPermanentError,
+    _discord_render_plan,
     _render_batch_hash,
 )
 from copilotd.render.tables import TableAsset
@@ -54,58 +55,6 @@ class FakeThread:
     async def history(self, **_kwargs: Any) -> Any:
         for message in reversed(self.messages.values()):
             yield message
-
-
-@pytest.mark.asyncio
-async def test_special_destination_rejects_internal_tool_artifact_delivery(
-    tmp_path: Path,
-) -> None:
-    bot = CopilotDiscordBot(Settings(data_dir=tmp_path))
-    thread = FakeThread()
-
-    async def render_destination(_session_id: str) -> FakeThread:
-        return thread
-
-    bot._render_destination = render_destination  # type: ignore[method-assign]
-    payload = {
-        "type": "tool_output_artifact",
-        "content": "Durable attachment set",
-        "status": "completed",
-        "tool_source": "test",
-        "verbatim": True,
-        "character_count": 11,
-        "line_count": 1,
-        "attachments": [
-            {
-                "filename": f"artifact-{index}.txt",
-                "media_type": "text/plain",
-                "content": str(index),
-            }
-            for index in range(11)
-        ],
-        "finalized": True,
-    }
-
-    async with Database(tmp_path / "special-destination.sqlite3") as database:
-        bot.database = database
-        with pytest.raises(RenderPermanentError, match="internal tool diagnostics"):
-            await bot.send(
-                session_id="ops:diagnostics",
-                lane="artifact",
-                payload=payload,
-                idempotency_key="ops:rich-artifacts",
-            )
-        rows = await database.fetchall(
-            """
-            SELECT batch_index, discord_message_id
-            FROM render_attachment_batches
-            WHERE session_id = 'ops:diagnostics'
-            ORDER BY batch_index
-            """
-        )
-
-    assert thread.send_calls == 0
-    assert rows == []
 
 
 @pytest.mark.asyncio
@@ -158,6 +107,67 @@ async def test_render_batches_checkpoint_each_message_and_retry_idempotently(
     assert [dict(row) for row in rows] == [
         {"batch_index": 0, "discord_message_id": "101", "attachment_count": 0},
         {"batch_index": 1, "discord_message_id": "102", "attachment_count": 1},
+    ]
+
+
+@pytest.mark.asyncio
+async def test_growing_nonfinal_response_updates_all_batches_in_one_family(
+    tmp_path: Path,
+) -> None:
+    bot = CopilotDiscordBot(Settings(data_dir=tmp_path))
+    thread = FakeThread()
+    first_content = "".join(f"first-{index:03d} " for index in range(300))
+    second_content = first_content + "".join(f"second-{index:03d} " for index in range(300))
+    first_plan = await _discord_render_plan(
+        {
+            "type": "assistant.message_delta",
+            "content": first_content,
+            "finalized": False,
+        }
+    )
+    second_plan = await _discord_render_plan(
+        {
+            "type": "assistant.message_delta",
+            "content": second_content,
+            "finalized": False,
+        }
+    )
+    assert len(second_plan.batches) > len(first_plan.batches) > 1
+
+    async with Database(tmp_path / "growing-stream.sqlite3") as database:
+        bot.database = database
+        first_id = await bot._deliver_render_plan(
+            thread=thread,
+            session_id="session-stream",
+            payload={"finalized": False},
+            plan=first_plan,
+            delivery_id="render:assistant:payload:1:1111111111111111",
+        )
+        first_message = await thread.fetch_message(int(first_id))
+        await bot._deliver_render_plan(
+            thread=thread,
+            session_id="session-stream",
+            payload={"finalized": False},
+            plan=second_plan,
+            delivery_id="render:assistant:payload:2:2222222222222222",
+            first_message=first_message,
+        )
+        current = await database.fetchall(
+            """
+            SELECT batch_index, discord_message_id FROM render_attachment_batches
+            WHERE session_id = 'session-stream'
+              AND render_message_id = 'render:assistant:payload:2:2222222222222222'
+            ORDER BY batch_index
+            """
+        )
+
+    assert [row["discord_message_id"] for row in current] == [
+        str(101 + index) for index in range(len(second_plan.batches))
+    ]
+    for index, batch in enumerate(second_plan.batches[: len(first_plan.batches)]):
+        assert thread.messages[101 + index].edits[-1]["content"] == batch.content
+    assert [payload["content"] for payload in thread.send_payloads[len(first_plan.batches) :]] == [
+        batch.content for batch in second_plan.batches[len(first_plan.batches) :]
     ]
 
 
@@ -416,6 +426,51 @@ async def test_new_payload_revision_recovers_prior_family_message(
 
 
 @pytest.mark.asyncio
+async def test_new_revision_skips_unsent_intent_to_recover_older_family_batches(
+    tmp_path: Path,
+) -> None:
+    bot = CopilotDiscordBot(Settings(data_dir=tmp_path))
+    thread = FakeThread()
+    initial = DiscordRenderPlan((DiscordRenderBatch("first-old"), DiscordRenderBatch("second-old")))
+    updated = DiscordRenderPlan((DiscordRenderBatch("first-new"), DiscordRenderBatch("second-new")))
+    async with Database(tmp_path / "delivery-family-unsent.sqlite3") as database:
+        bot.database = database
+        await bot._deliver_render_plan(
+            thread=thread,
+            session_id="session-family-unsent",
+            payload={"finalized": False},
+            plan=initial,
+            delivery_id="artifact:family:payload:1:1111111111111111",
+        )
+        await database.execute(
+            """
+            INSERT INTO render_batch_intents(
+                session_id, render_message_id, agent_id, batch_index,
+                nonce, payload_hash, state, discord_message_id,
+                delivery_family, created_at, updated_at
+            ) VALUES (
+                'session-family-unsent',
+                'artifact:family:payload:2:2222222222222222',
+                '', 1, 'unsent-nonce', 'unsent-hash', 'prepared', NULL,
+                'artifact:family', 9999999999, 9999999999
+            )
+            """
+        )
+        recovered_id = await bot._deliver_render_plan(
+            thread=thread,
+            session_id="session-family-unsent",
+            payload={"finalized": True},
+            plan=updated,
+            delivery_id="artifact:family:payload:3:3333333333333333",
+        )
+
+    assert recovered_id == "101"
+    assert thread.send_calls == 2
+    assert thread.messages[101].edits[-1]["content"] == "first-new"
+    assert thread.messages[102].edits[-1]["content"] == "second-new"
+
+
+@pytest.mark.asyncio
 async def test_new_revision_recovers_prior_post_send_crash_without_duplicate(
     tmp_path: Path,
 ) -> None:
@@ -515,43 +570,6 @@ async def test_edit_followup_crash_reconciles_without_orphan_duplicate(
     ]
 
 
-@pytest.mark.asyncio
-async def test_taskdeck_embeds_survive_send_and_in_place_edit(tmp_path: Path) -> None:
-    bot = CopilotDiscordBot(Settings(data_dir=tmp_path))
-    thread = FakeThread()
-    initial = DiscordRenderBatch(
-        "TaskDeck",
-        embeds=({"title": "Worker A", "description": "running"},),
-    )
-    updated = DiscordRenderBatch(
-        "TaskDeck",
-        embeds=({"title": "Worker A", "description": "completed"},),
-    )
-    assert _render_batch_hash(initial) != _render_batch_hash(updated)
-
-    async with Database(tmp_path / "taskdeck-embed-delivery.sqlite3") as database:
-        bot.database = database
-        first_id = await bot._deliver_render_plan(
-            thread=thread,
-            session_id="session-taskdeck",
-            payload={"type": "taskdeck", "finalized": False},
-            plan=DiscordRenderPlan((initial,)),
-            delivery_id="taskdeck:deck:payload:1:1111111111111111",
-        )
-        edited_id = await bot._deliver_render_plan(
-            thread=thread,
-            session_id="session-taskdeck",
-            payload={"type": "taskdeck", "finalized": True},
-            plan=DiscordRenderPlan((updated,)),
-            delivery_id="taskdeck:deck:payload:2:2222222222222222",
-        )
-
-    assert first_id == edited_id == "101"
-    assert thread.send_calls == 1
-    assert thread.send_payloads[0]["embeds"][0].description == "running"
-    assert thread.messages[101].edits[-1]["embeds"][0].description == "completed"
-
-
 class BlockingDispatcher:
     def __init__(self) -> None:
         self.entered = asyncio.Event()
@@ -636,3 +654,67 @@ async def test_edit_prunes_obsolete_followup_batches(tmp_path: Path) -> None:
     assert spill_two.deleted is True
     assert old_batches[0] == 0
     assert old_checkpoints[0] == 0
+
+
+@pytest.mark.asyncio
+async def test_checkpoint_only_restart_prunes_obsolete_followup_batches(
+    tmp_path: Path,
+) -> None:
+    bot = CopilotDiscordBot(Settings(data_dir=tmp_path))
+    thread = FakeThread()
+    first = FakeMessage(100)
+    obsolete = FakeMessage(101)
+    thread.messages = {100: first, 101: obsolete}
+    async with Database(tmp_path / "checkpoint-prune.sqlite3") as database:
+        bot.database = database
+        async with database.transaction() as connection:
+            await connection.executemany(
+                """
+                INSERT INTO render_attachment_checkpoints(
+                    session_id, render_message_id, agent_id,
+                    first_discord_message_id, next_batch_index, finalized, updated_at
+                ) VALUES ('session-1', ?, '', '100', ?, 1, 0)
+                """,
+                (("old-delivery", 2), ("new-delivery", 1)),
+            )
+            await connection.executemany(
+                """
+                INSERT INTO render_attachment_batches(
+                    session_id, render_message_id, agent_id, batch_index,
+                    discord_message_id, idempotency_key, attachment_count,
+                    created_at, updated_at
+                ) VALUES ('session-1', ?, '', ?, ?, ?, 0, 0, 0)
+                """,
+                (
+                    ("old-delivery", 0, "100", "old:0"),
+                    ("old-delivery", 1, "101", "old:1"),
+                    ("new-delivery", 0, "100", "new:0"),
+                ),
+            )
+
+        recovered = await bot._deliver_render_plan(
+            thread=thread,
+            session_id="session-1",
+            payload={"finalized": True},
+            plan=DiscordRenderPlan((DiscordRenderBatch("recovered"),)),
+            delivery_id="new-delivery",
+        )
+        old_checkpoint = await database.fetchone(
+            """
+            SELECT 1 FROM render_attachment_checkpoints
+            WHERE render_message_id = 'old-delivery'
+            """
+        )
+        current_checkpoint = await database.fetchone(
+            """
+            SELECT first_discord_message_id
+            FROM render_attachment_checkpoints
+            WHERE render_message_id = 'new-delivery'
+            """
+        )
+
+    assert recovered == "100"
+    assert first.deleted is False
+    assert obsolete.deleted is True
+    assert old_checkpoint is None
+    assert current_checkpoint["first_discord_message_id"] == "100"

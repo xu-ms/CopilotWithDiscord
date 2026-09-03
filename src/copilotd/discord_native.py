@@ -92,7 +92,7 @@ class NativeDiscordRegistrar:
                     )
                     return (
                         f"Fleet started as `{result['fleet_run_id']}`; "
-                        "workers remain in this thread's TaskDeck."
+                        "workers remain associated with this session."
                     )
 
                 await self._host._run_command(interaction, "fleet", operation)

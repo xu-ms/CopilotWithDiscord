@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from pathlib import Path
 
 import pytest
 
@@ -55,6 +56,62 @@ async def test_render_table_is_cacheable_and_handles_unicode_cells() -> None:
         assert plan1.assets[0].content.startswith(b"\x89PNG\r\n\x1a\n")
     else:
         assert plan1.preview_text is not None or plan1.assets[0].media_type == "text/markdown"
+
+
+def test_installed_unicode_fonts_do_not_render_missing_glyph_boxes() -> None:
+    assert not tables._font_supports(tables.ImageFont.load_default(), "中")
+    resolver = tables._FontResolver(scale=2)
+    try:
+        chinese = resolver.font_for("中", code=False)
+    except OSError:
+        pass
+    else:
+        assert tables._font_supports(chinese, "中")
+        assert bytes(chinese.getmask("中")) != bytes(chinese.getmask("文"))
+    try:
+        emoji = resolver.font_for("🙂", code=False)
+    except OSError:
+        pass
+    else:
+        assert tables._font_supports(emoji, "🙂")
+        assert bytes(emoji.getmask("🙂")) != bytes(emoji.getmask("\U0010ffff"))
+    assert resolver.glyph_width("\ufe0f", code=False) == 0
+    assert resolver.glyph_width("\u200d", code=False) == 0
+    assert resolver.text_width("e\u0301", code=False) == resolver.text_width("é", code=False)
+    assert tables._text_clusters("e\u0301👨\u200d👩") == ("é", "👨\u200d👩")
+    assert resolver.text_width("©︎", code=False) == resolver.text_width("©", code=False)
+    if resolver._emoji_font is not None:
+        assert resolver.font_for("©️", code=False) is resolver._emoji_font
+        assert resolver.text_width("©️", code=False) < resolver.text_width("©", code=False) * 2
+
+
+def test_font_resolver_accepts_fixed_strike_emoji_font(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fixed_strike = tmp_path / "NotoColorEmoji.ttf"
+    fixed_strike.write_bytes(b"font fixture")
+    default_font = tables.ImageFont.load_default()
+    monkeypatch.setattr(
+        tables._FontResolver,
+        "_load_font",
+        staticmethod(lambda _candidates, _size: default_font),
+    )
+    monkeypatch.setattr(tables, "_CJK_FONT_CANDIDATES", ())
+    monkeypatch.setattr(tables, "_EMOJI_FONT_CANDIDATES", (fixed_strike,))
+
+    def load_fixed_strike(path: str, *, size: int) -> tables.ImageFont.ImageFont:
+        assert path == str(fixed_strike)
+        if size != 109:
+            raise OSError("invalid pixel size")
+        return default_font
+
+    monkeypatch.setattr(tables.ImageFont, "truetype", load_fixed_strike)
+
+    resolver = tables._FontResolver(scale=2)
+
+    assert resolver._emoji_font is default_font
+    assert resolver._emoji_render_scale == pytest.approx(28 / 109)
 
 
 def test_pagination_contract_and_upload_fallback_do_not_chunk_png_bytes(

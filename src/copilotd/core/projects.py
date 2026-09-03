@@ -293,7 +293,12 @@ _CONFIG_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 class ProjectRegistry:
     """Resolves explicit channel projects before the immutable HOME fallback."""
 
-    def __init__(self, database: Database, *, resolved_home: Path) -> None:
+    def __init__(
+        self,
+        database: Database,
+        *,
+        resolved_home: Path,
+    ) -> None:
         self._database = database
         self._configured_home = resolved_home
         self._resolved_home: Path | None = None
@@ -477,7 +482,10 @@ class ProjectRegistry:
                 (channel_id,),
             )
             if project is not None:
-                snapshot = await _config_snapshot_from_connection(connection, project)
+                snapshot = await _config_snapshot_from_connection(
+                    connection,
+                    project,
+                )
                 await _insert_config_revision(connection, snapshot, now=now)
 
     async def channel_timezone(self, channel_id: str) -> str:
@@ -1342,7 +1350,10 @@ class ProjectRegistry:
             )
             if row is None:
                 raise ProjectConfigError(f"project does not exist: {project.project_id}")
-            return await _config_snapshot_from_connection(connection, row)
+            return await _config_snapshot_from_connection(
+                connection,
+                row,
+            )
 
     async def config_snapshot_by_id(self, project_id: str) -> ProjectConfigSnapshot:
         async with self._database.transaction() as connection:
@@ -1353,7 +1364,10 @@ class ProjectRegistry:
             )
             if row is None:
                 raise ProjectConfigError(f"project does not exist: {project_id}")
-            return await _config_snapshot_from_connection(connection, row)
+            return await _config_snapshot_from_connection(
+                connection,
+                row,
+            )
 
     async def project_by_id(self, project_id: str) -> ProjectSnapshot:
         row = await self._database.fetchone(
@@ -1454,7 +1468,10 @@ class ProjectRegistry:
                 (project_id,),
             )
             assert created is not None
-            config = await _config_snapshot_from_connection(connection, created)
+            config = await _config_snapshot_from_connection(
+                connection,
+                created,
+            )
             await _insert_config_revision(connection, config, now=timestamp)
         return await self.project_by_id(project_id)
 
@@ -1630,7 +1647,11 @@ class ProjectRegistry:
                 (project_id, name),
             )
 
-        return await self._mutate_config(project_id, mutate)
+        return await self._mutate_config(
+            project_id,
+            mutate,
+            expected_version=expected_version,
+        )
 
     async def remove_mcp_server(
         self,
@@ -1654,6 +1675,7 @@ class ProjectRegistry:
             table="mcp_servers",
             key_column="name",
             key=name,
+            expected_version=expected_version,
         )
 
     async def add_directory(
@@ -1779,7 +1801,11 @@ class ProjectRegistry:
                 enabled=enabled,
             )
 
-        return await self._mutate_config(project_id, mutate)
+        return await self._mutate_config(
+            project_id,
+            mutate,
+            expected_version=expected_version,
+        )
 
     async def remove_custom_agent(
         self,
@@ -1803,6 +1829,7 @@ class ProjectRegistry:
             table="custom_agents",
             key_column="name",
             key=name,
+            expected_version=expected_version,
         )
 
     async def _remove_named_config(
@@ -1812,6 +1839,7 @@ class ProjectRegistry:
         table: str,
         key_column: str,
         key: str,
+        expected_version: int | None = None,
     ) -> int:
         if table not in {"mcp_servers", "skill_dirs", "plugin_dirs", "custom_agents"}:
             raise ValueError(f"unsupported project config table: {table}")
@@ -1828,13 +1856,18 @@ class ProjectRegistry:
             if deleted != 1:
                 raise ProjectConfigError(f"project config entry does not exist: {key}")
 
-        return await self._mutate_config(project_id, mutate)
+        return await self._mutate_config(
+            project_id,
+            mutate,
+            expected_version=expected_version,
+        )
 
     async def _mutate_config(
         self,
         project_id: str,
         mutation: ConfigMutation,
         *,
+        expected_version: int | None = None,
         now: float | None = None,
     ) -> int:
         timestamp = time.time() if now is None else now
@@ -1849,22 +1882,35 @@ class ProjectRegistry:
             )
             if project is None:
                 raise ProjectConfigError("project configuration requires an explicit project")
+            current_version = int(project["config_version"])
+            if expected_version is not None and expected_version != current_version:
+                raise ProjectConflictError(
+                    "project config version changed: "
+                    f"expected {expected_version}, found {current_version}"
+                )
             await mutation(connection)
-            await connection.execute(
+            update = await connection.execute(
                 """
                 UPDATE projects
                 SET config_version = config_version + 1, updated_at = ?
-                WHERE id = ?
+                WHERE id = ? AND config_version = ?
                 """,
-                (timestamp, project_id),
+                (timestamp, project_id, current_version),
             )
+            if update.rowcount != 1:
+                await update.close()
+                raise ProjectConflictError("project config changed concurrently")
+            await update.close()
             updated = await _fetchone(
                 connection,
                 "SELECT * FROM projects WHERE id = ?",
                 (project_id,),
             )
             assert updated is not None
-            snapshot = await _config_snapshot_from_connection(connection, updated)
+            snapshot = await _config_snapshot_from_connection(
+                connection,
+                updated,
+            )
             await _insert_config_revision(connection, snapshot, now=timestamp)
             return snapshot.config_version
 

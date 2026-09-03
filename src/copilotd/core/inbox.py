@@ -10,6 +10,7 @@ from typing import Any
 from copilot.session_events import SessionEvent
 
 from copilotd.core.models import InboxEnvelope, OverflowIncident
+from copilotd.core.volatile_content import CommittedCancellation
 
 
 class ReducerInbox:
@@ -169,7 +170,7 @@ class ReducerInbox:
         )
         if not self._schedule(envelope):
             raise RuntimeError("failed to schedule reducer receipt")
-        await commit_ack
+        await _await_commit_ack(commit_ack)
 
     async def commit_recovered_sdk(self, event: SessionEvent) -> None:
         reservation = self._reserve(source="sdk", record_overflow=False)
@@ -195,7 +196,7 @@ class ReducerInbox:
         )
         if not self._schedule(envelope):
             raise RuntimeError("failed to schedule recovered SDK event")
-        await commit_ack
+        await _await_commit_ack(commit_ack)
 
     async def get(self) -> InboxEnvelope:
         return await self._queue.get()
@@ -375,6 +376,25 @@ class ReducerInbox:
             lost_count=self._overflow.lost_count + 1,
             observed_at=self._overflow.observed_at,
         )
+
+
+async def _await_commit_ack(commit_ack: asyncio.Future[None]) -> None:
+    try:
+        await asyncio.shield(commit_ack)
+    except asyncio.CancelledError as cancellation:
+        while not commit_ack.done():
+            try:
+                await asyncio.shield(commit_ack)
+            except asyncio.CancelledError:
+                continue
+        if commit_ack.cancelled():
+            raise
+        error = commit_ack.exception()
+        if error is not None:
+            raise error from cancellation
+        raise CommittedCancellation(
+            "reducer commit completed after caller cancellation"
+        ) from cancellation
 
 
 class SdkEventIngress:

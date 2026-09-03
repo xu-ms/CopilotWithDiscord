@@ -1,6 +1,5 @@
 """Durable Discord rendering primitives."""
 
-from copilotd.render.diffs import DiffRenderPlan, render_diff
 from copilotd.render.markdown import (
     MarkdownAssembler,
     MarkdownAstNode,
@@ -37,7 +36,6 @@ from copilotd.render.tables import (
 )
 
 __all__ = [
-    "DiffRenderPlan",
     "MarkdownAssembler",
     "MarkdownAstNode",
     "MarkdownAttachmentPlan",
@@ -65,7 +63,6 @@ __all__ = [
     "parse_markdown_blocks",
     "parse_table",
     "plan_markdown_messages",
-    "render_diff",
     "render_table",
     "render_table_sync",
     "split_table_row",

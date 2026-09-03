@@ -1,5 +1,7 @@
 import asyncio
+import hashlib
 import json
+import sqlite3
 import time
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
@@ -53,20 +55,30 @@ from copilotd.core.extensions import (
     McpStdioServer,
     ProjectExtensionConfig,
 )
+from copilotd.core.inbox import ReducerInbox
+from copilotd.core.interactions import InteractionGateway, InteractionScope
 from copilotd.core.mailbox import OperationAmbiguous, OperationRejected
 from copilotd.core.projects import ProjectRegistry
+from copilotd.core.recovery import StartupRecoveryInventory
+from copilotd.core.reducer import EventReducerWorker, JournalReducer
 from copilotd.core.session_runtime import (
     COMPACT_OPERATION_TIMEOUT_SECONDS,
     ClosedSessionRequiresReactivation,
     DetachBlocked,
     RuntimeState,
     SessionAttachUnknown,
+    SessionLeaseRenewalFailed,
     SessionNotReady,
     SessionOwnerConflict,
     SessionRuntime,
     SubmissionClaimDeferred,
 )
 from copilotd.core.sessions import SessionRegistry
+from copilotd.core.volatile_content import (
+    VolatileContentCapacityError,
+    VolatileContentStore,
+    opaque_content_key,
+)
 from copilotd.sdk.bridge import EventLogBatch, PermissionPostureError
 from copilotd.sdk.capabilities import CapabilityRegistry
 from copilotd.sdk.native import NativeCommandDefinition
@@ -367,45 +379,6 @@ class FakeSummaryAdapter:
         return {"reasoningSummary": "concise"}
 
 
-class FakeTaskActionAdapter:
-    def __init__(self) -> None:
-        self.calls: list[tuple[str, str, str | None]] = []
-
-    async def list_tasks(self, *, session_id: str) -> list[dict[str, Any]]:
-        del session_id
-        return []
-
-    async def show_task(self, *, session_id: str, task_id: str) -> dict[str, Any]:
-        del session_id
-        return {"id": task_id}
-
-    async def cancel_task(self, *, session_id: str, task_id: str) -> dict[str, Any]:
-        del session_id
-        self.calls.append(("cancel", task_id, None))
-        return {"cancelled": task_id}
-
-    async def promote_task(self, *, session_id: str, task_id: str) -> dict[str, Any]:
-        del session_id
-        self.calls.append(("promote", task_id, None))
-        return {"promoted": task_id}
-
-    async def message_task(
-        self,
-        *,
-        session_id: str,
-        task_id: str,
-        message: str,
-    ) -> dict[str, Any]:
-        del session_id
-        self.calls.append(("message", task_id, message))
-        return {"messaged": task_id}
-
-    async def remove_task(self, *, session_id: str, task_id: str) -> dict[str, Any]:
-        del session_id
-        self.calls.append(("remove", task_id, None))
-        return {"removed": task_id}
-
-
 def _event(
     data: Any,
     event_type: SessionEventType,
@@ -533,6 +506,8 @@ async def test_runtime_preregisters_ingress_stays_alive_after_idle_and_closes_cl
         message_id = await runtime.send(
             "hello",
             idempotency_key="discord-message-1",
+            discord_message_id="discord-source-1",
+            discord_channel_id="discord-channel-1",
             agent_mode="interactive",
             attachment_manifest_id=manifest_id,
         )
@@ -554,6 +529,9 @@ async def test_runtime_preregisters_ingress_stays_alive_after_idle_and_closes_cl
             FROM submissions
             """
         )
+        queued = await database.fetchone(
+            "SELECT discord_message_id, discord_channel_id FROM message_queue"
+        )
         lease = await database.fetchone(
             "SELECT state FROM liveness_leases WHERE kind = 'submission'"
         )
@@ -569,6 +547,8 @@ async def test_runtime_preregisters_ingress_stays_alive_after_idle_and_closes_cl
             "correlation_basis": "single_candidate_facts",
             "attachment_manifest_id": manifest_id,
         }
+        assert queued["discord_message_id"] == "discord-source-1"
+        assert queued["discord_channel_id"] == "discord-channel-1"
         assert lease["state"] == "released"
         assert early_event["raw_type"] == "assistant.message_delta"
 
@@ -632,6 +612,192 @@ async def test_immediate_delivery_steers_active_turn_while_queue_waits_for_quiet
     assert message_id == bridge.handle.message_id
     assert [item[0] for item in bridge.handle.sent] == ["steer active turn"]
     assert queued["state"] == "local_queued"
+
+
+@pytest.mark.asyncio
+async def test_conflicting_idempotent_retry_cannot_replace_admitted_prompt(
+    tmp_path: Path,
+) -> None:
+    session_id = str(uuid4())
+    async with Database(tmp_path / "send-idempotency.sqlite3") as database:
+        bindings = SessionBindingRepository(database)
+        binding = await bindings.create(
+            thread_id="thread-idempotency",
+            sdk_session_id=session_id,
+            cwd_snapshot=tmp_path,
+            project_source="implicit-home",
+        )
+        bridge = FakeBridge(session_id)
+        bridge.processing = True
+        runtime = SessionRuntime(
+            database=database,
+            bridge=bridge,
+            bindings=bindings,
+            owner_leases=OwnerLeaseStore(database),
+            owner_id="process-idempotency",
+            binding=binding,
+            queue_poll_seconds=3_600,
+        )
+        await runtime.attach_create()
+
+        submission_id = await runtime.send("prompt A", idempotency_key="immutable")
+        with pytest.raises(
+            ValueError,
+            match="different immutable submission",
+        ):
+            await runtime.send("prompt B", idempotency_key="immutable")
+        prompt_key = opaque_content_key(
+            "submission-prompt",
+            session_id,
+            submission_id,
+        )
+        assert database.content_store.require(prompt_key) == "prompt A"
+
+        bridge.processing = False
+        dispatched = await runtime.dispatch_queued_once()
+        assert database.content_store.get(prompt_key) is None
+        await runtime.shutdown()
+
+    assert dispatched is not None and dispatched[0] == submission_id
+    assert [prompt for prompt, _kwargs in bridge.handle.sent] == ["prompt A"]
+
+
+@pytest.mark.asyncio
+async def test_failed_submission_admission_removes_new_volatile_prompt(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    session_id = str(uuid4())
+    async with Database(tmp_path / "send-admission-failure.sqlite3") as database:
+        bindings = SessionBindingRepository(database)
+        binding = await bindings.create(
+            thread_id="thread-admission-failure",
+            sdk_session_id=session_id,
+            cwd_snapshot=tmp_path,
+            project_source="implicit-home",
+        )
+        runtime = SessionRuntime(
+            database=database,
+            bridge=FakeBridge(session_id),
+            bindings=bindings,
+            owner_leases=OwnerLeaseStore(database),
+            owner_id="process-admission-failure",
+            binding=binding,
+            queue_poll_seconds=3_600,
+        )
+        await runtime.attach_create()
+        inbox = runtime.inbox
+        assert inbox is not None
+        original_commit = inbox.commit_internal
+
+        async def fail_queued(
+            payload: dict[str, Any],
+            *,
+            internal_event_id: str,
+        ) -> None:
+            if payload.get("type") == "copilotd.submission.queued":
+                raise RuntimeError("admission failed")
+            await original_commit(
+                payload,
+                internal_event_id=internal_event_id,
+            )
+
+        monkeypatch.setattr(inbox, "commit_internal", fail_queued)
+        with pytest.raises(RuntimeError, match="admission failed"):
+            await runtime.send("do not retain", idempotency_key="failed-admission")
+
+        submission_id = str(
+            uuid5(
+                NAMESPACE_URL,
+                f"copilotd:{session_id}:submission:failed-admission",
+            )
+        )
+        assert (
+            database.content_store.get(
+                opaque_content_key("submission-prompt", session_id, submission_id)
+            )
+            is None
+        )
+        assert (
+            await database.fetchone(
+                "SELECT 1 FROM message_queue WHERE id = ?",
+                (submission_id,),
+            )
+            is None
+        )
+        await runtime.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_cancelled_submission_admission_keeps_committed_prompt_dispatchable(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    session_id = str(uuid4())
+    async with Database(tmp_path / "send-admission-cancel.sqlite3") as database:
+        bindings = SessionBindingRepository(database)
+        binding = await bindings.create(
+            thread_id="thread-admission-cancel",
+            sdk_session_id=session_id,
+            cwd_snapshot=tmp_path,
+            project_source="implicit-home",
+        )
+        bridge = FakeBridge(session_id)
+        bridge.processing = True
+        runtime = SessionRuntime(
+            database=database,
+            bridge=bridge,
+            bindings=bindings,
+            owner_leases=OwnerLeaseStore(database),
+            owner_id="process-admission-cancel",
+            binding=binding,
+            queue_poll_seconds=3_600,
+        )
+        await runtime.attach_create()
+        assert runtime._reducer is not None
+        reducer = runtime._reducer._reducer
+        original_persist = reducer.persist
+        admission_started = asyncio.Event()
+        allow_commit = asyncio.Event()
+
+        async def delayed_persist(events: list[Any]) -> int:
+            if any(event.raw_type == "copilotd.submission.queued" for event in events):
+                admission_started.set()
+                await allow_commit.wait()
+            return await original_persist(events)
+
+        monkeypatch.setattr(reducer, "persist", delayed_persist)
+        send = asyncio.create_task(
+            runtime.send("survives cancellation", idempotency_key="cancelled-admission")
+        )
+        await admission_started.wait()
+        send.cancel()
+        await asyncio.sleep(0)
+        assert not send.done()
+        allow_commit.set()
+        with pytest.raises(asyncio.CancelledError):
+            await send
+
+        submission_id = str(
+            uuid5(
+                NAMESPACE_URL,
+                f"copilotd:{session_id}:submission:cancelled-admission",
+            )
+        )
+        prompt_key = opaque_content_key("submission-prompt", session_id, submission_id)
+        queued = await database.fetchone(
+            "SELECT state FROM message_queue WHERE id = ?",
+            (submission_id,),
+        )
+        assert queued is not None and queued["state"] == "local_queued"
+        assert database.content_store.require(prompt_key) == "survives cancellation"
+
+        bridge.processing = False
+        dispatched = await runtime.dispatch_queued_once()
+        assert dispatched is not None and dispatched[0] == submission_id
+        assert bridge.handle.sent[-1][0] == "survives cancellation"
+        assert database.content_store.get(prompt_key) is None
+        await runtime.shutdown()
 
 
 @pytest.mark.asyncio
@@ -1527,6 +1693,125 @@ async def test_direct_attachments_cannot_bypass_complete_frame_limit(
         await runtime.shutdown()
 
 
+def _interaction_gateway(
+    database: Database,
+    store: VolatileContentStore,
+) -> tuple[InteractionGateway, EventReducerWorker]:
+    database.content_store = store
+    inbox = ReducerInbox(
+        sdk_session_id="interaction-atomic",
+        generation=1,
+        fence_token=7,
+        capacity=16,
+        thread_id="thread-interaction-atomic",
+    )
+    worker = EventReducerWorker(
+        inbox=inbox,
+        reducer=JournalReducer(database, content_store=store),
+        batch_size=4,
+    )
+    worker.start()
+    gateway = InteractionGateway(
+        database=database,
+        inbox=inbox,
+        scope=InteractionScope(
+            sdk_session_id="interaction-atomic",
+            runtime_generation=1,
+            owner_fence_token=7,
+            thread_id="thread-interaction-atomic",
+        ),
+        timeout_seconds=30,
+        content_store=store,
+    )
+    return gateway, worker
+
+
+@pytest.mark.asyncio
+async def test_interaction_response_capacity_failure_leaves_durable_request_pending(
+    tmp_path: Path,
+) -> None:
+    async with Database(tmp_path / "interaction-capacity.sqlite3") as database:
+        store = VolatileContentStore(max_items=2, max_bytes=1024 * 1024)
+        gateway, worker = _interaction_gateway(database, store)
+        request = asyncio.create_task(
+            gateway.request(
+                "user_input",
+                {"question": "Choose", "choices": ["yes"], "allowFreeform": False},
+            )
+        )
+        interaction_id = await _wait_for_pending_interaction(database, kind="user_input")
+
+        with pytest.raises(VolatileContentCapacityError):
+            await gateway.respond(interaction_id, selection=0)
+        row = await database.fetchone(
+            "SELECT state, response_hash FROM pending_interactions WHERE interaction_id = ?",
+            (interaction_id,),
+        )
+        assert dict(row) == {"state": "pending", "response_hash": None}
+
+        store.clear()
+        request.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await request
+        await worker.stop()
+
+
+@pytest.mark.asyncio
+async def test_interaction_commit_failure_rolls_back_published_response(
+    tmp_path: Path,
+) -> None:
+    async with Database(tmp_path / "interaction-rollback.sqlite3") as database:
+        store = VolatileContentStore(max_items=8, max_bytes=1024 * 1024)
+        gateway, worker = _interaction_gateway(database, store)
+        request = asyncio.create_task(
+            gateway.request(
+                "user_input",
+                {"question": "Choose", "choices": ["yes"], "allowFreeform": False},
+            )
+        )
+        interaction_id = await _wait_for_pending_interaction(database, kind="user_input")
+        response_key = opaque_content_key(
+            "interaction-response",
+            "interaction-atomic",
+            interaction_id,
+        )
+        await database.execute(
+            """
+            CREATE TRIGGER fail_interaction_resolution
+            BEFORE UPDATE OF state ON pending_interactions
+            WHEN NEW.state = 'resolved'
+            BEGIN
+                SELECT RAISE(ABORT, 'forced interaction rollback');
+            END
+            """
+        )
+
+        with pytest.raises(sqlite3.IntegrityError, match="forced interaction rollback"):
+            await gateway.respond(interaction_id, selection=0)
+        row = await database.fetchone(
+            "SELECT state, response_hash FROM pending_interactions WHERE interaction_id = ?",
+            (interaction_id,),
+        )
+        assert dict(row) == {"state": "pending", "response_hash": None}
+        assert store.get(response_key) is None
+
+        await database.execute("DROP TRIGGER fail_interaction_resolution")
+        assert await gateway.respond(interaction_id, selection=0) == "resolved"
+        assert await request == {"answer": "yes", "wasFreeform": False}
+        assert store.get(response_key) is None
+        assert (
+            store.get(
+                opaque_content_key(
+                    "interaction-request",
+                    "interaction-atomic",
+                    interaction_id,
+                )
+            )
+            is None
+        )
+        await worker.stop()
+
+
 @pytest.mark.asyncio
 async def test_runtime_routes_user_input_through_durable_interaction(
     tmp_path: Path,
@@ -1581,7 +1866,10 @@ async def test_runtime_routes_user_input_through_durable_interaction(
         assert await runtime.respond_interaction(interaction_id, selection=0) == "expired"
 
         settled = await database.fetchone(
-            "SELECT state, response FROM pending_interactions WHERE interaction_id = ?",
+            """
+            SELECT state, response, response_hash
+            FROM pending_interactions WHERE interaction_id = ?
+            """,
             (interaction_id,),
         )
         lease = await database.fetchone(
@@ -1596,7 +1884,8 @@ async def test_runtime_routes_user_input_through_durable_interaction(
             (f"interaction:{interaction_id}",),
         )
         assert settled is not None and settled["state"] == "resolved"
-        assert '"answer": "second"' in str(settled["response"])
+        assert settled["response"] is None
+        assert len(str(settled["response_hash"])) == 64
         assert lease is not None and lease["state"] == "released"
         assert [row["lane"] for row in render_rows] == ["interaction", "interaction"]
         assert all(row["coalesce_key"] == f"interaction:{interaction_id}" for row in render_rows)
@@ -1804,11 +2093,15 @@ async def test_interaction_timeout_returns_response_that_already_won_durable_cla
         allow_render_event.set()
         assert await response_task == "resolved"
         settled = await database.fetchone(
-            "SELECT state, response FROM pending_interactions WHERE interaction_id = ?",
+            """
+            SELECT state, response, response_hash
+            FROM pending_interactions WHERE interaction_id = ?
+            """,
             (str(pending["interaction_id"]),),
         )
         assert settled is not None and settled["state"] == "resolved"
-        assert '"answer": "winner"' in str(settled["response"])
+        assert settled["response"] is None
+        assert len(str(settled["response_hash"])) == 64
         await runtime.close(idempotency_key="close-interaction-race")
 
 
@@ -1875,16 +2168,11 @@ async def test_background_task_snapshot_marks_disappearance_unknown_then_termina
             if observation is not None and observation["observed_state"] == "unknown":
                 break
             await asyncio.sleep(0.01)
-        card = await database.fetchone(
-            "SELECT state FROM task_card_projections WHERE task_id = ?",
-            (task_id,),
-        )
         lease = await database.fetchone(
             "SELECT state FROM liveness_leases WHERE source_id = ?",
             (f"task:{task_id}",),
         )
         assert observation is not None and observation["observed_state"] == "unknown"
-        assert card is not None and card["state"] == "unknown"
         assert lease is not None and lease["state"] == "active"
 
         bridge.tasks = [
@@ -1913,10 +2201,6 @@ async def test_background_task_snapshot_marks_disappearance_unknown_then_termina
             if observation is not None and observation["terminal_evidence"]:
                 break
             await asyncio.sleep(0.01)
-        card = await database.fetchone(
-            "SELECT state FROM task_card_projections WHERE task_id = ?",
-            (task_id,),
-        )
         lease = await database.fetchone(
             "SELECT state FROM liveness_leases WHERE source_id = ?",
             (f"task:{task_id}",),
@@ -1926,7 +2210,6 @@ async def test_background_task_snapshot_marks_disappearance_unknown_then_termina
             "observed_state": "completed",
             "terminal_evidence": "task_snapshot",
         }
-        assert card is not None and card["state"] == "completed"
         assert lease is not None and lease["state"] == "released"
 
         shell_task_id = "shell-1"
@@ -2051,7 +2334,8 @@ async def test_pending_messages_modified_triggers_durable_queue_snapshot(
             )
             queue_item = await database.fetchone(
                 """
-                SELECT state FROM native_queue_items
+                SELECT state, display_text, display_text_hash
+                FROM native_queue_items
                 WHERE sdk_session_id = ? AND item_id = 'native-item-1'
                 """,
                 (session_id,),
@@ -2066,7 +2350,11 @@ async def test_pending_messages_modified_triggers_durable_queue_snapshot(
 
         assert bridge.readiness_snapshot_calls > initial_calls
         assert snapshot["applied_epoch"] == snapshot["requested_epoch"]
-        assert queue_item["state"] == "present"
+        assert dict(queue_item) == {
+            "state": "present",
+            "display_text": None,
+            "display_text_hash": hashlib.sha256(b"queued remotely").hexdigest(),
+        }
         await runtime.shutdown()
 
 
@@ -2493,6 +2781,198 @@ async def test_resume_ignores_shutdown_superseded_by_resume_event(
 
 
 @pytest.mark.asyncio
+async def test_shutdown_then_resume_keeps_same_generation_attached(
+    tmp_path: Path,
+) -> None:
+    session_id = str(uuid4())
+    shutdown = _shutdown_event()
+    resumed_at = datetime.now(UTC)
+    resume = SessionEvent(
+        data=SessionResumeData(event_count=1, resume_time=resumed_at),
+        id=uuid4(),
+        parent_id=shutdown.id,
+        timestamp=resumed_at,
+        type=SessionEventType.SESSION_RESUME,
+    )
+    async with Database(tmp_path / "sdk-shutdown-natural-order.sqlite3") as database:
+        bindings = SessionBindingRepository(database)
+        binding = await bindings.create(
+            thread_id="thread-sdk-shutdown-natural-order",
+            sdk_session_id=session_id,
+            cwd_snapshot=tmp_path,
+            project_source="implicit-home",
+        )
+        bridge = FakeBridge(session_id)
+        bridge.resume_events = [shutdown, resume]
+        runtime = SessionRuntime(
+            database=database,
+            bridge=bridge,
+            bindings=bindings,
+            owner_leases=OwnerLeaseStore(database),
+            owner_id="sdk-shutdown-natural-order-owner",
+            binding=binding,
+        )
+
+        await runtime.attach_resume()
+        await runtime.inbox.join()
+        await asyncio.sleep(0)
+        current = await bindings.by_thread(binding.thread_id)
+
+        assert current is not None
+        assert current.attachment_state == AttachmentState.ATTACHED
+        assert current.runtime_generation == runtime.binding.runtime_generation
+        assert runtime.state == RuntimeState.READY
+        assert runtime.handle is bridge.handle
+        assert runtime._shutdown_finalize_task is not None
+        await runtime._shutdown_finalize_task
+        assert runtime.state == RuntimeState.READY
+        assert runtime.handle is bridge.handle
+        await runtime.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_shutdown_resume_shutdown_settles_the_newer_shutdown(
+    tmp_path: Path,
+) -> None:
+    session_id = str(uuid4())
+    shutdown_a = _shutdown_event()
+    resumed_at = datetime.now(UTC)
+    resume_a = SessionEvent(
+        data=SessionResumeData(event_count=1, resume_time=resumed_at),
+        id=uuid4(),
+        parent_id=shutdown_a.id,
+        timestamp=resumed_at,
+        type=SessionEventType.SESSION_RESUME,
+    )
+    shutdown_b = _shutdown_event()
+    async with Database(tmp_path / "sdk-two-shutdowns.sqlite3") as database:
+        bindings = SessionBindingRepository(database)
+        binding = await bindings.create(
+            thread_id="thread-sdk-two-shutdowns",
+            sdk_session_id=session_id,
+            cwd_snapshot=tmp_path,
+            project_source="implicit-home",
+        )
+        bridge = FakeBridge(session_id)
+        runtime = SessionRuntime(
+            database=database,
+            bridge=bridge,
+            bindings=bindings,
+            owner_leases=OwnerLeaseStore(database),
+            owner_id="sdk-two-shutdowns-owner",
+            binding=binding,
+            shutdown_settle_seconds=0.01,
+        )
+        await runtime.attach_create()
+
+        bridge.ingress(shutdown_a)
+        await asyncio.sleep(0)
+        first_finalizer = runtime._shutdown_finalize_task
+        assert first_finalizer is not None
+        bridge.ingress(resume_a)
+        bridge.ingress(shutdown_b)
+        await first_finalizer
+
+        current = await bindings.by_thread(binding.thread_id)
+        shutdown_b_journal = await database.fetchone(
+            "SELECT journal_id FROM event_journal WHERE event_id = ?",
+            (str(shutdown_b.id),),
+        )
+
+    assert shutdown_b_journal is not None
+    assert current is not None
+    assert current.attachment_state == AttachmentState.RECOVERY_UNKNOWN
+    assert runtime.state == RuntimeState.RECOVERY_UNKNOWN
+    assert runtime.handle is None
+    assert runtime._pending_shutdown_event_id is None
+
+
+@pytest.mark.asyncio
+async def test_stale_resume_signal_cannot_wake_newer_shutdown_waiter(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    session_id = str(uuid4())
+    shutdown_a = _shutdown_event()
+    shutdown_b = _shutdown_event()
+    resumed_at = datetime.now(UTC)
+    resume_a = SessionEvent(
+        data=SessionResumeData(event_count=1, resume_time=resumed_at),
+        id=uuid4(),
+        parent_id=shutdown_a.id,
+        timestamp=resumed_at,
+        type=SessionEventType.SESSION_RESUME,
+    )
+    resume_b = SessionEvent(
+        data=SessionResumeData(event_count=1, resume_time=resumed_at),
+        id=uuid4(),
+        parent_id=shutdown_b.id,
+        timestamp=resumed_at,
+        type=SessionEventType.SESSION_RESUME,
+    )
+    async with Database(tmp_path / "sdk-shutdown-signal-race.sqlite3") as database:
+        bindings = SessionBindingRepository(database)
+        binding = await bindings.create(
+            thread_id="thread-sdk-shutdown-signal-race",
+            sdk_session_id=session_id,
+            cwd_snapshot=tmp_path,
+            project_source="implicit-home",
+        )
+        bridge = FakeBridge(session_id)
+        runtime = SessionRuntime(
+            database=database,
+            bridge=bridge,
+            bindings=bindings,
+            owner_leases=OwnerLeaseStore(database),
+            owner_id="sdk-shutdown-signal-race-owner",
+            binding=binding,
+            shutdown_settle_seconds=0.05,
+        )
+        await runtime.attach_create()
+        loop = asyncio.get_running_loop()
+        original_call_soon_threadsafe = loop.call_soon_threadsafe
+        delayed_signals: list[tuple[Any, tuple[Any, ...]]] = []
+
+        def delay_resume_a_signal(callback: Any, *args: Any) -> Any:
+            if callback == runtime._signal_shutdown_superseded and args == (str(shutdown_a.id),):
+                delayed_signals.append((callback, args))
+                return None
+            return original_call_soon_threadsafe(callback, *args)
+
+        monkeypatch.setattr(loop, "call_soon_threadsafe", delay_resume_a_signal)
+        bridge.ingress(shutdown_a)
+        await asyncio.sleep(0)
+        first_finalizer = runtime._shutdown_finalize_task
+        assert first_finalizer is not None
+        bridge.ingress(resume_a)
+        bridge.ingress(shutdown_b)
+        assert len(delayed_signals) == 1
+        callback, args = delayed_signals.pop()
+        original_call_soon_threadsafe(callback, *args)
+        await asyncio.sleep(0.01)
+        bridge.ingress(resume_b)
+        await runtime.inbox.join()
+
+        for _ in range(100):
+            finalizer = runtime._shutdown_finalize_task
+            if (
+                runtime._pending_shutdown_event_id is None
+                and finalizer is not None
+                and finalizer.done()
+            ):
+                break
+            await asyncio.sleep(0.005)
+        current = await bindings.by_thread(binding.thread_id)
+
+        assert current is not None
+        assert current.attachment_state == AttachmentState.ATTACHED
+        assert runtime.state == RuntimeState.READY
+        assert runtime.handle is bridge.handle
+        assert runtime._pending_shutdown_event_id is None
+        await runtime.shutdown()
+
+
+@pytest.mark.asyncio
 async def test_sdk_shutdown_during_explicit_close_finishes_closed(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -2525,6 +3005,7 @@ async def test_sdk_shutdown_during_explicit_close_finishes_closed(
         monkeypatch.setattr(bridge.handle, "disconnect", disconnect_with_shutdown)
 
         await runtime.close(idempotency_key="explicit-close-with-shutdown")
+        await asyncio.sleep(0.3)
         current = await bindings.by_thread(binding.thread_id)
 
         assert current is not None
@@ -2745,7 +3226,7 @@ async def test_forced_close_cancels_submission_before_atomic_dispatch_claim(
             """
         )
         assert teardown is not None
-        assert "native_queue" in json.loads(teardown["raw_payload"])["data"]["unknown"]
+        assert json.loads(teardown["raw_payload"])["payload_state"] == "discarded"
 
 
 @pytest.mark.asyncio
@@ -3089,7 +3570,9 @@ async def test_resume_backfills_durable_event_log_rebases_expired_cursor_and_rec
 
 
 @pytest.mark.asyncio
-async def test_resume_event_log_has_no_total_history_page_limit(tmp_path: Path) -> None:
+async def test_resume_event_log_continues_bounded_chunks_until_caught_up(
+    tmp_path: Path,
+) -> None:
     session_id = str(uuid4())
     async with Database(tmp_path / "unbounded-event-backfill.sqlite3") as database:
         bindings = SessionBindingRepository(database)
@@ -3100,7 +3583,7 @@ async def test_resume_event_log_has_no_total_history_page_limit(tmp_path: Path) 
             project_source="implicit-home",
         )
         bridge = FakeBridge(session_id)
-        bridge.event_log_pages_remaining = 1001
+        bridge.event_log_pages_remaining = 41
         runtime = SessionRuntime(
             database=database,
             bridge=bridge,
@@ -3114,9 +3597,142 @@ async def test_resume_event_log_has_no_total_history_page_limit(tmp_path: Path) 
         )
 
         await runtime.attach_resume()
+        cursor = await database.fetchone(
+            """
+            SELECT event_cursor, cursor_status
+            FROM session_bindings WHERE sdk_session_id = ?
+            """,
+            (session_id,),
+        )
+        incidents = await database.fetchall(
+            """
+            SELECT kind, detail FROM runtime_incidents
+            WHERE session_id = ? AND kind = 'event_replay_chunk_continued'
+            ORDER BY id
+            """,
+            (session_id,),
+        )
+        assert runtime.state == RuntimeState.READY
         await runtime.shutdown()
 
-    assert bridge.event_log_reads == 1002
+    assert bridge.event_log_reads == 42
+    assert cursor["event_cursor"] == "cursor-42"
+    assert cursor["cursor_status"] == "ok"
+    assert len(incidents) == 2
+    assert all(row["kind"] == "event_replay_chunk_continued" for row in incidents)
+    assert all('"has_more":true' in row["detail"] for row in incidents)
+
+
+@pytest.mark.asyncio
+async def test_event_replay_timeout_fails_attach_recoverably(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    session_id = str(uuid4())
+    async with Database(tmp_path / "event-replay-timeout.sqlite3") as database:
+        bindings = SessionBindingRepository(database)
+        binding = await bindings.create(
+            thread_id="thread-event-replay-timeout",
+            sdk_session_id=session_id,
+            cwd_snapshot=tmp_path,
+            project_source="implicit-home",
+        )
+        bridge = FakeBridge(session_id)
+        read_event_log = bridge.read_event_log
+
+        async def delayed_read_event_log(*args: Any, **kwargs: Any) -> EventLogBatch:
+            await asyncio.sleep(0.05)
+            return await read_event_log(*args, **kwargs)
+
+        monkeypatch.setattr(bridge, "read_event_log", delayed_read_event_log)
+        runtime = SessionRuntime(
+            database=database,
+            bridge=bridge,
+            bindings=bindings,
+            owner_leases=OwnerLeaseStore(database),
+            owner_id="process-event-replay-timeout",
+            binding=binding,
+            sdk_operation_timeout_seconds=0.01,
+            capabilities=CapabilityRegistry(
+                Settings(_env_file=None, data_dir=tmp_path)
+            ).load_checked(),
+        )
+
+        with pytest.raises(SessionAttachUnknown, match="event-log recovery failed"):
+            await runtime.attach_resume()
+
+        recovered = await bindings.by_thread(binding.thread_id)
+        incident = await database.fetchone(
+            """
+            SELECT detail FROM runtime_incidents
+            WHERE session_id = ? AND kind = 'event_replay_timeout'
+            """,
+            (session_id,),
+        )
+
+    assert recovered is not None
+    assert recovered.attachment_state == AttachmentState.RECOVERY_UNKNOWN
+    assert runtime.state == RuntimeState.RECOVERY_UNKNOWN
+    assert incident is not None
+    assert '"has_more":true' in incident["detail"]
+
+
+@pytest.mark.asyncio
+async def test_completed_event_replay_settles_checkpoint_restart_intent(
+    tmp_path: Path,
+) -> None:
+    session_id = str(uuid4())
+    async with Database(tmp_path / "checkpoint-replay-settlement.sqlite3") as database:
+        bindings = SessionBindingRepository(database)
+        binding = await bindings.create(
+            thread_id="thread-checkpoint-replay",
+            sdk_session_id=session_id,
+            cwd_snapshot=tmp_path,
+            project_source="implicit-home",
+        )
+        await database.execute(
+            """
+            INSERT INTO service_restart_intents(
+                intent_id, restart_id, kind, sdk_session_id, target_id,
+                state, outcome, detail, created_at, updated_at
+            ) VALUES (
+                'intent-checkpoint-replay', 'restart-checkpoint-replay',
+                'checkpoint_replay', ?, ?, 'requested', 'replay_required',
+                '{}', 1, 1
+            )
+            """,
+            (session_id, session_id),
+        )
+        await StartupRecoveryInventory(database).run()
+        claimed = await database.fetchone(
+            """
+            SELECT state, outcome FROM service_restart_intents
+            WHERE intent_id = 'intent-checkpoint-replay'
+            """
+        )
+        runtime = SessionRuntime(
+            database=database,
+            bridge=FakeBridge(session_id),
+            bindings=bindings,
+            owner_leases=OwnerLeaseStore(database),
+            owner_id="process-checkpoint-replay",
+            binding=binding,
+            capabilities=CapabilityRegistry(
+                Settings(_env_file=None, data_dir=tmp_path)
+            ).load_checked(),
+        )
+
+        await runtime.attach_resume()
+        intent = await database.fetchone(
+            """
+            SELECT state, outcome FROM service_restart_intents
+            WHERE intent_id = 'intent-checkpoint-replay'
+            """
+        )
+        await runtime.shutdown()
+
+    assert dict(claimed) == {"state": "claimed", "outcome": "replay_pending"}
+    assert dict(intent) == {"state": "settled", "outcome": "replayed"}
 
 
 @pytest.mark.asyncio
@@ -3377,7 +3993,7 @@ async def test_capability_runtime_unknown_states_gate_dispatch(tmp_path: Path) -
             INSERT INTO runtime_schedules(
                 sdk_session_id, runtime_schedule_id, builtin_name,
                 invocation_input, state, updated_at
-            ) VALUES (?, 'unknown-schedule', 'after', 'work', 'unknown', 1)
+            ) VALUES (?, 'unknown-schedule', 'after', '', 'unknown', 1)
             """,
             (session_id,),
         )
@@ -4180,179 +4796,6 @@ async def test_steer_requires_observed_active_work(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
-async def test_taskdeck_actions_are_state_gated_and_adapter_backed(
-    tmp_path: Path,
-) -> None:
-    session_id = str(uuid4())
-    async with Database(tmp_path / "task-actions.sqlite3") as database:
-        bindings = SessionBindingRepository(database)
-        binding = await bindings.create(
-            thread_id="thread-task-actions",
-            sdk_session_id=session_id,
-            cwd_snapshot=tmp_path,
-            project_source="implicit-home",
-        )
-        bridge = FakeBridge(session_id)
-        actions = FakeTaskActionAdapter()
-        runtime = SessionRuntime(
-            database=database,
-            bridge=bridge,
-            bindings=bindings,
-            owner_leases=OwnerLeaseStore(database),
-            owner_id="process-task-actions",
-            binding=binding,
-            task_action_adapter=actions,
-        )
-        await runtime.attach_create()
-        await database.execute(
-            """
-            INSERT INTO render_messages(
-                session_id, logical_key, discord_message_id, content_hash, finalized
-            ) VALUES (?, 'taskdeck', 'message-taskdeck', 'hash', 0)
-            """,
-            (session_id,),
-        )
-        await database.execute(
-            """
-            INSERT INTO task_card_projections(
-                sdk_session_id, panel_id, card_token, card_key, task_id, agent_id,
-                kind, title, state, progress_summary, detail_artifact,
-                dependencies_json, artifact_links_json, can_promote,
-                first_seen_at, revision, last_progress_at
-            ) VALUES (?, 'panel', 'card', 'task:1', 'task-1', 'agent-1',
-                      'agent', 'Worker', 'running', 'working', 'full detail',
-                      '[]', '[]', 1, 1, 1, 1)
-            """,
-            (session_id,),
-        )
-        await database.execute(
-            """
-            INSERT INTO taskdeck_panel_state(
-                sdk_session_id, panel_id, selected_card_token,
-                page, expanded, updated_at
-            ) VALUES (?, 'panel', 'card', 0, 0, 1)
-            """,
-            (session_id,),
-        )
-
-        stale = await runtime.perform_taskdeck_action(
-            panel_id="panel",
-            card_token="card",
-            expected_revision=0,
-            action="cancel",
-            message_id="message-taskdeck",
-            interaction_id="stale",
-        )
-        promoted = await runtime.perform_taskdeck_action(
-            panel_id="panel",
-            card_token="card",
-            expected_revision=1,
-            action="promote",
-            message_id="message-taskdeck",
-            interaction_id="promote",
-        )
-        promoted_duplicate = await runtime.perform_taskdeck_action(
-            panel_id="panel",
-            card_token="card",
-            expected_revision=1,
-            action="promote",
-            message_id="message-taskdeck",
-            interaction_id="promote",
-        )
-        messaged = await runtime.perform_taskdeck_action(
-            panel_id="panel",
-            card_token="card",
-            expected_revision=1,
-            action="message",
-            message_id="message-taskdeck",
-            interaction_id="message",
-            message="status please",
-        )
-        downloaded = await runtime.perform_taskdeck_action(
-            panel_id="panel",
-            card_token="card",
-            expected_revision=1,
-            action="download",
-            message_id="message-taskdeck",
-            interaction_id="download",
-        )
-        await database.execute(
-            """
-            UPDATE task_card_projections
-            SET state = 'completed', terminal_at = 2
-            WHERE sdk_session_id = ?
-            """,
-            (session_id,),
-        )
-        removed = await runtime.perform_taskdeck_action(
-            panel_id="panel",
-            card_token="card",
-            expected_revision=1,
-            action="remove",
-            message_id="message-taskdeck",
-            interaction_id="remove",
-        )
-
-        assert stale["status"] == "stale"
-        assert promoted["status"] == "updated"
-        assert promoted_duplicate["status"] == "updated"
-        assert messaged["status"] == "updated"
-        assert downloaded["status"] == "download"
-        assert downloaded["content"] == "full detail"
-        assert removed["status"] == "updated"
-        assert actions.calls == [
-            ("promote", "task-1", None),
-            ("message", "task-1", "status please"),
-            ("remove", "task-1", None),
-        ]
-        assert (
-            await database.fetchone(
-                "SELECT 1 FROM task_card_projections WHERE sdk_session_id = ?",
-                (session_id,),
-            )
-            is None
-        )
-        await database.execute(
-            """
-            INSERT INTO task_card_projections(
-                sdk_session_id, panel_id, card_token, card_key, task_id,
-                kind, title, state, dependencies_json, artifact_links_json,
-                can_promote, first_seen_at, revision, last_progress_at
-            ) VALUES (?, 'panel', 'card-fenced', 'task:2', 'task-2',
-                      'background', 'Fenced worker', 'running', '[]', '[]',
-                      0, 2, 1, 2)
-            """,
-            (session_id,),
-        )
-        await database.execute(
-            """
-            UPDATE session_owner_leases SET expires_at = 0
-            WHERE sdk_session_id = ?
-            """,
-            (session_id,),
-        )
-        with pytest.raises(OperationAmbiguous, match="owner fence lost"):
-            await runtime.perform_taskdeck_action(
-                panel_id="panel",
-                card_token="card-fenced",
-                expected_revision=1,
-                action="cancel",
-                message_id="message-taskdeck",
-                interaction_id="fenced-cancel",
-            )
-        assert all(call[0] != "cancel" for call in actions.calls)
-        await database.execute(
-            """
-            UPDATE session_owner_leases
-            SET expires_at = CAST(strftime('%s', 'now') AS REAL) + 60
-            WHERE sdk_session_id = ?
-            """,
-            (session_id,),
-        )
-        await runtime.shutdown()
-
-
-@pytest.mark.asyncio
 async def test_extension_config_hooks_and_same_fence_reattach(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -4785,9 +5228,8 @@ async def test_elicitation_and_oauth_handlers_are_exactly_once_and_redacted(
         assert oauth_result["accessToken"] == oauth_token
         assert oauth_row["state"] == "resolved"
         assert oauth_row["sensitive_response"] == 1
-        assert oauth_token not in oauth_row["response"]
-        assert "must-not-persist" not in oauth_row["payload"]
-        assert "[redacted]" in oauth_row["payload"]
+        assert oauth_row["response"] is None
+        assert oauth_row["payload"] == "{}"
         await runtime.close(idempotency_key="close-elicitation")
 
 
@@ -5153,7 +5595,7 @@ async def test_busy_runtime_keeps_durable_fifo_and_dispatches_only_the_head(
         assert bridge.handle.sent == []
         assert dict(queued) == {
             "id": queued_id,
-            "prompt": "first queued prompt",
+            "prompt": "",
             "state": "local_queued",
         }
         await database.execute(
@@ -6032,6 +6474,134 @@ async def test_owner_lease_renews_while_slow_attach_crosses_mutation_headroom(
 
 
 @pytest.mark.asyncio
+async def test_transient_owner_renewal_retries_without_fencing_or_task_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    session_id = str(uuid4())
+    async with Database(tmp_path / "transient-owner-renewal.sqlite3") as database:
+        bindings = SessionBindingRepository(database)
+        binding = await bindings.create(
+            thread_id="thread-transient-owner-renewal",
+            sdk_session_id=session_id,
+            cwd_snapshot=tmp_path,
+            project_source="implicit-home",
+        )
+        owner_leases = OwnerLeaseStore(database)
+        renew = owner_leases.renew
+        calls = 0
+
+        async def transient_renewal(lease: Any) -> Any:
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                raise OSError("database temporarily busy")
+            return await renew(lease)
+
+        monkeypatch.setattr(owner_leases, "renew", transient_renewal)
+        runtime = SessionRuntime(
+            database=database,
+            bridge=FakeBridge(session_id),
+            bindings=bindings,
+            owner_leases=owner_leases,
+            owner_id="process-transient-owner-renewal",
+            binding=binding,
+            owner_renew_seconds=0.01,
+        )
+        await runtime.attach_create()
+
+        for _ in range(100):
+            if calls >= 2:
+                break
+            await asyncio.sleep(0.005)
+
+        assert calls >= 2
+        assert runtime.state == RuntimeState.READY
+        assert runtime._renewal_task is not None
+        assert not runtime._renewal_task.done()
+        assert runtime._tasks.errors.empty()
+        await runtime.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_reattach_retires_stale_generation_observations(tmp_path: Path) -> None:
+    session_id = str(uuid4())
+    async with Database(tmp_path / "reattach-stale-observations.sqlite3") as database:
+        bindings = SessionBindingRepository(database)
+        binding = await bindings.create(
+            thread_id="thread-reattach-stale-observations",
+            sdk_session_id=session_id,
+            cwd_snapshot=tmp_path,
+            project_source="implicit-home",
+        )
+        leases = OwnerLeaseStore(database)
+        lease = await leases.acquire(session_id, "reattach-owner")
+        attached = await bindings.begin_attachment(
+            thread_id=binding.thread_id,
+            lease=lease,
+            state=AttachmentState.RESUMING,
+        )
+        attached = await bindings.mark_attached(attached)
+        await database.execute(
+            """
+            INSERT INTO background_observations(
+                sdk_session_id, runtime_generation, source_event_id,
+                observed_state, last_progress_at
+            ) VALUES (?, ?, 'stale-background', 'running', 1)
+            """,
+            (session_id, attached.runtime_generation),
+        )
+        await database.execute(
+            """
+            INSERT INTO reconciliation_state(
+                sdk_session_id, topic, status, runtime_generation,
+                owner_fence_token
+            ) VALUES (?, 'tasks', 'idle', ?, ?)
+            """,
+            (
+                session_id,
+                attached.runtime_generation,
+                attached.owner_fence_token,
+            ),
+        )
+        await database.execute(
+            """
+            INSERT INTO execution_health(
+                sdk_session_id, state, last_progress_at, suspect_since,
+                detail, updated_at
+            ) VALUES (?, 'suspect', 1, 1, '{}', 1)
+            """,
+            (session_id,),
+        )
+
+        await bindings.begin_reattach(thread_id=binding.thread_id, lease=lease)
+        background = await database.fetchone(
+            """
+            SELECT observed_state FROM background_observations
+            WHERE source_event_id = 'stale-background'
+            """
+        )
+        reconciliation = await database.fetchone(
+            """
+            SELECT status, uncertainty_reason FROM reconciliation_state
+            WHERE sdk_session_id = ? AND topic = 'tasks'
+            """,
+            (session_id,),
+        )
+        health = await database.fetchone(
+            "SELECT state FROM execution_health WHERE sdk_session_id = ?",
+            (session_id,),
+        )
+
+    assert background["observed_state"] == "unknown"
+    assert dict(reconciliation) == {
+        "status": "stale",
+        "uncertainty_reason": "generation_replaced",
+    }
+    assert health is None
+
+
+@pytest.mark.asyncio
 async def test_failed_owner_renewal_does_not_interrupt_shutdown_cleanup(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -6063,13 +6633,17 @@ async def test_failed_owner_renewal_does_not_interrupt_shutdown_cleanup(
 
         monkeypatch.setattr(owner_leases, "renew", fail_renewal)
         for _ in range(100):
-            if runtime.state == RuntimeState.FENCED:
+            if runtime._renewal_task is not None and runtime._renewal_task.done():
                 break
             await asyncio.sleep(0.005)
         else:
             raise AssertionError("owner renewal did not fail")
 
+        assert runtime.state == RuntimeState.FENCED
         assert runtime._renewal_task is not None and runtime._renewal_task.done()
+        failure = await asyncio.wait_for(runtime._tasks.errors.get(), timeout=1)
+        assert isinstance(failure.error, SessionLeaseRenewalFailed)
+        runtime._tasks.errors.task_done()
         await runtime.shutdown()
 
         assert runtime._renewal_task is None

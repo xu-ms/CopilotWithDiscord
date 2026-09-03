@@ -70,18 +70,6 @@ class RemotePrerequisites:
         return asdict(self)
 
 
-@dataclass(frozen=True, slots=True)
-class TaskDeckCard:
-    card_token: str
-    task_id: str | None
-    agent_id: str | None
-    kind: str
-    title: str
-    state: str
-    progress_summary: str | None
-    terminal_at: float | None
-
-
 class NativeBridge(Protocol):
     async def get_session_auth(self, session: Any) -> dict[str, Any]: ...
 
@@ -149,45 +137,6 @@ class NativeManifestController:
             (sdk_session_id,),
         )
         return tuple(dict(row) for row in rows)
-
-
-class TaskDeckAdapter:
-    def __init__(self, database: Database) -> None:
-        self._database = database
-
-    async def cards(self, sdk_session_id: str) -> tuple[TaskDeckCard, ...]:
-        rows = await self._database.fetchall(
-            """
-            SELECT card_token, task_id, agent_id, kind, title, state,
-                   progress_summary, terminal_at
-            FROM task_card_projections
-            WHERE sdk_session_id = ?
-            ORDER BY CASE WHEN terminal_at IS NULL THEN 0 ELSE 1 END,
-                     first_seen_at, card_key
-            """,
-            (sdk_session_id,),
-        )
-        return tuple(
-            TaskDeckCard(
-                card_token=str(row["card_token"]),
-                task_id=None if row["task_id"] is None else str(row["task_id"]),
-                agent_id=None if row["agent_id"] is None else str(row["agent_id"]),
-                kind=str(row["kind"]),
-                title=str(row["title"]),
-                state=str(row["state"]),
-                progress_summary=(
-                    None if row["progress_summary"] is None else str(row["progress_summary"])
-                ),
-                terminal_at=(None if row["terminal_at"] is None else float(row["terminal_at"])),
-            )
-            for row in rows
-        )
-
-    async def task(self, sdk_session_id: str, task_id: str) -> TaskDeckCard | None:
-        return next(
-            (card for card in await self.cards(sdk_session_id) if card.task_id == task_id),
-            None,
-        )
 
 
 class RemotePreflightController:

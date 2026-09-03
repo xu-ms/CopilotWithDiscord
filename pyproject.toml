@@ -9,6 +9,7 @@ description = "Always-on Discord bridge for the GitHub Copilot SDK"
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
+  "aiohttp>=3.11,<4",
   "aiosqlite>=0.22.1,<1",
   "croniter>=6.2.4,<7",
   "discord.py>=2.7.1,<3",

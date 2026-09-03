@@ -17,6 +17,7 @@ from copilotd.core.bindings import (
     SessionBindingRepository,
 )
 from copilotd.core.session_runtime import RuntimeState
+from copilotd.core.volatile_content import opaque_content_key, tool_event_evidence_key
 from copilotd.storage.database import Database
 
 if TYPE_CHECKING:
@@ -237,8 +238,9 @@ class SessionDeletionService:
             return True
         task = await self._database.fetchone(
             """
-            SELECT 1 FROM task_card_projections
-            WHERE sdk_session_id = ? AND state IN ('running', 'idle', 'unknown')
+            SELECT 1 FROM liveness_leases
+            WHERE sdk_session_id = ? AND kind = 'observed_background'
+              AND state = 'active'
             LIMIT 1
             """,
             (session_id,),
@@ -356,12 +358,13 @@ class SessionDeletionService:
             await connection.execute(
                 """
                 UPDATE session_operations
-                SET state = 'confirmed', result_ref = ?, error_code = NULL,
+                SET state = 'confirmed', result_ref = NULL, error_code = NULL,
                     settled_at = ?
                 WHERE operation_id = ?
                 """,
-                (json.dumps({"basis": basis}, sort_keys=True), now, operation_id),
+                (now, operation_id),
             )
+            del basis
             await connection.execute(
                 """
                 UPDATE session_bindings
@@ -396,67 +399,75 @@ class SessionDeletionService:
             """,
             (binding.sdk_session_id,),
         )
-        if row is None or row["delete_cleanup_state"] == "complete":
+        if row is None:
+            return
+        content_keys = await self._session_content_keys(binding)
+        if row["delete_cleanup_state"] == "complete":
+            for key in content_keys:
+                self._database.content_store.delete(key)
             return
         attachment_root = self._data_dir / "sessions" / binding.sdk_session_id / "attachments"
         try:
             await asyncio.to_thread(shutil.rmtree, attachment_root, True)
             now = time.time()
-            async with self._database.transaction() as connection:
-                await connection.execute(
-                    """
+            with self._database.content_store.transaction():
+                async with self._database.transaction() as connection:
+                    for key in content_keys:
+                        self._database.content_store.delete(key)
+                    await connection.execute(
+                        """
                     UPDATE attachment_items SET state = 'deleted'
                     WHERE manifest_id IN (
                         SELECT id FROM attachment_manifests WHERE session_id = ?
                     )
                     """,
-                    (binding.sdk_session_id,),
-                )
-                await connection.execute(
-                    """
+                        (binding.sdk_session_id,),
+                    )
+                    await connection.execute(
+                        """
                     UPDATE attachment_manifests SET state = 'deleted'
                     WHERE session_id = ?
                     """,
-                    (binding.sdk_session_id,),
-                )
-                await connection.execute(
-                    """
+                        (binding.sdk_session_id,),
+                    )
+                    await connection.execute(
+                        """
                     UPDATE worktree_intents
                     SET thread_id = NULL, sdk_session_id = NULL, updated_at = ?
                     WHERE sdk_session_id = ?
                     """,
-                    (now, binding.sdk_session_id),
-                )
-                await connection.execute(
-                    """
+                        (now, binding.sdk_session_id),
+                    )
+                    await connection.execute(
+                        """
                     UPDATE project_worktrees
                     SET thread_id = NULL, sdk_session_id = NULL, updated_at = ?
                     WHERE sdk_session_id = ?
                     """,
-                    (now, binding.sdk_session_id),
-                )
-                await connection.execute(
-                    """
+                        (now, binding.sdk_session_id),
+                    )
+                    await connection.execute(
+                        """
                     UPDATE session_ui_metadata
                     SET native_name_state = 'deleted', updated_at = ?
                     WHERE session_id = ?
                     """,
-                    (now, binding.sdk_session_id),
-                )
-                await connection.execute(
-                    "DELETE FROM session_owner_leases WHERE sdk_session_id = ?",
-                    (binding.sdk_session_id,),
-                )
-                await connection.execute(
-                    """
-                    UPDATE session_bindings
-                    SET delete_cleanup_state = 'complete',
-                        delete_cleanup_error = NULL, updated_at = ?,
-                        row_version = row_version + 1
-                    WHERE sdk_session_id = ? AND binding_intent = 'deleted'
-                    """,
-                    (now, binding.sdk_session_id),
-                )
+                        (now, binding.sdk_session_id),
+                    )
+                    await connection.execute(
+                        "DELETE FROM session_owner_leases WHERE sdk_session_id = ?",
+                        (binding.sdk_session_id,),
+                    )
+                    await connection.execute(
+                        """
+                        UPDATE session_bindings
+                        SET delete_cleanup_state = 'complete',
+                            delete_cleanup_error = NULL, updated_at = ?,
+                            row_version = row_version + 1
+                        WHERE sdk_session_id = ? AND binding_intent = 'deleted'
+                        """,
+                        (now, binding.sdk_session_id),
+                    )
         except Exception as error:
             await self._database.execute(
                 """
@@ -465,5 +476,198 @@ class SessionDeletionService:
                     updated_at = ?, row_version = row_version + 1
                 WHERE sdk_session_id = ? AND binding_intent = 'deleted'
                 """,
-                (f"{type(error).__name__}: {error}", time.time(), binding.sdk_session_id),
+                (type(error).__name__, time.time(), binding.sdk_session_id),
             )
+
+    async def _session_content_keys(self, binding: SessionBinding) -> set[str]:
+        rows = await self._database.fetchall(
+            """
+            SELECT content_key AS key FROM render_outbox
+            WHERE session_id = ? AND content_key IS NOT NULL
+            UNION
+            SELECT q.prompt_content_key AS key
+            FROM message_queue q
+            JOIN submissions s ON s.submission_id = q.id
+            WHERE s.sdk_session_id = ? AND q.prompt_content_key IS NOT NULL
+            UNION
+            SELECT content_key AS key FROM pending_interactions
+            WHERE sdk_session_id = ? AND content_key IS NOT NULL
+            UNION
+            SELECT result_ref AS key FROM session_operations
+            WHERE sdk_session_id = ? AND result_ref IS NOT NULL
+            """,
+            (
+                binding.sdk_session_id,
+                binding.sdk_session_id,
+                binding.sdk_session_id,
+                binding.sdk_session_id,
+            ),
+        )
+        keys = {str(row["key"]) for row in rows}
+        interactions = await self._database.fetchall(
+            """
+            SELECT interaction_id FROM pending_interactions
+            WHERE sdk_session_id = ?
+            """,
+            (binding.sdk_session_id,),
+        )
+        for row in interactions:
+            for scope in ("interaction-request", "interaction-response"):
+                keys.add(
+                    opaque_content_key(
+                        scope,
+                        binding.sdk_session_id,
+                        row["interaction_id"],
+                    )
+                )
+        streams = await self._database.fetchall(
+            """
+            SELECT DISTINCT message_id, COALESCE(agent_id, '') AS agent_id
+            FROM event_journal
+            WHERE sdk_session_id = ? AND message_id IS NOT NULL
+              AND raw_type IN ('assistant.message_delta', 'assistant.message')
+            """,
+            (binding.sdk_session_id,),
+        )
+        for row in streams:
+            keys.add(
+                opaque_content_key(
+                    "assistant-stream",
+                    binding.sdk_session_id,
+                    row["message_id"],
+                    row["agent_id"],
+                )
+            )
+        tools = await self._database.fetchall(
+            """
+            SELECT turn_key, tool_call_id FROM tool_render_state
+            WHERE sdk_session_id = ?
+            """,
+            (binding.sdk_session_id,),
+        )
+        for row in tools:
+            keys.add(
+                opaque_content_key(
+                    "tool-display",
+                    binding.sdk_session_id,
+                    row["turn_key"],
+                    row["tool_call_id"],
+                )
+            )
+        protocol = await self._database.fetchall(
+            """
+            SELECT generation, request_id, requested_type, completed_type
+            FROM protocol_requests WHERE sdk_session_id = ?
+            """,
+            (binding.sdk_session_id,),
+        )
+        for row in protocol:
+            keys.add(
+                opaque_content_key(
+                    "protocol-response",
+                    binding.sdk_session_id,
+                    row["generation"],
+                    row["request_id"],
+                )
+            )
+            for event_type in (row["requested_type"], row["completed_type"]):
+                if event_type is not None:
+                    keys.add(
+                        opaque_content_key(
+                            "protocol-body",
+                            binding.sdk_session_id,
+                            row["generation"],
+                            row["request_id"],
+                            event_type,
+                        )
+                    )
+        evidence = await self._database.fetchall(
+            """
+            SELECT DISTINCT generation, tool_call_id, raw_type
+            FROM event_journal
+            WHERE sdk_session_id = ? AND tool_call_id IS NOT NULL
+              AND raw_type IN ('tool.execution_start', 'tool.execution_complete')
+            """,
+            (binding.sdk_session_id,),
+        )
+        for row in evidence:
+            keys.add(
+                tool_event_evidence_key(
+                    binding.sdk_session_id,
+                    int(row["generation"]),
+                    str(row["tool_call_id"]),
+                    str(row["raw_type"]),
+                )
+            )
+        keys.add(opaque_content_key("session-display-name", binding.sdk_session_id))
+        runtime_schedules = await self._database.fetchall(
+            """
+            SELECT runtime_schedule_id FROM runtime_schedules
+            WHERE sdk_session_id = ?
+            """,
+            (binding.sdk_session_id,),
+        )
+        for row in runtime_schedules:
+            keys.add(
+                opaque_content_key(
+                    "runtime-schedule",
+                    binding.sdk_session_id,
+                    row["runtime_schedule_id"],
+                )
+            )
+        native_commands = await self._database.fetchall(
+            """
+            SELECT invocation_id FROM runtime_command_invocations
+            WHERE sdk_session_id = ?
+            """,
+            (binding.sdk_session_id,),
+        )
+        for row in native_commands:
+            keys.add(
+                opaque_content_key(
+                    "native-command-result",
+                    binding.sdk_session_id,
+                    row["invocation_id"],
+                )
+            )
+        schedule_actions = await self._database.fetchall(
+            """
+            SELECT action_id FROM runtime_schedule_actions
+            WHERE sdk_session_id = ?
+            """,
+            (binding.sdk_session_id,),
+        )
+        for row in schedule_actions:
+            keys.add(
+                opaque_content_key(
+                    "runtime-schedule-action-baseline",
+                    binding.sdk_session_id,
+                    row["action_id"],
+                )
+            )
+        manifests = await self._database.fetchall(
+            """
+            SELECT m.id, i.item_index
+            FROM attachment_manifests AS m
+            LEFT JOIN attachment_items AS i ON i.manifest_id = m.id
+            WHERE m.session_id = ?
+            """,
+            (binding.sdk_session_id,),
+        )
+        for row in manifests:
+            keys.add(opaque_content_key("attachment-recovery-prompt", row["id"]))
+            if row["item_index"] is not None:
+                keys.add(
+                    opaque_content_key(
+                        "attachment-name",
+                        row["id"],
+                        row["item_index"],
+                    )
+                )
+        schedules = await self._database.fetchall(
+            "SELECT id FROM schedules WHERE thread_id = ?",
+            (binding.thread_id,),
+        )
+        for row in schedules:
+            keys.add(opaque_content_key("schedule-prompt", row["id"]))
+        return keys

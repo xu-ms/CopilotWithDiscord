@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import json
 import os
 import re
 import signal
@@ -28,6 +27,7 @@ from copilotd.core.projects import (
 from copilotd.core.sessions import SessionCreationService, SessionCreationUnknown
 from copilotd.core.task_registry import TaskRegistry
 from copilotd.storage.database import Database
+from copilotd.storage.state_only import state_only_json
 
 try:
     import fcntl as _fcntl
@@ -1090,7 +1090,7 @@ class WorktreeManager:
                 len(rows),
                 recovered,
                 orphaned,
-                _canonical_json(
+                state_only_json(
                     {
                         "examined": len(rows),
                         "recovered": recovered,
@@ -1551,12 +1551,11 @@ class WorktreeManager:
                         UPDATE worktree_intents
                         SET git_create_holder = NULL, git_create_retry_at = ?,
                             error_code = 'git_owner_generation_stale',
-                            error_detail = ?, updated_at = ?
+                            error_detail = NULL, updated_at = ?
                         WHERE intent_id = ? AND state = 'git_creating'
                         """,
                         (
                             retry_at,
-                            "previous worktree process generation was invalidated",
                             now,
                             row["intent_id"],
                         ),
@@ -1570,7 +1569,7 @@ class WorktreeManager:
                         (
                             str(uuid.uuid4()),
                             row["intent_id"],
-                            _canonical_json(
+                            state_only_json(
                                 {
                                     "event": "git_owner_generation_invalidated",
                                     "process_generation": generation,
@@ -1676,7 +1675,7 @@ class WorktreeManager:
                 (
                     str(uuid.uuid4()),
                     intent_id,
-                    _canonical_json(
+                    state_only_json(
                         {
                             "git_create_holder": holder,
                             "git_create_fence_token": fence_token,
@@ -2041,7 +2040,7 @@ class WorktreeManager:
                 SET state = ?, created_branch = COALESCE(?, created_branch),
                     git_create_holder = NULL, git_create_lease_expires_at = NULL,
                     git_create_retry_at = NULL,
-                    error_code = ?, error_detail = ?, updated_at = ?
+                    error_code = ?, error_detail = NULL, updated_at = ?
                 WHERE intent_id = ? AND state = 'git_creating'
                   AND git_create_holder = ? AND git_create_fence_token = ?
                   AND git_create_process_generation = ?
@@ -2056,7 +2055,6 @@ class WorktreeManager:
                     state.value,
                     None if created_branch is None else int(created_branch),
                     error_code,
-                    error_detail,
                     now,
                     intent_id,
                     holder,
@@ -2079,7 +2077,7 @@ class WorktreeManager:
                     str(uuid.uuid4()),
                     intent_id,
                     state.value,
-                    _canonical_json(
+                    state_only_json(
                         {
                             "git_create_holder": holder,
                             "git_create_fence_token": fence_token,
@@ -2223,7 +2221,7 @@ class WorktreeManager:
                         (
                             str(uuid.uuid4()),
                             intent.intent_id,
-                            _canonical_json(
+                            state_only_json(
                                 {
                                     "event": "retry_known_git_preflight_conflict",
                                     "previous_error_code": intent.error_code,
@@ -2298,7 +2296,7 @@ class WorktreeManager:
                     thread_id = COALESCE(?, thread_id),
                     sdk_session_id = COALESCE(?, sdk_session_id),
                     created_branch = COALESCE(?, created_branch),
-                    error_code = ?, error_detail = ?, updated_at = ?
+                    error_code = ?, error_detail = NULL, updated_at = ?
                 WHERE intent_id = ? AND state IN ({placeholders})
                 """,
                 (
@@ -2308,7 +2306,6 @@ class WorktreeManager:
                     sdk_session_id,
                     None if created_branch is None else int(created_branch),
                     error_code,
-                    error_detail,
                     now,
                     intent_id,
                     *(item.value for item in predecessors),
@@ -2329,7 +2326,7 @@ class WorktreeManager:
                     str(uuid.uuid4()),
                     intent_id,
                     state.value,
-                    _canonical_json(
+                    state_only_json(
                         {
                             "project_id": project_id,
                             "thread_id": thread_id,
@@ -2355,11 +2352,10 @@ class WorktreeManager:
                 """
                 UPDATE worktree_intents
                 SET error_code = COALESCE(error_code, 'recovery_intervention'),
-                    error_detail = ?, updated_at = ?
+                    error_detail = NULL, updated_at = ?
                 WHERE intent_id = ? AND state = ?
                 """,
                 (
-                    f"{type(error).__name__}: {error}"[:1_000],
                     now,
                     intent.intent_id,
                     intent.state.value,
@@ -2401,7 +2397,7 @@ class WorktreeManager:
                     str(uuid.uuid4()),
                     intent.intent_id,
                     intent.state.value,
-                    _canonical_json(
+                    state_only_json(
                         {
                             "event": "recovery_intervention",
                             "error_type": type(error).__name__,
@@ -2892,10 +2888,6 @@ def _row_to_intent(row: Row) -> WorktreeIntent:
         created_at=float(row["created_at"]),
         updated_at=float(row["updated_at"]),
     )
-
-
-def _canonical_json(value: object) -> str:
-    return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
 
 
 async def _fetchone(

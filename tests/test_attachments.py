@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import hashlib
 import io
 from dataclasses import dataclass
 from pathlib import Path
@@ -82,7 +83,9 @@ async def test_attachment_manifest_is_durable_idempotent_and_integrity_checked(
         assert row["total_bytes"] == len(attachment.content)
         persisted_content = await asyncio.to_thread(Path(row["local_path"]).read_bytes)
         assert persisted_content == attachment.content
-        assert Path(row["local_path"]).name == "000-report.txt"
+        assert Path(row["local_path"]).name == (
+            "000-" + hashlib.sha256(attachment.content).hexdigest()
+        )
 
         await asyncio.to_thread(Path(row["local_path"]).write_bytes, b"tampered")
         with pytest.raises(AttachmentError, match="integrity check failed"):
