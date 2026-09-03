@@ -322,7 +322,6 @@ class CopilotDiscordBot(commands.Bot):
         self.projects = ProjectRegistry(
             self.database,
             resolved_home=self.settings.resolved_home,
-            content_store=self.content_store,
         )
         await self.projects.initialize()
         self.bindings = SessionBindingRepository(self.database)
