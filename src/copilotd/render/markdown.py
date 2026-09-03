@@ -6,6 +6,7 @@ import shlex
 from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
+from urllib.parse import unquote, urlsplit
 
 from PIL import Image, UnidentifiedImageError
 
@@ -1090,7 +1091,12 @@ def _parse_markdown_image_target(target: str) -> tuple[str | None, str | None]:
     path = parts[0]
     title = None if len(parts) == 1 else " ".join(parts[1:])
     if re.match(r"^[a-zA-Z][a-zA-Z0-9+.-]*:", path):
-        return None, None
+        parsed = urlsplit(path)
+        if parsed.scheme.lower() != "file" or parsed.netloc not in {"", "localhost"}:
+            return None, None
+        path = unquote(parsed.path)
+        if not Path(path).is_absolute():
+            return None, None
     return path, title
 
 

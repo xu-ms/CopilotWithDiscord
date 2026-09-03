@@ -119,6 +119,7 @@ from copilotd.render.markdown import (
     MarkdownAssembler,
     TableBlock,
     TextBlock,
+    extract_local_markdown_images,
     plan_markdown_messages,
 )
 from copilotd.render.outbox import (
@@ -1254,6 +1255,7 @@ class CopilotDiscordBot(commands.Bot):
                 thread = await self._thread_for_session(session_id)
                 plan = await _discord_render_plan(
                     payload,
+                    allowed_roots=_session_artifact_roots(session_id),
                     max_bytes=self.settings.discord_upload_max_bytes,
                 )
                 message_id = await self._deliver_render_plan(
@@ -1325,6 +1327,7 @@ class CopilotDiscordBot(commands.Bot):
                 )
                 plan = await _discord_render_plan(
                     payload,
+                    allowed_roots=_session_artifact_roots(session_id),
                     max_bytes=self.settings.discord_upload_max_bytes,
                 )
                 await self._deliver_render_plan(
@@ -4855,6 +4858,7 @@ async def _discord_render(
 async def _discord_render_plan(
     payload: dict[str, Any],
     *,
+    allowed_roots: tuple[Path, ...] = (),
     max_bytes: int | None = None,
 ) -> DiscordRenderPlan:
     content = str(payload.get("content", ""))
@@ -4899,6 +4903,29 @@ async def _discord_render_plan(
                 TableAsset(
                     filename=str(attachment.get("filename", "artifact.txt")),
                     media_type=str(attachment.get("media_type", "text/plain")),
+                    content=encoded,
+                )
+            )
+    local_image_assets: list[TableAsset] = []
+    if allowed_roots:
+        extraction = await asyncio.to_thread(
+            extract_local_markdown_images,
+            content,
+            allowed_roots=allowed_roots,
+        )
+        content = extraction.content
+        for attachment in extraction.attachments:
+            artifact_path = Path(attachment.resolved_path)
+            try:
+                encoded = await asyncio.to_thread(artifact_path.read_bytes)
+            except OSError as error:
+                raise RenderPermanentError(
+                    f"local image artifact is unavailable: {artifact_path}"
+                ) from error
+            local_image_assets.append(
+                TableAsset(
+                    filename=attachment.filename,
+                    media_type=_image_media_type(attachment.filename),
                     content=encoded,
                 )
             )
@@ -4959,7 +4986,7 @@ async def _discord_render_plan(
     if not batches:
         batches.append(DiscordRenderBatch(""))
 
-    batches = _append_assets_to_batches(batches, explicit_assets)
+    batches = _append_assets_to_batches(batches, explicit_assets + local_image_assets)
 
     prepared_batches: list[DiscordRenderBatch] = []
     for batch in batches:
@@ -5705,6 +5732,24 @@ def _append_assets_to_batches(
             )
         )
     return batches
+
+
+def _session_artifact_roots(
+    session_id: str,
+    *,
+    home: Path | None = None,
+) -> tuple[Path, ...]:
+    if not session_id or Path(session_id).name != session_id or session_id in {".", ".."}:
+        return ()
+    session_state = ((home or Path.home()) / ".copilot" / "session-state").resolve(
+        strict=False
+    )
+    artifact_root = (session_state / session_id / "files").resolve(strict=False)
+    try:
+        artifact_root.relative_to(session_state)
+    except ValueError:
+        return ()
+    return (artifact_root,)
 
 
 def _image_media_type(filename: str) -> str:

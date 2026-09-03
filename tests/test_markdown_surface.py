@@ -142,6 +142,24 @@ async def test_local_markdown_image_extraction_ignores_code_containers_and_batch
     assert {warning.kind for warning in plan.warnings} == {"invalid-root"}
 
 
+def test_local_markdown_image_extraction_accepts_file_uri_within_root(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "allowed"
+    root.mkdir()
+    image = root / "rendered chart.png"
+    _write_png(image)
+
+    plan = extract_local_markdown_images(
+        f"![chart]({image.as_uri()})",
+        allowed_roots=[root],
+    )
+
+    assert plan.content == ""
+    assert [item.resolved_path for item in plan.attachments] == [str(image.resolve())]
+    assert plan.warnings == ()
+
+
 @pytest.mark.asyncio
 async def test_local_markdown_image_extraction_ends_container_scoped_fences_at_boundary(
     tmp_path: Path,

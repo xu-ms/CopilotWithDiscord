@@ -9,6 +9,7 @@ from unittest.mock import AsyncMock
 import discord
 import pytest
 from discord.ext import commands
+from PIL import Image
 
 from copilotd.config import Settings
 from copilotd.core.bindings import BindingIntent, SessionBindingRepository
@@ -27,6 +28,7 @@ from copilotd.discord_app import (
     _prepare_discord_assets,
     _render_delivery_error,
     _render_view,
+    _session_artifact_roots,
 )
 from copilotd.render.outbox import (
     RenderPermanentError,
@@ -1226,6 +1228,36 @@ async def test_assistant_markdown_cannot_dereference_local_image_without_trust(
 
     assert all(not batch.assets for batch in plan.batches)
     assert "![private]" in plan.batches[0].content
+
+
+@pytest.mark.asyncio
+async def test_assistant_markdown_uploads_image_from_session_artifact_root(
+    tmp_path: Path,
+) -> None:
+    artifact_root = tmp_path / ".copilot" / "session-state" / "session-1" / "files"
+    artifact_root.mkdir(parents=True)
+    image = artifact_root / "weekly report.png"
+    Image.new("RGB", (2, 2), "blue").save(image, format="PNG")
+
+    plan = await _discord_render_plan(
+        {
+            "type": "assistant.message",
+            "content": f"Rendered result:\n\n![Weekly report]({image.as_uri()})",
+            "finalized": True,
+        },
+        allowed_roots=_session_artifact_roots("session-1", home=tmp_path),
+    )
+
+    assets = [asset for batch in plan.batches for asset in batch.assets]
+    assert [asset.filename for asset in assets] == ["weekly-report.png"]
+    assert assets[0].media_type == "image/png"
+    assert all("file://" not in batch.content for batch in plan.batches)
+    assert plan.batches[0].embeds[0]["image"]["url"] == "attachment://weekly-report.png"
+
+
+def test_session_artifact_roots_reject_path_escape(tmp_path: Path) -> None:
+    assert _session_artifact_roots("../../private", home=tmp_path) == ()
+    assert _session_artifact_roots("session-1/../session-2", home=tmp_path) == ()
 
 
 @pytest.mark.asyncio
