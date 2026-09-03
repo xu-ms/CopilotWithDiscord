@@ -6,6 +6,7 @@ import json
 import time
 import uuid
 from collections.abc import Awaitable, Callable
+from pathlib import Path
 from typing import Any, ClassVar, cast
 
 from aiosqlite import Connection, Row
@@ -245,12 +246,14 @@ class JournalReducer:
         require_binding_fence: bool = False,
         content_store: VolatileContentStore | None = None,
         capture_tool_acceptance_evidence: bool = False,
+        session_state_dir: Path | None = None,
     ) -> None:
         self._database = database
         self._planner = planner or RenderPlanner()
         self._require_binding_fence = require_binding_fence
         self._content_store = content_store or database.content_store
         self._capture_tool_acceptance_evidence = capture_tool_acceptance_evidence
+        self._session_state_dir = session_state_dir or Path.home() / ".copilot" / "session-state"
 
     async def persist(self, events: list[AdaptedEvent]) -> int:
         operation = asyncio.create_task(self._persist_coupled(events))
@@ -1910,6 +1913,11 @@ class JournalReducer:
         command = sanitize_tool_command(data)
         if command == "(command unavailable)" and previous.get("sanitized_command"):
             command = str(previous["sanitized_command"])
+        attachment = (
+            await self._verified_view_image_attachment(event, data)
+            if event.raw_type == "tool.execution_start"
+            else previous.get("attachment")
+        )
         if event.raw_type == "tool.execution_complete":
             state = "succeeded" if bool(data.get("success")) else "failed"
             progress_summary = "Completed successfully." if state == "succeeded" else "Failed."
@@ -1932,6 +1940,7 @@ class JournalReducer:
                 "sanitized_command": command,
                 "progress_summary": progress_summary,
                 "failure_summary": failure_summary,
+                "attachment": attachment,
             },
             key=display_key,
         )
@@ -2041,7 +2050,7 @@ class JournalReducer:
             details.append(f"{active_count} tools currently active.")
         detail = "\n".join(details)
         finalized = active_count == 0
-        return {
+        payload = {
             "type": "tool_card",
             "content": f"**{title}**\n{detail}",
             "status": {
@@ -2065,6 +2074,41 @@ class JournalReducer:
             "submission_id": context["submission_id"],
             "segment_index": context["segment_index"],
             "finalized": finalized,
+        }
+        current_attachment = current_values.get("attachment")
+        if current_state == "succeeded" and isinstance(current_attachment, dict):
+            payload["attachments"] = [current_attachment]
+        return payload
+
+    async def _verified_view_image_attachment(
+        self,
+        event: AdaptedEvent,
+        data: dict[str, Any],
+    ) -> dict[str, Any] | None:
+        if sanitize_tool_name(data.get("toolName")).lower() != "view":
+            return None
+        raw_path = None
+        for container in (data.get("arguments"), data.get("input")):
+            if isinstance(container, dict) and isinstance(container.get("path"), str):
+                raw_path = str(container["path"])
+                break
+        if raw_path is None:
+            return None
+        candidate = await asyncio.to_thread(
+            _resolve_session_png_path,
+            self._session_state_dir,
+            event.sdk_session_id,
+            raw_path,
+        )
+        if candidate is None:
+            return None
+        content = await asyncio.to_thread(candidate.read_bytes)
+        return {
+            "filename": candidate.name,
+            "media_type": "image/png",
+            "path": str(candidate),
+            "byte_size": len(content),
+            "sha256": hashlib.sha256(content).hexdigest(),
         }
 
     async def _materialize_render_payload(
@@ -9613,6 +9657,27 @@ async def _finalize_schedule_run_from_reducer(
             run_id,
         ),
     )
+
+
+def _resolve_session_png_path(
+    session_state_dir: Path,
+    session_id: str,
+    raw_path: str,
+) -> Path | None:
+    artifact_root = (session_state_dir / session_id / "files").resolve(strict=False)
+    candidate = Path(raw_path)
+    candidate = (
+        candidate.resolve(strict=False)
+        if candidate.is_absolute()
+        else (artifact_root / candidate).resolve(strict=False)
+    )
+    try:
+        candidate.relative_to(artifact_root)
+    except ValueError:
+        return None
+    if candidate.suffix.lower() != ".png" or not candidate.is_file():
+        return None
+    return candidate
 
 
 async def _fetchone_row(

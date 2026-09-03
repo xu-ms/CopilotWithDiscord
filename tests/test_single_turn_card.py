@@ -381,6 +381,113 @@ async def test_sequential_and_overlapping_tools_share_one_sanitized_card(
 
 
 @pytest.mark.asyncio
+async def test_successful_view_of_session_png_attaches_image_to_tool_card(
+    tmp_path: Path,
+) -> None:
+    session_state = tmp_path / "session-state"
+    image = session_state / "render-session" / "files" / "report.png"
+    image.parent.mkdir(parents=True)
+    image.write_bytes(b"png fixture")
+    async with Database(tmp_path / "view-image.sqlite3") as database:
+        await _binding(database, tmp_path)
+        reducer = JournalReducer(database, session_state_dir=session_state)
+        await reducer.persist([_queued()])
+        await reducer.persist(
+            [
+                _event(
+                    "tool.execution_start",
+                    {
+                        "toolCallId": "view-1",
+                        "toolName": "view",
+                        "arguments": {"path": str(image)},
+                    },
+                    2,
+                    source="sdk",
+                    event_id="view-start",
+                    tool_call_id="view-1",
+                ),
+                _event(
+                    "tool.execution_complete",
+                    {
+                        "toolCallId": "view-1",
+                        "toolName": "view",
+                        "success": True,
+                    },
+                    3,
+                    source="sdk",
+                    event_id="view-complete",
+                    tool_call_id="view-1",
+                ),
+            ]
+        )
+        row = await database.fetchone(
+            "SELECT content_key, content_hash FROM render_outbox WHERE lane = 'tool'"
+        )
+        payload = database.content_store.require(
+            str(row["content_key"]),
+            expected_hash=str(row["content_hash"]),
+        )
+        plan = await _discord_render_plan(payload)
+
+    assert payload["attachments"][0]["path"] == str(image)
+    assert [asset.filename for batch in plan.batches for asset in batch.assets] == [
+        "report.png"
+    ]
+
+
+@pytest.mark.asyncio
+async def test_view_image_outside_session_artifacts_is_not_attached(
+    tmp_path: Path,
+) -> None:
+    outside = tmp_path / "private.png"
+    outside.write_bytes(b"not exposed")
+    async with Database(tmp_path / "view-image-boundary.sqlite3") as database:
+        await _binding(database, tmp_path)
+        reducer = JournalReducer(
+            database,
+            session_state_dir=tmp_path / "session-state",
+        )
+        await reducer.persist([_queued()])
+        await reducer.persist(
+            [
+                _event(
+                    "tool.execution_start",
+                    {
+                        "toolCallId": "view-1",
+                        "toolName": "view",
+                        "arguments": {"path": str(outside)},
+                    },
+                    2,
+                    source="sdk",
+                    event_id="view-start",
+                    tool_call_id="view-1",
+                ),
+                _event(
+                    "tool.execution_complete",
+                    {
+                        "toolCallId": "view-1",
+                        "toolName": "view",
+                        "success": True,
+                    },
+                    3,
+                    source="sdk",
+                    event_id="view-complete",
+                    tool_call_id="view-1",
+                ),
+            ]
+        )
+        row = await database.fetchone(
+            "SELECT content_key, content_hash FROM render_outbox WHERE lane = 'tool'"
+        )
+        payload = database.content_store.require(
+            str(row["content_key"]),
+            expected_hash=str(row["content_hash"]),
+        )
+
+    assert "attachments" not in payload
+
+
+@pytest.mark.asyncio
 async def test_sequential_tools_reopen_and_refinalize_the_same_card(
     tmp_path: Path,
 ) -> None:
